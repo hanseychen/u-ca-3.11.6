@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitLogSegmentReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">CommitLogSegmentReader.java</span></div><h1>CommitLogSegmentReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+import java.util.zip.CRC32;
+import javax.crypto.Cipher;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.AbstractIterator;
+
+import org.apache.cassandra.db.commitlog.EncryptedFileSegmentInputStream.ChunkProvider;
+import org.apache.cassandra.db.commitlog.CommitLogReadHandler.*;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.ICompressor;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileSegmentInputStream;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.security.EncryptionUtils;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.SYNC_MARKER_SIZE;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+
+/**
+ * Read each sync section of a commit log, iteratively.
+ */
+public class CommitLogSegmentReader implements Iterable&lt;CommitLogSegmentReader.SyncSegment&gt;
+{
+    private final CommitLogReadHandler handler;
+    private final CommitLogDescriptor descriptor;
+    private final RandomAccessReader reader;
+    private final Segmenter segmenter;
+    private final boolean tolerateTruncation;
+
+    /**
+     * ending position of the current sync section.
+     */
+    protected int end;
+
+    protected CommitLogSegmentReader(CommitLogReadHandler handler,
+                                     CommitLogDescriptor descriptor,
+                                     RandomAccessReader reader,
+                                     boolean tolerateTruncation)
+<span class="nc" id="L64">    {</span>
+<span class="nc" id="L65">        this.handler = handler;</span>
+<span class="nc" id="L66">        this.descriptor = descriptor;</span>
+<span class="nc" id="L67">        this.reader = reader;</span>
+<span class="nc" id="L68">        this.tolerateTruncation = tolerateTruncation;</span>
+
+<span class="nc" id="L70">        end = (int) reader.getFilePointer();</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">        if (descriptor.getEncryptionContext().isEnabled())</span>
+<span class="nc" id="L72">            segmenter = new EncryptedSegmenter(descriptor, reader);</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">        else if (descriptor.compression != null)</span>
+<span class="nc" id="L74">            segmenter = new CompressedSegmenter(descriptor, reader);</span>
+        else
+<span class="nc" id="L76">            segmenter = new NoOpSegmenter(reader);</span>
+<span class="nc" id="L77">    }</span>
+
+    public Iterator&lt;SyncSegment&gt; iterator()
+    {
+<span class="nc" id="L81">        return new SegmentIterator();</span>
+    }
+
+<span class="nc" id="L84">    protected class SegmentIterator extends AbstractIterator&lt;CommitLogSegmentReader.SyncSegment&gt;</span>
+    {
+        protected SyncSegment computeNext()
+        {
+            while (true)
+            {
+                try
+                {
+<span class="nc" id="L92">                    final int currentStart = end;</span>
+<span class="nc" id="L93">                    end = readSyncMarker(descriptor, currentStart, reader);</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">                    if (end == -1)</span>
+                    {
+<span class="nc" id="L96">                        return endOfData();</span>
+                    }
+<span class="nc bnc" id="L98" title="All 2 branches missed.">                    if (end &gt; reader.length())</span>
+                    {
+                        // the CRC was good (meaning it was good when it was written and still looks legit), but the file is truncated now.
+                        // try to grab and use as much of the file as possible, which might be nothing if the end of the file truly is corrupt
+<span class="nc" id="L102">                        end = (int) reader.length();</span>
+                    }
+<span class="nc" id="L104">                    return segmenter.nextSegment(currentStart + SYNC_MARKER_SIZE, end);</span>
+                }
+<span class="nc" id="L106">                catch(CommitLogSegmentReader.SegmentReadException e)</span>
+                {
+                    try
+                    {
+<span class="nc" id="L110">                        handler.handleUnrecoverableError(new CommitLogReadException(</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                                                    e.getMessage(),</span>
+                                                    CommitLogReadErrorReason.UNRECOVERABLE_DESCRIPTOR_ERROR,
+<span class="nc bnc" id="L113" title="All 2 branches missed.">                                                    !e.invalidCrc &amp;&amp; tolerateTruncation));</span>
+                    }
+<span class="nc" id="L115">                    catch (IOException ioe)</span>
+                    {
+<span class="nc" id="L117">                        throw new RuntimeException(ioe);</span>
+<span class="nc" id="L118">                    }</span>
+                }
+<span class="nc" id="L120">                catch (IOException e)</span>
+                {
+                    try
+                    {
+<span class="nc" id="L124">                        boolean tolerateErrorsInSection = tolerateTruncation &amp; segmenter.tolerateSegmentErrors(end, reader.length());</span>
+                        // if no exception is thrown, the while loop will continue
+<span class="nc" id="L126">                        handler.handleUnrecoverableError(new CommitLogReadException(</span>
+<span class="nc" id="L127">                                                    e.getMessage(),</span>
+                                                    CommitLogReadErrorReason.UNRECOVERABLE_DESCRIPTOR_ERROR,
+                                                    tolerateErrorsInSection));
+                    }
+<span class="nc" id="L131">                    catch (IOException ioe)</span>
+                    {
+<span class="nc" id="L133">                        throw new RuntimeException(ioe);</span>
+<span class="nc" id="L134">                    }</span>
+<span class="nc" id="L135">                }</span>
+            }
+        }
+    }
+
+    private int readSyncMarker(CommitLogDescriptor descriptor, int offset, RandomAccessReader reader) throws IOException
+    {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (offset &gt; reader.length() - SYNC_MARKER_SIZE)</span>
+        {
+            // There was no room in the segment to write a final header. No data could be present here.
+<span class="nc" id="L145">            return -1;</span>
+        }
+<span class="nc" id="L147">        reader.seek(offset);</span>
+<span class="nc" id="L148">        CRC32 crc = new CRC32();</span>
+<span class="nc" id="L149">        updateChecksumInt(crc, (int) (descriptor.id &amp; 0xFFFFFFFFL));</span>
+<span class="nc" id="L150">        updateChecksumInt(crc, (int) (descriptor.id &gt;&gt;&gt; 32));</span>
+<span class="nc" id="L151">        updateChecksumInt(crc, (int) reader.getPosition());</span>
+<span class="nc" id="L152">        final int end = reader.readInt();</span>
+<span class="nc" id="L153">        long filecrc = reader.readInt() &amp; 0xffffffffL;</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (crc.getValue() != filecrc)</span>
+        {
+<span class="nc bnc" id="L156" title="All 4 branches missed.">            if (end != 0 || filecrc != 0)</span>
+            {
+<span class="nc" id="L158">                String msg = String.format(&quot;Encountered bad header at position %d of commit log %s, with invalid CRC. &quot; +</span>
+<span class="nc" id="L159">                             &quot;The end of segment marker should be zero.&quot;, offset, reader.getPath());</span>
+<span class="nc" id="L160">                throw new SegmentReadException(msg, true);</span>
+            }
+<span class="nc" id="L162">            return -1;</span>
+        }
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        else if (end &lt; offset || end &gt; reader.length())</span>
+        {
+<span class="nc" id="L166">            String msg = String.format(&quot;Encountered bad header at position %d of commit log %s, with bad position but valid CRC&quot;, offset, reader.getPath());</span>
+<span class="nc" id="L167">            throw new SegmentReadException(msg, false);</span>
+        }
+<span class="nc" id="L169">        return end;</span>
+    }
+
+    public static class SegmentReadException extends IOException
+    {
+        public final boolean invalidCrc;
+
+        public SegmentReadException(String msg, boolean invalidCrc)
+        {
+<span class="nc" id="L178">            super(msg);</span>
+<span class="nc" id="L179">            this.invalidCrc = invalidCrc;</span>
+<span class="nc" id="L180">        }</span>
+    }
+
+    public static class SyncSegment
+    {
+        /** the 'buffer' to replay commit log data from */
+        public final FileDataInput input;
+
+        /** offset in file where this section begins. */
+        public final int fileStartPosition;
+
+        /** offset in file where this section ends. */
+        public final int fileEndPosition;
+
+        /** the logical ending position of the buffer */
+        public final int endPosition;
+
+        public final boolean toleratesErrorsInSection;
+
+        public SyncSegment(FileDataInput input, int fileStartPosition, int fileEndPosition, int endPosition, boolean toleratesErrorsInSection)
+<span class="nc" id="L200">        {</span>
+<span class="nc" id="L201">            this.input = input;</span>
+<span class="nc" id="L202">            this.fileStartPosition = fileStartPosition;</span>
+<span class="nc" id="L203">            this.fileEndPosition = fileEndPosition;</span>
+<span class="nc" id="L204">            this.endPosition = endPosition;</span>
+<span class="nc" id="L205">            this.toleratesErrorsInSection = toleratesErrorsInSection;</span>
+<span class="nc" id="L206">        }</span>
+    }
+
+    /**
+     * Derives the next section of the commit log to be replayed. Section boundaries are derived from the commit log sync markers.
+     */
+    interface Segmenter
+    {
+        /**
+         * Get the next section of the commit log to replay.
+         *
+         * @param startPosition the position in the file to begin reading at
+         * @param nextSectionStartPosition the file position of the beginning of the next section
+         * @return the buffer and it's logical end position
+         * @throws IOException
+         */
+        SyncSegment nextSegment(int startPosition, int nextSectionStartPosition) throws IOException;
+
+        /**
+         * Determine if we tolerate errors in the current segment.
+         */
+        default boolean tolerateSegmentErrors(int segmentEndPosition, long fileLength)
+        {
+<span class="nc bnc" id="L229" title="All 4 branches missed.">            return segmentEndPosition &gt;= fileLength || segmentEndPosition &lt; 0;</span>
+        }
+    }
+
+    static class NoOpSegmenter implements Segmenter
+    {
+        private final RandomAccessReader reader;
+
+        public NoOpSegmenter(RandomAccessReader reader)
+<span class="nc" id="L238">        {</span>
+<span class="nc" id="L239">            this.reader = reader;</span>
+<span class="nc" id="L240">        }</span>
+
+        public SyncSegment nextSegment(int startPosition, int nextSectionStartPosition)
+        {
+<span class="nc" id="L244">            reader.seek(startPosition);</span>
+<span class="nc" id="L245">            return new SyncSegment(reader, startPosition, nextSectionStartPosition, nextSectionStartPosition, true);</span>
+        }
+
+        public boolean tolerateSegmentErrors(int end, long length)
+        {
+<span class="nc" id="L250">            return true;</span>
+        }
+    }
+
+    static class CompressedSegmenter implements Segmenter
+    {
+        private final ICompressor compressor;
+        private final RandomAccessReader reader;
+        private byte[] compressedBuffer;
+        private byte[] uncompressedBuffer;
+        private long nextLogicalStart;
+
+        public CompressedSegmenter(CommitLogDescriptor desc, RandomAccessReader reader)
+        {
+<span class="nc" id="L264">            this(CompressionParams.createCompressor(desc.compression), reader);</span>
+<span class="nc" id="L265">        }</span>
+
+        public CompressedSegmenter(ICompressor compressor, RandomAccessReader reader)
+<span class="nc" id="L268">        {</span>
+<span class="nc" id="L269">            this.compressor = compressor;</span>
+<span class="nc" id="L270">            this.reader = reader;</span>
+<span class="nc" id="L271">            compressedBuffer = new byte[0];</span>
+<span class="nc" id="L272">            uncompressedBuffer = new byte[0];</span>
+<span class="nc" id="L273">            nextLogicalStart = reader.getFilePointer();</span>
+<span class="nc" id="L274">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public SyncSegment nextSegment(final int startPosition, final int nextSectionStartPosition) throws IOException
+        {
+<span class="nc" id="L279">            reader.seek(startPosition);</span>
+<span class="nc" id="L280">            int uncompressedLength = reader.readInt();</span>
+
+<span class="nc" id="L282">            int compressedLength = nextSectionStartPosition - (int)reader.getPosition();</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            if (compressedLength &gt; compressedBuffer.length)</span>
+<span class="nc" id="L284">                compressedBuffer = new byte[(int) (1.2 * compressedLength)];</span>
+<span class="nc" id="L285">            reader.readFully(compressedBuffer, 0, compressedLength);</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (uncompressedLength &gt; uncompressedBuffer.length)</span>
+<span class="nc" id="L288">               uncompressedBuffer = new byte[(int) (1.2 * uncompressedLength)];</span>
+<span class="nc" id="L289">            int count = compressor.uncompress(compressedBuffer, 0, compressedLength, uncompressedBuffer, 0);</span>
+<span class="nc" id="L290">            nextLogicalStart += SYNC_MARKER_SIZE;</span>
+<span class="nc" id="L291">            FileDataInput input = new FileSegmentInputStream(ByteBuffer.wrap(uncompressedBuffer, 0, count), reader.getPath(), nextLogicalStart);</span>
+<span class="nc" id="L292">            nextLogicalStart += uncompressedLength;</span>
+<span class="nc" id="L293">            return new SyncSegment(input, startPosition, nextSectionStartPosition, (int)nextLogicalStart, tolerateSegmentErrors(nextSectionStartPosition, reader.length()));</span>
+        }
+    }
+
+    static class EncryptedSegmenter implements Segmenter
+    {
+        private final RandomAccessReader reader;
+        private final ICompressor compressor;
+        private final Cipher cipher;
+
+        /**
+         * the result of the decryption is written into this buffer.
+         */
+        private ByteBuffer decryptedBuffer;
+
+        /**
+         * the result of the decryption is written into this buffer.
+         */
+        private ByteBuffer uncompressedBuffer;
+
+        private final ChunkProvider chunkProvider;
+
+        private long currentSegmentEndPosition;
+        private long nextLogicalStart;
+
+        public EncryptedSegmenter(CommitLogDescriptor descriptor, RandomAccessReader reader)
+        {
+<span class="nc" id="L320">            this(reader, descriptor.getEncryptionContext());</span>
+<span class="nc" id="L321">        }</span>
+
+        @VisibleForTesting
+        EncryptedSegmenter(final RandomAccessReader reader, EncryptionContext encryptionContext)
+<span class="nc" id="L325">        {</span>
+<span class="nc" id="L326">            this.reader = reader;</span>
+<span class="nc" id="L327">            decryptedBuffer = ByteBuffer.allocate(0);</span>
+<span class="nc" id="L328">            compressor = encryptionContext.getCompressor();</span>
+<span class="nc" id="L329">            nextLogicalStart = reader.getFilePointer();</span>
+
+            try
+            {
+<span class="nc" id="L333">                cipher = encryptionContext.getDecryptor();</span>
+            }
+<span class="nc" id="L335">            catch (IOException ioe)</span>
+            {
+<span class="nc" id="L337">                throw new FSReadError(ioe, reader.getPath());</span>
+<span class="nc" id="L338">            }</span>
+
+<span class="nc" id="L340">            chunkProvider = () -&gt; {</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                if (reader.getFilePointer() &gt;= currentSegmentEndPosition)</span>
+<span class="nc" id="L342">                    return ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+                try
+                {
+<span class="nc" id="L345">                    decryptedBuffer = EncryptionUtils.decrypt(reader, decryptedBuffer, true, cipher);</span>
+<span class="nc" id="L346">                    uncompressedBuffer = EncryptionUtils.uncompress(decryptedBuffer, uncompressedBuffer, true, compressor);</span>
+<span class="nc" id="L347">                    return uncompressedBuffer;</span>
+                }
+<span class="nc" id="L349">                catch (IOException e)</span>
+                {
+<span class="nc" id="L351">                    throw new FSReadError(e, reader.getPath());</span>
+                }
+            };
+<span class="nc" id="L354">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public SyncSegment nextSegment(int startPosition, int nextSectionStartPosition) throws IOException
+        {
+<span class="nc" id="L359">            int totalPlainTextLength = reader.readInt();</span>
+<span class="nc" id="L360">            currentSegmentEndPosition = nextSectionStartPosition - 1;</span>
+
+<span class="nc" id="L362">            nextLogicalStart += SYNC_MARKER_SIZE;</span>
+<span class="nc" id="L363">            FileDataInput input = new EncryptedFileSegmentInputStream(reader.getPath(), nextLogicalStart, 0, totalPlainTextLength, chunkProvider);</span>
+<span class="nc" id="L364">            nextLogicalStart += totalPlainTextLength;</span>
+<span class="nc" id="L365">            return new SyncSegment(input, startPosition, nextSectionStartPosition, (int)nextLogicalStart, tolerateSegmentErrors(nextSectionStartPosition, reader.length()));</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

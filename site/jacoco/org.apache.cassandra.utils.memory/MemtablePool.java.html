@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MemtablePool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.memory</a> &gt; <span class="el_source">MemtablePool.java</span></div><h1>MemtablePool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.utils.memory;
+
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+import org.apache.cassandra.metrics.DefaultNameFactory;
+import org.apache.cassandra.utils.concurrent.WaitQueue;
+import org.apache.cassandra.utils.ExecutorUtils;
+
+
+/**
+ * Represents an amount of memory used for a given purpose, that can be allocated to specific tasks through
+ * child MemtableAllocator objects.
+ */
+public abstract class MemtablePool
+{
+    final MemtableCleanerThread&lt;?&gt; cleaner;
+
+    // the total memory used by this pool
+    public final SubPool onHeap;
+    public final SubPool offHeap;
+
+    public final Timer blockedOnAllocating;
+
+<span class="fc" id="L48">    final WaitQueue hasRoom = new WaitQueue();</span>
+
+    MemtablePool(long maxOnHeapMemory, long maxOffHeapMemory, float cleanThreshold, Runnable cleaner)
+<span class="fc" id="L51">    {</span>
+<span class="fc" id="L52">        this.onHeap = getSubPool(maxOnHeapMemory, cleanThreshold);</span>
+<span class="fc" id="L53">        this.offHeap = getSubPool(maxOffHeapMemory, cleanThreshold);</span>
+<span class="fc" id="L54">        this.cleaner = getCleaner(cleaner);</span>
+<span class="fc" id="L55">        blockedOnAllocating = CassandraMetricsRegistry.Metrics.timer(new DefaultNameFactory(&quot;MemtablePool&quot;)</span>
+<span class="fc" id="L56">                                                                         .createMetricName(&quot;BlockedOnAllocation&quot;));</span>
+<span class="pc bpc" id="L57" title="1 of 2 branches missed.">        if (this.cleaner != null)</span>
+<span class="fc" id="L58">            this.cleaner.start();</span>
+<span class="fc" id="L59">    }</span>
+
+    SubPool getSubPool(long limit, float cleanThreshold)
+    {
+<span class="fc" id="L63">        return new SubPool(limit, cleanThreshold);</span>
+    }
+
+    MemtableCleanerThread&lt;?&gt; getCleaner(Runnable cleaner)
+    {
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">        return cleaner == null ? null : new MemtableCleanerThread&lt;&gt;(this, cleaner);</span>
+    }
+
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L74">        ExecutorUtils.shutdownNowAndWait(timeout, unit, cleaner);</span>
+<span class="nc" id="L75">    }</span>
+
+
+    public abstract MemtableAllocator newAllocator();
+
+    /**
+     * Note the difference between acquire() and allocate(); allocate() makes more resources available to all owners,
+     * and acquire() makes shared resources unavailable but still recorded. An Owner must always acquire resources,
+     * but only needs to allocate if there are none already available. This distinction is not always meaningful.
+     */
+<span class="pc bpc" id="L85" title="1 of 2 branches missed.">    public class SubPool</span>
+    {
+
+        // total memory/resource permitted to allocate
+        public final long limit;
+
+        // ratio of used to spare (both excluding 'reclaiming') at which to trigger a clean
+        public final float cleanThreshold;
+
+        // total bytes allocated and reclaiming
+        volatile long allocated;
+        volatile long reclaiming;
+
+        // a cache of the calculation determining at what allocation threshold we should next clean
+        volatile long nextClean;
+
+        public SubPool(long limit, float cleanThreshold)
+<span class="fc" id="L102">        {</span>
+<span class="fc" id="L103">            this.limit = limit;</span>
+<span class="fc" id="L104">            this.cleanThreshold = cleanThreshold;</span>
+<span class="fc" id="L105">        }</span>
+
+        /** Methods for tracking and triggering a clean **/
+
+        boolean needsCleaning()
+        {
+            // use strictly-greater-than so we don't clean when limit is 0
+<span class="pc bpc" id="L112" title="1 of 4 branches missed.">            return used() &gt; nextClean &amp;&amp; updateNextClean();</span>
+        }
+
+        void maybeClean()
+        {
+<span class="pc bpc" id="L117" title="3 of 4 branches missed.">            if (needsCleaning() &amp;&amp; cleaner != null)</span>
+<span class="nc" id="L118">                cleaner.trigger();</span>
+<span class="fc" id="L119">        }</span>
+
+        private boolean updateNextClean()
+        {
+            while (true)
+            {
+<span class="fc" id="L125">                long current = nextClean;</span>
+<span class="fc" id="L126">                long reclaiming = this.reclaiming;</span>
+<span class="fc" id="L127">                long next =  reclaiming + (long) (this.limit * cleanThreshold);</span>
+<span class="pc bpc" id="L128" title="1 of 4 branches missed.">                if (current == next || nextCleanUpdater.compareAndSet(this, current, next))</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">                    return used() &gt; next;</span>
+<span class="nc" id="L130">            }</span>
+        }
+
+        /** Methods to allocate space **/
+
+        boolean tryAllocate(long size)
+        {
+            while (true)
+            {
+                long cur;
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                if ((cur = allocated) + size &gt; limit)</span>
+<span class="nc" id="L141">                    return false;</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">                if (allocatedUpdater.compareAndSet(this, cur, cur + size))</span>
+<span class="fc" id="L143">                    return true;</span>
+<span class="fc" id="L144">            }</span>
+        }
+
+        /**
+         * apply the size adjustment to allocated, bypassing any limits or constraints. If this reduces the
+         * allocated total, we will signal waiters
+         */
+        private void adjustAllocated(long size)
+        {
+            while (true)
+            {
+<span class="fc" id="L155">                long cur = allocated;</span>
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">                if (allocatedUpdater.compareAndSet(this, cur, cur + size))</span>
+<span class="fc" id="L157">                    return;</span>
+<span class="nc" id="L158">            }</span>
+        }
+
+        void allocated(long size)
+        {
+<span class="nc bnc" id="L163" title="All 4 branches missed.">            assert size &gt;= 0;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (size == 0)</span>
+<span class="nc" id="L165">                return;</span>
+
+<span class="nc" id="L167">            adjustAllocated(size);</span>
+<span class="nc" id="L168">            maybeClean();</span>
+<span class="nc" id="L169">        }</span>
+
+        void acquired(long size)
+        {
+<span class="fc" id="L173">            maybeClean();</span>
+<span class="fc" id="L174">        }</span>
+
+        void released(long size)
+        {
+<span class="pc bpc" id="L178" title="2 of 4 branches missed.">            assert size &gt;= 0;</span>
+<span class="fc" id="L179">            adjustAllocated(-size);</span>
+<span class="fc" id="L180">            hasRoom.signalAll();</span>
+<span class="fc" id="L181">        }</span>
+
+        void reclaiming(long size)
+        {
+<span class="fc bfc" id="L185" title="All 2 branches covered.">            if (size == 0)</span>
+<span class="fc" id="L186">                return;</span>
+<span class="fc" id="L187">            reclaimingUpdater.addAndGet(this, size);</span>
+<span class="fc" id="L188">        }</span>
+
+        void reclaimed(long size)
+        {
+<span class="fc bfc" id="L192" title="All 2 branches covered.">            if (size == 0)</span>
+<span class="fc" id="L193">                return;</span>
+
+<span class="fc" id="L195">            reclaimingUpdater.addAndGet(this, -size);</span>
+<span class="pc bpc" id="L196" title="3 of 4 branches missed.">            if (updateNextClean() &amp;&amp; cleaner != null)</span>
+<span class="nc" id="L197">                cleaner.trigger();</span>
+<span class="fc" id="L198">        }</span>
+
+        public long used()
+        {
+<span class="fc" id="L202">            return allocated;</span>
+        }
+
+        public float reclaimingRatio()
+        {
+<span class="nc" id="L207">            float r = reclaiming / (float) limit;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (Float.isNaN(r))</span>
+<span class="nc" id="L209">                return 0;</span>
+<span class="nc" id="L210">            return r;</span>
+        }
+
+        public float usedRatio()
+        {
+<span class="nc" id="L215">            float r = allocated / (float) limit;</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (Float.isNaN(r))</span>
+<span class="nc" id="L217">                return 0;</span>
+<span class="nc" id="L218">            return r;</span>
+        }
+
+        public MemtableAllocator.SubAllocator newAllocator()
+        {
+<span class="fc" id="L223">            return new MemtableAllocator.SubAllocator(this);</span>
+        }
+
+        public WaitQueue hasRoom()
+        {
+<span class="nc" id="L228">            return hasRoom;</span>
+        }
+
+        public Timer.Context blockedTimerContext()
+        {
+<span class="nc" id="L233">            return blockedOnAllocating.time();</span>
+        }
+    }
+
+<span class="fc" id="L237">    private static final AtomicLongFieldUpdater&lt;SubPool&gt; reclaimingUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, &quot;reclaiming&quot;);</span>
+<span class="fc" id="L238">    private static final AtomicLongFieldUpdater&lt;SubPool&gt; allocatedUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, &quot;allocated&quot;);</span>
+<span class="fc" id="L239">    private static final AtomicLongFieldUpdater&lt;SubPool&gt; nextCleanUpdater = AtomicLongFieldUpdater.newUpdater(SubPool.class, &quot;nextClean&quot;);</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

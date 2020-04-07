@@ -1,0 +1,711 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitLogSegment.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">CommitLogSegment.java</span></div><h1>CommitLogSegment.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32;
+
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.commitlog.CommitLog.Configuration;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.NativeLibrary;
+import org.apache.cassandra.utils.IntegerInterval;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.WaitQueue;
+
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+
+/*
+ * A single commit log file on disk. Manages creation of the file and writing mutations to disk,
+ * as well as tracking the last mutation position of any &quot;dirty&quot; CFs covered by the segment file. Segment
+ * files are initially allocated to a fixed size and can grow to accomidate a larger value if necessary.
+ */
+<span class="pc bpc" id="L52" title="1 of 2 branches missed.">public abstract class CommitLogSegment</span>
+{
+    private final static long idBase;
+
+<span class="fc" id="L56">    private CDCState cdcState = CDCState.PERMITTED;</span>
+<span class="fc" id="L57">    public enum CDCState</span>
+    {
+<span class="fc" id="L59">        PERMITTED,</span>
+<span class="fc" id="L60">        FORBIDDEN,</span>
+<span class="fc" id="L61">        CONTAINS</span>
+    }
+<span class="fc" id="L63">    Object cdcStateLock = new Object();</span>
+
+<span class="fc" id="L65">    private final static AtomicInteger nextId = new AtomicInteger(1);</span>
+    private static long replayLimitId;
+    static
+    {
+<span class="fc" id="L69">        long maxId = Long.MIN_VALUE;</span>
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">        for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).listFiles())</span>
+        {
+<span class="nc bnc" id="L72" title="All 2 branches missed.">            if (CommitLogDescriptor.isValid(file.getName()))</span>
+<span class="nc" id="L73">                maxId = Math.max(CommitLogDescriptor.fromFileName(file.getName()).id, maxId);</span>
+        }
+<span class="fc" id="L75">        replayLimitId = idBase = Math.max(System.currentTimeMillis(), maxId + 1);</span>
+<span class="fc" id="L76">    }</span>
+
+    // The commit log entry overhead in bytes (int: length + int: head checksum + int: tail checksum)
+    public static final int ENTRY_OVERHEAD_SIZE = 4 + 4 + 4;
+
+    // The commit log (chained) sync marker/header size in bytes (int: length + int: checksum [segmentId, position])
+    static final int SYNC_MARKER_SIZE = 4 + 4;
+
+    // The OpOrder used to order appends wrt sync
+<span class="fc" id="L85">    private final OpOrder appendOrder = new OpOrder();</span>
+
+<span class="fc" id="L87">    private final AtomicInteger allocatePosition = new AtomicInteger();</span>
+
+    // Everything before this offset has been synced and written.  The SYNC_MARKER_SIZE bytes after
+    // each sync are reserved, and point forwards to the next such offset.  The final
+    // sync marker in a segment will be zeroed out, or point to a position too close to the EOF to fit a marker.
+    private volatile int lastSyncedOffset;
+
+    /**
+     * Everything before this offset has it's markers written into the {@link #buffer}, but has not necessarily
+     * been flushed to disk. This value should be greater than or equal to {@link #lastSyncedOffset}.
+     */
+    private volatile int lastMarkerOffset;
+
+    // The end position of the buffer. Initially set to its capacity and updated to point to the last written position
+    // as the segment is being closed.
+    // No need to be volatile as writes are protected by appendOrder barrier.
+    private int endOfBuffer;
+
+    // a signal for writers to wait on to confirm the log message they provided has been written to disk
+<span class="fc" id="L106">    private final WaitQueue syncComplete = new WaitQueue();</span>
+
+    // a map of Cf-&gt;dirty interval in this segment; if interval is not covered by the clean set, the log contains unflushed data
+<span class="fc" id="L109">    private final NonBlockingHashMap&lt;UUID, IntegerInterval&gt; cfDirty = new NonBlockingHashMap&lt;&gt;(1024);</span>
+
+    // a map of Cf-&gt;clean intervals; separate map from above to permit marking Cfs clean whilst the log is still in use
+<span class="fc" id="L112">    private final ConcurrentHashMap&lt;UUID, IntegerInterval.Set&gt; cfClean = new ConcurrentHashMap&lt;&gt;();</span>
+
+    public final long id;
+
+    final File logFile;
+    final FileChannel channel;
+    final int fd;
+
+    protected final AbstractCommitLogSegmentManager manager;
+
+    ByteBuffer buffer;
+    private volatile boolean headerWritten;
+
+    public final CommitLogDescriptor descriptor;
+
+    static CommitLogSegment createSegment(CommitLog commitLog, AbstractCommitLogSegmentManager manager)
+    {
+<span class="fc" id="L129">        Configuration config = commitLog.configuration;</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">        CommitLogSegment segment = config.useEncryption() ? new EncryptedSegment(commitLog, manager)</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">                                                          : config.useCompression() ? new CompressedSegment(commitLog, manager)</span>
+                                                                                    : new MemoryMappedSegment(commitLog, manager);
+<span class="fc" id="L133">        segment.writeLogHeader();</span>
+<span class="fc" id="L134">        return segment;</span>
+    }
+
+    /**
+     * Checks if the segments use a buffer pool.
+     *
+     * @param commitLog the commit log
+     * @return &lt;code&gt;true&lt;/code&gt; if the segments use a buffer pool, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    static boolean usesBufferPool(CommitLog commitLog)
+    {
+<span class="fc" id="L145">        Configuration config = commitLog.configuration;</span>
+<span class="pc bpc" id="L146" title="2 of 4 branches missed.">        return config.useEncryption() || config.useCompression();</span>
+    }
+
+    static long getNextId()
+    {
+<span class="fc" id="L151">        return idBase + nextId.getAndIncrement();</span>
+    }
+
+    /**
+     * Constructs a new segment file.
+     */
+    CommitLogSegment(CommitLog commitLog, AbstractCommitLogSegmentManager manager)
+<span class="fc" id="L158">    {</span>
+<span class="fc" id="L159">        this.manager = manager;</span>
+
+<span class="fc" id="L161">        id = getNextId();</span>
+<span class="fc" id="L162">        descriptor = new CommitLogDescriptor(id,</span>
+<span class="fc" id="L163">                                             commitLog.configuration.getCompressorClass(),</span>
+<span class="fc" id="L164">                                             commitLog.configuration.getEncryptionContext());</span>
+<span class="fc" id="L165">        logFile = new File(manager.storageDirectory, descriptor.fileName());</span>
+
+        try
+        {
+<span class="fc" id="L169">            channel = FileChannel.open(logFile.toPath(), StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.CREATE);</span>
+<span class="fc" id="L170">            fd = NativeLibrary.getfd(channel);</span>
+        }
+<span class="nc" id="L172">        catch (IOException e)</span>
+        {
+<span class="nc" id="L174">            throw new FSWriteError(e, logFile);</span>
+<span class="fc" id="L175">        }</span>
+
+<span class="fc" id="L177">        buffer = createBuffer(commitLog);</span>
+<span class="fc" id="L178">    }</span>
+
+    /**
+     * Deferred writing of the commit log header until subclasses have had a chance to initialize
+     */
+    void writeLogHeader()
+    {
+<span class="fc" id="L185">        CommitLogDescriptor.writeHeader(buffer, descriptor, additionalHeaderParameters());</span>
+<span class="fc" id="L186">        endOfBuffer = buffer.capacity();</span>
+
+<span class="fc" id="L188">        lastSyncedOffset = lastMarkerOffset = buffer.position();</span>
+<span class="fc" id="L189">        allocatePosition.set(lastSyncedOffset + SYNC_MARKER_SIZE);</span>
+<span class="fc" id="L190">        headerWritten = true;</span>
+<span class="fc" id="L191">    }</span>
+
+    /**
+     * Provide any additional header data that should be stored in the {@link CommitLogDescriptor}.
+     */
+    protected Map&lt;String, String&gt; additionalHeaderParameters()
+    {
+<span class="fc" id="L198">        return Collections.&lt;String, String&gt;emptyMap();</span>
+    }
+
+    abstract ByteBuffer createBuffer(CommitLog commitLog);
+
+    /**
+     * Allocate space in this buffer for the provided mutation, and return the allocated Allocation object.
+     * Returns null if there is not enough space in this segment, and a new segment is needed.
+     */
+    @SuppressWarnings(&quot;resource&quot;) //we pass the op order around
+    Allocation allocate(Mutation mutation, int size)
+    {
+<span class="fc" id="L210">        final OpOrder.Group opGroup = appendOrder.start();</span>
+        try
+        {
+<span class="fc" id="L213">            int position = allocate(size);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">            if (position &lt; 0)</span>
+            {
+<span class="nc" id="L216">                opGroup.close();</span>
+<span class="nc" id="L217">                return null;</span>
+            }
+<span class="fc" id="L219">            markDirty(mutation, position);</span>
+<span class="fc" id="L220">            return new Allocation(this, opGroup, position, (ByteBuffer) buffer.duplicate().position(position).limit(position + size));</span>
+        }
+<span class="nc" id="L222">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L224">            opGroup.close();</span>
+<span class="nc" id="L225">            throw t;</span>
+        }
+    }
+
+    static boolean shouldReplay(String name)
+    {
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        return CommitLogDescriptor.fromFileName(name).id &lt; replayLimitId;</span>
+    }
+
+    /**
+     * FOR TESTING PURPOSES.
+     */
+    static void resetReplayLimit()
+    {
+<span class="nc" id="L239">        replayLimitId = getNextId();</span>
+<span class="nc" id="L240">    }</span>
+
+    // allocate bytes in the segment, or return -1 if not enough space
+    private int allocate(int size)
+    {
+        while (true)
+        {
+<span class="fc" id="L247">            int prev = allocatePosition.get();</span>
+<span class="fc" id="L248">            int next = prev + size;</span>
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">            if (next &gt;= endOfBuffer)</span>
+<span class="nc" id="L250">                return -1;</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">            if (allocatePosition.compareAndSet(prev, next))</span>
+            {
+<span class="pc bpc" id="L253" title="2 of 4 branches missed.">                assert buffer != null;</span>
+<span class="fc" id="L254">                return prev;</span>
+            }
+<span class="nc" id="L256">        }</span>
+    }
+
+    // ensures no more of this segment is writeable, by allocating any unused section at the end and marking it discarded
+    void discardUnusedTail()
+    {
+        // We guard this with the OpOrdering instead of synchronised due to potential dead-lock with ACLSM.advanceAllocatingFrom()
+        // Ensures endOfBuffer update is reflected in the buffer end position picked up by sync().
+        // This actually isn't strictly necessary, as currently all calls to discardUnusedTail are executed either by the thread
+        // running sync or within a mutation already protected by this OpOrdering, but to prevent future potential mistakes,
+        // we duplicate the protection here so that the contract between discardUnusedTail() and sync() is more explicit.
+<span class="nc" id="L267">        try (OpOrder.Group group = appendOrder.start())</span>
+        {
+            while (true)
+            {
+<span class="nc" id="L271">                int prev = allocatePosition.get();</span>
+
+<span class="nc" id="L273">                int next = endOfBuffer + 1;</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                if (prev &gt;= next)</span>
+                {
+                    // Already stopped allocating, might also be closed.
+<span class="nc bnc" id="L277" title="All 6 branches missed.">                    assert buffer == null || prev == buffer.capacity() + 1;</span>
+<span class="nc" id="L278">                    return;</span>
+                }
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                if (allocatePosition.compareAndSet(prev, next))</span>
+                {
+                    // Stopped allocating now. Can only succeed once, no further allocation or discardUnusedTail can succeed.
+<span class="nc" id="L283">                    endOfBuffer = prev;</span>
+<span class="nc bnc" id="L284" title="All 6 branches missed.">                    assert buffer != null &amp;&amp; next == buffer.capacity() + 1;</span>
+<span class="nc" id="L285">                    return;</span>
+                }
+<span class="nc" id="L287">            }</span>
+        }
+    }
+
+    /**
+     * Wait for any appends or discardUnusedTail() operations started before this method was called
+     */
+    void waitForModifications()
+    {
+        // issue a barrier and wait for it
+<span class="fc" id="L297">        appendOrder.awaitNewBarrier();</span>
+<span class="fc" id="L298">    }</span>
+
+    /**
+     * Update the chained markers in the commit log buffer and possibly force a disk flush for this segment file.
+     *
+     * @param flush true if the segment should flush to disk; else, false for just updating the chained markers.
+     */
+    synchronized void sync(boolean flush)
+    {
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">        if (!headerWritten)</span>
+<span class="nc" id="L308">            throw new IllegalStateException(&quot;commit log header has not been written&quot;);</span>
+<span class="pc bpc" id="L309" title="2 of 4 branches missed.">        assert lastMarkerOffset &gt;= lastSyncedOffset : String.format(&quot;commit log segment positions are incorrect: last marked = %d, last synced = %d&quot;,</span>
+<span class="nc" id="L310">                                                                    lastMarkerOffset, lastSyncedOffset);</span>
+        // check we have more work to do
+<span class="fc bfc" id="L312" title="All 2 branches covered.">        final boolean needToMarkData = allocatePosition.get() &gt; lastMarkerOffset + SYNC_MARKER_SIZE;</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">        final boolean hasDataToFlush = lastSyncedOffset != lastMarkerOffset;</span>
+<span class="fc bfc" id="L314" title="All 4 branches covered.">        if (!(needToMarkData || hasDataToFlush))</span>
+<span class="fc" id="L315">            return;</span>
+        // Note: Even if the very first allocation of this sync section failed, we still want to enter this
+        // to ensure the segment is closed. As allocatePosition is set to 1 beyond the capacity of the buffer,
+        // this will always be entered when a mutation allocation has been attempted after the marker allocation
+        // succeeded in the previous sync.
+<span class="pc bpc" id="L320" title="2 of 4 branches missed.">        assert buffer != null;  // Only close once.</span>
+
+<span class="fc" id="L322">        boolean close = false;</span>
+<span class="fc" id="L323">        int startMarker = lastMarkerOffset;</span>
+        int nextMarker, sectionEnd;
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        if (needToMarkData)</span>
+        {
+            // Allocate a new sync marker; this is both necessary in itself, but also serves to demarcate
+            // the point at which we can safely consider records to have been completely written to.
+<span class="fc" id="L329">            nextMarker = allocate(SYNC_MARKER_SIZE);</span>
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">            if (nextMarker &lt; 0)</span>
+            {
+                // Ensure no more of this CLS is writeable, and mark ourselves for closing.
+<span class="nc" id="L333">                discardUnusedTail();</span>
+<span class="nc" id="L334">                close = true;</span>
+
+                // We use the buffer size as the synced position after a close instead of the end of the actual data
+                // to make sure we only close the buffer once.
+                // The endOfBuffer position may be incorrect at this point (to be written by another stalled thread).
+<span class="nc" id="L339">                nextMarker = buffer.capacity();</span>
+            }
+            // Wait for mutations to complete as well as endOfBuffer to have been written.
+<span class="fc" id="L342">            waitForModifications();</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">            sectionEnd = close ? endOfBuffer : nextMarker;</span>
+
+            // Possibly perform compression or encryption and update the chained markers
+<span class="fc" id="L346">            write(startMarker, sectionEnd);</span>
+<span class="fc" id="L347">            lastMarkerOffset = sectionEnd;</span>
+        }
+        else
+        {
+            // note: we don't need to waitForModifications() as, once we get to this block, we are only doing the flush
+            // and any mutations have already been fully written into the segment (as we wait for it in the previous block).
+<span class="fc" id="L353">            nextMarker = lastMarkerOffset;</span>
+<span class="fc" id="L354">            sectionEnd = nextMarker;</span>
+        }
+
+
+<span class="pc bpc" id="L358" title="1 of 4 branches missed.">        if (flush || close)</span>
+        {
+<span class="fc" id="L360">            flush(startMarker, sectionEnd);</span>
+<span class="fc" id="L361">            lastSyncedOffset = lastMarkerOffset = nextMarker;</span>
+
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">            if (close)</span>
+<span class="nc" id="L364">                internalClose();</span>
+
+<span class="fc" id="L366">            syncComplete.signalAll();</span>
+        }
+<span class="fc" id="L368">    }</span>
+
+    /**
+     * Create a sync marker to delineate sections of the commit log, typically created on each sync of the file.
+     * The sync marker consists of a file pointer to where the next sync marker should be (effectively declaring the length
+     * of this section), as well as a CRC value.
+     *
+     * @param buffer buffer in which to write out the sync marker.
+     * @param offset Offset into the {@code buffer} at which to write the sync marker.
+     * @param filePos The current position in the target file where the sync marker will be written (most likely different from the buffer position).
+     * @param nextMarker The file position of where the next sync marker should be.
+     */
+    protected static void writeSyncMarker(long id, ByteBuffer buffer, int offset, int filePos, int nextMarker)
+    {
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">        if (filePos &gt; nextMarker)</span>
+<span class="nc" id="L383">            throw new IllegalArgumentException(String.format(&quot;commit log sync marker's current file position %d is greater than next file position %d&quot;, filePos, nextMarker));</span>
+<span class="fc" id="L384">        CRC32 crc = new CRC32();</span>
+<span class="fc" id="L385">        updateChecksumInt(crc, (int) (id &amp; 0xFFFFFFFFL));</span>
+<span class="fc" id="L386">        updateChecksumInt(crc, (int) (id &gt;&gt;&gt; 32));</span>
+<span class="fc" id="L387">        updateChecksumInt(crc, filePos);</span>
+<span class="fc" id="L388">        buffer.putInt(offset, nextMarker);</span>
+<span class="fc" id="L389">        buffer.putInt(offset + 4, (int) crc.getValue());</span>
+<span class="fc" id="L390">    }</span>
+
+    abstract void write(int lastSyncedOffset, int nextMarker);
+
+    abstract void flush(int startMarker, int nextMarker);
+
+    public boolean isStillAllocating()
+    {
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">        return allocatePosition.get() &lt; endOfBuffer;</span>
+    }
+
+    /**
+     * Discards a segment file when the log no longer requires it. The file may be left on disk if the archive script
+     * requires it. (Potentially blocking operation)
+     */
+    void discard(boolean deleteFile)
+    {
+<span class="nc" id="L407">        close();</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        if (deleteFile)</span>
+<span class="nc" id="L409">            FileUtils.deleteWithConfirm(logFile);</span>
+<span class="nc" id="L410">        manager.addSize(-onDiskSize());</span>
+<span class="nc" id="L411">    }</span>
+
+    /**
+     * @return the current CommitLogPosition for this log segment
+     */
+    public CommitLogPosition getCurrentCommitLogPosition()
+    {
+<span class="fc" id="L418">        return new CommitLogPosition(id, allocatePosition.get());</span>
+    }
+
+    /**
+     * @return the file path to this segment
+     */
+    public String getPath()
+    {
+<span class="nc" id="L426">        return logFile.getPath();</span>
+    }
+
+    /**
+     * @return the file name of this segment
+     */
+    public String getName()
+    {
+<span class="nc" id="L434">        return logFile.getName();</span>
+    }
+
+    void waitForFinalSync()
+    {
+        while (true)
+        {
+<span class="nc" id="L441">            WaitQueue.Signal signal = syncComplete.register();</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            if (lastSyncedOffset &lt; endOfBuffer)</span>
+            {
+<span class="nc" id="L444">                signal.awaitUninterruptibly();</span>
+            }
+            else
+            {
+<span class="nc" id="L448">                signal.cancel();</span>
+<span class="nc" id="L449">                break;</span>
+            }
+<span class="nc" id="L451">        }</span>
+<span class="nc" id="L452">    }</span>
+
+    void waitForSync(int position, Timer waitingOnCommit)
+    {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        while (lastSyncedOffset &lt; position)</span>
+        {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            WaitQueue.Signal signal = waitingOnCommit != null ?</span>
+<span class="nc" id="L459">                                      syncComplete.register(waitingOnCommit.time()) :</span>
+<span class="nc" id="L460">                                      syncComplete.register();</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            if (lastSyncedOffset &lt; position)</span>
+<span class="nc" id="L462">                signal.awaitUninterruptibly();</span>
+            else
+<span class="nc" id="L464">                signal.cancel();</span>
+<span class="nc" id="L465">        }</span>
+<span class="nc" id="L466">    }</span>
+
+    /**
+     * Stop writing to this file, sync and close it. Does nothing if the file is already closed.
+     */
+    synchronized void close()
+    {
+<span class="nc" id="L473">        discardUnusedTail();</span>
+<span class="nc" id="L474">        sync(true);</span>
+<span class="nc bnc" id="L475" title="All 4 branches missed.">        assert buffer == null;</span>
+<span class="nc" id="L476">    }</span>
+
+    /**
+     * Close the segment file. Do not call from outside this class, use syncAndClose() instead.
+     */
+    protected void internalClose()
+    {
+        try
+        {
+<span class="nc" id="L485">            channel.close();</span>
+<span class="nc" id="L486">            buffer = null;</span>
+        }
+<span class="nc" id="L488">        catch (IOException e)</span>
+        {
+<span class="nc" id="L490">            throw new FSWriteError(e, getPath());</span>
+<span class="nc" id="L491">        }</span>
+<span class="nc" id="L492">    }</span>
+
+    public static&lt;K&gt; void coverInMap(ConcurrentMap&lt;K, IntegerInterval&gt; map, K key, int value)
+    {
+<span class="fc" id="L496">        IntegerInterval i = map.get(key);</span>
+<span class="fc bfc" id="L497" title="All 2 branches covered.">        if (i == null)</span>
+        {
+<span class="fc" id="L499">            i = map.putIfAbsent(key, new IntegerInterval(value, value));</span>
+<span class="fc bfc" id="L500" title="All 2 branches covered.">            if (i == null)</span>
+                // success
+<span class="fc" id="L502">                return;</span>
+        }
+<span class="fc" id="L504">        i.expandToCover(value);</span>
+<span class="fc" id="L505">    }</span>
+
+    void markDirty(Mutation mutation, int allocatedPosition)
+    {
+<span class="fc bfc" id="L509" title="All 2 branches covered.">        for (PartitionUpdate update : mutation.getPartitionUpdates())</span>
+<span class="fc" id="L510">            coverInMap(cfDirty, update.metadata().cfId, allocatedPosition);</span>
+<span class="fc" id="L511">    }</span>
+
+    /**
+     * Marks the ColumnFamily specified by cfId as clean for this log segment. If the
+     * given context argument is contained in this file, it will only mark the CF as
+     * clean if no newer writes have taken place.
+     *
+     * @param cfId           the column family ID that is now clean
+     * @param startPosition  the start of the range that is clean
+     * @param endPosition    the end of the range that is clean
+     */
+    public synchronized void markClean(UUID cfId, CommitLogPosition startPosition, CommitLogPosition endPosition)
+    {
+<span class="pc bpc" id="L524" title="2 of 4 branches missed.">        if (startPosition.segmentId &gt; id || endPosition.segmentId &lt; id)</span>
+<span class="nc" id="L525">            return;</span>
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">        if (!cfDirty.containsKey(cfId))</span>
+<span class="nc" id="L527">            return;</span>
+<span class="pc bpc" id="L528" title="1 of 2 branches missed.">        int start = startPosition.segmentId == id ? startPosition.position : 0;</span>
+<span class="pc bpc" id="L529" title="1 of 2 branches missed.">        int end = endPosition.segmentId == id ? endPosition.position : Integer.MAX_VALUE;</span>
+<span class="fc" id="L530">        cfClean.computeIfAbsent(cfId, k -&gt; new IntegerInterval.Set()).add(start, end);</span>
+<span class="fc" id="L531">        removeCleanFromDirty();</span>
+<span class="fc" id="L532">    }</span>
+
+    private void removeCleanFromDirty()
+    {
+        // if we're still allocating from this segment, don't touch anything since it can't be done thread-safely
+<span class="pc bpc" id="L537" title="1 of 2 branches missed.">        if (isStillAllocating())</span>
+<span class="fc" id="L538">            return;</span>
+
+<span class="nc" id="L540">        Iterator&lt;Map.Entry&lt;UUID, IntegerInterval.Set&gt;&gt; iter = cfClean.entrySet().iterator();</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L543">            Map.Entry&lt;UUID, IntegerInterval.Set&gt; clean = iter.next();</span>
+<span class="nc" id="L544">            UUID cfId = clean.getKey();</span>
+<span class="nc" id="L545">            IntegerInterval.Set cleanSet = clean.getValue();</span>
+<span class="nc" id="L546">            IntegerInterval dirtyInterval = cfDirty.get(cfId);</span>
+<span class="nc bnc" id="L547" title="All 4 branches missed.">            if (dirtyInterval != null &amp;&amp; cleanSet.covers(dirtyInterval))</span>
+            {
+<span class="nc" id="L549">                cfDirty.remove(cfId);</span>
+<span class="nc" id="L550">                iter.remove();</span>
+            }
+<span class="nc" id="L552">        }</span>
+<span class="nc" id="L553">    }</span>
+
+    /**
+     * @return a collection of dirty CFIDs for this segment file.
+     */
+    public synchronized Collection&lt;UUID&gt; getDirtyCFIDs()
+    {
+<span class="nc bnc" id="L560" title="All 4 branches missed.">        if (cfClean.isEmpty() || cfDirty.isEmpty())</span>
+<span class="nc" id="L561">            return cfDirty.keySet();</span>
+
+<span class="nc" id="L563">        List&lt;UUID&gt; r = new ArrayList&lt;&gt;(cfDirty.size());</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        for (Map.Entry&lt;UUID, IntegerInterval&gt; dirty : cfDirty.entrySet())</span>
+        {
+<span class="nc" id="L566">            UUID cfId = dirty.getKey();</span>
+<span class="nc" id="L567">            IntegerInterval dirtyInterval = dirty.getValue();</span>
+<span class="nc" id="L568">            IntegerInterval.Set cleanSet = cfClean.get(cfId);</span>
+<span class="nc bnc" id="L569" title="All 4 branches missed.">            if (cleanSet == null || !cleanSet.covers(dirtyInterval))</span>
+<span class="nc" id="L570">                r.add(dirty.getKey());</span>
+<span class="nc" id="L571">        }</span>
+<span class="nc" id="L572">        return r;</span>
+    }
+
+    /**
+     * @return true if this segment is unused and safe to recycle or delete
+     */
+    public synchronized boolean isUnused()
+    {
+        // if room to allocate, we're still in use as the active allocatingFrom,
+        // so we don't want to race with updates to cfClean with removeCleanFromDirty
+<span class="pc bpc" id="L582" title="1 of 2 branches missed.">        if (isStillAllocating())</span>
+<span class="fc" id="L583">            return false;</span>
+
+<span class="nc" id="L585">        removeCleanFromDirty();</span>
+<span class="nc" id="L586">        return cfDirty.isEmpty();</span>
+    }
+
+    /**
+     * Check to see if a certain CommitLogPosition is contained by this segment file.
+     *
+     * @param   context the commit log segment position to be checked
+     * @return  true if the commit log segment position is contained by this segment file.
+     */
+    public boolean contains(CommitLogPosition context)
+    {
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">        return context.segmentId == id;</span>
+    }
+
+    // For debugging, not fast
+    public String dirtyString()
+    {
+<span class="nc" id="L603">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        for (UUID cfId : getDirtyCFIDs())</span>
+        {
+<span class="nc" id="L606">            CFMetaData m = Schema.instance.getCFMetaData(cfId);</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">            sb.append(m == null ? &quot;&lt;deleted&gt;&quot; : m.cfName).append(&quot; (&quot;).append(cfId)</span>
+<span class="nc" id="L608">              .append(&quot;, dirty: &quot;).append(cfDirty.get(cfId))</span>
+<span class="nc" id="L609">              .append(&quot;, clean: &quot;).append(cfClean.get(cfId))</span>
+<span class="nc" id="L610">              .append(&quot;), &quot;);</span>
+<span class="nc" id="L611">        }</span>
+<span class="nc" id="L612">        return sb.toString();</span>
+    }
+
+    abstract public long onDiskSize();
+
+    public long contentSize()
+    {
+<span class="nc" id="L619">        return lastSyncedOffset;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L625">        return &quot;CommitLogSegment(&quot; + getPath() + ')';</span>
+    }
+
+<span class="nc" id="L628">    public static class CommitLogSegmentFileComparator implements Comparator&lt;File&gt;</span>
+    {
+        public int compare(File f, File f2)
+        {
+<span class="nc" id="L632">            CommitLogDescriptor desc = CommitLogDescriptor.fromFileName(f.getName());</span>
+<span class="nc" id="L633">            CommitLogDescriptor desc2 = CommitLogDescriptor.fromFileName(f2.getName());</span>
+<span class="nc" id="L634">            return Long.compare(desc.id, desc2.id);</span>
+        }
+    }
+
+    public CDCState getCDCState()
+    {
+<span class="nc" id="L640">        return cdcState;</span>
+    }
+
+    /**
+     * Change the current cdcState on this CommitLogSegment. There are some restrictions on state transitions and this
+     * method is idempotent.
+     */
+    public void setCDCState(CDCState newState)
+    {
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        if (newState == cdcState)</span>
+<span class="nc" id="L650">            return;</span>
+
+        // Also synchronized in CDCSizeTracker.processNewSegment and .processDiscardedSegment
+<span class="nc" id="L653">        synchronized(cdcStateLock)</span>
+        {
+<span class="nc bnc" id="L655" title="All 4 branches missed.">            if (cdcState == CDCState.CONTAINS &amp;&amp; newState != CDCState.CONTAINS)</span>
+<span class="nc" id="L656">                throw new IllegalArgumentException(&quot;Cannot transition from CONTAINS to any other state.&quot;);</span>
+
+<span class="nc bnc" id="L658" title="All 4 branches missed.">            if (cdcState == CDCState.FORBIDDEN &amp;&amp; newState != CDCState.PERMITTED)</span>
+<span class="nc" id="L659">                throw new IllegalArgumentException(&quot;Only transition from FORBIDDEN to PERMITTED is allowed.&quot;);</span>
+
+<span class="nc" id="L661">            cdcState = newState;</span>
+<span class="nc" id="L662">        }</span>
+<span class="nc" id="L663">    }</span>
+
+    /**
+     * A simple class for tracking information about the portion of a segment that has been allocated to a log write.
+     */
+    protected static class Allocation
+    {
+        private final CommitLogSegment segment;
+        private final OpOrder.Group appendOp;
+        private final int position;
+        private final ByteBuffer buffer;
+
+        Allocation(CommitLogSegment segment, OpOrder.Group appendOp, int position, ByteBuffer buffer)
+<span class="fc" id="L676">        {</span>
+<span class="fc" id="L677">            this.segment = segment;</span>
+<span class="fc" id="L678">            this.appendOp = appendOp;</span>
+<span class="fc" id="L679">            this.position = position;</span>
+<span class="fc" id="L680">            this.buffer = buffer;</span>
+<span class="fc" id="L681">        }</span>
+
+        CommitLogSegment getSegment()
+        {
+<span class="nc" id="L685">            return segment;</span>
+        }
+
+        ByteBuffer getBuffer()
+        {
+<span class="fc" id="L690">            return buffer;</span>
+        }
+
+        // markWritten() MUST be called once we are done with the segment or the CL will never flush
+        // but must not be called more than once
+        void markWritten()
+        {
+<span class="fc" id="L697">            appendOp.close();</span>
+<span class="fc" id="L698">        }</span>
+
+        void awaitDiskSync(Timer waitingOnCommit)
+        {
+<span class="nc" id="L702">            segment.waitForSync(position, waitingOnCommit);</span>
+<span class="nc" id="L703">        }</span>
+
+        public CommitLogPosition getCommitLogPosition()
+        {
+<span class="fc" id="L707">            return new CommitLogPosition(segment.id, buffer.limit());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,584 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BatchStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">BatchStatement.java</span></div><h1>BatchStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.helpers.MessageFormatter;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.service.*;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+
+/**
+ * A &lt;code&gt;BATCH&lt;/code&gt; statement parsed from a CQL query.
+ */
+<span class="nc bnc" id="L50" title="All 2 branches missed.">public class BatchStatement implements CQLStatement</span>
+{
+<span class="nc" id="L52">    public enum Type</span>
+    {
+<span class="nc" id="L54">        LOGGED, UNLOGGED, COUNTER</span>
+    }
+
+    private final int boundTerms;
+    public final Type type;
+    private final List&lt;ModificationStatement&gt; statements;
+
+    // Columns modified for each table (keyed by the table ID)
+    private final Map&lt;UUID, PartitionColumns&gt; updatedColumns;
+    // Columns on which there is conditions. Note that if there is any, then the batch can only be on a single partition (and thus table).
+    private final PartitionColumns conditionColumns;
+
+    private final boolean updatesRegularRows;
+    private final boolean updatesStaticRow;
+    private final Attributes attrs;
+    private final boolean hasConditions;
+<span class="nc" id="L70">    private static final Logger logger = LoggerFactory.getLogger(BatchStatement.class);</span>
+
+    private static final String UNLOGGED_BATCH_WARNING = &quot;Unlogged batch covering {} partitions detected &quot; +
+                                                         &quot;against table{} {}. You should use a logged batch for &quot; +
+                                                         &quot;atomicity, or asynchronous writes for performance.&quot;;
+
+    private static final String LOGGED_BATCH_LOW_GCGS_WARNING = &quot;Executing a LOGGED BATCH on table{} {}, configured with a &quot; +
+                                                                &quot;gc_grace_seconds of 0. The gc_grace_seconds is used to TTL &quot; +
+                                                                &quot;batchlog entries, so setting gc_grace_seconds too low on &quot; +
+                                                                &quot;tables involved in an atomic batch might cause batchlog &quot; +
+                                                                &quot;entries to expire before being replayed.&quot;;
+
+    /**
+     * Creates a new BatchStatement from a list of statements and a
+     * Thrift consistency level.
+     *
+     * @param type       type of the batch
+     * @param statements a list of UpdateStatements
+     * @param attrs      additional attributes for statement (CL, timestamp, timeToLive)
+     */
+    public BatchStatement(int boundTerms, Type type, List&lt;ModificationStatement&gt; statements, Attributes attrs)
+<span class="nc" id="L91">    {</span>
+<span class="nc" id="L92">        this.boundTerms = boundTerms;</span>
+<span class="nc" id="L93">        this.type = type;</span>
+<span class="nc" id="L94">        this.statements = statements;</span>
+<span class="nc" id="L95">        this.attrs = attrs;</span>
+
+<span class="nc" id="L97">        boolean hasConditions = false;</span>
+<span class="nc" id="L98">        MultiTableColumnsBuilder regularBuilder = new MultiTableColumnsBuilder();</span>
+<span class="nc" id="L99">        PartitionColumns.Builder conditionBuilder = PartitionColumns.builder();</span>
+<span class="nc" id="L100">        boolean updateRegular = false;</span>
+<span class="nc" id="L101">        boolean updateStatic = false;</span>
+
+<span class="nc bnc" id="L103" title="All 2 branches missed.">        for (ModificationStatement stmt : statements)</span>
+        {
+<span class="nc" id="L105">            regularBuilder.addAll(stmt.cfm, stmt.updatedColumns());</span>
+<span class="nc" id="L106">            updateRegular |= stmt.updatesRegularRows();</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">            if (stmt.hasConditions())</span>
+            {
+<span class="nc" id="L109">                hasConditions = true;</span>
+<span class="nc" id="L110">                conditionBuilder.addAll(stmt.conditionColumns());</span>
+<span class="nc" id="L111">                updateStatic |= stmt.updatesStaticRow();</span>
+            }
+<span class="nc" id="L113">        }</span>
+
+<span class="nc" id="L115">        this.updatedColumns = regularBuilder.build();</span>
+<span class="nc" id="L116">        this.conditionColumns = conditionBuilder.build();</span>
+<span class="nc" id="L117">        this.updatesRegularRows = updateRegular;</span>
+<span class="nc" id="L118">        this.updatesStaticRow = updateStatic;</span>
+<span class="nc" id="L119">        this.hasConditions = hasConditions;</span>
+<span class="nc" id="L120">    }</span>
+
+    public Iterable&lt;org.apache.cassandra.cql3.functions.Function&gt; getFunctions()
+    {
+<span class="nc" id="L124">        List&lt;org.apache.cassandra.cql3.functions.Function&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        for (ModificationStatement statement : statements)</span>
+<span class="nc" id="L126">            statement.addFunctionsTo(functions);</span>
+<span class="nc" id="L127">        return functions;</span>
+    }
+
+    public int getBoundTerms()
+    {
+<span class="nc" id="L132">        return boundTerms;</span>
+    }
+
+    public void checkAccess(ClientState state) throws InvalidRequestException, UnauthorizedException
+    {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        for (ModificationStatement statement : statements)</span>
+<span class="nc" id="L138">            statement.checkAccess(state);</span>
+<span class="nc" id="L139">    }</span>
+
+    // Validates a prepared batch statement without validating its nested statements.
+    public void validate() throws InvalidRequestException
+    {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (attrs.isTimeToLiveSet())</span>
+<span class="nc" id="L145">            throw new InvalidRequestException(&quot;Global TTL on the BATCH statement is not supported.&quot;);</span>
+
+<span class="nc" id="L147">        boolean timestampSet = attrs.isTimestampSet();</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (timestampSet)</span>
+        {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">            if (hasConditions)</span>
+<span class="nc" id="L151">                throw new InvalidRequestException(&quot;Cannot provide custom timestamp for conditional BATCH&quot;);</span>
+
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (isCounter())</span>
+<span class="nc" id="L154">                throw new InvalidRequestException(&quot;Cannot provide custom timestamp for counter BATCH&quot;);</span>
+        }
+
+<span class="nc" id="L157">        boolean hasCounters = false;</span>
+<span class="nc" id="L158">        boolean hasNonCounters = false;</span>
+
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        for (ModificationStatement statement : statements)</span>
+        {
+<span class="nc bnc" id="L162" title="All 4 branches missed.">            if (timestampSet &amp;&amp; statement.isCounter())</span>
+<span class="nc" id="L163">                throw new InvalidRequestException(&quot;Cannot provide custom timestamp for a BATCH containing counters&quot;);</span>
+
+<span class="nc bnc" id="L165" title="All 4 branches missed.">            if (timestampSet &amp;&amp; statement.isTimestampSet())</span>
+<span class="nc" id="L166">                throw new InvalidRequestException(&quot;Timestamp must be set either on BATCH or individual statements&quot;);</span>
+
+<span class="nc bnc" id="L168" title="All 4 branches missed.">            if (isCounter() &amp;&amp; !statement.isCounter())</span>
+<span class="nc" id="L169">                throw new InvalidRequestException(&quot;Cannot include non-counter statement in a counter batch&quot;);</span>
+
+<span class="nc bnc" id="L171" title="All 4 branches missed.">            if (isLogged() &amp;&amp; statement.isCounter())</span>
+<span class="nc" id="L172">                throw new InvalidRequestException(&quot;Cannot include a counter statement in a logged batch&quot;);</span>
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (statement.isCounter())</span>
+<span class="nc" id="L175">                hasCounters = true;</span>
+            else
+<span class="nc" id="L177">                hasNonCounters = true;</span>
+<span class="nc" id="L178">        }</span>
+
+<span class="nc bnc" id="L180" title="All 4 branches missed.">        if (hasCounters &amp;&amp; hasNonCounters)</span>
+<span class="nc" id="L181">            throw new InvalidRequestException(&quot;Counter and non-counter mutations cannot exist in the same batch&quot;);</span>
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (hasConditions)</span>
+        {
+<span class="nc" id="L185">            String ksName = null;</span>
+<span class="nc" id="L186">            String cfName = null;</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            for (ModificationStatement stmt : statements)</span>
+            {
+<span class="nc bnc" id="L189" title="All 6 branches missed.">                if (ksName != null &amp;&amp; (!stmt.keyspace().equals(ksName) || !stmt.columnFamily().equals(cfName)))</span>
+<span class="nc" id="L190">                    throw new InvalidRequestException(&quot;Batch with conditions cannot span multiple tables&quot;);</span>
+<span class="nc" id="L191">                ksName = stmt.keyspace();</span>
+<span class="nc" id="L192">                cfName = stmt.columnFamily();</span>
+<span class="nc" id="L193">            }</span>
+        }
+<span class="nc" id="L195">    }</span>
+
+    private boolean isCounter()
+    {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        return type == Type.COUNTER;</span>
+    }
+
+    private boolean isLogged()
+    {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        return type == Type.LOGGED;</span>
+    }
+
+    // The batch itself will be validated in either Parsed#prepare() - for regular CQL3 batches,
+    //   or in QueryProcessor.processBatch() - for native protocol batches.
+    public void validate(ClientState state) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        for (ModificationStatement statement : statements)</span>
+<span class="nc" id="L212">            statement.validate(state);</span>
+<span class="nc" id="L213">    }</span>
+
+    public List&lt;ModificationStatement&gt; getStatements()
+    {
+<span class="nc" id="L217">        return statements;</span>
+    }
+
+    private Collection&lt;? extends IMutation&gt; getMutations(BatchQueryOptions options, boolean local, long now, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L223">        Set&lt;String&gt; tablesWithZeroGcGs = null;</span>
+<span class="nc" id="L224">        UpdatesCollector collector = new UpdatesCollector(updatedColumns, updatedRows());</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        for (int i = 0; i &lt; statements.size(); i++)</span>
+        {
+<span class="nc" id="L227">            ModificationStatement statement = statements.get(i);</span>
+<span class="nc bnc" id="L228" title="All 4 branches missed.">            if (isLogged() &amp;&amp; statement.cfm.params.gcGraceSeconds == 0)</span>
+            {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                if (tablesWithZeroGcGs == null)</span>
+<span class="nc" id="L231">                    tablesWithZeroGcGs = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L232">                tablesWithZeroGcGs.add(String.format(&quot;%s.%s&quot;, statement.cfm.ksName, statement.cfm.cfName));</span>
+            }
+<span class="nc" id="L234">            QueryOptions statementOptions = options.forStatement(i);</span>
+<span class="nc" id="L235">            long timestamp = attrs.getTimestamp(now, statementOptions);</span>
+<span class="nc" id="L236">            statement.addUpdates(collector, statementOptions, local, timestamp, queryStartNanoTime);</span>
+        }
+
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (tablesWithZeroGcGs != null)</span>
+        {
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            String suffix = tablesWithZeroGcGs.size() == 1 ? &quot;&quot; : &quot;s&quot;;</span>
+<span class="nc" id="L242">            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, LOGGED_BATCH_LOW_GCGS_WARNING,</span>
+                             suffix, tablesWithZeroGcGs);
+<span class="nc" id="L244">            ClientWarn.instance.warn(MessageFormatter.arrayFormat(LOGGED_BATCH_LOW_GCGS_WARNING, new Object[] { suffix, tablesWithZeroGcGs })</span>
+<span class="nc" id="L245">                                                     .getMessage());</span>
+        }
+
+<span class="nc" id="L248">        collector.validateIndexedColumns();</span>
+<span class="nc" id="L249">        return collector.toMutations();</span>
+    }
+
+    private int updatedRows()
+    {
+        // Note: it's possible for 2 statements to actually apply to the same row, but that's just an estimation
+        // for sizing our PartitionUpdate backing array, so it's good enough.
+<span class="nc" id="L256">        return statements.size();</span>
+    }
+
+    /**
+     * Checks batch size to ensure threshold is met. If not, a warning is logged.
+     *
+     * @param updates - the batch mutations.
+     */
+    private static void verifyBatchSize(Collection&lt;? extends IMutation&gt; mutations) throws InvalidRequestException
+    {
+        // We only warn for batch spanning multiple mutations (#10876)
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (mutations.size() &lt;= 1)</span>
+<span class="nc" id="L268">            return;</span>
+
+<span class="nc" id="L270">        long size = 0;</span>
+<span class="nc" id="L271">        long warnThreshold = DatabaseDescriptor.getBatchSizeWarnThreshold();</span>
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        for (IMutation mutation : mutations)</span>
+        {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            for (PartitionUpdate update : mutation.getPartitionUpdates())</span>
+<span class="nc" id="L276">                size += update.dataSize();</span>
+<span class="nc" id="L277">        }</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (size &gt; warnThreshold)</span>
+        {
+<span class="nc" id="L281">            Set&lt;String&gt; tableNames = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">            for (IMutation mutation : mutations)</span>
+            {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                for (PartitionUpdate update : mutation.getPartitionUpdates())</span>
+<span class="nc" id="L285">                    tableNames.add(String.format(&quot;%s.%s&quot;, update.metadata().ksName, update.metadata().cfName));</span>
+<span class="nc" id="L286">            }</span>
+
+<span class="nc" id="L288">            long failThreshold = DatabaseDescriptor.getBatchSizeFailThreshold();</span>
+
+<span class="nc" id="L290">            String format = &quot;Batch for {} is of size {}, exceeding specified threshold of {} by {}.{}&quot;;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (size &gt; failThreshold)</span>
+            {
+<span class="nc" id="L293">                Tracing.trace(format, tableNames, FBUtilities.prettyPrintMemory(size), FBUtilities.prettyPrintMemory(failThreshold),</span>
+<span class="nc" id="L294">                              FBUtilities.prettyPrintMemory(size - failThreshold), &quot; (see batch_size_fail_threshold_in_kb)&quot;);</span>
+<span class="nc" id="L295">                logger.error(format, tableNames, FBUtilities.prettyPrintMemory(size), FBUtilities.prettyPrintMemory(failThreshold),</span>
+<span class="nc" id="L296">                             FBUtilities.prettyPrintMemory(size - failThreshold), &quot; (see batch_size_fail_threshold_in_kb)&quot;);</span>
+<span class="nc" id="L297">                throw new InvalidRequestException(&quot;Batch too large&quot;);</span>
+            }
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            else if (logger.isWarnEnabled())</span>
+            {
+<span class="nc" id="L301">                logger.warn(format, tableNames, FBUtilities.prettyPrintMemory(size), FBUtilities.prettyPrintMemory(warnThreshold),</span>
+<span class="nc" id="L302">                            FBUtilities.prettyPrintMemory(size - warnThreshold), &quot;&quot;);</span>
+            }
+<span class="nc" id="L304">            ClientWarn.instance.warn(MessageFormatter.arrayFormat(format, new Object[] {tableNames, size, warnThreshold, size - warnThreshold, &quot;&quot;}).getMessage());</span>
+        }
+<span class="nc" id="L306">    }</span>
+
+    private void verifyBatchType(Collection&lt;? extends IMutation&gt; mutations)
+    {
+<span class="nc bnc" id="L310" title="All 4 branches missed.">        if (!isLogged() &amp;&amp; mutations.size() &gt; 1)</span>
+        {
+<span class="nc" id="L312">            Set&lt;DecoratedKey&gt; keySet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L313">            Set&lt;String&gt; tableNames = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            for (IMutation mutation : mutations)</span>
+            {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                for (PartitionUpdate update : mutation.getPartitionUpdates())</span>
+                {
+<span class="nc" id="L319">                    keySet.add(update.partitionKey());</span>
+
+<span class="nc" id="L321">                    tableNames.add(String.format(&quot;%s.%s&quot;, update.metadata().ksName, update.metadata().cfName));</span>
+<span class="nc" id="L322">                }</span>
+<span class="nc" id="L323">            }</span>
+
+            // CASSANDRA-11529: log only if we have more than a threshold of keys, this was also suggested in the
+            // original ticket that introduced this warning, CASSANDRA-9282
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (keySet.size() &gt; DatabaseDescriptor.getUnloggedBatchAcrossPartitionsWarnThreshold())</span>
+            {
+<span class="nc" id="L329">                NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, UNLOGGED_BATCH_WARNING,</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                                 keySet.size(), tableNames.size() == 1 ? &quot;&quot; : &quot;s&quot;, tableNames);</span>
+
+<span class="nc" id="L332">                ClientWarn.instance.warn(MessageFormatter.arrayFormat(UNLOGGED_BATCH_WARNING, new Object[]{keySet.size(),</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                                                    tableNames.size() == 1 ? &quot;&quot; : &quot;s&quot;, tableNames}).getMessage());</span>
+            }
+        }
+<span class="nc" id="L336">    }</span>
+
+
+    public ResultMessage execute(QueryState queryState, QueryOptions options, long queryStartNanoTime) throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L341">        return execute(queryState, BatchQueryOptions.withoutPerStatementVariables(options), queryStartNanoTime);</span>
+    }
+
+    public ResultMessage execute(QueryState queryState, BatchQueryOptions options, long queryStartNanoTime) throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L346">        return execute(queryState, options, false, options.getTimestamp(queryState), queryStartNanoTime);</span>
+    }
+
+    private ResultMessage execute(QueryState queryState, BatchQueryOptions options, boolean local, long now, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (options.getConsistency() == null)</span>
+<span class="nc" id="L353">            throw new InvalidRequestException(&quot;Invalid empty consistency level&quot;);</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if (options.getSerialConsistency() == null)</span>
+<span class="nc" id="L355">            throw new InvalidRequestException(&quot;Invalid empty serial consistency level&quot;);</span>
+
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (hasConditions)</span>
+<span class="nc" id="L358">            return executeWithConditions(options, queryState, queryStartNanoTime);</span>
+
+<span class="nc" id="L360">        executeWithoutConditions(getMutations(options, local, now, queryStartNanoTime), options.getConsistency(), queryStartNanoTime);</span>
+<span class="nc" id="L361">        return new ResultMessage.Void();</span>
+    }
+
+    private void executeWithoutConditions(Collection&lt;? extends IMutation&gt; mutations, ConsistencyLevel cl, long queryStartNanoTime) throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if (mutations.isEmpty())</span>
+<span class="nc" id="L367">            return;</span>
+
+<span class="nc" id="L369">        verifyBatchSize(mutations);</span>
+<span class="nc" id="L370">        verifyBatchType(mutations);</span>
+
+<span class="nc bnc" id="L372" title="All 4 branches missed.">        boolean mutateAtomic = (isLogged() &amp;&amp; mutations.size() &gt; 1);</span>
+<span class="nc" id="L373">        StorageProxy.mutateWithTriggers(mutations, cl, mutateAtomic, queryStartNanoTime);</span>
+<span class="nc" id="L374">    }</span>
+
+    private ResultMessage executeWithConditions(BatchQueryOptions options, QueryState state, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L379">        Pair&lt;CQL3CasRequest, Set&lt;ColumnDefinition&gt;&gt; p = makeCasRequest(options, state);</span>
+<span class="nc" id="L380">        CQL3CasRequest casRequest = p.left;</span>
+<span class="nc" id="L381">        Set&lt;ColumnDefinition&gt; columnsWithConditions = p.right;</span>
+
+<span class="nc" id="L383">        String ksName = casRequest.cfm.ksName;</span>
+<span class="nc" id="L384">        String tableName = casRequest.cfm.cfName;</span>
+
+<span class="nc" id="L386">        try (RowIterator result = StorageProxy.cas(ksName,</span>
+                                                   tableName,
+                                                   casRequest.key,
+                                                   casRequest,
+<span class="nc" id="L390">                                                   options.getSerialConsistency(),</span>
+<span class="nc" id="L391">                                                   options.getConsistency(),</span>
+<span class="nc" id="L392">                                                   state.getClientState(),</span>
+                                                   queryStartNanoTime))
+        {
+<span class="nc" id="L395">            return new ResultMessage.Rows(ModificationStatement.buildCasResultSet(ksName, tableName, result, columnsWithConditions, true, options.forStatement(0)));</span>
+        }
+    }
+
+
+    private Pair&lt;CQL3CasRequest,Set&lt;ColumnDefinition&gt;&gt; makeCasRequest(BatchQueryOptions options, QueryState state)
+    {
+<span class="nc" id="L402">        long now = state.getTimestamp();</span>
+<span class="nc" id="L403">        DecoratedKey key = null;</span>
+<span class="nc" id="L404">        CQL3CasRequest casRequest = null;</span>
+<span class="nc" id="L405">        Set&lt;ColumnDefinition&gt; columnsWithConditions = new LinkedHashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        for (int i = 0; i &lt; statements.size(); i++)</span>
+        {
+<span class="nc" id="L409">            ModificationStatement statement = statements.get(i);</span>
+<span class="nc" id="L410">            QueryOptions statementOptions = options.forStatement(i);</span>
+<span class="nc" id="L411">            long timestamp = attrs.getTimestamp(now, statementOptions);</span>
+<span class="nc" id="L412">            List&lt;ByteBuffer&gt; pks = statement.buildPartitionKeyNames(statementOptions);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (statement.getRestrictions().keyIsInRelation())</span>
+<span class="nc" id="L414">                throw new IllegalArgumentException(&quot;Batch with conditions cannot span multiple partitions (you cannot use IN on the partition key)&quot;);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (key == null)</span>
+            {
+<span class="nc" id="L417">                key = statement.cfm.decorateKey(pks.get(0));</span>
+<span class="nc" id="L418">                casRequest = new CQL3CasRequest(statement.cfm, key, true, conditionColumns, updatesRegularRows, updatesStaticRow);</span>
+            }
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            else if (!key.getKey().equals(pks.get(0)))</span>
+            {
+<span class="nc" id="L422">                throw new InvalidRequestException(&quot;Batch with conditions cannot span multiple partitions&quot;);</span>
+            }
+
+<span class="nc" id="L425">            checkFalse(statement.getRestrictions().clusteringKeyRestrictionsHasIN(),</span>
+                       &quot;IN on the clustering key columns is not supported with conditional %s&quot;,
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                       statement.type.isUpdate()? &quot;updates&quot; : &quot;deletions&quot;);</span>
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (statement.hasSlices())</span>
+            {
+                // All of the conditions require meaningful Clustering, not Slices
+<span class="nc bnc" id="L432" title="All 4 branches missed.">                assert !statement.hasConditions();</span>
+
+<span class="nc" id="L434">                Slices slices = statement.createSlices(statementOptions);</span>
+                // If all the ranges were invalid we do not need to do anything.
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                if (slices.isEmpty())</span>
+<span class="nc" id="L437">                    continue;</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                for (Slice slice : slices)</span>
+                {
+<span class="nc" id="L441">                    casRequest.addRangeDeletion(slice, statement, statementOptions, timestamp);</span>
+<span class="nc" id="L442">                }</span>
+
+<span class="nc" id="L444">            }</span>
+            else
+            {
+<span class="nc" id="L447">                Clustering clustering = Iterables.getOnlyElement(statement.createClustering(statementOptions));</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                if (statement.hasConditions())</span>
+                {
+<span class="nc" id="L450">                    statement.addConditions(clustering, casRequest, statementOptions);</span>
+                    // As soon as we have a ifNotExists, we set columnsWithConditions to null so that everything is in the resultSet
+<span class="nc bnc" id="L452" title="All 4 branches missed.">                    if (statement.hasIfNotExistCondition() || statement.hasIfExistCondition())</span>
+<span class="nc" id="L453">                        columnsWithConditions = null;</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">                    else if (columnsWithConditions != null)</span>
+<span class="nc" id="L455">                        Iterables.addAll(columnsWithConditions, statement.getColumnsWithConditions());</span>
+                }
+<span class="nc" id="L457">                casRequest.addRowUpdate(clustering, statement, statementOptions, timestamp);</span>
+            }
+        }
+
+<span class="nc" id="L461">        return Pair.create(casRequest, columnsWithConditions);</span>
+    }
+
+    public ResultMessage executeInternal(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        if (hasConditions)</span>
+<span class="nc" id="L467">            return executeInternalWithConditions(BatchQueryOptions.withoutPerStatementVariables(options), queryState);</span>
+
+<span class="nc" id="L469">        executeInternalWithoutCondition(queryState, options, System.nanoTime());</span>
+<span class="nc" id="L470">        return new ResultMessage.Void();</span>
+    }
+
+    private ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        for (IMutation mutation : getMutations(BatchQueryOptions.withoutPerStatementVariables(options), true, queryState.getTimestamp(), queryStartNanoTime))</span>
+<span class="nc" id="L476">            mutation.apply();</span>
+<span class="nc" id="L477">        return null;</span>
+    }
+
+    private ResultMessage executeInternalWithConditions(BatchQueryOptions options, QueryState state) throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L482">        Pair&lt;CQL3CasRequest, Set&lt;ColumnDefinition&gt;&gt; p = makeCasRequest(options, state);</span>
+<span class="nc" id="L483">        CQL3CasRequest request = p.left;</span>
+<span class="nc" id="L484">        Set&lt;ColumnDefinition&gt; columnsWithConditions = p.right;</span>
+
+<span class="nc" id="L486">        String ksName = request.cfm.ksName;</span>
+<span class="nc" id="L487">        String tableName = request.cfm.cfName;</span>
+
+<span class="nc" id="L489">        try (RowIterator result = ModificationStatement.casInternal(request, state))</span>
+        {
+<span class="nc" id="L491">            return new ResultMessage.Rows(ModificationStatement.buildCasResultSet(ksName, tableName, result, columnsWithConditions, true, options.forStatement(0)));</span>
+        }
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L497">        return String.format(&quot;BatchStatement(type=%s, statements=%s)&quot;, type, statements);</span>
+    }
+
+    public static class Parsed extends CFStatement
+    {
+        private final Type type;
+        private final Attributes.Raw attrs;
+        private final List&lt;ModificationStatement.Parsed&gt; parsedStatements;
+
+        public Parsed(Type type, Attributes.Raw attrs, List&lt;ModificationStatement.Parsed&gt; parsedStatements)
+        {
+<span class="nc" id="L508">            super(null);</span>
+<span class="nc" id="L509">            this.type = type;</span>
+<span class="nc" id="L510">            this.attrs = attrs;</span>
+<span class="nc" id="L511">            this.parsedStatements = parsedStatements;</span>
+<span class="nc" id="L512">        }</span>
+
+        @Override
+        public void prepareKeyspace(ClientState state) throws InvalidRequestException
+        {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">            for (ModificationStatement.Parsed statement : parsedStatements)</span>
+<span class="nc" id="L518">                statement.prepareKeyspace(state);</span>
+<span class="nc" id="L519">        }</span>
+
+        public ParsedStatement.Prepared prepare(ClientState clientState) throws InvalidRequestException
+        {
+<span class="nc" id="L523">            VariableSpecifications boundNames = getBoundVariables();</span>
+
+<span class="nc" id="L525">            String firstKS = null;</span>
+<span class="nc" id="L526">            String firstCF = null;</span>
+<span class="nc" id="L527">            boolean haveMultipleCFs = false;</span>
+
+<span class="nc" id="L529">            List&lt;ModificationStatement&gt; statements = new ArrayList&lt;&gt;(parsedStatements.size());</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            for (ModificationStatement.Parsed parsed : parsedStatements)</span>
+            {
+<span class="nc bnc" id="L532" title="All 2 branches missed.">                if (firstKS == null)</span>
+                {
+<span class="nc" id="L534">                    firstKS = parsed.keyspace();</span>
+<span class="nc" id="L535">                    firstCF = parsed.columnFamily();</span>
+                }
+<span class="nc bnc" id="L537" title="All 2 branches missed.">                else if (!haveMultipleCFs)</span>
+                {
+<span class="nc bnc" id="L539" title="All 4 branches missed.">                    haveMultipleCFs = !firstKS.equals(parsed.keyspace()) || !firstCF.equals(parsed.columnFamily());</span>
+                }
+
+<span class="nc" id="L542">                statements.add(parsed.prepare(boundNames, clientState));</span>
+<span class="nc" id="L543">            }</span>
+
+<span class="nc" id="L545">            Attributes prepAttrs = attrs.prepare(&quot;[batch]&quot;, &quot;[batch]&quot;);</span>
+<span class="nc" id="L546">            prepAttrs.collectMarkerSpecification(boundNames);</span>
+
+<span class="nc" id="L548">            BatchStatement batchStatement = new BatchStatement(boundNames.size(), type, statements, prepAttrs);</span>
+<span class="nc" id="L549">            batchStatement.validate();</span>
+
+            // Use the CFMetadata of the first statement for partition key bind indexes.  If the statements affect
+            // multiple tables, we won't send partition key bind indexes.
+<span class="nc bnc" id="L553" title="All 4 branches missed.">            short[] partitionKeyBindIndexes = (haveMultipleCFs || batchStatement.statements.isEmpty())? null</span>
+<span class="nc" id="L554">                                                              : boundNames.getPartitionKeyBindIndexes(batchStatement.statements.get(0).cfm);</span>
+
+<span class="nc" id="L556">            return new ParsedStatement.Prepared(batchStatement, boundNames, partitionKeyBindIndexes);</span>
+        }
+    }
+
+<span class="nc" id="L560">    private static class MultiTableColumnsBuilder</span>
+    {
+<span class="nc" id="L562">        private final Map&lt;UUID, PartitionColumns.Builder&gt; perTableBuilders = new HashMap&lt;&gt;();</span>
+
+        public void addAll(CFMetaData table, PartitionColumns columns)
+        {
+<span class="nc" id="L566">            PartitionColumns.Builder builder = perTableBuilders.get(table.cfId);</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">            if (builder == null)</span>
+            {
+<span class="nc" id="L569">                builder = PartitionColumns.builder();</span>
+<span class="nc" id="L570">                perTableBuilders.put(table.cfId, builder);</span>
+            }
+<span class="nc" id="L572">            builder.addAll(columns);</span>
+<span class="nc" id="L573">        }</span>
+
+        public Map&lt;UUID, PartitionColumns&gt; build()
+        {
+<span class="nc" id="L577">            Map&lt;UUID, PartitionColumns&gt; m = Maps.newHashMapWithExpectedSize(perTableBuilders.size());</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">            for (Map.Entry&lt;UUID, PartitionColumns.Builder&gt; p : perTableBuilders.entrySet())</span>
+<span class="nc" id="L579">                m.put(p.getKey(), p.getValue().build());</span>
+<span class="nc" id="L580">            return m;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

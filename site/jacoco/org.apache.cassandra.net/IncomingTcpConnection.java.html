@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IncomingTcpConnection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">IncomingTcpConnection.java</span></div><h1>IncomingTcpConnection.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.*;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.SocketException;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import java.util.zip.Checksum;
+import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocalThread;
+import net.jpountz.lz4.LZ4BlockInputStream;
+import net.jpountz.lz4.LZ4FastDecompressor;
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.xxhash.XXHashFactory;
+
+import org.apache.cassandra.config.Config;
+import org.xerial.snappy.SnappyInputStream;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.db.monitoring.ApproximateTime;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.io.util.NIODataInputStream;
+
+public class IncomingTcpConnection extends FastThreadLocalThread implements Closeable
+{
+<span class="fc" id="L49">    private static final Logger logger = LoggerFactory.getLogger(IncomingTcpConnection.class);</span>
+
+<span class="fc" id="L51">    private static final int BUFFER_SIZE = Integer.getInteger(Config.PROPERTY_PREFIX + &quot;.itc_buffer_size&quot;, 1024 * 4);</span>
+
+    private final int version;
+    private final boolean compressed;
+    private final Socket socket;
+    private final Set&lt;Closeable&gt; group;
+    public InetAddress from;
+
+    public IncomingTcpConnection(int version, boolean compressed, Socket socket, Set&lt;Closeable&gt; group)
+    {
+<span class="fc" id="L61">        super(&quot;MessagingService-Incoming-&quot; + socket.getInetAddress());</span>
+<span class="fc" id="L62">        this.version = version;</span>
+<span class="fc" id="L63">        this.compressed = compressed;</span>
+<span class="fc" id="L64">        this.socket = socket;</span>
+<span class="fc" id="L65">        this.group = group;</span>
+<span class="pc bpc" id="L66" title="1 of 2 branches missed.">        if (DatabaseDescriptor.getInternodeRecvBufferSize() &gt; 0)</span>
+        {
+            try
+            {
+<span class="nc" id="L70">                this.socket.setReceiveBufferSize(DatabaseDescriptor.getInternodeRecvBufferSize());</span>
+            }
+<span class="nc" id="L72">            catch (SocketException se)</span>
+            {
+<span class="nc" id="L74">                logger.warn(&quot;Failed to set receive buffer size on internode socket.&quot;, se);</span>
+<span class="nc" id="L75">            }</span>
+        }
+<span class="fc" id="L77">    }</span>
+
+    /**
+     * A new connection will either stream or message for its entire lifetime: because streaming
+     * bypasses the InputStream implementations to use sendFile, we cannot begin buffering until
+     * we've determined the type of the connection.
+     */
+    @Override
+    public void run()
+    {
+        try
+        {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L90">                throw new UnsupportedOperationException(String.format(&quot;Unable to read obsolete message version %s; &quot;</span>
+                                                                      + &quot;The earliest version supported is 2.0.0&quot;,
+<span class="nc" id="L92">                                                                      version));</span>
+
+<span class="nc" id="L94">            receiveMessages();</span>
+        }
+<span class="fc" id="L96">        catch (EOFException e)</span>
+        {
+<span class="fc" id="L98">            logger.trace(&quot;eof reading from socket; closing&quot;, e);</span>
+            // connection will be reset so no need to throw an exception.
+        }
+<span class="nc" id="L101">        catch (UnknownColumnFamilyException e)</span>
+        {
+<span class="nc" id="L103">            logger.warn(&quot;UnknownColumnFamilyException reading from socket; closing&quot;, e);</span>
+        }
+<span class="nc" id="L105">        catch (IOException e)</span>
+        {
+<span class="nc" id="L107">            logger.trace(&quot;IOException reading from socket; closing&quot;, e);</span>
+        }
+        finally
+        {
+<span class="fc" id="L111">            close();</span>
+        }
+<span class="fc" id="L113">    }</span>
+
+    @Override
+    public void close()
+    {
+        try
+        {
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L121">                logger.trace(&quot;Closing socket {} - isclosed: {}&quot;, socket, socket.isClosed());</span>
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">            if (!socket.isClosed())</span>
+            {
+<span class="fc" id="L124">                socket.close();</span>
+            }
+        }
+<span class="nc" id="L127">        catch (IOException e)</span>
+        {
+<span class="nc" id="L129">            logger.trace(&quot;Error closing socket&quot;, e);</span>
+        }
+        finally
+        {
+<span class="fc" id="L133">            group.remove(this);</span>
+        }
+<span class="fc" id="L135">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // Not closing constructed DataInputPlus's as the stream needs to remain open.
+    private void receiveMessages() throws IOException
+    {
+        // handshake (true) endpoint versions
+<span class="fc" id="L141">        DataOutputStream out = new DataOutputStream(socket.getOutputStream());</span>
+        // if this version is &lt; the MS version the other node is trying
+        // to connect with, the other node will disconnect
+<span class="fc" id="L144">        out.writeInt(MessagingService.current_version);</span>
+<span class="fc" id="L145">        out.flush();</span>
+
+        // outbound side will reconnect if necessary to upgrade version
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">        if (version &gt; MessagingService.current_version)</span>
+<span class="nc" id="L149">            throw new IOException(&quot;Peer-used messaging version &quot; + version + &quot; is larger than max supported &quot; + MessagingService.current_version);</span>
+
+<span class="fc" id="L151">        DataInputPlus in = new DataInputStreamPlus(socket.getInputStream());</span>
+<span class="fc" id="L152">        int maxVersion = in.readInt();</span>
+<span class="fc" id="L153">        from = CompactEndpointSerializationHelper.deserialize(in);</span>
+        // record the (true) version of the endpoint
+<span class="fc" id="L155">        MessagingService.instance().setVersion(from, maxVersion);</span>
+<span class="fc" id="L156">        logger.trace(&quot;Set version for {} to {} (will use {})&quot;, from, maxVersion, MessagingService.instance().getVersion(from));</span>
+
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">        if (compressed)</span>
+        {
+<span class="nc" id="L160">            logger.trace(&quot;Upgrading incoming connection to be compressed&quot;);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_21)</span>
+            {
+<span class="nc" id="L163">                in = new DataInputStreamPlus(new SnappyInputStream(socket.getInputStream()));</span>
+            }
+            else
+            {
+<span class="nc" id="L167">                LZ4FastDecompressor decompressor = LZ4Factory.fastestInstance().fastDecompressor();</span>
+<span class="nc" id="L168">                Checksum checksum = XXHashFactory.fastestInstance().newStreamingHash32(OutboundTcpConnection.LZ4_HASH_SEED).asChecksum();</span>
+<span class="nc" id="L169">                in = new DataInputStreamPlus(new LZ4BlockInputStream(socket.getInputStream(),</span>
+                                                                 decompressor,
+                                                                 checksum));
+<span class="nc" id="L172">            }</span>
+        }
+        else
+        {
+<span class="fc" id="L176">            ReadableByteChannel channel = socket.getChannel();</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">            in = new NIODataInputStream(channel != null ? channel : Channels.newChannel(socket.getInputStream()), BUFFER_SIZE);</span>
+        }
+
+        while (true)
+        {
+<span class="fc" id="L182">            MessagingService.validateMagic(in.readInt());</span>
+<span class="fc" id="L183">            receiveMessage(in, version);</span>
+        }
+    }
+
+    private InetAddress receiveMessage(DataInputPlus input, int version) throws IOException
+    {
+        int id;
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">        if (version &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L191">            id = Integer.parseInt(input.readUTF());</span>
+        else
+<span class="fc" id="L193">            id = input.readInt();</span>
+<span class="fc" id="L194">        long currentTime = ApproximateTime.currentTimeMillis();</span>
+<span class="fc" id="L195">        MessageIn message = MessageIn.read(input, version, id, MessageIn.readConstructionTime(from, input, currentTime));</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">        if (message == null)</span>
+        {
+            // callback expired; nothing to do
+<span class="nc" id="L199">            return null;</span>
+        }
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">        if (version &lt;= MessagingService.current_version)</span>
+        {
+<span class="fc" id="L203">            MessagingService.instance().receive(message, id);</span>
+        }
+        else
+        {
+<span class="nc" id="L207">            logger.trace(&quot;Received connection from newer protocol version {}. Ignoring message&quot;, version);</span>
+        }
+<span class="fc" id="L209">        return message.from;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

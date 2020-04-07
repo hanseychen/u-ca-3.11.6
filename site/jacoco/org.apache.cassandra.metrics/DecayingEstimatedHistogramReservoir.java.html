@@ -1,0 +1,555 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DecayingEstimatedHistogramReservoir.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.metrics</a> &gt; <span class="el_source">DecayingEstimatedHistogramReservoir.java</span></div><h1>DecayingEstimatedHistogramReservoir.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.metrics;
+
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.nio.charset.Charset;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import com.codahale.metrics.Clock;
+import com.codahale.metrics.Reservoir;
+import com.codahale.metrics.Snapshot;
+import org.apache.cassandra.utils.EstimatedHistogram;
+
+/**
+ * A decaying histogram reservoir where values collected during each minute will be twice as significant as the values
+ * collected in the previous minute. Measured values are collected in variable sized buckets, using small buckets in the
+ * lower range and larger buckets in the upper range. Use this histogram when you want to know if the distribution of
+ * the underlying data stream has changed recently and you want high resolution on values in the lower range.
+ *
+ * The histogram use forward decay [1] to make recent values more significant. The forward decay factor will be doubled
+ * every minute (half-life time set to 60 seconds) [2]. The forward decay landmark is reset every 30 minutes (or at
+ * first read/update after 30 minutes). During landmark reset, updates and reads in the reservoir will be blocked in a
+ * fashion similar to the one used in the metrics library [3]. The 30 minute rescale interval is used based on the
+ * assumption that in an extreme case we would have to collect a metric 1M times for a single bucket each second. By the
+ * end of the 30:th minute all collected values will roughly add up to 1.000.000 * 60 * pow(2, 30) which can be
+ * represented with 56 bits giving us some head room in a signed 64 bit long.
+ *
+ * Internally two reservoirs are maintained, one with decay and one without decay. All public getters in a {@Snapshot}
+ * will expose the decay functionality with the exception of the {@link Snapshot#getValues()} which will return values
+ * from the reservoir without decay. This makes it possible for the caller to maintain precise deltas in an interval of
+ * its choise.
+ *
+ * The bucket size starts at 1 and grows by 1.2 each time (rounding and removing duplicates). It goes from 1 to around
+ * 18T by default (creating 164+1 buckets), which will give a timing resolution from microseconds to roughly 210 days,
+ * with less precision as the numbers get larger.
+ *
+ * The series of values to which the counts in `decayingBuckets` correspond:
+ * 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 17, 20, 24, 29, 35, 42, 50, 60, 72 etc.
+ * Thus, a `decayingBuckets` of [0, 0, 1, 10] would mean we had seen 1 value of 3 and 10 values of 4.
+ *
+ * Each bucket represents values from (previous bucket offset, current offset].
+ *
+ * [1]: http://dimacs.rutgers.edu/~graham/pubs/papers/fwddecay.pdf
+ * [2]: https://en.wikipedia.org/wiki/Half-life
+ * [3]: https://github.com/dropwizard/metrics/blob/v3.1.2/metrics-core/src/main/java/com/codahale/metrics/ExponentiallyDecayingReservoir.java
+ */
+public class DecayingEstimatedHistogramReservoir implements Reservoir
+{
+    /**
+     * The default number of decayingBuckets. Use this bucket count to reduce memory allocation for bucket offsets.
+     */
+    public static final int DEFAULT_BUCKET_COUNT = 164;
+    public static final boolean DEFAULT_ZERO_CONSIDERATION = false;
+
+    // The offsets used with a default sized bucket array without a separate bucket for zero values.
+<span class="fc" id="L79">    public static final long[] DEFAULT_WITHOUT_ZERO_BUCKET_OFFSETS = EstimatedHistogram.newOffsets(DEFAULT_BUCKET_COUNT, false);</span>
+
+    // The offsets used with a default sized bucket array with a separate bucket for zero values.
+<span class="fc" id="L82">    public static final long[] DEFAULT_WITH_ZERO_BUCKET_OFFSETS = EstimatedHistogram.newOffsets(DEFAULT_BUCKET_COUNT, true);</span>
+
+    // Represents the bucket offset as created by {@link EstimatedHistogram#newOffsets()}
+    private final long[] bucketOffsets;
+
+    // decayingBuckets and buckets are one element longer than bucketOffsets -- the last element is values greater than the last offset
+    private final AtomicLongArray decayingBuckets;
+    private final AtomicLongArray buckets;
+
+    public static final long HALF_TIME_IN_S = 60L;
+<span class="fc" id="L92">    public static final double MEAN_LIFETIME_IN_S = HALF_TIME_IN_S / Math.log(2.0);</span>
+    public static final long LANDMARK_RESET_INTERVAL_IN_MS = 30L * 60L * 1000L;
+
+<span class="fc" id="L95">    private final AtomicBoolean rescaling = new AtomicBoolean(false);</span>
+    private volatile long decayLandmark;
+
+<span class="fc" id="L98">    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();</span>
+
+    // Wrapper around System.nanoTime() to simplify unit testing.
+    private final Clock clock;
+
+
+    /**
+     * Construct a decaying histogram with default number of buckets and without considering zeroes.
+     */
+    public DecayingEstimatedHistogramReservoir()
+    {
+<span class="fc" id="L109">        this(DEFAULT_ZERO_CONSIDERATION, DEFAULT_BUCKET_COUNT, Clock.defaultClock());</span>
+<span class="fc" id="L110">    }</span>
+
+    /**
+     * Construct a decaying histogram with default number of buckets.
+     *
+     * @param considerZeroes when true, 0-value measurements in a separate bucket, otherwise they will be collected in
+     *                       same bucket as 1-value measurements
+     */
+    public DecayingEstimatedHistogramReservoir(boolean considerZeroes)
+    {
+<span class="fc" id="L120">        this(considerZeroes, DEFAULT_BUCKET_COUNT, Clock.defaultClock());</span>
+<span class="fc" id="L121">    }</span>
+
+    /**
+     * Construct a decaying histogram.
+     *
+     * @param considerZeroes when true, 0-value measurements in a separate bucket, otherwise they will be collected in
+     *                       same bucket as 1-value measurements
+     * @param bucketCount number of buckets used to collect measured values
+     */
+    public DecayingEstimatedHistogramReservoir(boolean considerZeroes, int bucketCount)
+    {
+<span class="nc" id="L132">        this(considerZeroes, bucketCount, Clock.defaultClock());</span>
+<span class="nc" id="L133">    }</span>
+
+    @VisibleForTesting
+    DecayingEstimatedHistogramReservoir(boolean considerZeroes, int bucketCount, Clock clock)
+<span class="fc" id="L137">    {</span>
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">        if (bucketCount == DEFAULT_BUCKET_COUNT)</span>
+        {
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (considerZeroes == true)</span>
+            {
+<span class="fc" id="L142">                bucketOffsets = DEFAULT_WITH_ZERO_BUCKET_OFFSETS;</span>
+            }
+            else
+            {
+<span class="fc" id="L146">                bucketOffsets = DEFAULT_WITHOUT_ZERO_BUCKET_OFFSETS;</span>
+            }
+        }
+        else
+        {
+<span class="nc" id="L151">            bucketOffsets = EstimatedHistogram.newOffsets(bucketCount, considerZeroes);</span>
+        }
+<span class="fc" id="L153">        decayingBuckets = new AtomicLongArray(bucketOffsets.length + 1);</span>
+<span class="fc" id="L154">        buckets = new AtomicLongArray(bucketOffsets.length + 1);</span>
+<span class="fc" id="L155">        this.clock = clock;</span>
+<span class="fc" id="L156">        decayLandmark = clock.getTime();</span>
+<span class="fc" id="L157">    }</span>
+
+    /**
+     * Increments the count of the bucket closest to n, rounding UP.
+     *
+     * @param value the data point to add to the histogram
+     */
+    public void update(long value)
+    {
+<span class="fc" id="L166">        long now = clock.getTime();</span>
+<span class="fc" id="L167">        rescaleIfNeeded(now);</span>
+
+<span class="fc" id="L169">        int index = Arrays.binarySearch(bucketOffsets, value);</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        if (index &lt; 0)</span>
+        {
+            // inexact match, take the first bucket higher than n
+<span class="fc" id="L173">            index = -index - 1;</span>
+        }
+        // else exact match; we're good
+
+<span class="fc" id="L177">        lockForRegularUsage();</span>
+
+        try
+        {
+<span class="fc" id="L181">            decayingBuckets.getAndAdd(index, Math.round(forwardDecayWeight(now)));</span>
+        }
+        finally
+        {
+<span class="fc" id="L185">            unlockForRegularUsage();</span>
+        }
+
+<span class="fc" id="L188">        buckets.getAndIncrement(index);</span>
+<span class="fc" id="L189">    }</span>
+
+    private double forwardDecayWeight(long now)
+    {
+<span class="fc" id="L193">        return Math.exp(((now - decayLandmark) / 1000L) / MEAN_LIFETIME_IN_S);</span>
+    }
+
+    /**
+     * Return the number of buckets where recorded values are stored.
+     *
+     * This method does not return the number of recorded values as suggested by the {@link Reservoir} interface.
+     *
+     * @return the number of buckets
+     */
+    public int size()
+    {
+<span class="nc" id="L205">        return decayingBuckets.length();</span>
+    }
+
+    /**
+     * Returns a snapshot of the decaying values in this reservoir.
+     *
+     * Non-decaying reservoir will not be included in the snapshot.
+     *
+     * @return the snapshot
+     */
+    public Snapshot getSnapshot()
+    {
+<span class="fc" id="L217">        rescaleIfNeeded();</span>
+
+<span class="fc" id="L219">        lockForRegularUsage();</span>
+
+        try
+        {
+<span class="fc" id="L223">            return new EstimatedHistogramReservoirSnapshot(this);</span>
+        }
+        finally
+        {
+<span class="fc" id="L227">            unlockForRegularUsage();</span>
+        }
+    }
+
+    /**
+     * @return true if this histogram has overflowed -- that is, a value larger than our largest bucket could bound was added
+     */
+    @VisibleForTesting
+    boolean isOverflowed()
+    {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        return decayingBuckets.get(decayingBuckets.length() - 1) &gt; 0;</span>
+    }
+
+    private void rescaleIfNeeded()
+    {
+<span class="fc" id="L242">        rescaleIfNeeded(clock.getTime());</span>
+<span class="fc" id="L243">    }</span>
+
+    private void rescaleIfNeeded(long now)
+    {
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (needRescale(now))</span>
+        {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if (rescaling.compareAndSet(false, true))</span>
+            {
+                try
+                {
+<span class="nc" id="L253">                    rescale(now);</span>
+                }
+                finally
+                {
+<span class="nc" id="L257">                    rescaling.set(false);</span>
+                }
+            }
+        }
+<span class="fc" id="L261">    }</span>
+
+    private void rescale(long now)
+    {
+        // Check again to make sure that another thread didn't complete rescale already
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (needRescale(now))</span>
+        {
+<span class="nc" id="L268">            lockForRescale();</span>
+
+            try
+            {
+<span class="nc" id="L272">                final double rescaleFactor = forwardDecayWeight(now);</span>
+<span class="nc" id="L273">                decayLandmark = now;</span>
+
+<span class="nc" id="L275">                final int bucketCount = decayingBuckets.length();</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                for (int i = 0; i &lt; bucketCount; i++)</span>
+                {
+<span class="nc" id="L278">                    long newValue = Math.round((decayingBuckets.get(i) / rescaleFactor));</span>
+<span class="nc" id="L279">                    decayingBuckets.set(i, newValue);</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L284">                unlockForRescale();</span>
+            }
+        }
+<span class="nc" id="L287">    }</span>
+
+    private boolean needRescale(long now)
+    {
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        return (now - decayLandmark) &gt; LANDMARK_RESET_INTERVAL_IN_MS;</span>
+    }
+
+    @VisibleForTesting
+    public void clear()
+    {
+<span class="nc" id="L297">        lockForRescale();</span>
+
+        try
+        {
+<span class="nc" id="L301">            final int bucketCount = decayingBuckets.length();</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            for (int i = 0; i &lt; bucketCount; i++)</span>
+            {
+<span class="nc" id="L304">                decayingBuckets.set(i, 0L);</span>
+<span class="nc" id="L305">                buckets.set(i, 0L);</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L310">            unlockForRescale();</span>
+        }
+<span class="nc" id="L312">    }</span>
+
+    private void lockForRegularUsage()
+    {
+<span class="fc" id="L316">        this.lock.readLock().lock();</span>
+<span class="fc" id="L317">    }</span>
+
+    private void unlockForRegularUsage()
+    {
+<span class="fc" id="L321">        this.lock.readLock().unlock();</span>
+<span class="fc" id="L322">    }</span>
+
+    private void lockForRescale()
+    {
+<span class="nc" id="L326">        this.lock.writeLock().lock();</span>
+<span class="nc" id="L327">    }</span>
+
+    private void unlockForRescale()
+    {
+<span class="nc" id="L331">        this.lock.writeLock().unlock();</span>
+<span class="nc" id="L332">    }</span>
+
+
+<span class="fc" id="L335">    private static final Charset UTF_8 = Charset.forName(&quot;UTF-8&quot;);</span>
+
+    /**
+     * Represents a snapshot of the decaying histogram.
+     *
+     * The decaying buckets are copied into a snapshot array to give a consistent view for all getters. However, the
+     * copy is made without a write-lock and so other threads may change the buckets while the array is copied,
+     * probably causign a slight skew up in the quantiles and mean values.
+     *
+     * The decaying buckets will be used for quantile calculations and mean values, but the non decaying buckets will be
+     * exposed for calls to {@link Snapshot#getValues()}.
+     */
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">    private class EstimatedHistogramReservoirSnapshot extends Snapshot</span>
+    {
+        private final long[] decayingBuckets;
+
+        public EstimatedHistogramReservoirSnapshot(DecayingEstimatedHistogramReservoir reservoir)
+<span class="fc" id="L352">        {</span>
+<span class="fc" id="L353">            final int length = reservoir.decayingBuckets.length();</span>
+<span class="fc" id="L354">            final double rescaleFactor = forwardDecayWeight(clock.getTime());</span>
+
+<span class="fc" id="L356">            this.decayingBuckets = new long[length];</span>
+
+<span class="fc bfc" id="L358" title="All 2 branches covered.">            for (int i = 0; i &lt; length; i++)</span>
+<span class="fc" id="L359">                this.decayingBuckets[i] = Math.round(reservoir.decayingBuckets.get(i) / rescaleFactor);</span>
+<span class="fc" id="L360">        }</span>
+
+        /**
+         * Get the estimated value at the specified quantile in the distribution.
+         *
+         * @param quantile the quantile specified as a value between 0.0 (zero) and 1.0 (one)
+         * @return estimated value at given quantile
+         * @throws IllegalStateException in case the histogram overflowed
+         */
+        public double getValue(double quantile)
+        {
+<span class="pc bpc" id="L371" title="3 of 6 branches missed.">            assert quantile &gt;= 0 &amp;&amp; quantile &lt;= 1.0;</span>
+
+<span class="fc" id="L373">            final int lastBucket = decayingBuckets.length - 1;</span>
+
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">            if (decayingBuckets[lastBucket] &gt; 0)</span>
+<span class="nc" id="L376">                throw new IllegalStateException(&quot;Unable to compute when histogram overflowed&quot;);</span>
+
+<span class="fc" id="L378">            final long qcount = (long) Math.ceil(count() * quantile);</span>
+<span class="fc bfc" id="L379" title="All 2 branches covered.">            if (qcount == 0)</span>
+<span class="fc" id="L380">                return 0;</span>
+
+<span class="fc" id="L382">            long elements = 0;</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">            for (int i = 0; i &lt; lastBucket; i++)</span>
+            {
+<span class="fc" id="L385">                elements += decayingBuckets[i];</span>
+<span class="fc bfc" id="L386" title="All 2 branches covered.">                if (elements &gt;= qcount)</span>
+<span class="fc" id="L387">                    return bucketOffsets[i];</span>
+            }
+<span class="nc" id="L389">            return 0;</span>
+        }
+
+        /**
+         * Will return a snapshot of the non-decaying buckets.
+         *
+         * The values returned will not be consistent with the quantile and mean values. The caller must be aware of the
+         * offsets created by {@link EstimatedHistogram#getBucketOffsets()} to make use of the values returned.
+         *
+         * @return a snapshot of the non-decaying buckets.
+         */
+        public long[] getValues()
+        {
+<span class="nc" id="L402">            final int length = buckets.length();</span>
+
+<span class="nc" id="L404">            long[] values = new long[length];</span>
+
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            for (int i = 0; i &lt; length; i++)</span>
+<span class="nc" id="L407">                values[i] = buckets.get(i);</span>
+
+<span class="nc" id="L409">            return values;</span>
+        }
+
+        /**
+         * Return the number of buckets where recorded values are stored.
+         *
+         * This method does not return the number of recorded values as suggested by the {@link Snapshot} interface.
+         *
+         * @return the number of buckets
+         */
+        public int size()
+        {
+<span class="nc" id="L421">            return decayingBuckets.length;</span>
+        }
+
+        /**
+         * Return the number of registered values taking forward decay into account.
+         *
+         * @return the sum of all bucket values
+         */
+        private long count()
+        {
+<span class="fc" id="L431">            long sum = 0L;</span>
+<span class="fc bfc" id="L432" title="All 2 branches covered.">            for (int i = 0; i &lt; decayingBuckets.length; i++)</span>
+<span class="fc" id="L433">                sum += decayingBuckets[i];</span>
+<span class="fc" id="L434">            return sum;</span>
+        }
+
+        /**
+         * Get the estimated max-value that could have been added to this reservoir.
+         *
+         * As values are collected in variable sized buckets, the actual max value recored in the reservoir may be less
+         * than the value returned.
+         *
+         * @return the largest value that could have been added to this reservoir, or Long.MAX_VALUE if the reservoir
+         * overflowed
+         */
+        public long getMax()
+        {
+<span class="nc" id="L448">            final int lastBucket = decayingBuckets.length - 1;</span>
+
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (decayingBuckets[lastBucket] &gt; 0)</span>
+<span class="nc" id="L451">                return Long.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L453" title="All 2 branches missed.">            for (int i = lastBucket - 1; i &gt;= 0; i--)</span>
+            {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                if (decayingBuckets[i] &gt; 0)</span>
+<span class="nc" id="L456">                    return bucketOffsets[i];</span>
+            }
+<span class="nc" id="L458">            return 0;</span>
+        }
+
+        /**
+         * Get the estimated mean value in the distribution.
+         *
+         * @return the mean histogram value (average of bucket offsets, weighted by count)
+         * @throws IllegalStateException if any values were greater than the largest bucket threshold
+         */
+        public double getMean()
+        {
+<span class="nc" id="L469">            final int lastBucket = decayingBuckets.length - 1;</span>
+
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (decayingBuckets[lastBucket] &gt; 0)</span>
+<span class="nc" id="L472">                throw new IllegalStateException(&quot;Unable to compute when histogram overflowed&quot;);</span>
+
+<span class="nc" id="L474">            long elements = 0;</span>
+<span class="nc" id="L475">            long sum = 0;</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">            for (int i = 0; i &lt; lastBucket; i++)</span>
+            {
+<span class="nc" id="L478">                long bCount = decayingBuckets[i];</span>
+<span class="nc" id="L479">                elements += bCount;</span>
+<span class="nc" id="L480">                sum += bCount * bucketOffsets[i];</span>
+            }
+
+<span class="nc" id="L483">            return (double) sum / elements;</span>
+        }
+
+        /**
+         * Get the estimated min-value that could have been added to this reservoir.
+         *
+         * As values are collected in variable sized buckets, the actual min value recored in the reservoir may be
+         * higher than the value returned.
+         *
+         * @return the smallest value that could have been added to this reservoir
+         */
+        public long getMin()
+        {
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            for (int i = 0; i &lt; decayingBuckets.length; i++)</span>
+            {
+<span class="nc bnc" id="L498" title="All 2 branches missed.">                if (decayingBuckets[i] &gt; 0)</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                    return i == 0 ? 0 : 1 + bucketOffsets[i - 1];</span>
+            }
+<span class="nc" id="L501">            return 0;</span>
+        }
+
+        /**
+         * Get the estimated standard deviation of the values added to this reservoir.
+         *
+         * As values are collected in variable sized buckets, the actual deviation may be more or less than the value
+         * returned.
+         *
+         * @return an estimate of the standard deviation
+         */
+        public double getStdDev()
+        {
+<span class="nc" id="L514">            final int lastBucket = decayingBuckets.length - 1;</span>
+
+<span class="nc bnc" id="L516" title="All 2 branches missed.">            if (decayingBuckets[lastBucket] &gt; 0)</span>
+<span class="nc" id="L517">                throw new IllegalStateException(&quot;Unable to compute when histogram overflowed&quot;);</span>
+
+<span class="nc" id="L519">            final long count = count();</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            if(count &lt;= 1)</span>
+            {
+<span class="nc" id="L523">                return 0.0D;</span>
+            }
+            else
+            {
+<span class="nc" id="L527">                double mean = this.getMean();</span>
+<span class="nc" id="L528">                double sum = 0.0D;</span>
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                for(int i = 0; i &lt; lastBucket; ++i)</span>
+                {
+<span class="nc" id="L532">                    long value = bucketOffsets[i];</span>
+<span class="nc" id="L533">                    double diff = value - mean;</span>
+<span class="nc" id="L534">                    sum += diff * diff * decayingBuckets[i];</span>
+                }
+
+<span class="nc" id="L537">                return Math.sqrt(sum / (count - 1));</span>
+            }
+        }
+
+        public void dump(OutputStream output)
+        {
+<span class="nc" id="L543">            try (PrintWriter out = new PrintWriter(new OutputStreamWriter(output, UTF_8)))</span>
+            {
+<span class="nc" id="L545">                int length = decayingBuckets.length;</span>
+
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                for(int i = 0; i &lt; length; ++i)</span>
+                {
+<span class="nc" id="L549">                    out.printf(&quot;%d%n&quot;, decayingBuckets[i]);</span>
+                }
+            }
+<span class="nc" id="L552">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

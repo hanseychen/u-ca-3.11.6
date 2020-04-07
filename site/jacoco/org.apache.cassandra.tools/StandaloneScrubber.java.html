@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StandaloneScrubber.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.tools</a> &gt; <span class="el_source">StandaloneScrubber.java</span></div><h1>StandaloneScrubber.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.tools;
+
+import java.io.File;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import org.apache.commons.cli.*;
+
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.*;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
+
+<span class="nc" id="L46">public class StandaloneScrubber</span>
+{
+    public static final String REINSERT_OVERFLOWED_TTL_OPTION_DESCRIPTION = &quot;Rewrites rows with overflowed expiration date affected by CASSANDRA-14092 with &quot; +
+                                                                            &quot;the maximum supported expiration date of 2038-01-19T03:14:06+00:00. &quot; +
+                                                                            &quot;The rows are rewritten with the original timestamp incremented by one millisecond &quot; +
+                                                                            &quot;to override/supersede any potential tombstone that may have been generated &quot; +
+                                                                            &quot;during compaction of the affected rows.&quot;;
+
+    private static final String TOOL_NAME = &quot;sstablescrub&quot;;
+    private static final String VERBOSE_OPTION  = &quot;verbose&quot;;
+    private static final String DEBUG_OPTION  = &quot;debug&quot;;
+    private static final String HELP_OPTION  = &quot;help&quot;;
+    private static final String MANIFEST_CHECK_OPTION  = &quot;manifest-check&quot;;
+    private static final String SKIP_CORRUPTED_OPTION = &quot;skip-corrupted&quot;;
+    private static final String NO_VALIDATE_OPTION = &quot;no-validate&quot;;
+    private static final String REINSERT_OVERFLOWED_TTL_OPTION = &quot;reinsert-overflowed-ttl&quot;;
+    private static final String HEADERFIX_OPTION = &quot;header-fix&quot;;
+
+    public static void main(String args[])
+    {
+<span class="nc" id="L66">        Options options = Options.parseArgs(args);</span>
+<span class="nc" id="L67">        Util.initDatabaseDescriptor();</span>
+
+        try
+        {
+            // load keyspace descriptions.
+<span class="nc" id="L72">            Schema.instance.loadFromDisk(false);</span>
+
+<span class="nc bnc" id="L74" title="All 2 branches missed.">            if (Schema.instance.getKSMetaData(options.keyspaceName) == null)</span>
+<span class="nc" id="L75">                throw new IllegalArgumentException(String.format(&quot;Unknown keyspace %s&quot;, options.keyspaceName));</span>
+
+            // Do not load sstables since they might be broken
+<span class="nc" id="L78">            Keyspace keyspace = Keyspace.openWithoutSSTables(options.keyspaceName);</span>
+
+<span class="nc" id="L80">            ColumnFamilyStore cfs = null;</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            for (ColumnFamilyStore c : keyspace.getValidColumnFamilies(true, false, options.cfName))</span>
+            {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">                if (c.name.equals(options.cfName))</span>
+                {
+<span class="nc" id="L85">                    cfs = c;</span>
+<span class="nc" id="L86">                    break;</span>
+                }
+<span class="nc" id="L88">            }</span>
+
+<span class="nc bnc" id="L90" title="All 2 branches missed.">            if (cfs == null)</span>
+<span class="nc" id="L91">                throw new IllegalArgumentException(String.format(&quot;Unknown table %s.%s&quot;,</span>
+                                                                  options.keyspaceName,
+                                                                  options.cfName));
+
+<span class="nc" id="L95">            String snapshotName = &quot;pre-scrub-&quot; + System.currentTimeMillis();</span>
+
+<span class="nc" id="L97">            OutputHandler handler = new OutputHandler.SystemOutput(options.verbose, options.debug);</span>
+<span class="nc" id="L98">            Directories.SSTableLister lister = cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);</span>
+<span class="nc" id="L99">            List&lt;Pair&lt;Descriptor, Set&lt;Component&gt;&gt;&gt; listResult = new ArrayList&lt;&gt;();</span>
+
+            // create snapshot
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            for (Map.Entry&lt;Descriptor, Set&lt;Component&gt;&gt; entry : lister.list().entrySet())</span>
+            {
+<span class="nc" id="L104">                Descriptor descriptor = entry.getKey();</span>
+<span class="nc" id="L105">                Set&lt;Component&gt; components = entry.getValue();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">                if (!components.contains(Component.DATA))</span>
+<span class="nc" id="L107">                    continue;</span>
+
+<span class="nc" id="L109">                listResult.add(Pair.create(descriptor, components));</span>
+
+<span class="nc" id="L111">                File snapshotDirectory = Directories.getSnapshotDirectory(descriptor, snapshotName);</span>
+<span class="nc" id="L112">                SSTableReader.createLinks(descriptor, components, snapshotDirectory.getPath());</span>
+<span class="nc" id="L113">            }</span>
+<span class="nc" id="L114">            System.out.println(String.format(&quot;Pre-scrub sstables snapshotted into snapshot %s&quot;, snapshotName));</span>
+
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            if (options.headerFixMode != Options.HeaderFixMode.OFF)</span>
+            {
+                // Run the frozen-UDT checks _before_ the sstables are opened
+
+<span class="nc" id="L120">                List&lt;String&gt; logOutput = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L122">                SSTableHeaderFix.Builder headerFixBuilder = SSTableHeaderFix.builder()</span>
+<span class="nc" id="L123">                                                                            .logToList(logOutput)</span>
+<span class="nc" id="L124">                                                                            .schemaCallback(() -&gt; Schema.instance::getCFMetaData);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">                if (options.headerFixMode == Options.HeaderFixMode.VALIDATE)</span>
+<span class="nc" id="L126">                    headerFixBuilder = headerFixBuilder.dryRun();</span>
+
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                for (Pair&lt;Descriptor, Set&lt;Component&gt;&gt; p : listResult)</span>
+<span class="nc" id="L129">                    headerFixBuilder.withPath(Paths.get(p.left.filenameFor(Component.DATA)));</span>
+
+<span class="nc" id="L131">                SSTableHeaderFix headerFix = headerFixBuilder.build();</span>
+                try
+                {
+<span class="nc" id="L134">                    headerFix.execute();</span>
+                }
+<span class="nc" id="L136">                catch (Exception e)</span>
+                {
+<span class="nc" id="L138">                    JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">                    if (options.debug)</span>
+<span class="nc" id="L140">                        e.printStackTrace(System.err);</span>
+<span class="nc" id="L141">                }</span>
+
+<span class="nc bnc" id="L143" title="All 4 branches missed.">                if (headerFix.hasChanges() || headerFix.hasError())</span>
+<span class="nc" id="L144">                    logOutput.forEach(System.out::println);</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">                if (headerFix.hasError())</span>
+                {
+<span class="nc" id="L148">                    System.err.println(&quot;Errors in serialization-header detected, aborting.&quot;);</span>
+<span class="nc" id="L149">                    System.exit(1);</span>
+                }
+
+<span class="nc bnc" id="L152" title="All 3 branches missed.">                switch (options.headerFixMode)</span>
+                {
+                    case VALIDATE_ONLY:
+                    case FIX_ONLY:
+<span class="nc" id="L156">                        System.out.printf(&quot;Not continuing with scrub, since '--%s %s' was specified.%n&quot;,</span>
+                                          HEADERFIX_OPTION,
+<span class="nc" id="L158">                                          options.headerFixMode.asCommandLineOption());</span>
+<span class="nc" id="L159">                        System.exit(0);</span>
+                    case VALIDATE:
+<span class="nc bnc" id="L161" title="All 2 branches missed.">                        if (headerFix.hasChanges())</span>
+                        {
+<span class="nc" id="L163">                            System.err.printf(&quot;Unfixed, but fixable errors in serialization-header detected, aborting. &quot; +</span>
+                                              &quot;Use a non-validating mode ('-e %s' or '-e %s') for --%s%n&quot;,
+<span class="nc" id="L165">                                              Options.HeaderFixMode.FIX.asCommandLineOption(),</span>
+<span class="nc" id="L166">                                              Options.HeaderFixMode.FIX_ONLY.asCommandLineOption(),</span>
+                                              HEADERFIX_OPTION);
+<span class="nc" id="L168">                            System.exit(2);</span>
+                        }
+                        break;
+                    case FIX:
+                        break;
+                }
+            }
+
+<span class="nc" id="L176">            List&lt;SSTableReader&gt; sstables = new ArrayList&lt;&gt;();</span>
+
+            // Open sstables
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            for (Pair&lt;Descriptor, Set&lt;Component&gt;&gt; pair : listResult)</span>
+            {
+<span class="nc" id="L181">                Descriptor descriptor = pair.left;</span>
+<span class="nc" id="L182">                Set&lt;Component&gt; components = pair.right;</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">                if (!components.contains(Component.DATA))</span>
+<span class="nc" id="L184">                    continue;</span>
+
+                try
+                {
+<span class="nc" id="L188">                    SSTableReader sstable = SSTableReader.openNoValidation(descriptor, components, cfs);</span>
+<span class="nc" id="L189">                    sstables.add(sstable);</span>
+                }
+<span class="nc" id="L191">                catch (Exception e)</span>
+                {
+<span class="nc" id="L193">                    JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L194">                    System.err.println(String.format(&quot;Error Loading %s: %s&quot;, descriptor, e.getMessage()));</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                    if (options.debug)</span>
+<span class="nc" id="L196">                        e.printStackTrace(System.err);</span>
+<span class="nc" id="L197">                }</span>
+<span class="nc" id="L198">            }</span>
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (!options.manifestCheckOnly)</span>
+            {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                for (SSTableReader sstable : sstables)</span>
+                {
+<span class="nc" id="L204">                    try (LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.SCRUB, sstable))</span>
+                    {
+<span class="nc" id="L206">                        txn.obsoleteOriginals(); // make sure originals are deleted and avoid NPE if index is missing, CASSANDRA-9591</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                        try (Scrubber scrubber = new Scrubber(cfs, txn, options.skipCorrupted, handler, !options.noValidate, options.reinserOverflowedTTL))</span>
+                        {
+<span class="nc" id="L209">                            scrubber.scrub();</span>
+                        }
+<span class="nc" id="L211">                        catch (Throwable t)</span>
+                        {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                            if (!cfs.rebuildOnFailedScrub(t))</span>
+                            {
+<span class="nc" id="L215">                                System.out.println(t.getMessage());</span>
+<span class="nc" id="L216">                                throw t;</span>
+                            }
+<span class="nc" id="L218">                        }</span>
+                    }
+<span class="nc" id="L220">                    catch (Exception e)</span>
+                    {
+<span class="nc" id="L222">                        System.err.println(String.format(&quot;Error scrubbing %s: %s&quot;, sstable, e.getMessage()));</span>
+<span class="nc" id="L223">                        e.printStackTrace(System.err);</span>
+<span class="nc" id="L224">                    }</span>
+<span class="nc" id="L225">                }</span>
+            }
+
+            // Check (and repair) manifests
+<span class="nc" id="L229">            checkManifest(cfs.getCompactionStrategyManager(), cfs, sstables);</span>
+<span class="nc" id="L230">            CompactionManager.instance.finishCompactionsAndShutdown(5, TimeUnit.MINUTES);</span>
+<span class="nc" id="L231">            LifecycleTransaction.waitForDeletions();</span>
+<span class="nc" id="L232">            System.exit(0); // We need that to stop non daemonized threads</span>
+        }
+<span class="nc" id="L234">        catch (Exception e)</span>
+        {
+<span class="nc" id="L236">            System.err.println(e.getMessage());</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (options.debug)</span>
+<span class="nc" id="L238">                e.printStackTrace(System.err);</span>
+<span class="nc" id="L239">            System.exit(1);</span>
+<span class="nc" id="L240">        }</span>
+<span class="nc" id="L241">    }</span>
+
+    private static void checkManifest(CompactionStrategyManager strategyManager, ColumnFamilyStore cfs, Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (strategyManager.getCompactionParams().klass().equals(LeveledCompactionStrategy.class))</span>
+        {
+<span class="nc" id="L247">            int maxSizeInMB = (int)((cfs.getCompactionStrategyManager().getMaxSSTableBytes()) / (1024L * 1024L));</span>
+
+<span class="nc" id="L249">            System.out.println(&quot;Checking leveled manifest&quot;);</span>
+<span class="nc" id="L250">            Predicate&lt;SSTableReader&gt; repairedPredicate = new Predicate&lt;SSTableReader&gt;()</span>
+<span class="nc" id="L251">            {</span>
+                @Override
+                public boolean apply(SSTableReader sstable)
+                {
+<span class="nc" id="L255">                    return sstable.isRepaired();</span>
+                }
+            };
+
+<span class="nc" id="L259">            List&lt;SSTableReader&gt; repaired = Lists.newArrayList(Iterables.filter(sstables, repairedPredicate));</span>
+<span class="nc" id="L260">            List&lt;SSTableReader&gt; unRepaired = Lists.newArrayList(Iterables.filter(sstables, Predicates.not(repairedPredicate)));</span>
+
+<span class="nc" id="L262">            LeveledManifest repairedManifest = LeveledManifest.create(cfs, maxSizeInMB, cfs.getLevelFanoutSize(), repaired);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            for (int i = 1; i &lt; repairedManifest.getLevelCount(); i++)</span>
+            {
+<span class="nc" id="L265">                repairedManifest.repairOverlappingSSTables(i);</span>
+            }
+<span class="nc" id="L267">            LeveledManifest unRepairedManifest = LeveledManifest.create(cfs, maxSizeInMB, cfs.getLevelFanoutSize(), unRepaired);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            for (int i = 1; i &lt; unRepairedManifest.getLevelCount(); i++)</span>
+            {
+<span class="nc" id="L270">                unRepairedManifest.repairOverlappingSSTables(i);</span>
+            }
+        }
+<span class="nc" id="L273">    }</span>
+
+    private static class Options
+    {
+        public final String keyspaceName;
+        public final String cfName;
+
+        public boolean debug;
+        public boolean verbose;
+        public boolean manifestCheckOnly;
+        public boolean skipCorrupted;
+        public boolean noValidate;
+        public boolean reinserOverflowedTTL;
+<span class="nc" id="L286">        public HeaderFixMode headerFixMode = HeaderFixMode.VALIDATE;</span>
+
+<span class="nc" id="L288">        enum HeaderFixMode</span>
+        {
+<span class="nc" id="L290">            VALIDATE_ONLY,</span>
+<span class="nc" id="L291">            VALIDATE,</span>
+<span class="nc" id="L292">            FIX_ONLY,</span>
+<span class="nc" id="L293">            FIX,</span>
+<span class="nc" id="L294">            OFF;</span>
+
+            static HeaderFixMode fromCommandLine(String value)
+            {
+<span class="nc" id="L298">                return valueOf(value.replace('-', '_').toUpperCase().trim());</span>
+            }
+
+            String asCommandLineOption()
+            {
+<span class="nc" id="L303">                return name().toLowerCase().replace('_', '-');</span>
+            }
+        }
+
+        private Options(String keyspaceName, String cfName)
+<span class="nc" id="L308">        {</span>
+<span class="nc" id="L309">            this.keyspaceName = keyspaceName;</span>
+<span class="nc" id="L310">            this.cfName = cfName;</span>
+<span class="nc" id="L311">        }</span>
+
+        public static Options parseArgs(String cmdArgs[])
+        {
+<span class="nc" id="L315">            CommandLineParser parser = new GnuParser();</span>
+<span class="nc" id="L316">            CmdLineOptions options = getCmdLineOptions();</span>
+            try
+            {
+<span class="nc" id="L319">                CommandLine cmd = parser.parse(options, cmdArgs, false);</span>
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                if (cmd.hasOption(HELP_OPTION))</span>
+                {
+<span class="nc" id="L323">                    printUsage(options);</span>
+<span class="nc" id="L324">                    System.exit(0);</span>
+                }
+
+<span class="nc" id="L327">                String[] args = cmd.getArgs();</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                if (args.length != 2)</span>
+                {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    String msg = args.length &lt; 2 ? &quot;Missing arguments&quot; : &quot;Too many arguments&quot;;</span>
+<span class="nc" id="L331">                    System.err.println(msg);</span>
+<span class="nc" id="L332">                    printUsage(options);</span>
+<span class="nc" id="L333">                    System.exit(1);</span>
+                }
+
+<span class="nc" id="L336">                String keyspaceName = args[0];</span>
+<span class="nc" id="L337">                String cfName = args[1];</span>
+
+<span class="nc" id="L339">                Options opts = new Options(keyspaceName, cfName);</span>
+
+<span class="nc" id="L341">                opts.debug = cmd.hasOption(DEBUG_OPTION);</span>
+<span class="nc" id="L342">                opts.verbose = cmd.hasOption(VERBOSE_OPTION);</span>
+<span class="nc" id="L343">                opts.manifestCheckOnly = cmd.hasOption(MANIFEST_CHECK_OPTION);</span>
+<span class="nc" id="L344">                opts.skipCorrupted = cmd.hasOption(SKIP_CORRUPTED_OPTION);</span>
+<span class="nc" id="L345">                opts.noValidate = cmd.hasOption(NO_VALIDATE_OPTION);</span>
+<span class="nc" id="L346">                opts.reinserOverflowedTTL = cmd.hasOption(REINSERT_OVERFLOWED_TTL_OPTION);</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">                if (cmd.hasOption(HEADERFIX_OPTION))</span>
+                {
+                    try
+                    {
+<span class="nc" id="L351">                        opts.headerFixMode = HeaderFixMode.fromCommandLine(cmd.getOptionValue(HEADERFIX_OPTION));</span>
+                    }
+<span class="nc" id="L353">                    catch (Exception e)</span>
+                    {
+<span class="nc" id="L355">                        errorMsg(String.format(&quot;Invalid argument value '%s' for --%s&quot;, cmd.getOptionValue(HEADERFIX_OPTION), HEADERFIX_OPTION), options);</span>
+<span class="nc" id="L356">                        return null;</span>
+<span class="nc" id="L357">                    }</span>
+                }
+<span class="nc" id="L359">                return opts;</span>
+            }
+<span class="nc" id="L361">            catch (ParseException e)</span>
+            {
+<span class="nc" id="L363">                errorMsg(e.getMessage(), options);</span>
+<span class="nc" id="L364">                return null;</span>
+            }
+        }
+
+        private static void errorMsg(String msg, CmdLineOptions options)
+        {
+<span class="nc" id="L370">            System.err.println(msg);</span>
+<span class="nc" id="L371">            printUsage(options);</span>
+<span class="nc" id="L372">            System.exit(1);</span>
+<span class="nc" id="L373">        }</span>
+
+        private static CmdLineOptions getCmdLineOptions()
+        {
+<span class="nc" id="L377">            CmdLineOptions options = new CmdLineOptions();</span>
+<span class="nc" id="L378">            options.addOption(null, DEBUG_OPTION,          &quot;display stack traces&quot;);</span>
+<span class="nc" id="L379">            options.addOption(&quot;v&quot;,  VERBOSE_OPTION,        &quot;verbose output&quot;);</span>
+<span class="nc" id="L380">            options.addOption(&quot;h&quot;,  HELP_OPTION,           &quot;display this help message&quot;);</span>
+<span class="nc" id="L381">            options.addOption(&quot;m&quot;,  MANIFEST_CHECK_OPTION, &quot;only check and repair the leveled manifest, without actually scrubbing the sstables&quot;);</span>
+<span class="nc" id="L382">            options.addOption(&quot;s&quot;,  SKIP_CORRUPTED_OPTION, &quot;skip corrupt rows in counter tables&quot;);</span>
+<span class="nc" id="L383">            options.addOption(&quot;n&quot;,  NO_VALIDATE_OPTION,    &quot;do not validate columns using column validator&quot;);</span>
+<span class="nc" id="L384">            options.addOption(&quot;e&quot;,  HEADERFIX_OPTION,      true, &quot;Option whether and how to perform a &quot; +</span>
+                                                                 &quot;check of the sstable serialization-headers and fix known, &quot; +
+                                                                 &quot;fixable issues.\n&quot; +
+                                                                 &quot;Possible argument values:\n&quot; +
+                                                                 &quot;- validate-only: validate the serialization-headers, &quot; +
+                                                                 &quot;but do not fix those. Do not continue with scrub - &quot; +
+                                                                 &quot;i.e. only validate the header (dry-run of fix-only).\n&quot; +
+                                                                 &quot;- validate: (default) validate the serialization-headers, &quot; +
+                                                                 &quot;but do not fix those and only continue with scrub if no &quot; +
+                                                                 &quot;error were detected.\n&quot; +
+                                                                 &quot;- fix-only: validate and fix the serialization-headers, &quot; +
+                                                                 &quot;don't continue with scrub.\n&quot; +
+                                                                 &quot;- fix: validate and fix the serialization-headers, do not &quot; +
+                                                                 &quot;fix and do not continue with scrub if the serialization-header &quot; +
+                                                                 &quot;check encountered errors.\n&quot; +
+                                                                 &quot;- off: don't perform the serialization-header checks.&quot;);
+<span class="nc" id="L400">            options.addOption(&quot;r&quot;, REINSERT_OVERFLOWED_TTL_OPTION, REINSERT_OVERFLOWED_TTL_OPTION_DESCRIPTION);</span>
+<span class="nc" id="L401">            return options;</span>
+        }
+
+        public static void printUsage(CmdLineOptions options)
+        {
+<span class="nc" id="L406">            String usage = String.format(&quot;%s [options] &lt;keyspace&gt; &lt;column_family&gt;&quot;, TOOL_NAME);</span>
+<span class="nc" id="L407">            StringBuilder header = new StringBuilder();</span>
+<span class="nc" id="L408">            header.append(&quot;--\n&quot;);</span>
+<span class="nc" id="L409">            header.append(&quot;Scrub the sstable for the provided table.&quot; );</span>
+<span class="nc" id="L410">            header.append(&quot;\n--\n&quot;);</span>
+<span class="nc" id="L411">            header.append(&quot;Options are:&quot;);</span>
+<span class="nc" id="L412">            new HelpFormatter().printHelp(120, usage, header.toString(), options, &quot;&quot;);</span>
+<span class="nc" id="L413">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

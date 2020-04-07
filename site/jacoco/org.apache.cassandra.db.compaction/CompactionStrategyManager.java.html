@@ -1,0 +1,1091 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionStrategyManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionStrategyManager.java</span></div><h1>CompactionStrategyManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.DiskBoundaries;
+import org.apache.cassandra.db.Memtable;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.notifications.*;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.service.ActiveRepairService;
+
+/**
+ * Manages the compaction strategies.
+ *
+ * Currently has two instances of actual compaction strategies per data directory - one for repaired data and one for
+ * unrepaired data. This is done to be able to totally separate the different sets of sstables.
+ *
+ * Operations on this class are guarded by a {@link ReentrantReadWriteLock}. This lock performs mutual exclusion on
+ * reads and writes to the following variables: {@link this#repaired}, {@link this#unrepaired}, {@link this#isActive},
+ * {@link this#params}, {@link this#currentBoundaries}. Whenever performing reads on these variables,
+ * the {@link this#readLock} should be acquired. Likewise, updates to these variables should be guarded by
+ * {@link this#writeLock}.
+ *
+ * Whenever the {@link DiskBoundaries} change, the compaction strategies must be reloaded, so in order to ensure
+ * the compaction strategy placement reflect most up-to-date disk boundaries, call {@link this#maybeReloadDiskBoundaries()}
+ * before acquiring the read lock to acess the strategies.
+ *
+ */
+<span class="pc bpc" id="L73" title="1 of 2 branches missed.">public class CompactionStrategyManager implements INotificationConsumer</span>
+{
+<span class="fc" id="L75">    private static final Logger logger = LoggerFactory.getLogger(CompactionStrategyManager.class);</span>
+    public final CompactionLogger compactionLogger;
+    private final ColumnFamilyStore cfs;
+    private final boolean partitionSSTablesByTokenRange;
+    private final Supplier&lt;DiskBoundaries&gt; boundariesSupplier;
+
+    /**
+     * Performs mutual exclusion on the variables below
+     */
+<span class="fc" id="L84">    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();</span>
+<span class="fc" id="L85">    private final ReentrantReadWriteLock.ReadLock readLock = lock.readLock();</span>
+<span class="fc" id="L86">    private final ReentrantReadWriteLock.WriteLock writeLock = lock.writeLock();</span>
+
+    /**
+     * Variables guarded by read and write lock above
+     */
+    //TODO check possibility of getting rid of these locks by encapsulating these in an immutable atomic object
+<span class="fc" id="L92">    private final List&lt;AbstractCompactionStrategy&gt; repaired = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L93">    private final List&lt;AbstractCompactionStrategy&gt; unrepaired = new ArrayList&lt;&gt;();</span>
+    private volatile CompactionParams params;
+    private DiskBoundaries currentBoundaries;
+<span class="fc" id="L96">    private volatile boolean enabled = true;</span>
+<span class="fc" id="L97">    private volatile boolean isActive = true;</span>
+
+    /**
+        We keep a copy of the schema compaction parameters here to be able to decide if we
+        should update the compaction strategy in {@link this#maybeReload(CFMetaData)} due to an ALTER.
+
+        If a user changes the local compaction strategy and then later ALTERs a compaction parameter,
+        we will use the new compaction parameters.
+     **/
+    private volatile CompactionParams schemaCompactionParams;
+    private boolean shouldDefragment;
+    private boolean supportsEarlyOpen;
+    private int fanout;
+
+    public CompactionStrategyManager(ColumnFamilyStore cfs)
+    {
+<span class="fc" id="L113">        this(cfs, cfs::getDiskBoundaries, cfs.getPartitioner().splitter().isPresent());</span>
+<span class="fc" id="L114">    }</span>
+
+    @VisibleForTesting
+    public CompactionStrategyManager(ColumnFamilyStore cfs, Supplier&lt;DiskBoundaries&gt; boundariesSupplier,
+                                     boolean partitionSSTablesByTokenRange)
+<span class="fc" id="L119">    {</span>
+<span class="fc" id="L120">        cfs.getTracker().subscribe(this);</span>
+<span class="fc" id="L121">        logger.trace(&quot;{} subscribed to the data tracker.&quot;, this);</span>
+<span class="fc" id="L122">        this.cfs = cfs;</span>
+<span class="fc" id="L123">        this.compactionLogger = new CompactionLogger(cfs, this);</span>
+<span class="fc" id="L124">        this.boundariesSupplier = boundariesSupplier;</span>
+<span class="fc" id="L125">        this.partitionSSTablesByTokenRange = partitionSSTablesByTokenRange;</span>
+<span class="fc" id="L126">        params = cfs.metadata.params.compaction;</span>
+<span class="fc" id="L127">        enabled = params.isEnabled();</span>
+<span class="fc" id="L128">        reload(cfs.metadata.params.compaction);</span>
+<span class="fc" id="L129">    }</span>
+
+    /**
+     * Return the next background task
+     *
+     * Returns a task for the compaction strategy that needs it the most (most estimated remaining tasks)
+     *
+     */
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    {
+<span class="fc" id="L139">        maybeReloadDiskBoundaries();</span>
+<span class="fc" id="L140">        readLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">            if (!isEnabled())</span>
+<span class="nc" id="L144">                return null;</span>
+
+<span class="fc" id="L146">            List&lt;AbstractCompactionStrategy&gt; strategies = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L148">            strategies.addAll(repaired);</span>
+<span class="fc" id="L149">            strategies.addAll(unrepaired);</span>
+<span class="fc" id="L150">            Collections.sort(strategies, (o1, o2) -&gt; Ints.compare(o2.getEstimatedRemainingTasks(), o1.getEstimatedRemainingTasks()));</span>
+<span class="fc bfc" id="L151" title="All 2 branches covered.">            for (AbstractCompactionStrategy strategy : strategies)</span>
+            {
+<span class="fc" id="L153">                AbstractCompactionTask task = strategy.getNextBackgroundTask(gcBefore);</span>
+<span class="fc bfc" id="L154" title="All 2 branches covered.">                if (task != null)</span>
+<span class="fc" id="L155">                    return task;</span>
+<span class="fc" id="L156">            }</span>
+        }
+        finally
+        {
+<span class="fc" id="L160">            readLock.unlock();</span>
+        }
+<span class="fc" id="L162">        return null;</span>
+    }
+
+    public boolean isEnabled()
+    {
+<span class="fc bfc" id="L167" title="All 4 branches covered.">        return enabled &amp;&amp; isActive;</span>
+    }
+
+    public boolean isActive()
+    {
+<span class="fc" id="L172">        return isActive;</span>
+    }
+
+    public void resume()
+    {
+<span class="nc" id="L177">        writeLock.lock();</span>
+        try
+        {
+<span class="nc" id="L180">            isActive = true;</span>
+        }
+        finally
+        {
+<span class="nc" id="L184">            writeLock.unlock();</span>
+        }
+<span class="nc" id="L186">    }</span>
+
+    /**
+     * pause compaction while we cancel all ongoing compactions
+     *
+     * Separate call from enable/disable to not have to save the enabled-state externally
+      */
+    public void pause()
+    {
+<span class="nc" id="L195">        writeLock.lock();</span>
+        try
+        {
+<span class="nc" id="L198">            isActive = false;</span>
+        }
+        finally
+        {
+<span class="nc" id="L202">            writeLock.unlock();</span>
+        }
+
+<span class="nc" id="L205">    }</span>
+
+    private void startup()
+    {
+<span class="fc" id="L209">        writeLock.lock();</span>
+        try
+        {
+<span class="fc bfc" id="L212" title="All 2 branches covered.">            for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))</span>
+            {
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                if (sstable.openReason != SSTableReader.OpenReason.EARLY)</span>
+<span class="fc" id="L215">                    compactionStrategyFor(sstable).addSSTable(sstable);</span>
+<span class="fc" id="L216">            }</span>
+<span class="fc" id="L217">            repaired.forEach(AbstractCompactionStrategy::startup);</span>
+<span class="fc" id="L218">            unrepaired.forEach(AbstractCompactionStrategy::startup);</span>
+<span class="fc" id="L219">            shouldDefragment = repaired.get(0).shouldDefragment();</span>
+<span class="fc" id="L220">            supportsEarlyOpen = repaired.get(0).supportsEarlyOpen();</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">            fanout = (repaired.get(0) instanceof LeveledCompactionStrategy) ? ((LeveledCompactionStrategy) repaired.get(0)).getLevelFanoutSize() : LeveledCompactionStrategy.DEFAULT_LEVEL_FANOUT_SIZE;</span>
+        }
+        finally
+        {
+<span class="fc" id="L225">            writeLock.unlock();</span>
+        }
+<span class="fc" id="L227">        repaired.forEach(AbstractCompactionStrategy::startup);</span>
+<span class="fc" id="L228">        unrepaired.forEach(AbstractCompactionStrategy::startup);</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        if (Stream.concat(repaired.stream(), unrepaired.stream()).anyMatch(cs -&gt; cs.logAll))</span>
+<span class="nc" id="L230">            compactionLogger.enable();</span>
+<span class="fc" id="L231">    }</span>
+
+    /**
+     * return the compaction strategy for the given sstable
+     *
+     * returns differently based on the repaired status and which vnode the compaction strategy belongs to
+     * @param sstable
+     * @return
+     */
+    protected AbstractCompactionStrategy getCompactionStrategyFor(SSTableReader sstable)
+    {
+<span class="nc" id="L242">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L243">        return compactionStrategyFor(sstable);</span>
+    }
+
+    @VisibleForTesting
+    protected AbstractCompactionStrategy compactionStrategyFor(SSTableReader sstable)
+    {
+        // should not call maybeReloadDiskBoundaries because it may be called from within lock
+<span class="fc" id="L250">        readLock.lock();</span>
+        try
+        {
+<span class="fc" id="L253">            int index = compactionStrategyIndexFor(sstable);</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">            if (sstable.isRepaired())</span>
+<span class="nc" id="L255">                return repaired.get(index);</span>
+            else
+<span class="fc" id="L257">                return unrepaired.get(index);</span>
+        }
+        finally
+        {
+<span class="fc" id="L261">            readLock.unlock();</span>
+        }
+    }
+
+    /**
+     * Get the correct compaction strategy for the given sstable. If the first token starts within a disk boundary, we
+     * will add it to that compaction strategy.
+     *
+     * In the case we are upgrading, the first compaction strategy will get most files - we do not care about which disk
+     * the sstable is on currently (unless we don't know the local tokens yet). Once we start compacting we will write out
+     * sstables in the correct locations and give them to the correct compaction strategy instance.
+     *
+     * @param sstable
+     * @return
+     */
+    @VisibleForTesting
+    protected int compactionStrategyIndexFor(SSTableReader sstable)
+    {
+        // should not call maybeReload because it may be called from within lock
+<span class="fc" id="L280">        readLock.lock();</span>
+        try
+        {
+            //We only have a single compaction strategy when sstables are not
+            //partitioned by token range
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">            if (!partitionSSTablesByTokenRange)</span>
+<span class="nc" id="L286">                return 0;</span>
+
+<span class="fc" id="L288">            return currentBoundaries.getDiskIndex(sstable);</span>
+        }
+        finally
+        {
+<span class="fc" id="L292">            readLock.unlock();</span>
+        }
+    }
+
+    public void shutdown()
+    {
+<span class="fc" id="L298">        writeLock.lock();</span>
+        try
+        {
+<span class="fc" id="L301">            isActive = false;</span>
+<span class="fc" id="L302">            repaired.forEach(AbstractCompactionStrategy::shutdown);</span>
+<span class="fc" id="L303">            unrepaired.forEach(AbstractCompactionStrategy::shutdown);</span>
+<span class="fc" id="L304">            compactionLogger.disable();</span>
+        }
+        finally
+        {
+<span class="fc" id="L308">            writeLock.unlock();</span>
+        }
+<span class="fc" id="L310">    }</span>
+
+    public void maybeReload(CFMetaData metadata)
+    {
+        // compare the old schema configuration to the new one, ignore any locally set changes.
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">        if (metadata.params.compaction.equals(schemaCompactionParams))</span>
+<span class="fc" id="L316">            return;</span>
+
+<span class="nc" id="L318">        writeLock.lock();</span>
+        try
+        {
+            // compare the old schema configuration to the new one, ignore any locally set changes.
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (metadata.params.compaction.equals(schemaCompactionParams))</span>
+<span class="nc" id="L323">                return;</span>
+<span class="nc" id="L324">            reload(metadata.params.compaction);</span>
+        }
+        finally
+        {
+<span class="nc" id="L328">            writeLock.unlock();</span>
+        }
+<span class="nc" id="L330">    }</span>
+
+    /**
+     * Checks if the disk boundaries changed and reloads the compaction strategies
+     * to reflect the most up-to-date disk boundaries.
+     *
+     * This is typically called before acquiring the {@link this#readLock} to ensure the most up-to-date
+     * disk locations and boundaries are used.
+     *
+     * This should *never* be called inside by a thread holding the {@link this#readLock}, since it
+     * will potentially acquire the {@link this#writeLock} to update the compaction strategies
+     * what can cause a deadlock.
+     */
+    //TODO improve this to reload after receiving a notification rather than trying to reload on every operation
+    @VisibleForTesting
+    protected boolean maybeReloadDiskBoundaries()
+    {
+<span class="fc bfc" id="L347" title="All 2 branches covered.">        if (!currentBoundaries.isOutOfDate())</span>
+<span class="fc" id="L348">            return false;</span>
+
+<span class="fc" id="L350">        writeLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">            if (!currentBoundaries.isOutOfDate())</span>
+<span class="nc" id="L354">                return false;</span>
+<span class="fc" id="L355">            reload(params);</span>
+<span class="fc" id="L356">            return true;</span>
+        }
+        finally
+        {
+<span class="fc" id="L360">            writeLock.unlock();</span>
+        }
+    }
+
+    /**
+     * Reload the compaction strategies
+     *
+     * Called after changing configuration and at startup.
+     * @param newCompactionParams
+     */
+    private void reload(CompactionParams newCompactionParams)
+    {
+<span class="pc bpc" id="L372" title="1 of 4 branches missed.">        boolean enabledWithJMX = enabled &amp;&amp; !shouldBeEnabled();</span>
+<span class="fc bfc" id="L373" title="All 4 branches covered.">        boolean disabledWithJMX = !enabled &amp;&amp; shouldBeEnabled();</span>
+
+<span class="fc bfc" id="L375" title="All 2 branches covered.">        if (currentBoundaries != null)</span>
+        {
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">            if (!newCompactionParams.equals(schemaCompactionParams))</span>
+<span class="nc" id="L378">                logger.debug(&quot;Recreating compaction strategy - compaction parameters changed for {}.{}&quot;, cfs.keyspace.getName(), cfs.getTableName());</span>
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">            else if (currentBoundaries.isOutOfDate())</span>
+<span class="fc" id="L380">                logger.debug(&quot;Recreating compaction strategy - disk boundaries are out of date for {}.{}.&quot;, cfs.keyspace.getName(), cfs.getTableName());</span>
+        }
+
+<span class="pc bpc" id="L383" title="1 of 4 branches missed.">        if (currentBoundaries == null || currentBoundaries.isOutOfDate())</span>
+<span class="fc" id="L384">            currentBoundaries = boundariesSupplier.get();</span>
+
+<span class="fc" id="L386">        setStrategy(newCompactionParams);</span>
+<span class="fc" id="L387">        schemaCompactionParams = cfs.metadata.params.compaction;</span>
+
+<span class="pc bpc" id="L389" title="1 of 6 branches missed.">        if (disabledWithJMX || !shouldBeEnabled() &amp;&amp; !enabledWithJMX)</span>
+<span class="fc" id="L390">            disable();</span>
+        else
+<span class="fc" id="L392">            enable();</span>
+<span class="fc" id="L393">        startup();</span>
+<span class="fc" id="L394">    }</span>
+
+    public void replaceFlushed(Memtable memtable, Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L398">        cfs.getTracker().replaceFlushed(memtable, sstables);</span>
+<span class="pc bpc" id="L399" title="2 of 4 branches missed.">        if (sstables != null &amp;&amp; !sstables.isEmpty())</span>
+<span class="fc" id="L400">            CompactionManager.instance.submitBackground(cfs);</span>
+<span class="fc" id="L401">    }</span>
+
+    public int getUnleveledSSTables()
+    {
+<span class="nc" id="L405">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L406">        readLock.lock();</span>
+        try
+        {
+<span class="nc bnc" id="L409" title="All 4 branches missed.">            if (repaired.get(0) instanceof LeveledCompactionStrategy &amp;&amp; unrepaired.get(0) instanceof LeveledCompactionStrategy)</span>
+            {
+<span class="nc" id="L411">                int count = 0;</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                for (AbstractCompactionStrategy strategy : repaired)</span>
+<span class="nc" id="L413">                    count += ((LeveledCompactionStrategy) strategy).getLevelSize(0);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                for (AbstractCompactionStrategy strategy : unrepaired)</span>
+<span class="nc" id="L415">                    count += ((LeveledCompactionStrategy) strategy).getLevelSize(0);</span>
+<span class="nc" id="L416">                return count;</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L421">            readLock.unlock();</span>
+        }
+<span class="nc" id="L423">        return 0;</span>
+    }
+
+    public int getLevelFanoutSize()
+    {
+<span class="nc" id="L428">        return fanout;</span>
+    }
+
+    public int[] getSSTableCountPerLevel()
+    {
+<span class="nc" id="L433">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L434">        readLock.lock();</span>
+        try
+        {
+<span class="nc bnc" id="L437" title="All 4 branches missed.">            if (repaired.get(0) instanceof LeveledCompactionStrategy &amp;&amp; unrepaired.get(0) instanceof LeveledCompactionStrategy)</span>
+            {
+<span class="nc" id="L439">                int[] res = new int[LeveledManifest.MAX_LEVEL_COUNT];</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                for (AbstractCompactionStrategy strategy : repaired)</span>
+                {
+<span class="nc" id="L442">                    int[] repairedCountPerLevel = ((LeveledCompactionStrategy) strategy).getAllLevelSize();</span>
+<span class="nc" id="L443">                    res = sumArrays(res, repairedCountPerLevel);</span>
+<span class="nc" id="L444">                }</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">                for (AbstractCompactionStrategy strategy : unrepaired)</span>
+                {
+<span class="nc" id="L447">                    int[] unrepairedCountPerLevel = ((LeveledCompactionStrategy) strategy).getAllLevelSize();</span>
+<span class="nc" id="L448">                    res = sumArrays(res, unrepairedCountPerLevel);</span>
+<span class="nc" id="L449">                }</span>
+<span class="nc" id="L450">                return res;</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L455">            readLock.unlock();</span>
+        }
+<span class="nc" id="L457">        return null;</span>
+    }
+
+    private static int[] sumArrays(int[] a, int[] b)
+    {
+<span class="nc" id="L462">        int[] res = new int[Math.max(a.length, b.length)];</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">        for (int i = 0; i &lt; res.length; i++)</span>
+        {
+<span class="nc bnc" id="L465" title="All 4 branches missed.">            if (i &lt; a.length &amp;&amp; i &lt; b.length)</span>
+<span class="nc" id="L466">                res[i] = a[i] + b[i];</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            else if (i &lt; a.length)</span>
+<span class="nc" id="L468">                res[i] = a[i];</span>
+            else
+<span class="nc" id="L470">                res[i] = b[i];</span>
+        }
+<span class="nc" id="L472">        return res;</span>
+    }
+
+    public boolean shouldDefragment()
+    {
+<span class="nc" id="L477">        return shouldDefragment;</span>
+    }
+
+    public Directories getDirectories()
+    {
+<span class="fc" id="L482">        maybeReloadDiskBoundaries();</span>
+<span class="fc" id="L483">        readLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L486" title="2 of 4 branches missed.">            assert repaired.get(0).getClass().equals(unrepaired.get(0).getClass());</span>
+<span class="fc" id="L487">            return repaired.get(0).getDirectories();</span>
+        }
+        finally
+        {
+<span class="fc" id="L491">            readLock.unlock();</span>
+        }
+    }
+
+    private void handleFlushNotification(Iterable&lt;SSTableReader&gt; added)
+    {
+        // If reloaded, SSTables will be placed in their correct locations
+        // so there is no need to process notification
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">        if (maybeReloadDiskBoundaries())</span>
+<span class="nc" id="L500">            return;</span>
+
+<span class="fc" id="L502">        readLock.lock();</span>
+        try
+        {
+<span class="fc bfc" id="L505" title="All 2 branches covered.">            for (SSTableReader sstable : added)</span>
+<span class="fc" id="L506">                compactionStrategyFor(sstable).addSSTable(sstable);</span>
+        }
+        finally
+        {
+<span class="fc" id="L510">            readLock.unlock();</span>
+        }
+<span class="fc" id="L512">    }</span>
+
+    private void handleListChangedNotification(Iterable&lt;SSTableReader&gt; added, Iterable&lt;SSTableReader&gt; removed)
+    {
+        // If reloaded, SSTables will be placed in their correct locations
+        // so there is no need to process notification
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">        if (maybeReloadDiskBoundaries())</span>
+<span class="nc" id="L519">            return;</span>
+
+<span class="fc" id="L521">        readLock.lock();</span>
+        try
+        {
+            // a bit of gymnastics to be able to replace sstables in compaction strategies
+            // we use this to know that a compaction finished and where to start the next compaction in LCS
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">            int locationSize = partitionSSTablesByTokenRange? currentBoundaries.directories.size() : 1;</span>
+
+<span class="fc" id="L528">            List&lt;Set&lt;SSTableReader&gt;&gt; repairedRemoved = new ArrayList&lt;&gt;(locationSize);</span>
+<span class="fc" id="L529">            List&lt;Set&lt;SSTableReader&gt;&gt; repairedAdded = new ArrayList&lt;&gt;(locationSize);</span>
+<span class="fc" id="L530">            List&lt;Set&lt;SSTableReader&gt;&gt; unrepairedRemoved = new ArrayList&lt;&gt;(locationSize);</span>
+<span class="fc" id="L531">            List&lt;Set&lt;SSTableReader&gt;&gt; unrepairedAdded = new ArrayList&lt;&gt;(locationSize);</span>
+
+<span class="fc bfc" id="L533" title="All 2 branches covered.">            for (int i = 0; i &lt; locationSize; i++)</span>
+            {
+<span class="fc" id="L535">                repairedRemoved.add(new HashSet&lt;&gt;());</span>
+<span class="fc" id="L536">                repairedAdded.add(new HashSet&lt;&gt;());</span>
+<span class="fc" id="L537">                unrepairedRemoved.add(new HashSet&lt;&gt;());</span>
+<span class="fc" id="L538">                unrepairedAdded.add(new HashSet&lt;&gt;());</span>
+            }
+
+<span class="fc bfc" id="L541" title="All 2 branches covered.">            for (SSTableReader sstable : removed)</span>
+            {
+<span class="fc" id="L543">                int i = compactionStrategyIndexFor(sstable);</span>
+<span class="pc bpc" id="L544" title="1 of 2 branches missed.">                if (sstable.isRepaired())</span>
+<span class="nc" id="L545">                    repairedRemoved.get(i).add(sstable);</span>
+                else
+<span class="fc" id="L547">                    unrepairedRemoved.get(i).add(sstable);</span>
+<span class="fc" id="L548">            }</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">            for (SSTableReader sstable : added)</span>
+            {
+<span class="fc" id="L551">                int i = compactionStrategyIndexFor(sstable);</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">                if (sstable.isRepaired())</span>
+<span class="nc" id="L553">                    repairedAdded.get(i).add(sstable);</span>
+                else
+<span class="fc" id="L555">                    unrepairedAdded.get(i).add(sstable);</span>
+<span class="fc" id="L556">            }</span>
+<span class="fc bfc" id="L557" title="All 2 branches covered.">            for (int i = 0; i &lt; locationSize; i++)</span>
+            {
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">                if (!repairedRemoved.get(i).isEmpty())</span>
+<span class="nc" id="L560">                    repaired.get(i).replaceSSTables(repairedRemoved.get(i), repairedAdded.get(i));</span>
+                else
+<span class="fc" id="L562">                    repaired.get(i).addSSTables(repairedAdded.get(i));</span>
+
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">                if (!unrepairedRemoved.get(i).isEmpty())</span>
+<span class="fc" id="L565">                    unrepaired.get(i).replaceSSTables(unrepairedRemoved.get(i), unrepairedAdded.get(i));</span>
+                else
+<span class="nc" id="L567">                    unrepaired.get(i).addSSTables(unrepairedAdded.get(i));</span>
+            }
+        }
+        finally
+        {
+<span class="fc" id="L572">            readLock.unlock();</span>
+        }
+<span class="fc" id="L574">    }</span>
+
+    private void handleRepairStatusChangedNotification(Iterable&lt;SSTableReader&gt; sstables)
+    {
+        // If reloaded, SSTables will be placed in their correct locations
+        // so there is no need to process notification
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (maybeReloadDiskBoundaries())</span>
+<span class="nc" id="L581">            return;</span>
+        // we need a write lock here since we move sstables from one strategy instance to another
+<span class="nc" id="L583">        readLock.lock();</span>
+        try
+        {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+            {
+<span class="nc" id="L588">                int index = compactionStrategyIndexFor(sstable);</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                if (sstable.isRepaired())</span>
+                {
+<span class="nc" id="L591">                    unrepaired.get(index).removeSSTable(sstable);</span>
+<span class="nc" id="L592">                    repaired.get(index).addSSTable(sstable);</span>
+                }
+                else
+                {
+<span class="nc" id="L596">                    repaired.get(index).removeSSTable(sstable);</span>
+<span class="nc" id="L597">                    unrepaired.get(index).addSSTable(sstable);</span>
+                }
+<span class="nc" id="L599">            }</span>
+        }
+        finally
+        {
+<span class="nc" id="L603">            readLock.unlock();</span>
+        }
+<span class="nc" id="L605">    }</span>
+
+    private void handleDeletingNotification(SSTableReader deleted)
+    {
+        // If reloaded, SSTables will be placed in their correct locations
+        // so there is no need to process notification
+<span class="pc bpc" id="L611" title="1 of 2 branches missed.">        if (maybeReloadDiskBoundaries())</span>
+<span class="nc" id="L612">            return;</span>
+<span class="fc" id="L613">        readLock.lock();</span>
+        try
+        {
+<span class="fc" id="L616">            compactionStrategyFor(deleted).removeSSTable(deleted);</span>
+        }
+        finally
+        {
+<span class="fc" id="L620">            readLock.unlock();</span>
+        }
+<span class="fc" id="L622">    }</span>
+
+    public void handleNotification(INotification notification, Object sender)
+    {
+<span class="fc bfc" id="L626" title="All 2 branches covered.">        if (notification instanceof SSTableAddedNotification)</span>
+        {
+<span class="fc" id="L628">            handleFlushNotification(((SSTableAddedNotification) notification).added);</span>
+        }
+<span class="fc bfc" id="L630" title="All 2 branches covered.">        else if (notification instanceof SSTableListChangedNotification)</span>
+        {
+<span class="fc" id="L632">            SSTableListChangedNotification listChangedNotification = (SSTableListChangedNotification) notification;</span>
+<span class="fc" id="L633">            handleListChangedNotification(listChangedNotification.added, listChangedNotification.removed);</span>
+<span class="fc" id="L634">        }</span>
+<span class="pc bpc" id="L635" title="1 of 2 branches missed.">        else if (notification instanceof SSTableRepairStatusChanged)</span>
+        {
+<span class="nc" id="L637">            handleRepairStatusChangedNotification(((SSTableRepairStatusChanged) notification).sstables);</span>
+        }
+<span class="fc bfc" id="L639" title="All 2 branches covered.">        else if (notification instanceof SSTableDeletingNotification)</span>
+        {
+<span class="fc" id="L641">            handleDeletingNotification(((SSTableDeletingNotification) notification).deleting);</span>
+        }
+<span class="fc" id="L643">    }</span>
+
+    public void enable()
+    {
+<span class="fc" id="L647">        writeLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L650" title="1 of 2 branches missed.">            if (repaired != null)</span>
+<span class="fc" id="L651">                repaired.forEach(AbstractCompactionStrategy::enable);</span>
+<span class="pc bpc" id="L652" title="1 of 2 branches missed.">            if (unrepaired != null)</span>
+<span class="fc" id="L653">                unrepaired.forEach(AbstractCompactionStrategy::enable);</span>
+            // enable this last to make sure the strategies are ready to get calls.
+<span class="fc" id="L655">            enabled = true;</span>
+        }
+        finally
+        {
+<span class="fc" id="L659">            writeLock.unlock();</span>
+        }
+<span class="fc" id="L661">    }</span>
+
+    public void disable()
+    {
+<span class="fc" id="L665">        writeLock.lock();</span>
+        try
+        {
+            // disable this first avoid asking disabled strategies for compaction tasks
+<span class="fc" id="L669">            enabled = false;</span>
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">            if (repaired != null)</span>
+<span class="fc" id="L671">                repaired.forEach(AbstractCompactionStrategy::disable);</span>
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">            if (unrepaired != null)</span>
+<span class="fc" id="L673">                unrepaired.forEach(AbstractCompactionStrategy::disable);</span>
+        }
+        finally
+        {
+<span class="fc" id="L677">            writeLock.unlock();</span>
+        }
+<span class="fc" id="L679">    }</span>
+
+    /**
+     * Create ISSTableScanners from the given sstables
+     *
+     * Delegates the call to the compaction strategies to allow LCS to create a scanner
+     * @param sstables
+     * @param ranges
+     * @return
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public AbstractCompactionStrategy.ScannerList getScanners(Collection&lt;SSTableReader&gt; sstables,  Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="fc" id="L692">        maybeReloadDiskBoundaries();</span>
+<span class="fc" id="L693">        readLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L696" title="2 of 4 branches missed.">            assert repaired.size() == unrepaired.size();</span>
+<span class="fc" id="L697">            List&lt;Set&lt;SSTableReader&gt;&gt; repairedSSTables = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L698">            List&lt;Set&lt;SSTableReader&gt;&gt; unrepairedSSTables = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L700" title="All 2 branches covered.">            for (int i = 0; i &lt; repaired.size(); i++)</span>
+            {
+<span class="fc" id="L702">                repairedSSTables.add(new HashSet&lt;&gt;());</span>
+<span class="fc" id="L703">                unrepairedSSTables.add(new HashSet&lt;&gt;());</span>
+            }
+
+<span class="fc bfc" id="L706" title="All 2 branches covered.">            for (SSTableReader sstable : sstables)</span>
+            {
+<span class="pc bpc" id="L708" title="1 of 2 branches missed.">                if (sstable.isRepaired())</span>
+<span class="nc" id="L709">                    repairedSSTables.get(compactionStrategyIndexFor(sstable)).add(sstable);</span>
+                else
+<span class="fc" id="L711">                    unrepairedSSTables.get(compactionStrategyIndexFor(sstable)).add(sstable);</span>
+<span class="fc" id="L712">            }</span>
+
+<span class="fc" id="L714">            List&lt;ISSTableScanner&gt; scanners = new ArrayList&lt;&gt;(sstables.size());</span>
+<span class="fc bfc" id="L715" title="All 2 branches covered.">            for (int i = 0; i &lt; repairedSSTables.size(); i++)</span>
+            {
+<span class="pc bpc" id="L717" title="1 of 2 branches missed.">                if (!repairedSSTables.get(i).isEmpty())</span>
+<span class="nc" id="L718">                    scanners.addAll(repaired.get(i).getScanners(repairedSSTables.get(i), ranges).scanners);</span>
+            }
+<span class="fc bfc" id="L720" title="All 2 branches covered.">            for (int i = 0; i &lt; unrepairedSSTables.size(); i++)</span>
+            {
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">                if (!unrepairedSSTables.get(i).isEmpty())</span>
+<span class="fc" id="L723">                    scanners.addAll(unrepaired.get(i).getScanners(unrepairedSSTables.get(i), ranges).scanners);</span>
+            }
+
+<span class="fc" id="L726">            return new AbstractCompactionStrategy.ScannerList(scanners);</span>
+        }
+        finally
+        {
+<span class="fc" id="L730">            readLock.unlock();</span>
+        }
+    }
+
+    public AbstractCompactionStrategy.ScannerList getScanners(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L736">        return getScanners(sstables, null);</span>
+    }
+
+    public Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupSSTablesForAntiCompaction(Collection&lt;SSTableReader&gt; sstablesToGroup)
+    {
+<span class="nc" id="L741">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L742">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L745">            Map&lt;Integer, List&lt;SSTableReader&gt;&gt; groups = sstablesToGroup.stream().collect(Collectors.groupingBy((s) -&gt; compactionStrategyIndexFor(s)));</span>
+<span class="nc" id="L746">            Collection&lt;Collection&lt;SSTableReader&gt;&gt; anticompactionGroups = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            for (Map.Entry&lt;Integer, List&lt;SSTableReader&gt;&gt; group : groups.entrySet())</span>
+<span class="nc" id="L749">                anticompactionGroups.addAll(unrepaired.get(group.getKey()).groupSSTablesForAntiCompaction(group.getValue()));</span>
+<span class="nc" id="L750">            return anticompactionGroups;</span>
+        }
+        finally
+        {
+<span class="nc" id="L754">            readLock.unlock();</span>
+        }
+    }
+
+    public long getMaxSSTableBytes()
+    {
+<span class="fc" id="L760">        readLock.lock();</span>
+        try
+        {
+<span class="fc" id="L763">            return unrepaired.get(0).getMaxSSTableBytes();</span>
+        }
+        finally
+        {
+<span class="fc" id="L767">            readLock.unlock();</span>
+        }
+    }
+
+    public AbstractCompactionTask getCompactionTask(LifecycleTransaction txn, int gcBefore, long maxSSTableBytes)
+    {
+<span class="nc" id="L773">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L774">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L777">            validateForCompaction(txn.originals());</span>
+<span class="nc" id="L778">            return compactionStrategyFor(txn.originals().iterator().next()).getCompactionTask(txn, gcBefore, maxSSTableBytes);</span>
+        }
+        finally
+        {
+<span class="nc" id="L782">            readLock.unlock();</span>
+        }
+
+    }
+
+    private void validateForCompaction(Iterable&lt;SSTableReader&gt; input)
+    {
+<span class="nc" id="L789">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L792">            SSTableReader firstSSTable = Iterables.getFirst(input, null);</span>
+<span class="nc bnc" id="L793" title="All 4 branches missed.">            assert firstSSTable != null;</span>
+<span class="nc" id="L794">            boolean repaired = firstSSTable.isRepaired();</span>
+<span class="nc" id="L795">            int firstIndex = compactionStrategyIndexFor(firstSSTable);</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">            for (SSTableReader sstable : input)</span>
+            {
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                if (sstable.isRepaired() != repaired)</span>
+<span class="nc" id="L799">                    throw new UnsupportedOperationException(&quot;You can't mix repaired and unrepaired data in a compaction&quot;);</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">                if (firstIndex != compactionStrategyIndexFor(sstable))</span>
+<span class="nc" id="L801">                    throw new UnsupportedOperationException(&quot;You can't mix sstables from different directories in a compaction&quot;);</span>
+<span class="nc" id="L802">            }</span>
+        }
+        finally
+        {
+<span class="nc" id="L806">            readLock.unlock();</span>
+        }
+
+<span class="nc" id="L809">    }</span>
+
+    public Collection&lt;AbstractCompactionTask&gt; getMaximalTasks(final int gcBefore, final boolean splitOutput)
+    {
+<span class="nc" id="L813">        maybeReloadDiskBoundaries();</span>
+        // runWithCompactionsDisabled cancels active compactions and disables them, then we are able
+        // to make the repaired/unrepaired strategies mark their own sstables as compacting. Once the
+        // sstables are marked the compactions are re-enabled
+<span class="nc" id="L817">        return cfs.runWithCompactionsDisabled(new Callable&lt;Collection&lt;AbstractCompactionTask&gt;&gt;()</span>
+<span class="nc" id="L818">        {</span>
+            @Override
+            public Collection&lt;AbstractCompactionTask&gt; call()
+            {
+<span class="nc" id="L822">                List&lt;AbstractCompactionTask&gt; tasks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L823">                readLock.lock();</span>
+                try
+                {
+<span class="nc bnc" id="L826" title="All 2 branches missed.">                    for (AbstractCompactionStrategy strategy : repaired)</span>
+                    {
+<span class="nc" id="L828">                        Collection&lt;AbstractCompactionTask&gt; task = strategy.getMaximalTask(gcBefore, splitOutput);</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">                        if (task != null)</span>
+<span class="nc" id="L830">                            tasks.addAll(task);</span>
+<span class="nc" id="L831">                    }</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">                    for (AbstractCompactionStrategy strategy : unrepaired)</span>
+                    {
+<span class="nc" id="L834">                        Collection&lt;AbstractCompactionTask&gt; task = strategy.getMaximalTask(gcBefore, splitOutput);</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">                        if (task != null)</span>
+<span class="nc" id="L836">                            tasks.addAll(task);</span>
+<span class="nc" id="L837">                    }</span>
+                }
+                finally
+                {
+<span class="nc" id="L841">                    readLock.unlock();</span>
+                }
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                if (tasks.isEmpty())</span>
+<span class="nc" id="L844">                    return null;</span>
+<span class="nc" id="L845">                return tasks;</span>
+            }
+        }, false, false);
+    }
+
+    /**
+     * Return a list of compaction tasks corresponding to the sstables requested. Split the sstables according
+     * to whether they are repaired or not, and by disk location. Return a task per disk location and repair status
+     * group.
+     *
+     * @param sstables the sstables to compact
+     * @param gcBefore gc grace period, throw away tombstones older than this
+     * @return a list of compaction tasks corresponding to the sstables requested
+     */
+    public List&lt;AbstractCompactionTask&gt; getUserDefinedTasks(Collection&lt;SSTableReader&gt; sstables, int gcBefore)
+    {
+<span class="nc" id="L861">        return getUserDefinedTasks(sstables, gcBefore, false);</span>
+    }
+
+    public List&lt;AbstractCompactionTask&gt; getUserDefinedTasks(Collection&lt;SSTableReader&gt; sstables, int gcBefore, boolean validateForCompaction)
+    {
+<span class="nc" id="L866">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L867">        List&lt;AbstractCompactionTask&gt; ret = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L868">        readLock.lock();</span>
+        try
+        {
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            if (validateForCompaction)</span>
+<span class="nc" id="L872">                validateForCompaction(sstables);</span>
+
+<span class="nc" id="L874">            Map&lt;Integer, List&lt;SSTableReader&gt;&gt; repairedSSTables = sstables.stream()</span>
+<span class="nc bnc" id="L875" title="All 4 branches missed.">                                                                         .filter(s -&gt; !s.isMarkedSuspect() &amp;&amp; s.isRepaired())</span>
+<span class="nc" id="L876">                                                                         .collect(Collectors.groupingBy((s) -&gt; compactionStrategyIndexFor(s)));</span>
+
+<span class="nc" id="L878">            Map&lt;Integer, List&lt;SSTableReader&gt;&gt; unrepairedSSTables = sstables.stream()</span>
+<span class="nc bnc" id="L879" title="All 4 branches missed.">                                                                           .filter(s -&gt; !s.isMarkedSuspect() &amp;&amp; !s.isRepaired())</span>
+<span class="nc" id="L880">                                                                           .collect(Collectors.groupingBy((s) -&gt; compactionStrategyIndexFor(s)));</span>
+
+
+<span class="nc bnc" id="L883" title="All 2 branches missed.">            for (Map.Entry&lt;Integer, List&lt;SSTableReader&gt;&gt; group : repairedSSTables.entrySet())</span>
+<span class="nc" id="L884">                ret.add(repaired.get(group.getKey()).getUserDefinedTask(group.getValue(), gcBefore));</span>
+
+<span class="nc bnc" id="L886" title="All 2 branches missed.">            for (Map.Entry&lt;Integer, List&lt;SSTableReader&gt;&gt; group : unrepairedSSTables.entrySet())</span>
+<span class="nc" id="L887">                ret.add(unrepaired.get(group.getKey()).getUserDefinedTask(group.getValue(), gcBefore));</span>
+
+<span class="nc" id="L889">            return ret;</span>
+        }
+        finally
+        {
+<span class="nc" id="L893">            readLock.unlock();</span>
+        }
+    }
+
+    /**
+     * @deprecated use {@link #getUserDefinedTasks(Collection, int)} instead.
+     */
+    @Deprecated()
+    public AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, int gcBefore)
+    {
+<span class="nc" id="L903">        List&lt;AbstractCompactionTask&gt; tasks = getUserDefinedTasks(sstables, gcBefore, true);</span>
+<span class="nc bnc" id="L904" title="All 4 branches missed.">        assert tasks.size() == 1;</span>
+<span class="nc" id="L905">        return tasks.get(0);</span>
+    }
+
+    public int getEstimatedRemainingTasks()
+    {
+<span class="nc" id="L910">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L911">        int tasks = 0;</span>
+<span class="nc" id="L912">        readLock.lock();</span>
+        try
+        {
+
+<span class="nc bnc" id="L916" title="All 2 branches missed.">            for (AbstractCompactionStrategy strategy : repaired)</span>
+<span class="nc" id="L917">                tasks += strategy.getEstimatedRemainingTasks();</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            for (AbstractCompactionStrategy strategy : unrepaired)</span>
+<span class="nc" id="L919">                tasks += strategy.getEstimatedRemainingTasks();</span>
+        }
+        finally
+        {
+<span class="nc" id="L923">            readLock.unlock();</span>
+        }
+<span class="nc" id="L925">        return tasks;</span>
+    }
+
+    public boolean shouldBeEnabled()
+    {
+<span class="fc" id="L930">        return params.isEnabled();</span>
+    }
+
+    public String getName()
+    {
+<span class="fc" id="L935">        maybeReloadDiskBoundaries();</span>
+<span class="fc" id="L936">        readLock.lock();</span>
+        try
+        {
+<span class="fc" id="L939">            return unrepaired.get(0).getName();</span>
+        }
+        finally
+        {
+<span class="fc" id="L943">            readLock.unlock();</span>
+        }
+    }
+
+    public List&lt;List&lt;AbstractCompactionStrategy&gt;&gt; getStrategies()
+    {
+<span class="nc" id="L949">        maybeReloadDiskBoundaries();</span>
+<span class="nc" id="L950">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L953">            return Arrays.asList(repaired, unrepaired);</span>
+        }
+        finally
+        {
+<span class="nc" id="L957">            readLock.unlock();</span>
+        }
+    }
+
+    public void setNewLocalCompactionStrategy(CompactionParams params)
+    {
+<span class="nc" id="L963">        logger.info(&quot;Switching local compaction strategy from {} to {}}&quot;, this.params, params);</span>
+<span class="nc" id="L964">        writeLock.lock();</span>
+        try
+        {
+<span class="nc" id="L967">            setStrategy(params);</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">            if (shouldBeEnabled())</span>
+<span class="nc" id="L969">                enable();</span>
+            else
+<span class="nc" id="L971">                disable();</span>
+<span class="nc" id="L972">            startup();</span>
+        }
+        finally
+        {
+<span class="nc" id="L976">            writeLock.unlock();</span>
+        }
+<span class="nc" id="L978">    }</span>
+
+    private void setStrategy(CompactionParams params)
+    {
+<span class="fc" id="L982">        repaired.forEach(AbstractCompactionStrategy::shutdown);</span>
+<span class="fc" id="L983">        unrepaired.forEach(AbstractCompactionStrategy::shutdown);</span>
+<span class="fc" id="L984">        repaired.clear();</span>
+<span class="fc" id="L985">        unrepaired.clear();</span>
+
+<span class="fc bfc" id="L987" title="All 2 branches covered.">        if (partitionSSTablesByTokenRange)</span>
+        {
+<span class="fc bfc" id="L989" title="All 2 branches covered.">            for (int i = 0; i &lt; currentBoundaries.directories.size(); i++)</span>
+            {
+<span class="fc" id="L991">                repaired.add(CFMetaData.createCompactionStrategyInstance(cfs, params));</span>
+<span class="fc" id="L992">                unrepaired.add(CFMetaData.createCompactionStrategyInstance(cfs, params));</span>
+            }
+        }
+        else
+        {
+<span class="fc" id="L997">            repaired.add(CFMetaData.createCompactionStrategyInstance(cfs, params));</span>
+<span class="fc" id="L998">            unrepaired.add(CFMetaData.createCompactionStrategyInstance(cfs, params));</span>
+        }
+<span class="fc" id="L1000">        this.params = params;</span>
+<span class="fc" id="L1001">    }</span>
+
+    public CompactionParams getCompactionParams()
+    {
+<span class="fc" id="L1005">        return params;</span>
+    }
+
+    public boolean onlyPurgeRepairedTombstones()
+    {
+<span class="fc" id="L1010">        return Boolean.parseBoolean(params.options().get(AbstractCompactionStrategy.ONLY_PURGE_REPAIRED_TOMBSTONES));</span>
+    }
+
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+                                                       long keyCount,
+                                                       long repairedAt,
+                                                       MetadataCollector collector,
+                                                       SerializationHeader header,
+                                                       Collection&lt;Index&gt; indexes,
+                                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="fc" id="L1021">        maybeReloadDiskBoundaries();</span>
+<span class="fc" id="L1022">        readLock.lock();</span>
+        try
+        {
+<span class="pc bpc" id="L1025" title="1 of 2 branches missed.">            if (repairedAt == ActiveRepairService.UNREPAIRED_SSTABLE)</span>
+            {
+<span class="fc" id="L1027">                return unrepaired.get(0).createSSTableMultiWriter(descriptor, keyCount, repairedAt, collector, header, indexes, lifecycleNewTracker);</span>
+            }
+            else
+            {
+<span class="nc" id="L1031">                return repaired.get(0).createSSTableMultiWriter(descriptor, keyCount, repairedAt, collector, header, indexes, lifecycleNewTracker);</span>
+            }
+        }
+        finally
+        {
+<span class="fc" id="L1036">            readLock.unlock();</span>
+        }
+    }
+
+    public boolean isRepaired(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L1042">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L1045">            return repaired.contains(strategy);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1049">            readLock.unlock();</span>
+        }
+    }
+
+    public List&lt;String&gt; getStrategyFolders(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L1055">        readLock.lock();</span>
+        try
+        {
+<span class="nc" id="L1058">            List&lt;Directories.DataDirectory&gt; locations = currentBoundaries.directories;</span>
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">            if (partitionSSTablesByTokenRange)</span>
+            {
+<span class="nc" id="L1061">                int unrepairedIndex = unrepaired.indexOf(strategy);</span>
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">                if (unrepairedIndex &gt; 0)</span>
+                {
+<span class="nc" id="L1064">                    return Collections.singletonList(locations.get(unrepairedIndex).location.getAbsolutePath());</span>
+                }
+<span class="nc" id="L1066">                int repairedIndex = repaired.indexOf(strategy);</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">                if (repairedIndex &gt; 0)</span>
+                {
+<span class="nc" id="L1069">                    return Collections.singletonList(locations.get(repairedIndex).location.getAbsolutePath());</span>
+                }
+            }
+<span class="nc" id="L1072">            List&lt;String&gt; folders = new ArrayList&lt;&gt;(locations.size());</span>
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">            for (Directories.DataDirectory location : locations)</span>
+            {
+<span class="nc" id="L1075">                folders.add(location.location.getAbsolutePath());</span>
+<span class="nc" id="L1076">            }</span>
+<span class="nc" id="L1077">            return folders;</span>
+        }
+        finally
+        {
+<span class="nc" id="L1081">            readLock.unlock();</span>
+        }
+
+    }
+
+    public boolean supportsEarlyOpen()
+    {
+<span class="fc" id="L1088">        return supportsEarlyOpen;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

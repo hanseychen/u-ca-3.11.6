@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>EncodingStats.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">EncodingStats.java</span></div><h1>EncodingStats.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.io.IOException;
+import java.util.*;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+
+/**
+ * Stats used for the encoding of the rows and tombstones of a given source.
+ * &lt;p&gt;
+ * Those stats are used to optimize the on-wire and on-disk storage of rows. More precisely,
+ * the {@code minTimestamp}, {@code minLocalDeletionTime} and {@code minTTL} stats are used to
+ * delta-encode those information for the sake of vint encoding.
+ * &lt;p&gt;
+ * Note that due to their use, those stats can suffer to be somewhat inaccurate (the more incurrate
+ * they are, the less effective the storage will be, but provided the stats are not completly wacky,
+ * this shouldn't have too huge an impact on performance) and in fact they will not always be
+ * accurate for reasons explained in {@link SerializationHeader#make}.
+ */
+public class EncodingStats
+{
+    // Default values for the timestamp, deletion time and ttl. We use this both for NO_STATS, but also to serialize
+    // an EncodingStats. Basically, we encode the diff of each value of to these epoch, which give values with better vint encoding.
+    private static final long TIMESTAMP_EPOCH;
+    private static final int DELETION_TIME_EPOCH;
+    private static final int TTL_EPOCH = 0;
+    static
+    {
+        // We want a fixed epoch, but that provide small values when substracted from our timestamp and deletion time.
+        // So we somewhat arbitrary use the date of the summit 2015, which should hopefully roughly correspond to 3.0 release.
+<span class="fc" id="L51">        Calendar c = Calendar.getInstance(TimeZone.getTimeZone(&quot;GMT-0&quot;), Locale.US);</span>
+<span class="fc" id="L52">        c.set(Calendar.YEAR, 2015);</span>
+<span class="fc" id="L53">        c.set(Calendar.MONTH, Calendar.SEPTEMBER);</span>
+<span class="fc" id="L54">        c.set(Calendar.DAY_OF_MONTH, 22);</span>
+<span class="fc" id="L55">        c.set(Calendar.HOUR_OF_DAY, 0);</span>
+<span class="fc" id="L56">        c.set(Calendar.MINUTE, 0);</span>
+<span class="fc" id="L57">        c.set(Calendar.SECOND, 0);</span>
+<span class="fc" id="L58">        c.set(Calendar.MILLISECOND, 0);</span>
+
+<span class="fc" id="L60">        TIMESTAMP_EPOCH = c.getTimeInMillis() * 1000; // timestamps should be in microseconds by convention</span>
+<span class="fc" id="L61">        DELETION_TIME_EPOCH = (int)(c.getTimeInMillis() / 1000); // local deletion times are in seconds</span>
+    }
+
+    // We should use this sparingly obviously
+<span class="fc" id="L65">    public static final EncodingStats NO_STATS = new EncodingStats(TIMESTAMP_EPOCH, DELETION_TIME_EPOCH, TTL_EPOCH);</span>
+
+<span class="fc" id="L67">    public static final Serializer serializer = new Serializer();</span>
+
+    public final long minTimestamp;
+    public final int minLocalDeletionTime;
+    public final int minTTL;
+
+    public EncodingStats(long minTimestamp,
+                         int minLocalDeletionTime,
+                         int minTTL)
+<span class="fc" id="L76">    {</span>
+        // Note that the exact value of those don't impact correctness, just the efficiency of the encoding. So when we
+        // get a value for timestamp (resp. minLocalDeletionTime) that means 'no object had a timestamp' (resp. 'a local
+        // deletion time'), then what value we store for minTimestamp (resp. minLocalDeletionTime) doesn't matter, and
+        // it's thus more efficient to use our EPOCH numbers, since it will result in a guaranteed 1 byte encoding.
+
+<span class="pc bpc" id="L82" title="1 of 2 branches missed.">        this.minTimestamp = minTimestamp == LivenessInfo.NO_TIMESTAMP ? TIMESTAMP_EPOCH : minTimestamp;</span>
+<span class="fc bfc" id="L83" title="All 2 branches covered.">        this.minLocalDeletionTime = minLocalDeletionTime == LivenessInfo.NO_EXPIRATION_TIME ? DELETION_TIME_EPOCH : minLocalDeletionTime;</span>
+<span class="fc" id="L84">        this.minTTL = minTTL;</span>
+<span class="fc" id="L85">    }</span>
+
+    /**
+     * Merge this stats with another one.
+     * &lt;p&gt;
+     * The comments of {@link SerializationHeader#make} applies here too, i.e. the result of
+     * merging will be not totally accurate but we can live with that.
+     */
+    public EncodingStats mergeWith(EncodingStats that)
+    {
+<span class="pc bpc" id="L95" title="1 of 4 branches missed.">        long minTimestamp = this.minTimestamp == TIMESTAMP_EPOCH</span>
+                          ? that.minTimestamp
+<span class="fc" id="L97">                          : (that.minTimestamp == TIMESTAMP_EPOCH ? this.minTimestamp : Math.min(this.minTimestamp, that.minTimestamp));</span>
+
+<span class="fc bfc" id="L99" title="All 4 branches covered.">        int minDelTime = this.minLocalDeletionTime == DELETION_TIME_EPOCH</span>
+                       ? that.minLocalDeletionTime
+<span class="fc" id="L101">                       : (that.minLocalDeletionTime == DELETION_TIME_EPOCH ? this.minLocalDeletionTime : Math.min(this.minLocalDeletionTime, that.minLocalDeletionTime));</span>
+
+<span class="pc bpc" id="L103" title="1 of 4 branches missed.">        int minTTL = this.minTTL == TTL_EPOCH</span>
+                   ? that.minTTL
+<span class="fc" id="L105">                   : (that.minTTL == TTL_EPOCH ? this.minTTL : Math.min(this.minTTL, that.minTTL));</span>
+
+<span class="fc" id="L107">        return new EncodingStats(minTimestamp, minDelTime, minTTL);</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L114" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L116">        EncodingStats that = (EncodingStats) o;</span>
+
+<span class="nc bnc" id="L118" title="All 6 branches missed.">        return this.minLocalDeletionTime == that.minLocalDeletionTime</span>
+            &amp;&amp; this.minTTL == that.minTTL
+            &amp;&amp; this.minTimestamp == that.minTimestamp;
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L126">        return Objects.hash(minTimestamp, minLocalDeletionTime, minTTL);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L132">        return String.format(&quot;EncodingStats(ts=%d, ldt=%d, ttl=%d)&quot;, minTimestamp, minLocalDeletionTime, minTTL);</span>
+    }
+
+<span class="fc" id="L135">    public static class Collector implements PartitionStatisticsCollector</span>
+    {
+        private boolean isTimestampSet;
+<span class="fc" id="L138">        private long minTimestamp = Long.MAX_VALUE;</span>
+
+        private boolean isDelTimeSet;
+<span class="fc" id="L141">        private int minDeletionTime = Integer.MAX_VALUE;</span>
+
+        private boolean isTTLSet;
+<span class="fc" id="L144">        private int minTTL = Integer.MAX_VALUE;</span>
+
+        public void update(LivenessInfo info)
+        {
+<span class="fc bfc" id="L148" title="All 2 branches covered.">            if (info.isEmpty())</span>
+<span class="fc" id="L149">                return;</span>
+
+<span class="fc" id="L151">            updateTimestamp(info.timestamp());</span>
+
+<span class="fc bfc" id="L153" title="All 2 branches covered.">            if (info.isExpiring())</span>
+            {
+<span class="fc" id="L155">                updateTTL(info.ttl());</span>
+<span class="fc" id="L156">                updateLocalDeletionTime(info.localExpirationTime());</span>
+            }
+<span class="fc" id="L158">        }</span>
+
+        public void update(Cell cell)
+        {
+<span class="fc" id="L162">            updateTimestamp(cell.timestamp());</span>
+<span class="fc bfc" id="L163" title="All 2 branches covered.">            if (cell.isExpiring())</span>
+            {
+<span class="fc" id="L165">                updateTTL(cell.ttl());</span>
+<span class="fc" id="L166">                updateLocalDeletionTime(cell.localDeletionTime());</span>
+            }
+<span class="fc bfc" id="L168" title="All 2 branches covered.">            else if (cell.isTombstone())</span>
+            {
+<span class="fc" id="L170">                updateLocalDeletionTime(cell.localDeletionTime());</span>
+            }
+<span class="fc" id="L172">        }</span>
+
+        public void update(DeletionTime deletionTime)
+        {
+<span class="fc bfc" id="L176" title="All 2 branches covered.">            if (deletionTime.isLive())</span>
+<span class="fc" id="L177">                return;</span>
+
+<span class="fc" id="L179">            updateTimestamp(deletionTime.markedForDeleteAt());</span>
+<span class="fc" id="L180">            updateLocalDeletionTime(deletionTime.localDeletionTime());</span>
+<span class="fc" id="L181">        }</span>
+
+        public void updateTimestamp(long timestamp)
+        {
+<span class="fc" id="L185">            isTimestampSet = true;</span>
+<span class="fc" id="L186">            minTimestamp = Math.min(minTimestamp, timestamp);</span>
+<span class="fc" id="L187">        }</span>
+
+        public void updateLocalDeletionTime(int deletionTime)
+        {
+<span class="fc" id="L191">            isDelTimeSet = true;</span>
+<span class="fc" id="L192">            minDeletionTime = Math.min(minDeletionTime, deletionTime);</span>
+<span class="fc" id="L193">        }</span>
+
+        public void updateTTL(int ttl)
+        {
+<span class="fc" id="L197">            isTTLSet = true;</span>
+<span class="fc" id="L198">            minTTL = Math.min(minTTL, ttl);</span>
+<span class="fc" id="L199">        }</span>
+
+        public void updateColumnSetPerRow(long columnSetInRow)
+        {
+<span class="fc" id="L203">        }</span>
+
+        public void updateHasLegacyCounterShards(boolean hasLegacyCounterShards)
+        {
+            // We don't care about this but this come with PartitionStatisticsCollector
+<span class="nc" id="L208">        }</span>
+
+        public EncodingStats get()
+        {
+<span class="pc bpc" id="L212" title="1 of 4 branches missed.">            return new EncodingStats(isTimestampSet ? minTimestamp : TIMESTAMP_EPOCH,</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">                                     isDelTimeSet ? minDeletionTime : DELETION_TIME_EPOCH,</span>
+                                     isTTLSet ? minTTL : TTL_EPOCH);
+        }
+
+        public static EncodingStats collect(Row staticRow, Iterator&lt;Row&gt; rows, DeletionInfo deletionInfo)
+        {
+<span class="fc" id="L219">            Collector collector = new Collector();</span>
+<span class="fc" id="L220">            deletionInfo.collectStats(collector);</span>
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">            if (!staticRow.isEmpty())</span>
+<span class="nc" id="L222">                Rows.collectStats(staticRow, collector);</span>
+<span class="fc bfc" id="L223" title="All 2 branches covered.">            while (rows.hasNext())</span>
+<span class="fc" id="L224">                Rows.collectStats(rows.next(), collector);</span>
+<span class="fc" id="L225">            return collector.get();</span>
+        }
+    }
+
+<span class="fc" id="L229">    public static class Serializer</span>
+    {
+        public void serialize(EncodingStats stats, DataOutputPlus out) throws IOException
+        {
+<span class="fc" id="L233">            out.writeUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH);</span>
+<span class="fc" id="L234">            out.writeUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH);</span>
+<span class="fc" id="L235">            out.writeUnsignedVInt(stats.minTTL - TTL_EPOCH);</span>
+<span class="fc" id="L236">        }</span>
+
+        public int serializedSize(EncodingStats stats)
+        {
+<span class="fc" id="L240">            return TypeSizes.sizeofUnsignedVInt(stats.minTimestamp - TIMESTAMP_EPOCH)</span>
+<span class="fc" id="L241">                   + TypeSizes.sizeofUnsignedVInt(stats.minLocalDeletionTime - DELETION_TIME_EPOCH)</span>
+<span class="fc" id="L242">                   + TypeSizes.sizeofUnsignedVInt(stats.minTTL - TTL_EPOCH);</span>
+        }
+
+        public EncodingStats deserialize(DataInputPlus in) throws IOException
+        {
+<span class="fc" id="L247">            long minTimestamp = in.readUnsignedVInt() + TIMESTAMP_EPOCH;</span>
+<span class="fc" id="L248">            int minLocalDeletionTime = (int)in.readUnsignedVInt() + DELETION_TIME_EPOCH;</span>
+<span class="fc" id="L249">            int minTTL = (int)in.readUnsignedVInt() + TTL_EPOCH;</span>
+<span class="fc" id="L250">            return new EncodingStats(minTimestamp, minLocalDeletionTime, minTTL);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

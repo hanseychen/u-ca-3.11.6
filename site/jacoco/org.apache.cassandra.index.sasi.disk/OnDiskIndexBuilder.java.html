@@ -1,0 +1,682 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OnDiskIndexBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.disk</a> &gt; <span class="el_source">OnDiskIndexBuilder.java</span></div><h1>OnDiskIndexBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.disk;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.sa.IndexedTerm;
+import org.apache.cassandra.index.sasi.sa.IntegralSA;
+import org.apache.cassandra.index.sasi.sa.SA;
+import org.apache.cassandra.index.sasi.sa.TermIterator;
+import org.apache.cassandra.index.sasi.sa.SuffixSA;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+import com.carrotsearch.hppc.LongArrayList;
+import com.carrotsearch.hppc.LongSet;
+import com.carrotsearch.hppc.ShortArrayList;
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class OnDiskIndexBuilder
+{
+<span class="nc" id="L49">    private static final Logger logger = LoggerFactory.getLogger(OnDiskIndexBuilder.class);</span>
+
+<span class="nc" id="L51">    public enum Mode</span>
+    {
+<span class="nc" id="L53">        PREFIX(EnumSet.of(Op.EQ, Op.MATCH, Op.PREFIX, Op.NOT_EQ, Op.RANGE)),</span>
+<span class="nc" id="L54">        CONTAINS(EnumSet.of(Op.EQ, Op.MATCH, Op.CONTAINS, Op.PREFIX, Op.SUFFIX, Op.NOT_EQ)),</span>
+<span class="nc" id="L55">        SPARSE(EnumSet.of(Op.EQ, Op.NOT_EQ, Op.RANGE));</span>
+
+        Set&lt;Op&gt; supportedOps;
+
+        Mode(Set&lt;Op&gt; ops)
+<span class="nc" id="L60">        {</span>
+<span class="nc" id="L61">            supportedOps = ops;</span>
+<span class="nc" id="L62">        }</span>
+
+        public static Mode mode(String mode)
+        {
+<span class="nc" id="L66">            return Mode.valueOf(mode.toUpperCase());</span>
+        }
+
+        public boolean supports(Op op)
+        {
+<span class="nc" id="L71">            return supportedOps.contains(op);</span>
+        }
+    }
+
+<span class="nc" id="L75">    public enum TermSize</span>
+    {
+<span class="nc" id="L77">        INT(4), LONG(8), UUID(16), VARIABLE(-1);</span>
+
+        public final int size;
+
+        TermSize(int size)
+<span class="nc" id="L82">        {</span>
+<span class="nc" id="L83">            this.size = size;</span>
+<span class="nc" id="L84">        }</span>
+
+        public boolean isConstant()
+        {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">            return this != VARIABLE;</span>
+        }
+
+        public static TermSize of(int size)
+        {
+<span class="nc bnc" id="L93" title="All 5 branches missed.">            switch (size)</span>
+            {
+                case -1:
+<span class="nc" id="L96">                    return VARIABLE;</span>
+
+                case 4:
+<span class="nc" id="L99">                    return INT;</span>
+
+                case 8:
+<span class="nc" id="L102">                    return LONG;</span>
+
+                case 16:
+<span class="nc" id="L105">                    return UUID;</span>
+
+                default:
+<span class="nc" id="L108">                    throw new IllegalStateException(&quot;unknown state: &quot; + size);</span>
+            }
+        }
+
+        public static TermSize sizeOf(AbstractType&lt;?&gt; comparator)
+        {
+<span class="nc bnc" id="L114" title="All 4 branches missed.">            if (comparator instanceof Int32Type || comparator instanceof FloatType)</span>
+<span class="nc" id="L115">                return INT;</span>
+
+<span class="nc bnc" id="L117" title="All 8 branches missed.">            if (comparator instanceof LongType || comparator instanceof DoubleType</span>
+                    || comparator instanceof TimestampType || comparator instanceof DateType)
+<span class="nc" id="L119">                return LONG;</span>
+
+<span class="nc bnc" id="L121" title="All 4 branches missed.">            if (comparator instanceof TimeUUIDType || comparator instanceof UUIDType)</span>
+<span class="nc" id="L122">                return UUID;</span>
+
+<span class="nc" id="L124">            return VARIABLE;</span>
+        }
+    }
+
+    public static final int BLOCK_SIZE = 4096;
+    public static final int MAX_TERM_SIZE = 1024;
+    public static final int SUPER_BLOCK_SIZE = 64;
+    public static final int IS_PARTIAL_BIT = 15;
+
+<span class="nc" id="L133">    private static final SequentialWriterOption WRITER_OPTION = SequentialWriterOption.newBuilder()</span>
+<span class="nc" id="L134">                                                                                      .bufferSize(BLOCK_SIZE)</span>
+<span class="nc" id="L135">                                                                                      .build();</span>
+
+<span class="nc" id="L137">    private final List&lt;MutableLevel&lt;InMemoryPointerTerm&gt;&gt; levels = new ArrayList&lt;&gt;();</span>
+    private MutableLevel&lt;InMemoryDataTerm&gt; dataLevel;
+
+    private final TermSize termSize;
+
+    private final AbstractType&lt;?&gt; keyComparator, termComparator;
+
+    private final Map&lt;ByteBuffer, TokenTreeBuilder&gt; terms;
+    private final Mode mode;
+    private final boolean marksPartials;
+
+    private ByteBuffer minKey, maxKey;
+    private long estimatedBytes;
+
+    public OnDiskIndexBuilder(AbstractType&lt;?&gt; keyComparator, AbstractType&lt;?&gt; comparator, Mode mode)
+    {
+<span class="nc" id="L153">        this(keyComparator, comparator, mode, true);</span>
+<span class="nc" id="L154">    }</span>
+
+    public OnDiskIndexBuilder(AbstractType&lt;?&gt; keyComparator, AbstractType&lt;?&gt; comparator, Mode mode, boolean marksPartials)
+<span class="nc" id="L157">    {</span>
+<span class="nc" id="L158">        this.keyComparator = keyComparator;</span>
+<span class="nc" id="L159">        this.termComparator = comparator;</span>
+<span class="nc" id="L160">        this.terms = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L161">        this.termSize = TermSize.sizeOf(comparator);</span>
+<span class="nc" id="L162">        this.mode = mode;</span>
+<span class="nc" id="L163">        this.marksPartials = marksPartials;</span>
+<span class="nc" id="L164">    }</span>
+
+    public OnDiskIndexBuilder add(ByteBuffer term, DecoratedKey key, long keyPosition)
+    {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (term.remaining() &gt;= MAX_TERM_SIZE)</span>
+        {
+<span class="nc" id="L170">            logger.error(&quot;Rejecting value (value size {}, maximum size {}).&quot;,</span>
+<span class="nc" id="L171">                         FBUtilities.prettyPrintMemory(term.remaining()),</span>
+<span class="nc" id="L172">                         FBUtilities.prettyPrintMemory(Short.MAX_VALUE));</span>
+<span class="nc" id="L173">            return this;</span>
+        }
+
+<span class="nc" id="L176">        TokenTreeBuilder tokens = terms.get(term);</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (tokens == null)</span>
+        {
+<span class="nc" id="L179">            terms.put(term, (tokens = new DynamicTokenTreeBuilder()));</span>
+
+            // on-heap size estimates from jol
+            // 64 bytes for TTB + 48 bytes for TreeMap in TTB + size bytes for the term (map key)
+<span class="nc" id="L183">            estimatedBytes += 64 + 48 + term.remaining();</span>
+        }
+
+<span class="nc" id="L186">        tokens.add((Long) key.getToken().getTokenValue(), keyPosition);</span>
+
+        // calculate key range (based on actual key values) for current index
+<span class="nc bnc" id="L189" title="All 4 branches missed.">        minKey = (minKey == null || keyComparator.compare(minKey, key.getKey()) &gt; 0) ? key.getKey() : minKey;</span>
+<span class="nc bnc" id="L190" title="All 4 branches missed.">        maxKey = (maxKey == null || keyComparator.compare(maxKey, key.getKey()) &lt; 0) ? key.getKey() : maxKey;</span>
+
+        // 60 ((boolean(1)*4) + (long(8)*4) + 24) bytes for the LongOpenHashSet created when the keyPosition was added
+        // + 40 bytes for the TreeMap.Entry + 8 bytes for the token (key).
+        // in the case of hash collision for the token we may overestimate but this is extremely rare
+<span class="nc" id="L195">        estimatedBytes += 60 + 40 + 8;</span>
+
+<span class="nc" id="L197">        return this;</span>
+    }
+
+    public long estimatedMemoryUse()
+    {
+<span class="nc" id="L202">        return estimatedBytes;</span>
+    }
+
+    private void addTerm(InMemoryDataTerm term, SequentialWriter out) throws IOException
+    {
+<span class="nc" id="L207">        InMemoryPointerTerm ptr = dataLevel.add(term);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (ptr == null)</span>
+<span class="nc" id="L209">            return;</span>
+
+<span class="nc" id="L211">        int levelIdx = 0;</span>
+        for (;;)
+        {
+<span class="nc" id="L214">            MutableLevel&lt;InMemoryPointerTerm&gt; level = getIndexLevel(levelIdx++, out);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            if ((ptr = level.add(ptr)) == null)</span>
+<span class="nc" id="L216">                break;</span>
+<span class="nc" id="L217">        }</span>
+<span class="nc" id="L218">    }</span>
+
+    public boolean isEmpty()
+    {
+<span class="nc" id="L222">        return terms.isEmpty();</span>
+    }
+
+    public void finish(Pair&lt;ByteBuffer, ByteBuffer&gt; range, File file, TermIterator terms)
+    {
+<span class="nc" id="L227">        finish(Descriptor.CURRENT, range, file, terms);</span>
+<span class="nc" id="L228">    }</span>
+
+    /**
+     * Finishes up index building process by creating/populating index file.
+     *
+     * @param indexFile The file to write index contents to.
+     *
+     * @return true if index was written successfully, false otherwise (e.g. if index was empty).
+     *
+     * @throws FSWriteError on I/O error.
+     */
+    public boolean finish(File indexFile) throws FSWriteError
+    {
+<span class="nc" id="L241">        return finish(Descriptor.CURRENT, indexFile);</span>
+    }
+
+    @VisibleForTesting
+    protected boolean finish(Descriptor descriptor, File file) throws FSWriteError
+    {
+        // no terms means there is nothing to build
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (terms.isEmpty())</span>
+        {
+            try
+            {
+<span class="nc" id="L252">                file.createNewFile();</span>
+            }
+<span class="nc" id="L254">            catch (IOException e)</span>
+            {
+<span class="nc" id="L256">                throw new FSWriteError(e, file);</span>
+<span class="nc" id="L257">            }</span>
+
+<span class="nc" id="L259">            return false;</span>
+        }
+
+        // split terms into suffixes only if it's text, otherwise (even if CONTAINS is set) use terms in original form
+<span class="nc bnc" id="L263" title="All 6 branches missed.">        SA sa = ((termComparator instanceof UTF8Type || termComparator instanceof AsciiType) &amp;&amp; mode == Mode.CONTAINS)</span>
+                    ? new SuffixSA(termComparator, mode) : new IntegralSA(termComparator, mode);
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        for (Map.Entry&lt;ByteBuffer, TokenTreeBuilder&gt; term : terms.entrySet())</span>
+<span class="nc" id="L267">            sa.add(term.getKey(), term.getValue());</span>
+
+<span class="nc" id="L269">        finish(descriptor, Pair.create(minKey, maxKey), file, sa.finish());</span>
+<span class="nc" id="L270">        return true;</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    protected void finish(Descriptor descriptor, Pair&lt;ByteBuffer, ByteBuffer&gt; range, File file, TermIterator terms)
+    {
+<span class="nc" id="L276">        SequentialWriter out = null;</span>
+
+        try
+        {
+<span class="nc" id="L280">            out = new SequentialWriter(file, WRITER_OPTION);</span>
+
+<span class="nc" id="L282">            out.writeUTF(descriptor.version.toString());</span>
+
+<span class="nc" id="L284">            out.writeShort(termSize.size);</span>
+
+            // min, max term (useful to find initial scan range from search expressions)
+<span class="nc" id="L287">            ByteBufferUtil.writeWithShortLength(terms.minTerm(), out);</span>
+<span class="nc" id="L288">            ByteBufferUtil.writeWithShortLength(terms.maxTerm(), out);</span>
+
+            // min, max keys covered by index (useful when searching across multiple indexes)
+<span class="nc" id="L291">            ByteBufferUtil.writeWithShortLength(range.left, out);</span>
+<span class="nc" id="L292">            ByteBufferUtil.writeWithShortLength(range.right, out);</span>
+
+<span class="nc" id="L294">            out.writeUTF(mode.toString());</span>
+<span class="nc" id="L295">            out.writeBoolean(marksPartials);</span>
+
+<span class="nc" id="L297">            out.skipBytes((int) (BLOCK_SIZE - out.position()));</span>
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            dataLevel = mode == Mode.SPARSE ? new DataBuilderLevel(out, new MutableDataBlock(termComparator, mode))</span>
+                                            : new MutableLevel&lt;&gt;(out, new MutableDataBlock(termComparator, mode));
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            while (terms.hasNext())</span>
+            {
+<span class="nc" id="L303">                Pair&lt;IndexedTerm, TokenTreeBuilder&gt; term = terms.next();</span>
+<span class="nc" id="L304">                addTerm(new InMemoryDataTerm(term.left, term.right), out);</span>
+<span class="nc" id="L305">            }</span>
+
+<span class="nc" id="L307">            dataLevel.finalFlush();</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            for (MutableLevel l : levels)</span>
+<span class="nc" id="L309">                l.flush(); // flush all of the buffers</span>
+
+            // and finally write levels index
+<span class="nc" id="L312">            final long levelIndexPosition = out.position();</span>
+
+<span class="nc" id="L314">            out.writeInt(levels.size());</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            for (int i = levels.size() - 1; i &gt;= 0; i--)</span>
+<span class="nc" id="L316">                levels.get(i).flushMetadata();</span>
+
+<span class="nc" id="L318">            dataLevel.flushMetadata();</span>
+
+<span class="nc" id="L320">            out.writeLong(levelIndexPosition);</span>
+
+            // sync contents of the output and disk,
+            // since it's not done implicitly on close
+<span class="nc" id="L324">            out.sync();</span>
+        }
+<span class="nc" id="L326">        catch (IOException e)</span>
+        {
+<span class="nc" id="L328">            throw new FSWriteError(e, file);</span>
+        }
+        finally
+        {
+<span class="nc" id="L332">            FileUtils.closeQuietly(out);</span>
+        }
+<span class="nc" id="L334">    }</span>
+
+    private MutableLevel&lt;InMemoryPointerTerm&gt; getIndexLevel(int idx, SequentialWriter out)
+    {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (levels.size() == 0)</span>
+<span class="nc" id="L339">            levels.add(new MutableLevel&lt;&gt;(out, new MutableBlock&lt;&gt;()));</span>
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (levels.size() - 1 &lt; idx)</span>
+        {
+<span class="nc" id="L343">            int toAdd = idx - (levels.size() - 1);</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">            for (int i = 0; i &lt; toAdd; i++)</span>
+<span class="nc" id="L345">                levels.add(new MutableLevel&lt;&gt;(out, new MutableBlock&lt;&gt;()));</span>
+        }
+
+<span class="nc" id="L348">        return levels.get(idx);</span>
+    }
+
+    protected static void alignToBlock(SequentialWriter out) throws IOException
+    {
+<span class="nc" id="L353">        long endOfBlock = out.position();</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if ((endOfBlock &amp; (BLOCK_SIZE - 1)) != 0) // align on the block boundary if needed</span>
+<span class="nc" id="L355">            out.skipBytes((int) (FBUtilities.align(endOfBlock, BLOCK_SIZE) - endOfBlock));</span>
+<span class="nc" id="L356">    }</span>
+
+    private class InMemoryTerm
+    {
+        protected final IndexedTerm term;
+
+        public InMemoryTerm(IndexedTerm term)
+<span class="nc" id="L363">        {</span>
+<span class="nc" id="L364">            this.term = term;</span>
+<span class="nc" id="L365">        }</span>
+
+        public int serializedSize()
+        {
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            return (termSize.isConstant() ? 0 : 2) + term.getBytes().remaining();</span>
+        }
+
+        public void serialize(DataOutputPlus out) throws IOException
+        {
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            if (termSize.isConstant())</span>
+            {
+<span class="nc" id="L376">                out.write(term.getBytes());</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L380" title="All 4 branches missed.">                out.writeShort(term.getBytes().remaining() | ((marksPartials &amp;&amp; term.isPartial() ? 1 : 0) &lt;&lt; IS_PARTIAL_BIT));</span>
+<span class="nc" id="L381">                out.write(term.getBytes());</span>
+            }
+
+<span class="nc" id="L384">        }</span>
+    }
+
+    private class InMemoryPointerTerm extends InMemoryTerm
+    {
+        protected final int blockCnt;
+
+        public InMemoryPointerTerm(IndexedTerm term, int blockCnt)
+<span class="nc" id="L392">        {</span>
+<span class="nc" id="L393">            super(term);</span>
+<span class="nc" id="L394">            this.blockCnt = blockCnt;</span>
+<span class="nc" id="L395">        }</span>
+
+        public int serializedSize()
+        {
+<span class="nc" id="L399">            return super.serializedSize() + 4;</span>
+        }
+
+        public void serialize(DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L404">            super.serialize(out);</span>
+<span class="nc" id="L405">            out.writeInt(blockCnt);</span>
+<span class="nc" id="L406">        }</span>
+    }
+
+    private class InMemoryDataTerm extends InMemoryTerm
+    {
+        private final TokenTreeBuilder keys;
+
+        public InMemoryDataTerm(IndexedTerm term, TokenTreeBuilder keys)
+<span class="nc" id="L414">        {</span>
+<span class="nc" id="L415">            super(term);</span>
+<span class="nc" id="L416">            this.keys = keys;</span>
+<span class="nc" id="L417">        }</span>
+    }
+
+    private class MutableLevel&lt;T extends InMemoryTerm&gt;
+    {
+<span class="nc" id="L422">        private final LongArrayList blockOffsets = new LongArrayList();</span>
+
+        protected final SequentialWriter out;
+
+        private final MutableBlock&lt;T&gt; inProcessBlock;
+        private InMemoryPointerTerm lastTerm;
+
+        public MutableLevel(SequentialWriter out, MutableBlock&lt;T&gt; block)
+<span class="nc" id="L430">        {</span>
+<span class="nc" id="L431">            this.out = out;</span>
+<span class="nc" id="L432">            this.inProcessBlock = block;</span>
+<span class="nc" id="L433">        }</span>
+
+        /**
+         * @return If we flushed a block, return the last term of that block; else, null.
+         */
+        public InMemoryPointerTerm add(T term) throws IOException
+        {
+<span class="nc" id="L440">            InMemoryPointerTerm toPromote = null;</span>
+
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            if (!inProcessBlock.hasSpaceFor(term))</span>
+            {
+<span class="nc" id="L444">                flush();</span>
+<span class="nc" id="L445">                toPromote = lastTerm;</span>
+            }
+
+<span class="nc" id="L448">            inProcessBlock.add(term);</span>
+
+<span class="nc" id="L450">            lastTerm = new InMemoryPointerTerm(term.term, blockOffsets.size());</span>
+<span class="nc" id="L451">            return toPromote;</span>
+        }
+
+        public void flush() throws IOException
+        {
+<span class="nc" id="L456">            blockOffsets.add(out.position());</span>
+<span class="nc" id="L457">            inProcessBlock.flushAndClear(out);</span>
+<span class="nc" id="L458">        }</span>
+
+        public void finalFlush() throws IOException
+        {
+<span class="nc" id="L462">            flush();</span>
+<span class="nc" id="L463">        }</span>
+
+        public void flushMetadata() throws IOException
+        {
+<span class="nc" id="L467">            flushMetadata(blockOffsets);</span>
+<span class="nc" id="L468">        }</span>
+
+        protected void flushMetadata(LongArrayList longArrayList) throws IOException
+        {
+<span class="nc" id="L472">            out.writeInt(longArrayList.size());</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            for (int i = 0; i &lt; longArrayList.size(); i++)</span>
+<span class="nc" id="L474">                out.writeLong(longArrayList.get(i));</span>
+<span class="nc" id="L475">        }</span>
+    }
+
+    /** builds standard data blocks and super blocks, as well */
+    private class DataBuilderLevel extends MutableLevel&lt;InMemoryDataTerm&gt;
+    {
+<span class="nc" id="L481">        private final LongArrayList superBlockOffsets = new LongArrayList();</span>
+
+        /** count of regular data blocks written since current super block was init'd */
+        private int dataBlocksCnt;
+        private TokenTreeBuilder superBlockTree;
+
+        public DataBuilderLevel(SequentialWriter out, MutableBlock&lt;InMemoryDataTerm&gt; block)
+<span class="nc" id="L488">        {</span>
+<span class="nc" id="L489">            super(out, block);</span>
+<span class="nc" id="L490">            superBlockTree = new DynamicTokenTreeBuilder();</span>
+<span class="nc" id="L491">        }</span>
+
+        public InMemoryPointerTerm add(InMemoryDataTerm term) throws IOException
+        {
+<span class="nc" id="L495">            InMemoryPointerTerm ptr = super.add(term);</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            if (ptr != null)</span>
+            {
+<span class="nc" id="L498">                dataBlocksCnt++;</span>
+<span class="nc" id="L499">                flushSuperBlock(false);</span>
+            }
+<span class="nc" id="L501">            superBlockTree.add(term.keys);</span>
+<span class="nc" id="L502">            return ptr;</span>
+        }
+
+        public void flushSuperBlock(boolean force) throws IOException
+        {
+<span class="nc bnc" id="L507" title="All 6 branches missed.">            if (dataBlocksCnt == SUPER_BLOCK_SIZE || (force &amp;&amp; !superBlockTree.isEmpty()))</span>
+            {
+<span class="nc" id="L509">                superBlockOffsets.add(out.position());</span>
+<span class="nc" id="L510">                superBlockTree.finish().write(out);</span>
+<span class="nc" id="L511">                alignToBlock(out);</span>
+
+<span class="nc" id="L513">                dataBlocksCnt = 0;</span>
+<span class="nc" id="L514">                superBlockTree = new DynamicTokenTreeBuilder();</span>
+            }
+<span class="nc" id="L516">        }</span>
+
+        public void finalFlush() throws IOException
+        {
+<span class="nc" id="L520">            super.flush();</span>
+<span class="nc" id="L521">            flushSuperBlock(true);</span>
+<span class="nc" id="L522">        }</span>
+
+        public void flushMetadata() throws IOException
+        {
+<span class="nc" id="L526">            super.flushMetadata();</span>
+<span class="nc" id="L527">            flushMetadata(superBlockOffsets);</span>
+<span class="nc" id="L528">        }</span>
+    }
+
+    private static class MutableBlock&lt;T extends InMemoryTerm&gt;
+    {
+        protected final DataOutputBufferFixed buffer;
+        protected final ShortArrayList offsets;
+
+        public MutableBlock()
+<span class="nc" id="L537">        {</span>
+<span class="nc" id="L538">            buffer = new DataOutputBufferFixed(BLOCK_SIZE);</span>
+<span class="nc" id="L539">            offsets = new ShortArrayList();</span>
+<span class="nc" id="L540">        }</span>
+
+        public final void add(T term) throws IOException
+        {
+<span class="nc" id="L544">            offsets.add((short) buffer.position());</span>
+<span class="nc" id="L545">            addInternal(term);</span>
+<span class="nc" id="L546">        }</span>
+
+        protected void addInternal(T term) throws IOException
+        {
+<span class="nc" id="L550">            term.serialize(buffer);</span>
+<span class="nc" id="L551">        }</span>
+
+        public boolean hasSpaceFor(T element)
+        {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">            return sizeAfter(element) &lt; BLOCK_SIZE;</span>
+        }
+
+        protected int sizeAfter(T element)
+        {
+<span class="nc" id="L560">            return getWatermark() + 4 + element.serializedSize();</span>
+        }
+
+        protected int getWatermark()
+        {
+<span class="nc" id="L565">            return 4 + offsets.size() * 2 + (int) buffer.position();</span>
+        }
+
+        public void flushAndClear(SequentialWriter out) throws IOException
+        {
+<span class="nc" id="L570">            out.writeInt(offsets.size());</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">            for (int i = 0; i &lt; offsets.size(); i++)</span>
+<span class="nc" id="L572">                out.writeShort(offsets.get(i));</span>
+
+<span class="nc" id="L574">            out.write(buffer.buffer());</span>
+
+<span class="nc" id="L576">            alignToBlock(out);</span>
+
+<span class="nc" id="L578">            offsets.clear();</span>
+<span class="nc" id="L579">            buffer.clear();</span>
+<span class="nc" id="L580">        }</span>
+    }
+
+    private static class MutableDataBlock extends MutableBlock&lt;InMemoryDataTerm&gt;
+    {
+        private static final int MAX_KEYS_SPARSE = 5;
+
+        private final AbstractType&lt;?&gt; comparator;
+        private final Mode mode;
+
+<span class="nc" id="L590">        private int offset = 0;</span>
+
+<span class="nc" id="L592">        private final List&lt;TokenTreeBuilder&gt; containers = new ArrayList&lt;&gt;();</span>
+        private TokenTreeBuilder combinedIndex;
+
+        public MutableDataBlock(AbstractType&lt;?&gt; comparator, Mode mode)
+<span class="nc" id="L596">        {</span>
+<span class="nc" id="L597">            this.comparator = comparator;</span>
+<span class="nc" id="L598">            this.mode = mode;</span>
+<span class="nc" id="L599">            this.combinedIndex = initCombinedIndex();</span>
+<span class="nc" id="L600">        }</span>
+
+        protected void addInternal(InMemoryDataTerm term) throws IOException
+        {
+<span class="nc" id="L604">            TokenTreeBuilder keys = term.keys;</span>
+
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            if (mode == Mode.SPARSE)</span>
+            {
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                if (keys.getTokenCount() &gt; MAX_KEYS_SPARSE)</span>
+<span class="nc" id="L609">                    throw new IOException(String.format(&quot;Term - '%s' belongs to more than %d keys in %s mode, which is not allowed.&quot;,</span>
+<span class="nc" id="L610">                                                        comparator.getString(term.term.getBytes()), MAX_KEYS_SPARSE, mode.name()));</span>
+
+<span class="nc" id="L612">                writeTerm(term, keys);</span>
+            }
+            else
+            {
+<span class="nc" id="L616">                writeTerm(term, offset);</span>
+
+<span class="nc" id="L618">                offset += keys.serializedSize();</span>
+<span class="nc" id="L619">                containers.add(keys);</span>
+            }
+
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            if (mode == Mode.SPARSE)</span>
+<span class="nc" id="L623">                combinedIndex.add(keys);</span>
+<span class="nc" id="L624">        }</span>
+
+        protected int sizeAfter(InMemoryDataTerm element)
+        {
+<span class="nc" id="L628">            return super.sizeAfter(element) + ptrLength(element);</span>
+        }
+
+        public void flushAndClear(SequentialWriter out) throws IOException
+        {
+<span class="nc" id="L633">            super.flushAndClear(out);</span>
+
+<span class="nc bnc" id="L635" title="All 2 branches missed.">            out.writeInt(mode == Mode.SPARSE ? offset : -1);</span>
+
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (containers.size() &gt; 0)</span>
+            {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">                for (TokenTreeBuilder tokens : containers)</span>
+<span class="nc" id="L640">                    tokens.write(out);</span>
+            }
+
+<span class="nc bnc" id="L643" title="All 4 branches missed.">            if (mode == Mode.SPARSE &amp;&amp; combinedIndex != null)</span>
+<span class="nc" id="L644">                combinedIndex.finish().write(out);</span>
+
+<span class="nc" id="L646">            alignToBlock(out);</span>
+
+<span class="nc" id="L648">            containers.clear();</span>
+<span class="nc" id="L649">            combinedIndex = initCombinedIndex();</span>
+
+<span class="nc" id="L651">            offset = 0;</span>
+<span class="nc" id="L652">        }</span>
+
+        private int ptrLength(InMemoryDataTerm term)
+        {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            return (term.keys.getTokenCount() &gt; 5)</span>
+                    ? 5 // 1 byte type + 4 byte offset to the tree
+<span class="nc" id="L658">                    : 1 + (8 * (int) term.keys.getTokenCount()); // 1 byte size + n 8 byte tokens</span>
+        }
+
+        private void writeTerm(InMemoryTerm term, TokenTreeBuilder keys) throws IOException
+        {
+<span class="nc" id="L663">            term.serialize(buffer);</span>
+<span class="nc" id="L664">            buffer.writeByte((byte) keys.getTokenCount());</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            for (Pair&lt;Long, LongSet&gt; key : keys)</span>
+<span class="nc" id="L666">                buffer.writeLong(key.left);</span>
+<span class="nc" id="L667">        }</span>
+
+        private void writeTerm(InMemoryTerm term, int offset) throws IOException
+        {
+<span class="nc" id="L671">            term.serialize(buffer);</span>
+<span class="nc" id="L672">            buffer.writeByte(0x0);</span>
+<span class="nc" id="L673">            buffer.writeInt(offset);</span>
+<span class="nc" id="L674">        }</span>
+
+        private TokenTreeBuilder initCombinedIndex()
+        {
+<span class="nc bnc" id="L678" title="All 2 branches missed.">            return mode == Mode.SPARSE ? new DynamicTokenTreeBuilder() : null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

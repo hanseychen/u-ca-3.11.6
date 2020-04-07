@@ -1,0 +1,446 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AutoSavingCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cache</a> &gt; <span class="el_source">AutoSavingCache.java</span></div><h1>AutoSavingCache.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cache;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import org.cliffc.high_scale_lib.NonBlockingHashSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.CompactionInfo;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.compaction.CompactionInfo.Unit;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.io.util.CorruptFileException;
+import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.UUIDGen;
+
+public class AutoSavingCache&lt;K extends CacheKey, V&gt; extends InstrumentingCache&lt;K, V&gt;
+{
+    public interface IStreamFactory
+    {
+        InputStream getInputStream(File dataPath, File crcPath) throws IOException;
+        OutputStream getOutputStream(File dataPath, File crcPath) throws FileNotFoundException;
+    }
+
+<span class="fc" id="L63">    private static final Logger logger = LoggerFactory.getLogger(AutoSavingCache.class);</span>
+
+    /** True if a cache flush is currently executing: only one may execute at a time. */
+<span class="fc" id="L66">    public static final Set&lt;CacheService.CacheType&gt; flushInProgress = new NonBlockingHashSet&lt;CacheService.CacheType&gt;();</span>
+
+    protected volatile ScheduledFuture&lt;?&gt; saveTask;
+    protected final CacheService.CacheType cacheType;
+
+    private final CacheSerializer&lt;K, V&gt; cacheLoader;
+
+    /*
+     * CASSANDRA-10155 required a format change to fix 2i indexes and caching.
+     * 2.2 is already at version &quot;c&quot; and 3.0 is at &quot;d&quot;.
+     *
+     * Since cache versions match exactly and there is no partial fallback just add
+     * a minor version letter.
+     *
+     * Sticking with &quot;d&quot; is fine for 3.0 since it has never been released or used by another version
+     *
+     * &quot;e&quot; introduced with CASSANDRA-11206, omits IndexInfo from key-cache, stores offset into index-file
+     */
+    private static final String CURRENT_VERSION = &quot;e&quot;;
+
+<span class="fc" id="L86">    private static volatile IStreamFactory streamFactory = new IStreamFactory()</span>
+<span class="fc" id="L87">    {</span>
+<span class="fc" id="L88">        private final SequentialWriterOption writerOption = SequentialWriterOption.newBuilder()</span>
+<span class="fc" id="L89">                                                                    .trickleFsync(DatabaseDescriptor.getTrickleFsync())</span>
+<span class="fc" id="L90">                                                                    .trickleFsyncByteInterval(DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024)</span>
+<span class="fc" id="L91">                                                                    .finishOnClose(true).build();</span>
+
+        public InputStream getInputStream(File dataPath, File crcPath) throws IOException
+        {
+<span class="nc" id="L95">            return ChecksummedRandomAccessReader.open(dataPath, crcPath);</span>
+        }
+
+        public OutputStream getOutputStream(File dataPath, File crcPath)
+        {
+<span class="nc" id="L100">            return new ChecksummedSequentialWriter(dataPath, crcPath, null, writerOption);</span>
+        }
+    };
+
+    // Unused, but exposed for a reason. See CASSANDRA-8096.
+    public static void setStreamFactory(IStreamFactory streamFactory)
+    {
+<span class="nc" id="L107">        AutoSavingCache.streamFactory = streamFactory;</span>
+<span class="nc" id="L108">    }</span>
+
+    public AutoSavingCache(ICache&lt;K, V&gt; cache, CacheService.CacheType cacheType, CacheSerializer&lt;K, V&gt; cacheloader)
+    {
+<span class="fc" id="L112">        super(cacheType.toString(), cache);</span>
+<span class="fc" id="L113">        this.cacheType = cacheType;</span>
+<span class="fc" id="L114">        this.cacheLoader = cacheloader;</span>
+<span class="fc" id="L115">    }</span>
+
+    public File getCacheDataPath(String version)
+    {
+<span class="fc" id="L119">        return DatabaseDescriptor.getSerializedCachePath( cacheType, version, &quot;db&quot;);</span>
+    }
+
+    public File getCacheCrcPath(String version)
+    {
+<span class="fc" id="L124">        return DatabaseDescriptor.getSerializedCachePath( cacheType, version, &quot;crc&quot;);</span>
+    }
+
+    public Writer getWriter(int keysToSave)
+    {
+<span class="nc" id="L129">        return new Writer(keysToSave);</span>
+    }
+
+    public void scheduleSaving(int savePeriodInSeconds, final int keysToSave)
+    {
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">        if (saveTask != null)</span>
+        {
+<span class="nc" id="L136">            saveTask.cancel(false); // Do not interrupt an in-progress save</span>
+<span class="nc" id="L137">            saveTask = null;</span>
+        }
+<span class="fc bfc" id="L139" title="All 2 branches covered.">        if (savePeriodInSeconds &gt; 0)</span>
+        {
+<span class="fc" id="L141">            Runnable runnable = new Runnable()</span>
+<span class="fc" id="L142">            {</span>
+                public void run()
+                {
+<span class="nc" id="L145">                    submitWrite(keysToSave);</span>
+<span class="nc" id="L146">                }</span>
+            };
+<span class="fc" id="L148">            saveTask = ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(runnable,</span>
+                                                                               savePeriodInSeconds,
+                                                                               savePeriodInSeconds,
+                                                                               TimeUnit.SECONDS);
+        }
+<span class="fc" id="L153">    }</span>
+
+    public ListenableFuture&lt;Integer&gt; loadSavedAsync()
+    {
+<span class="fc" id="L157">        final ListeningExecutorService es = MoreExecutors.listeningDecorator(Executors.newSingleThreadExecutor());</span>
+<span class="fc" id="L158">        final long start = System.nanoTime();</span>
+
+<span class="fc" id="L160">        ListenableFuture&lt;Integer&gt; cacheLoad = es.submit(new Callable&lt;Integer&gt;()</span>
+<span class="fc" id="L161">        {</span>
+            @Override
+            public Integer call()
+            {
+<span class="fc" id="L165">                return loadSaved();</span>
+            }
+        });
+<span class="fc" id="L168">        cacheLoad.addListener(new Runnable()</span>
+<span class="fc" id="L169">        {</span>
+            @Override
+            public void run()
+            {
+<span class="fc bfc" id="L173" title="All 2 branches covered.">                if (size() &gt; 0)</span>
+<span class="fc" id="L174">                    logger.info(&quot;Completed loading ({} ms; {} keys) {} cache&quot;,</span>
+<span class="fc" id="L175">                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start),</span>
+<span class="fc" id="L176">                            CacheService.instance.keyCache.size(),</span>
+                            cacheType);
+<span class="fc" id="L178">                es.shutdown();</span>
+<span class="fc" id="L179">            }</span>
+<span class="fc" id="L180">        }, MoreExecutors.directExecutor());</span>
+
+<span class="fc" id="L182">        return cacheLoad;</span>
+    }
+
+    public int loadSaved()
+    {
+<span class="fc" id="L187">        int count = 0;</span>
+<span class="fc" id="L188">        long start = System.nanoTime();</span>
+
+        // modern format, allows both key and value (so key cache load can be purely sequential)
+<span class="fc" id="L191">        File dataPath = getCacheDataPath(CURRENT_VERSION);</span>
+<span class="fc" id="L192">        File crcPath = getCacheCrcPath(CURRENT_VERSION);</span>
+<span class="pc bpc" id="L193" title="3 of 4 branches missed.">        if (dataPath.exists() &amp;&amp; crcPath.exists())</span>
+        {
+<span class="nc" id="L195">            DataInputStreamPlus in = null;</span>
+            try
+            {
+<span class="nc" id="L198">                logger.info(&quot;reading saved cache {}&quot;, dataPath);</span>
+<span class="nc" id="L199">                in = new DataInputStreamPlus(new LengthAvailableInputStream(new BufferedInputStream(streamFactory.getInputStream(dataPath, crcPath)), dataPath.length()));</span>
+
+                //Check the schema has not changed since CFs are looked up by name which is ambiguous
+<span class="nc" id="L202">                UUID schemaVersion = new UUID(in.readLong(), in.readLong());</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                if (!schemaVersion.equals(Schema.instance.getVersion()))</span>
+<span class="nc" id="L204">                    throw new RuntimeException(&quot;Cache schema version &quot;</span>
+<span class="nc" id="L205">                                              + schemaVersion.toString()</span>
+                                              + &quot; does not match current schema version &quot;
+<span class="nc" id="L207">                                              + Schema.instance.getVersion());</span>
+
+<span class="nc" id="L209">                ArrayDeque&lt;Future&lt;Pair&lt;K, V&gt;&gt;&gt; futures = new ArrayDeque&lt;Future&lt;Pair&lt;K, V&gt;&gt;&gt;();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                while (in.available() &gt; 0)</span>
+                {
+                    //ksname and cfname are serialized by the serializers in CacheService
+                    //That is delegated there because there are serializer specific conditions
+                    //where a cache key is skipped and not written
+<span class="nc" id="L215">                    String ksname = in.readUTF();</span>
+<span class="nc" id="L216">                    String cfname = in.readUTF();</span>
+
+<span class="nc" id="L218">                    ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreIncludingIndexes(Pair.create(ksname, cfname));</span>
+
+<span class="nc" id="L220">                    Future&lt;Pair&lt;K, V&gt;&gt; entryFuture = cacheLoader.deserialize(in, cfs);</span>
+                    // Key cache entry can return null, if the SSTable doesn't exist.
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                    if (entryFuture == null)</span>
+<span class="nc" id="L223">                        continue;</span>
+
+<span class="nc" id="L225">                    futures.offer(entryFuture);</span>
+<span class="nc" id="L226">                    count++;</span>
+
+                    /*
+                     * Kind of unwise to accrue an unbounded number of pending futures
+                     * So now there is this loop to keep a bounded number pending.
+                     */
+                    do
+                    {
+<span class="nc bnc" id="L234" title="All 4 branches missed.">                        while (futures.peek() != null &amp;&amp; futures.peek().isDone())</span>
+                        {
+<span class="nc" id="L236">                            Future&lt;Pair&lt;K, V&gt;&gt; future = futures.poll();</span>
+<span class="nc" id="L237">                            Pair&lt;K, V&gt; entry = future.get();</span>
+<span class="nc bnc" id="L238" title="All 4 branches missed.">                            if (entry != null &amp;&amp; entry.right != null)</span>
+<span class="nc" id="L239">                                put(entry.left, entry.right);</span>
+<span class="nc" id="L240">                        }</span>
+
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                        if (futures.size() &gt; 1000)</span>
+<span class="nc" id="L243">                            Thread.yield();</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                    } while(futures.size() &gt; 1000);</span>
+<span class="nc" id="L245">                }</span>
+
+<span class="nc" id="L247">                Future&lt;Pair&lt;K, V&gt;&gt; future = null;</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                while ((future = futures.poll()) != null)</span>
+                {
+<span class="nc" id="L250">                    Pair&lt;K, V&gt; entry = future.get();</span>
+<span class="nc bnc" id="L251" title="All 4 branches missed.">                    if (entry != null &amp;&amp; entry.right != null)</span>
+<span class="nc" id="L252">                        put(entry.left, entry.right);</span>
+<span class="nc" id="L253">                }</span>
+            }
+<span class="nc" id="L255">            catch (CorruptFileException e)</span>
+            {
+<span class="nc" id="L257">                JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L258">                logger.warn(String.format(&quot;Non-fatal checksum error reading saved cache %s&quot;, dataPath.getAbsolutePath()), e);</span>
+            }
+<span class="nc" id="L260">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L262">                JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc" id="L263">                logger.info(String.format(&quot;Harmless error reading saved cache %s&quot;, dataPath.getAbsolutePath()), t);</span>
+            }
+            finally
+            {
+<span class="nc" id="L267">                FileUtils.closeQuietly(in);</span>
+            }
+        }
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L271">            logger.trace(&quot;completed reading ({} ms; {} keys) saved cache {}&quot;,</span>
+<span class="nc" id="L272">                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), count, dataPath);</span>
+<span class="fc" id="L273">        return count;</span>
+    }
+
+    public Future&lt;?&gt; submitWrite(int keysToSave)
+    {
+<span class="nc" id="L278">        return CompactionManager.instance.submitCacheWrite(getWriter(keysToSave));</span>
+    }
+
+<span class="nc bnc" id="L281" title="All 2 branches missed.">    public class Writer extends CompactionInfo.Holder</span>
+    {
+        private final Iterator&lt;K&gt; keyIterator;
+        private final CompactionInfo info;
+        private long keysWritten;
+        private final long keysEstimate;
+
+        protected Writer(int keysToSave)
+<span class="nc" id="L289">        {</span>
+<span class="nc" id="L290">            int size = size();</span>
+<span class="nc bnc" id="L291" title="All 4 branches missed.">            if (keysToSave &gt;= size || keysToSave == 0)</span>
+            {
+<span class="nc" id="L293">                keyIterator = keyIterator();</span>
+<span class="nc" id="L294">                keysEstimate = size;</span>
+            }
+            else
+            {
+<span class="nc" id="L298">                keyIterator = hotKeyIterator(keysToSave);</span>
+<span class="nc" id="L299">                keysEstimate = keysToSave;</span>
+            }
+
+            OperationType type;
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (cacheType == CacheService.CacheType.KEY_CACHE)</span>
+<span class="nc" id="L304">                type = OperationType.KEY_CACHE_SAVE;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">            else if (cacheType == CacheService.CacheType.ROW_CACHE)</span>
+<span class="nc" id="L306">                type = OperationType.ROW_CACHE_SAVE;</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            else if (cacheType == CacheService.CacheType.COUNTER_CACHE)</span>
+<span class="nc" id="L308">                type = OperationType.COUNTER_CACHE_SAVE;</span>
+            else
+<span class="nc" id="L310">                type = OperationType.UNKNOWN;</span>
+
+<span class="nc" id="L312">            info = new CompactionInfo(CFMetaData.createFake(SchemaConstants.SYSTEM_KEYSPACE_NAME, cacheType.toString()),</span>
+                                      type,
+                                      0,
+                                      keysEstimate,
+                                      Unit.KEYS,
+<span class="nc" id="L317">                                      UUIDGen.getTimeUUID());</span>
+<span class="nc" id="L318">        }</span>
+
+        public CacheService.CacheType cacheType()
+        {
+<span class="nc" id="L322">            return cacheType;</span>
+        }
+
+        public CompactionInfo getCompactionInfo()
+        {
+            // keyset can change in size, thus total can too
+            // TODO need to check for this one... was: info.forProgress(keysWritten, Math.max(keysWritten, keys.size()));
+<span class="nc" id="L329">            return info.forProgress(keysWritten, Math.max(keysWritten, keysEstimate));</span>
+        }
+
+        public void saveCache()
+        {
+<span class="nc" id="L334">            logger.trace(&quot;Deleting old {} files.&quot;, cacheType);</span>
+<span class="nc" id="L335">            deleteOldCacheFiles();</span>
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            if (!keyIterator.hasNext())</span>
+            {
+<span class="nc" id="L339">                logger.trace(&quot;Skipping {} save, cache is empty.&quot;, cacheType);</span>
+<span class="nc" id="L340">                return;</span>
+            }
+
+<span class="nc" id="L343">            long start = System.nanoTime();</span>
+
+<span class="nc" id="L345">            Pair&lt;File, File&gt; cacheFilePaths = tempCacheFiles();</span>
+<span class="nc" id="L346">            try (WrappedDataOutputStreamPlus writer = new WrappedDataOutputStreamPlus(streamFactory.getOutputStream(cacheFilePaths.left, cacheFilePaths.right)))</span>
+            {
+
+                //Need to be able to check schema version because CF names are ambiguous
+<span class="nc" id="L350">                UUID schemaVersion = Schema.instance.getVersion();</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                if (schemaVersion == null)</span>
+                {
+<span class="nc" id="L353">                    Schema.instance.updateVersion();</span>
+<span class="nc" id="L354">                    schemaVersion = Schema.instance.getVersion();</span>
+                }
+<span class="nc" id="L356">                writer.writeLong(schemaVersion.getMostSignificantBits());</span>
+<span class="nc" id="L357">                writer.writeLong(schemaVersion.getLeastSignificantBits());</span>
+
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                while (keyIterator.hasNext())</span>
+                {
+<span class="nc" id="L361">                    K key = keyIterator.next();</span>
+
+<span class="nc" id="L363">                    ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreIncludingIndexes(key.ksAndCFName);</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                    if (cfs == null)</span>
+<span class="nc" id="L365">                        continue; // the table or 2i has been dropped.</span>
+
+<span class="nc" id="L367">                    cacheLoader.serialize(key, writer, cfs);</span>
+
+<span class="nc" id="L369">                    keysWritten++;</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                    if (keysWritten &gt;= keysEstimate)</span>
+<span class="nc" id="L371">                        break;</span>
+<span class="nc" id="L372">                }</span>
+            }
+<span class="nc" id="L374">            catch (FileNotFoundException e)</span>
+            {
+<span class="nc" id="L376">                throw new RuntimeException(e);</span>
+            }
+<span class="nc" id="L378">            catch (IOException e)</span>
+            {
+<span class="nc" id="L380">                throw new FSWriteError(e, cacheFilePaths.left);</span>
+<span class="nc" id="L381">            }</span>
+
+<span class="nc" id="L383">            File cacheFile = getCacheDataPath(CURRENT_VERSION);</span>
+<span class="nc" id="L384">            File crcFile = getCacheCrcPath(CURRENT_VERSION);</span>
+
+<span class="nc" id="L386">            cacheFile.delete(); // ignore error if it didn't exist</span>
+<span class="nc" id="L387">            crcFile.delete();</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (!cacheFilePaths.left.renameTo(cacheFile))</span>
+<span class="nc" id="L390">                logger.error(&quot;Unable to rename {} to {}&quot;, cacheFilePaths.left, cacheFile);</span>
+
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (!cacheFilePaths.right.renameTo(crcFile))</span>
+<span class="nc" id="L393">                logger.error(&quot;Unable to rename {} to {}&quot;, cacheFilePaths.right, crcFile);</span>
+
+<span class="nc" id="L395">            logger.info(&quot;Saved {} ({} items) in {} ms&quot;, cacheType, keysWritten, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));</span>
+<span class="nc" id="L396">        }</span>
+
+        private Pair&lt;File, File&gt; tempCacheFiles()
+        {
+<span class="nc" id="L400">            File dataPath = getCacheDataPath(CURRENT_VERSION);</span>
+<span class="nc" id="L401">            File crcPath = getCacheCrcPath(CURRENT_VERSION);</span>
+<span class="nc" id="L402">            return Pair.create(FileUtils.createTempFile(dataPath.getName(), null, dataPath.getParentFile()),</span>
+<span class="nc" id="L403">                               FileUtils.createTempFile(crcPath.getName(), null, crcPath.getParentFile()));</span>
+        }
+
+        private void deleteOldCacheFiles()
+        {
+<span class="nc" id="L408">            File savedCachesDir = new File(DatabaseDescriptor.getSavedCachesLocation());</span>
+<span class="nc bnc" id="L409" title="All 6 branches missed.">            assert savedCachesDir.exists() &amp;&amp; savedCachesDir.isDirectory();</span>
+<span class="nc" id="L410">            File[] files = savedCachesDir.listFiles();</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (files != null)</span>
+            {
+<span class="nc" id="L413">                String cacheNameFormat = String.format(&quot;%s-%s.db&quot;, cacheType.toString(), CURRENT_VERSION);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                for (File file : files)</span>
+                {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                    if (!file.isFile())</span>
+<span class="nc" id="L417">                        continue; // someone's been messing with our directory.  naughty!</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                    if (file.getName().endsWith(cacheNameFormat)</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                     || file.getName().endsWith(cacheType.toString()))</span>
+                    {
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                        if (!file.delete())</span>
+<span class="nc" id="L423">                            logger.warn(&quot;Failed to delete {}&quot;, file.getAbsolutePath());</span>
+                    }
+                }
+<span class="nc" id="L426">            }</span>
+            else
+            {
+<span class="nc" id="L429">                logger.warn(&quot;Could not list files in {}&quot;, savedCachesDir);</span>
+            }
+<span class="nc" id="L431">        }</span>
+
+        public boolean isGlobal()
+        {
+<span class="nc" id="L435">            return false;</span>
+        }
+    }
+
+    public interface CacheSerializer&lt;K extends CacheKey, V&gt;
+    {
+        void serialize(K key, DataOutputPlus out, ColumnFamilyStore cfs) throws IOException;
+
+        Future&lt;Pair&lt;K, V&gt;&gt; deserialize(DataInputPlus in, ColumnFamilyStore cfs) throws IOException;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

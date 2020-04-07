@@ -1,0 +1,745 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UnfilteredSerializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">UnfilteredSerializer.java</span></div><h1>UnfilteredSerializer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.io.IOException;
+
+import com.google.common.collect.Collections2;
+
+import net.nicoulaj.compilecommand.annotations.Inline;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.Row.Deletion;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.WrappedException;
+
+/**
+ * Serialize/deserialize a single Unfiltered (both on-wire and on-disk).
+ * &lt;p&gt;
+ *
+ * The encoded format for an unfiltered is {@code &lt;flags&gt;(&lt;row&gt;|&lt;marker&gt;)} where:
+ * &lt;ul&gt;
+ *   &lt;li&gt;
+ *     {@code &lt;flags&gt;} is a byte (or two) whose bits are flags used by the rest
+ *     of the serialization. Each flag is defined/explained below as the
+ *     &quot;Unfiltered flags&quot; constants. One of those flags is an extension flag,
+ *     and if present, indicates the presence of a 2ndbyte that contains more
+ *     flags. If the extension is not set, defaults are assumed for the flags
+ *     of that 2nd byte.
+ *   &lt;/li&gt;
+ *   &lt;li&gt;
+ *     {@code &lt;row&gt;} is
+ *        {@code &lt;clustering&gt;&lt;sizes&gt;[&lt;pkliveness&gt;][&lt;deletion&gt;][&lt;columns&gt;]&lt;columns_data&gt;}
+ *     where:
+ *     &lt;ul&gt;
+ *       &lt;li&gt;{@code &lt;clustering&gt;} is the row clustering as serialized by
+ *           {@link org.apache.cassandra.db.Clustering.Serializer} (note that static row are an
+ *           exception and don't have this). &lt;/li&gt;
+ *       &lt;li&gt;{@code &lt;sizes&gt;} are the sizes of the whole unfiltered on disk and
+ *           of the previous unfiltered. This is only present for sstables and
+ *           is used to efficiently skip rows (both forward and backward).&lt;/li&gt;
+ *       &lt;li&gt;{@code &lt;pkliveness&gt;} is the row primary key liveness infos, and it
+ *           contains the timestamp, ttl and local deletion time of that info,
+ *           though some/all of those can be absent based on the flags. &lt;/li&gt;
+ *       &lt;li&gt;{@code deletion} is the row deletion. It's presence is determined
+ *           by the flags and if present, it conists of both the deletion
+ *           timestamp and local deletion time.&lt;/li&gt;
+ *       &lt;li&gt;{@code &lt;columns&gt;} are the columns present in the row  encoded by
+ *           {@link org.apache.cassandra.db.Columns.Serializer#serializeSubset}. It is absent if the row
+ *           contains all the columns of the {@code SerializationHeader} (which
+ *           is then indicated by a flag). &lt;/li&gt;
+ *       &lt;li&gt;{@code &lt;columns_data&gt;} is the data for each of the column present
+ *           in the row. The encoding of each data depends on whether the data
+ *           is for a simple or complex column:
+ *           &lt;ul&gt;
+ *              &lt;li&gt;Simple columns are simply encoded as one {@code &lt;cell&gt;}&lt;/li&gt;
+ *              &lt;li&gt;Complex columns are encoded as {@code [&lt;delTime&gt;]&lt;n&gt;&lt;cell1&gt;...&lt;celln&gt;}
+ *                  where {@code &lt;delTime&gt;} is the deletion for this complex
+ *                  column (if flags indicates its presence), {@code &lt;n&gt;} is the
+ *                  vint encoded value of n, i.e. {@code &lt;celln&gt;}'s 1-based
+ *                  inde and {@code &lt;celli&gt;} are the {@code &lt;cell&gt;} for this
+ *                  complex column&lt;/li&gt;
+ *           &lt;/ul&gt;
+ *       &lt;/li&gt;
+ *     &lt;/ul&gt;
+ *   &lt;/li&gt;
+ *   &lt;li&gt;
+ *     {@code &lt;marker&gt;} is {@code &lt;bound&gt;&lt;deletion&gt;} where {@code &lt;bound&gt;} is
+ *     the marker bound as serialized by {@link org.apache.cassandra.db.ClusteringBoundOrBoundary.Serializer}
+ *     and {@code &lt;deletion&gt;} is the marker deletion time.
+ *   &lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;p&gt;
+ * The serialization of a {@code &lt;cell&gt;} is defined by {@link Cell.Serializer}.
+ */
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">public class UnfilteredSerializer</span>
+{
+<span class="fc" id="L96">    public static final UnfilteredSerializer serializer = new UnfilteredSerializer();</span>
+
+    /*
+     * Unfiltered flags constants.
+     */
+    private final static int END_OF_PARTITION     = 0x01; // Signal the end of the partition. Nothing follows a &lt;flags&gt; field with that flag.
+    private final static int IS_MARKER            = 0x02; // Whether the encoded unfiltered is a marker or a row. All following markers applies only to rows.
+    private final static int HAS_TIMESTAMP        = 0x04; // Whether the encoded row has a timestamp (i.e. if row.partitionKeyLivenessInfo().hasTimestamp() == true).
+    private final static int HAS_TTL              = 0x08; // Whether the encoded row has some expiration info (i.e. if row.partitionKeyLivenessInfo().hasTTL() == true).
+    private final static int HAS_DELETION         = 0x10; // Whether the encoded row has some deletion info.
+    private final static int HAS_ALL_COLUMNS      = 0x20; // Whether the encoded row has all of the columns from the header present.
+    private final static int HAS_COMPLEX_DELETION = 0x40; // Whether the encoded row has some complex deletion for at least one of its columns.
+    private final static int EXTENSION_FLAG       = 0x80; // If present, another byte is read containing the &quot;extended flags&quot; above.
+
+    /*
+     * Extended flags
+     */
+    private final static int IS_STATIC               = 0x01; // Whether the encoded row is a static. If there is no extended flag, the row is assumed not static.
+    /**
+     * A shadowable tombstone cannot replace a previous row deletion otherwise it could resurrect a
+     * previously deleted cell not updated by a subsequent update, SEE CASSANDRA-11500
+     */
+    @Deprecated
+    private final static int HAS_SHADOWABLE_DELETION = 0x02; // Whether the row deletion is shadowable. If there is no extended flag (or no row deletion), the deletion is assumed not shadowable.
+
+    public void serialize(Unfiltered unfiltered, SerializationHeader header, DataOutputPlus out, int version)
+    throws IOException
+    {
+<span class="pc bpc" id="L124" title="2 of 4 branches missed.">        assert !header.isForSSTable();</span>
+<span class="fc" id="L125">        serialize(unfiltered, header, out, 0, version);</span>
+<span class="fc" id="L126">    }</span>
+
+    public void serialize(Unfiltered unfiltered, SerializationHeader header, DataOutputPlus out, long previousUnfilteredSize, int version)
+    throws IOException
+    {
+<span class="fc bfc" id="L131" title="All 2 branches covered.">        if (unfiltered.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)</span>
+        {
+<span class="fc" id="L133">            serialize((RangeTombstoneMarker) unfiltered, header, out, previousUnfilteredSize, version);</span>
+        }
+        else
+        {
+<span class="fc" id="L137">            serialize((Row) unfiltered, header, out, previousUnfilteredSize, version);</span>
+        }
+<span class="fc" id="L139">    }</span>
+
+    public void serializeStaticRow(Row row, SerializationHeader header, DataOutputPlus out, int version)
+    throws IOException
+    {
+<span class="nc bnc" id="L144" title="All 4 branches missed.">        assert row.isStatic();</span>
+<span class="nc" id="L145">        serialize(row, header, out, 0, version);</span>
+<span class="nc" id="L146">    }</span>
+
+    private void serialize(Row row, SerializationHeader header, DataOutputPlus out, long previousUnfilteredSize, int version)
+    throws IOException
+    {
+<span class="fc" id="L151">        int flags = 0;</span>
+<span class="fc" id="L152">        int extendedFlags = 0;</span>
+
+<span class="fc" id="L154">        boolean isStatic = row.isStatic();</span>
+<span class="fc" id="L155">        Columns headerColumns = header.columns(isStatic);</span>
+<span class="fc" id="L156">        LivenessInfo pkLiveness = row.primaryKeyLivenessInfo();</span>
+<span class="fc" id="L157">        Row.Deletion deletion = row.deletion();</span>
+<span class="fc" id="L158">        boolean hasComplexDeletion = row.hasComplexDeletion();</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">        boolean hasAllColumns = (row.columnCount() == headerColumns.size());</span>
+<span class="fc" id="L160">        boolean hasExtendedFlags = hasExtendedFlags(row);</span>
+
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (isStatic)</span>
+<span class="nc" id="L163">            extendedFlags |= IS_STATIC;</span>
+
+<span class="fc bfc" id="L165" title="All 2 branches covered.">        if (!pkLiveness.isEmpty())</span>
+<span class="fc" id="L166">            flags |= HAS_TIMESTAMP;</span>
+<span class="fc bfc" id="L167" title="All 2 branches covered.">        if (pkLiveness.isExpiring())</span>
+<span class="fc" id="L168">            flags |= HAS_TTL;</span>
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">        if (!deletion.isLive())</span>
+        {
+<span class="nc" id="L171">            flags |= HAS_DELETION;</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (deletion.isShadowable())</span>
+<span class="nc" id="L173">                extendedFlags |= HAS_SHADOWABLE_DELETION;</span>
+        }
+<span class="fc bfc" id="L175" title="All 2 branches covered.">        if (hasComplexDeletion)</span>
+<span class="fc" id="L176">            flags |= HAS_COMPLEX_DELETION;</span>
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if (hasAllColumns)</span>
+<span class="fc" id="L178">            flags |= HAS_ALL_COLUMNS;</span>
+
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">        if (hasExtendedFlags)</span>
+<span class="nc" id="L181">            flags |= EXTENSION_FLAG;</span>
+
+<span class="fc" id="L183">        out.writeByte((byte)flags);</span>
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">        if (hasExtendedFlags)</span>
+<span class="nc" id="L185">            out.writeByte((byte)extendedFlags);</span>
+
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">        if (!isStatic)</span>
+<span class="fc" id="L188">            Clustering.serializer.serialize(row.clustering(), out, version, header.clusteringTypes());</span>
+
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        if (header.isForSSTable())</span>
+        {
+<span class="fc" id="L192">            try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())</span>
+            {
+<span class="fc" id="L194">                serializeRowBody(row, flags, header, dob);</span>
+
+<span class="fc" id="L196">                out.writeUnsignedVInt(dob.position() + TypeSizes.sizeofUnsignedVInt(previousUnfilteredSize));</span>
+                // We write the size of the previous unfiltered to make reverse queries more efficient (and simpler).
+                // This is currently not used however and using it is tbd.
+<span class="fc" id="L199">                out.writeUnsignedVInt(previousUnfilteredSize);</span>
+<span class="fc" id="L200">                out.write(dob.getData(), 0, dob.getLength());</span>
+<span class="fc" id="L201">            }</span>
+        }
+        else
+        {
+<span class="fc" id="L205">            serializeRowBody(row, flags, header, out);</span>
+        }
+<span class="fc" id="L207">    }</span>
+
+    @Inline
+    private void serializeRowBody(Row row, int flags, SerializationHeader header, DataOutputPlus out)
+    throws IOException
+    {
+<span class="fc" id="L213">        boolean isStatic = row.isStatic();</span>
+
+<span class="fc" id="L215">        Columns headerColumns = header.columns(isStatic);</span>
+<span class="fc" id="L216">        LivenessInfo pkLiveness = row.primaryKeyLivenessInfo();</span>
+<span class="fc" id="L217">        Row.Deletion deletion = row.deletion();</span>
+
+<span class="fc bfc" id="L219" title="All 2 branches covered.">        if ((flags &amp; HAS_TIMESTAMP) != 0)</span>
+<span class="fc" id="L220">            header.writeTimestamp(pkLiveness.timestamp(), out);</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        if ((flags &amp; HAS_TTL) != 0)</span>
+        {
+<span class="fc" id="L223">            header.writeTTL(pkLiveness.ttl(), out);</span>
+<span class="fc" id="L224">            header.writeLocalDeletionTime(pkLiveness.localExpirationTime(), out);</span>
+        }
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        if ((flags &amp; HAS_DELETION) != 0)</span>
+<span class="nc" id="L227">            header.writeDeletionTime(deletion.time(), out);</span>
+
+<span class="fc bfc" id="L229" title="All 2 branches covered.">        if ((flags &amp; HAS_ALL_COLUMNS) == 0)</span>
+<span class="fc" id="L230">            Columns.serializer.serializeSubset(row.columns(), headerColumns, out);</span>
+
+<span class="fc" id="L232">        SearchIterator&lt;ColumnDefinition, ColumnDefinition&gt; si = headerColumns.iterator();</span>
+
+        try
+        {
+<span class="fc" id="L236">            row.apply(cd -&gt; {</span>
+                // We can obtain the column for data directly from data.column(). However, if the cell/complex data
+                // originates from a sstable, the column we'll get will have the type used when the sstable was serialized,
+                // and if that type have been recently altered, that may not be the type we want to serialize the column
+                // with. So we use the ColumnDefinition from the &quot;header&quot; which is &quot;current&quot;. Also see #11810 for what
+                // happens if we don't do that.
+<span class="fc" id="L242">                ColumnDefinition column = si.next(cd.column());</span>
+<span class="pc bpc" id="L243" title="2 of 4 branches missed.">                assert column != null : cd.column.toString();</span>
+
+                try
+                {
+<span class="fc bfc" id="L247" title="All 2 branches covered.">                    if (cd.column.isSimple())</span>
+<span class="fc" id="L248">                        Cell.serializer.serialize((Cell) cd, column, out, pkLiveness, header);</span>
+                    else
+<span class="fc bfc" id="L250" title="All 2 branches covered.">                        writeComplexColumn((ComplexColumnData) cd, column, (flags &amp; HAS_COMPLEX_DELETION) != 0, pkLiveness, header, out);</span>
+                }
+<span class="nc" id="L252">                catch (IOException e)</span>
+                {
+<span class="nc" id="L254">                    throw new WrappedException(e);</span>
+<span class="fc" id="L255">                }</span>
+<span class="fc" id="L256">            }, false);</span>
+        }
+<span class="nc" id="L258">        catch (WrappedException e)</span>
+        {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">            if (e.getCause() instanceof IOException)</span>
+<span class="nc" id="L261">                throw (IOException) e.getCause();</span>
+
+<span class="nc" id="L263">            throw e;</span>
+<span class="fc" id="L264">        }</span>
+<span class="fc" id="L265">    }</span>
+
+    private void writeComplexColumn(ComplexColumnData data, ColumnDefinition column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header, DataOutputPlus out)
+    throws IOException
+    {
+<span class="fc bfc" id="L270" title="All 2 branches covered.">        if (hasComplexDeletion)</span>
+<span class="fc" id="L271">            header.writeDeletionTime(data.complexDeletion(), out);</span>
+
+<span class="fc" id="L273">        out.writeUnsignedVInt(data.cellsCount());</span>
+<span class="fc bfc" id="L274" title="All 2 branches covered.">        for (Cell cell : data)</span>
+<span class="fc" id="L275">            Cell.serializer.serialize(cell, column, out, rowLiveness, header);</span>
+<span class="fc" id="L276">    }</span>
+
+    private void serialize(RangeTombstoneMarker marker, SerializationHeader header, DataOutputPlus out, long previousUnfilteredSize, int version)
+    throws IOException
+    {
+<span class="fc" id="L281">        out.writeByte((byte)IS_MARKER);</span>
+<span class="fc" id="L282">        ClusteringBoundOrBoundary.serializer.serialize(marker.clustering(), out, version, header.clusteringTypes());</span>
+
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">        if (header.isForSSTable())</span>
+        {
+<span class="nc" id="L286">            out.writeUnsignedVInt(serializedMarkerBodySize(marker, header, previousUnfilteredSize, version));</span>
+<span class="nc" id="L287">            out.writeUnsignedVInt(previousUnfilteredSize);</span>
+        }
+
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">        if (marker.isBoundary())</span>
+        {
+<span class="nc" id="L292">            RangeTombstoneBoundaryMarker bm = (RangeTombstoneBoundaryMarker)marker;</span>
+<span class="nc" id="L293">            header.writeDeletionTime(bm.endDeletionTime(), out);</span>
+<span class="nc" id="L294">            header.writeDeletionTime(bm.startDeletionTime(), out);</span>
+<span class="nc" id="L295">        }</span>
+        else
+        {
+<span class="fc" id="L298">            header.writeDeletionTime(((RangeTombstoneBoundMarker)marker).deletionTime(), out);</span>
+        }
+<span class="fc" id="L300">    }</span>
+
+    public long serializedSize(Unfiltered unfiltered, SerializationHeader header, int version)
+    {
+<span class="nc bnc" id="L304" title="All 4 branches missed.">        assert !header.isForSSTable();</span>
+<span class="nc" id="L305">        return serializedSize(unfiltered, header, 0, version);</span>
+    }
+
+    public long serializedSize(Unfiltered unfiltered, SerializationHeader header, long previousUnfilteredSize,int version)
+    {
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        return unfiltered.kind() == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER</span>
+<span class="nc" id="L311">             ? serializedSize((RangeTombstoneMarker) unfiltered, header, previousUnfilteredSize, version)</span>
+<span class="nc" id="L312">             : serializedSize((Row) unfiltered, header, previousUnfilteredSize, version);</span>
+    }
+
+    private long serializedSize(Row row, SerializationHeader header, long previousUnfilteredSize, int version)
+    {
+<span class="nc" id="L317">        long size = 1; // flags</span>
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (hasExtendedFlags(row))</span>
+<span class="nc" id="L320">            size += 1; // extended flags</span>
+
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        if (!row.isStatic())</span>
+<span class="nc" id="L323">            size += Clustering.serializer.serializedSize(row.clustering(), version, header.clusteringTypes());</span>
+
+<span class="nc" id="L325">        return size + serializedRowBodySize(row, header, previousUnfilteredSize, version);</span>
+    }
+
+    private long serializedRowBodySize(Row row, SerializationHeader header, long previousUnfilteredSize, int version)
+    {
+<span class="nc" id="L330">        long size = 0;</span>
+
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (header.isForSSTable())</span>
+<span class="nc" id="L333">            size += TypeSizes.sizeofUnsignedVInt(previousUnfilteredSize);</span>
+
+<span class="nc" id="L335">        boolean isStatic = row.isStatic();</span>
+<span class="nc" id="L336">        Columns headerColumns = header.columns(isStatic);</span>
+<span class="nc" id="L337">        LivenessInfo pkLiveness = row.primaryKeyLivenessInfo();</span>
+<span class="nc" id="L338">        Row.Deletion deletion = row.deletion();</span>
+<span class="nc" id="L339">        boolean hasComplexDeletion = row.hasComplexDeletion();</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        boolean hasAllColumns = (row.columnCount() == headerColumns.size());</span>
+
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (!pkLiveness.isEmpty())</span>
+<span class="nc" id="L343">            size += header.timestampSerializedSize(pkLiveness.timestamp());</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (pkLiveness.isExpiring())</span>
+        {
+<span class="nc" id="L346">            size += header.ttlSerializedSize(pkLiveness.ttl());</span>
+<span class="nc" id="L347">            size += header.localDeletionTimeSerializedSize(pkLiveness.localExpirationTime());</span>
+        }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (!deletion.isLive())</span>
+<span class="nc" id="L350">            size += header.deletionTimeSerializedSize(deletion.time());</span>
+
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (!hasAllColumns)</span>
+<span class="nc" id="L353">            size += Columns.serializer.serializedSubsetSize(row.columns(), header.columns(isStatic));</span>
+
+<span class="nc" id="L355">        SearchIterator&lt;ColumnDefinition, ColumnDefinition&gt; si = headerColumns.iterator();</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        for (ColumnData data : row)</span>
+        {
+<span class="nc" id="L358">            ColumnDefinition column = si.next(data.column());</span>
+<span class="nc bnc" id="L359" title="All 4 branches missed.">            assert column != null;</span>
+
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            if (data.column.isSimple())</span>
+<span class="nc" id="L362">                size += Cell.serializer.serializedSize((Cell) data, column, pkLiveness, header);</span>
+            else
+<span class="nc" id="L364">                size += sizeOfComplexColumn((ComplexColumnData) data, column, hasComplexDeletion, pkLiveness, header);</span>
+<span class="nc" id="L365">        }</span>
+
+<span class="nc" id="L367">        return size;</span>
+    }
+
+    private long sizeOfComplexColumn(ComplexColumnData data, ColumnDefinition column, boolean hasComplexDeletion, LivenessInfo rowLiveness, SerializationHeader header)
+    {
+<span class="nc" id="L372">        long size = 0;</span>
+
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (hasComplexDeletion)</span>
+<span class="nc" id="L375">            size += header.deletionTimeSerializedSize(data.complexDeletion());</span>
+
+<span class="nc" id="L377">        size += TypeSizes.sizeofUnsignedVInt(data.cellsCount());</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        for (Cell cell : data)</span>
+<span class="nc" id="L379">            size += Cell.serializer.serializedSize(cell, column, rowLiveness, header);</span>
+
+<span class="nc" id="L381">        return size;</span>
+    }
+
+    private long serializedSize(RangeTombstoneMarker marker, SerializationHeader header, long previousUnfilteredSize, int version)
+    {
+<span class="nc bnc" id="L386" title="All 4 branches missed.">        assert !header.isForSSTable();</span>
+<span class="nc" id="L387">        return 1 // flags</span>
+<span class="nc" id="L388">             + ClusteringBoundOrBoundary.serializer.serializedSize(marker.clustering(), version, header.clusteringTypes())</span>
+<span class="nc" id="L389">             + serializedMarkerBodySize(marker, header, previousUnfilteredSize, version);</span>
+    }
+
+    private long serializedMarkerBodySize(RangeTombstoneMarker marker, SerializationHeader header, long previousUnfilteredSize, int version)
+    {
+<span class="nc" id="L394">        long size = 0;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (header.isForSSTable())</span>
+<span class="nc" id="L396">            size += TypeSizes.sizeofUnsignedVInt(previousUnfilteredSize);</span>
+
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (marker.isBoundary())</span>
+        {
+<span class="nc" id="L400">            RangeTombstoneBoundaryMarker bm = (RangeTombstoneBoundaryMarker)marker;</span>
+<span class="nc" id="L401">            size += header.deletionTimeSerializedSize(bm.endDeletionTime());</span>
+<span class="nc" id="L402">            size += header.deletionTimeSerializedSize(bm.startDeletionTime());</span>
+<span class="nc" id="L403">        }</span>
+        else
+        {
+<span class="nc" id="L406">           size += header.deletionTimeSerializedSize(((RangeTombstoneBoundMarker)marker).deletionTime());</span>
+        }
+<span class="nc" id="L408">        return size;</span>
+    }
+
+    public void writeEndOfPartition(DataOutputPlus out) throws IOException
+    {
+<span class="fc" id="L413">        out.writeByte((byte)1);</span>
+<span class="fc" id="L414">    }</span>
+
+    public long serializedSizeEndOfPartition()
+    {
+<span class="nc" id="L418">        return 1;</span>
+    }
+
+    /**
+     * Deserialize an {@link Unfiltered} from the provided input.
+     *
+     * @param in the input from which to deserialize.
+     * @param header serialization header corresponding to the serialized data.
+     * @param helper the helper to use for deserialization.
+     * @param builder a row builder, passed here so we don't allocate a new one for every new row.
+     * @return the deserialized {@link Unfiltered} or {@code null} if we've read the end of a partition. This method is
+     * guaranteed to never return empty rows.
+     */
+    public Unfiltered deserialize(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
+    throws IOException
+    {
+        while (true)
+        {
+<span class="fc" id="L436">            Unfiltered unfiltered = deserializeOne(in, header, helper, builder);</span>
+<span class="fc bfc" id="L437" title="All 2 branches covered.">            if (unfiltered == null)</span>
+<span class="fc" id="L438">                return null;</span>
+
+            // Skip empty rows, see deserializeOne javadoc
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">            if (!unfiltered.isEmpty())</span>
+<span class="fc" id="L442">                return unfiltered;</span>
+<span class="nc" id="L443">        }</span>
+    }
+
+    /**
+     * Deserialize a single {@link Unfiltered} from the provided input.
+     * &lt;p&gt;
+     * &lt;b&gt;WARNING:&lt;/b&gt; this can return an empty row because it's possible there is a row serialized, but that row only
+     * contains data for dropped columns, see CASSANDRA-13337. But as most code expect rows to not be empty, this isn't
+     * meant to be exposed publicly.
+     *
+     * But as {@link UnfilteredRowIterator} should not return empty
+     * rows, this mean consumer of this method should make sure to skip said empty rows.
+     */
+    private Unfiltered deserializeOne(DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder)
+    throws IOException
+    {
+        // It wouldn't be wrong per-se to use an unsorted builder, but it would be inefficient so make sure we don't do it by mistake
+<span class="pc bpc" id="L460" title="2 of 4 branches missed.">        assert builder.isSorted();</span>
+
+<span class="fc" id="L462">        int flags = in.readUnsignedByte();</span>
+<span class="fc bfc" id="L463" title="All 2 branches covered.">        if (isEndOfPartition(flags))</span>
+<span class="fc" id="L464">            return null;</span>
+
+<span class="fc" id="L466">        int extendedFlags = readExtendedFlags(in, flags);</span>
+
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">        if (kind(flags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)</span>
+        {
+<span class="nc" id="L470">            ClusteringBoundOrBoundary bound = ClusteringBoundOrBoundary.serializer.deserialize(in, helper.version, header.clusteringTypes());</span>
+<span class="nc" id="L471">            return deserializeMarkerBody(in, header, bound);</span>
+        }
+        else
+        {
+            // deserializeStaticRow should be used for that.
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">            if (isStatic(extendedFlags))</span>
+<span class="nc" id="L477">                throw new IOException(&quot;Corrupt flags value for unfiltered partition (isStatic flag set): &quot; + flags);</span>
+
+<span class="fc" id="L479">            builder.newRow(Clustering.serializer.deserialize(in, helper.version, header.clusteringTypes()));</span>
+<span class="fc" id="L480">            return deserializeRowBody(in, header, helper, flags, extendedFlags, builder);</span>
+        }
+    }
+
+    public Unfiltered deserializeTombstonesOnly(FileDataInput in, SerializationHeader header, SerializationHelper helper)
+    throws IOException
+    {
+        while (true)
+        {
+<span class="nc" id="L489">            int flags = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (isEndOfPartition(flags))</span>
+<span class="nc" id="L491">                return null;</span>
+
+<span class="nc" id="L493">            int extendedFlags = readExtendedFlags(in, flags);</span>
+
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            if (kind(flags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)</span>
+            {
+<span class="nc" id="L497">                ClusteringBoundOrBoundary bound = ClusteringBoundOrBoundary.serializer.deserialize(in, helper.version, header.clusteringTypes());</span>
+<span class="nc" id="L498">                return deserializeMarkerBody(in, header, bound);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L502" title="All 4 branches missed.">                assert !isStatic(extendedFlags); // deserializeStaticRow should be used for that.</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">                if ((flags &amp; HAS_DELETION) != 0)</span>
+                {
+<span class="nc bnc" id="L505" title="All 4 branches missed.">                    assert header.isForSSTable();</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                    boolean hasTimestamp = (flags &amp; HAS_TIMESTAMP) != 0;</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                    boolean hasTTL = (flags &amp; HAS_TTL) != 0;</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                    boolean deletionIsShadowable = (extendedFlags &amp; HAS_SHADOWABLE_DELETION) != 0;</span>
+<span class="nc" id="L509">                    Clustering clustering = Clustering.serializer.deserialize(in, helper.version, header.clusteringTypes());</span>
+<span class="nc" id="L510">                    long nextPosition = in.readUnsignedVInt() + in.getFilePointer();</span>
+<span class="nc" id="L511">                    in.readUnsignedVInt(); // skip previous unfiltered size</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    if (hasTimestamp)</span>
+                    {
+<span class="nc" id="L514">                        header.readTimestamp(in);</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                        if (hasTTL)</span>
+                        {
+<span class="nc" id="L517">                            header.readTTL(in);</span>
+<span class="nc" id="L518">                            header.readLocalDeletionTime(in);</span>
+                        }
+                    }
+
+<span class="nc" id="L522">                    Deletion deletion = new Row.Deletion(header.readDeletionTime(in), deletionIsShadowable);</span>
+<span class="nc" id="L523">                    in.seek(nextPosition);</span>
+<span class="nc" id="L524">                    return BTreeRow.emptyDeletedRow(clustering, deletion);</span>
+                }
+                else
+                {
+<span class="nc" id="L528">                    Clustering.serializer.skip(in, helper.version, header.clusteringTypes());</span>
+<span class="nc" id="L529">                    skipRowBody(in);</span>
+                    // Continue with next item.
+                }
+            }
+<span class="nc" id="L533">        }</span>
+    }
+
+    public Row deserializeStaticRow(DataInputPlus in, SerializationHeader header, SerializationHelper helper)
+    throws IOException
+    {
+<span class="nc" id="L539">        int flags = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L540" title="All 8 branches missed.">        assert !isEndOfPartition(flags) &amp;&amp; kind(flags) == Unfiltered.Kind.ROW &amp;&amp; isExtended(flags) : flags;</span>
+<span class="nc" id="L541">        int extendedFlags = in.readUnsignedByte();</span>
+<span class="nc" id="L542">        Row.Builder builder = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L543">        builder.newRow(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L544">        return deserializeRowBody(in, header, helper, flags, extendedFlags, builder);</span>
+    }
+
+    public RangeTombstoneMarker deserializeMarkerBody(DataInputPlus in, SerializationHeader header, ClusteringBoundOrBoundary bound)
+    throws IOException
+    {
+<span class="nc bnc" id="L550" title="All 2 branches missed.">        if (header.isForSSTable())</span>
+        {
+<span class="nc" id="L552">            in.readUnsignedVInt(); // marker size</span>
+<span class="nc" id="L553">            in.readUnsignedVInt(); // previous unfiltered size</span>
+        }
+
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (bound.isBoundary())</span>
+<span class="nc" id="L557">            return new RangeTombstoneBoundaryMarker((ClusteringBoundary) bound, header.readDeletionTime(in), header.readDeletionTime(in));</span>
+        else
+<span class="nc" id="L559">            return new RangeTombstoneBoundMarker((ClusteringBound) bound, header.readDeletionTime(in));</span>
+    }
+
+    public Row deserializeRowBody(DataInputPlus in,
+                                  SerializationHeader header,
+                                  SerializationHelper helper,
+                                  int flags,
+                                  int extendedFlags,
+                                  Row.Builder builder)
+    throws IOException
+    {
+        try
+        {
+<span class="fc" id="L572">            boolean isStatic = isStatic(extendedFlags);</span>
+<span class="fc bfc" id="L573" title="All 2 branches covered.">            boolean hasTimestamp = (flags &amp; HAS_TIMESTAMP) != 0;</span>
+<span class="pc bpc" id="L574" title="1 of 2 branches missed.">            boolean hasTTL = (flags &amp; HAS_TTL) != 0;</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">            boolean hasDeletion = (flags &amp; HAS_DELETION) != 0;</span>
+<span class="pc bpc" id="L576" title="1 of 2 branches missed.">            boolean deletionIsShadowable = (extendedFlags &amp; HAS_SHADOWABLE_DELETION) != 0;</span>
+<span class="fc bfc" id="L577" title="All 2 branches covered.">            boolean hasComplexDeletion = (flags &amp; HAS_COMPLEX_DELETION) != 0;</span>
+<span class="fc bfc" id="L578" title="All 2 branches covered.">            boolean hasAllColumns = (flags &amp; HAS_ALL_COLUMNS) != 0;</span>
+<span class="fc" id="L579">            Columns headerColumns = header.columns(isStatic);</span>
+
+<span class="fc bfc" id="L581" title="All 2 branches covered.">            if (header.isForSSTable())</span>
+            {
+<span class="fc" id="L583">                in.readUnsignedVInt(); // Skip row size</span>
+<span class="fc" id="L584">                in.readUnsignedVInt(); // previous unfiltered size</span>
+            }
+
+<span class="fc" id="L587">            LivenessInfo rowLiveness = LivenessInfo.EMPTY;</span>
+<span class="fc bfc" id="L588" title="All 2 branches covered.">            if (hasTimestamp)</span>
+            {
+<span class="fc" id="L590">                long timestamp = header.readTimestamp(in);</span>
+<span class="pc bpc" id="L591" title="1 of 2 branches missed.">                int ttl = hasTTL ? header.readTTL(in) : LivenessInfo.NO_TTL;</span>
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">                int localDeletionTime = hasTTL ? header.readLocalDeletionTime(in) : LivenessInfo.NO_EXPIRATION_TIME;</span>
+<span class="fc" id="L593">                rowLiveness = LivenessInfo.withExpirationTime(timestamp, ttl, localDeletionTime);</span>
+            }
+
+<span class="fc" id="L596">            builder.addPrimaryKeyLivenessInfo(rowLiveness);</span>
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">            builder.addRowDeletion(hasDeletion ? new Row.Deletion(header.readDeletionTime(in), deletionIsShadowable) : Row.Deletion.LIVE);</span>
+
+<span class="fc bfc" id="L599" title="All 2 branches covered.">            Columns columns = hasAllColumns ? headerColumns : Columns.serializer.deserializeSubset(headerColumns, in);</span>
+
+<span class="fc" id="L601">            final LivenessInfo livenessInfo = rowLiveness;</span>
+
+            try
+            {
+<span class="fc" id="L605">                columns.apply(column -&gt; {</span>
+                    try
+                    {
+<span class="fc bfc" id="L608" title="All 2 branches covered.">                        if (column.isSimple())</span>
+<span class="fc" id="L609">                            readSimpleColumn(column, in, header, helper, builder, livenessInfo);</span>
+                        else
+<span class="fc" id="L611">                            readComplexColumn(column, in, header, helper, hasComplexDeletion, builder, livenessInfo);</span>
+                    }
+<span class="nc" id="L613">                    catch (IOException e)</span>
+                    {
+<span class="nc" id="L615">                        throw new WrappedException(e);</span>
+<span class="fc" id="L616">                    }</span>
+<span class="fc" id="L617">                }, false);</span>
+            }
+<span class="nc" id="L619">            catch (WrappedException e)</span>
+            {
+<span class="nc bnc" id="L621" title="All 2 branches missed.">                if (e.getCause() instanceof IOException)</span>
+<span class="nc" id="L622">                    throw (IOException) e.getCause();</span>
+
+<span class="nc" id="L624">                throw e;</span>
+<span class="fc" id="L625">            }</span>
+
+<span class="fc" id="L627">            return builder.build();</span>
+        }
+<span class="nc" id="L629">        catch (RuntimeException | AssertionError e)</span>
+        {
+            // Corrupted data could be such that it triggers an assertion in the row Builder, or break one of its assumption.
+            // Of course, a bug in said builder could also trigger this, but it's impossible a priori to always make the distinction
+            // between a real bug and data corrupted in just the bad way. Besides, re-throwing as an IOException doesn't hide the
+            // exception, it just make we catch it properly and mark the sstable as corrupted.
+<span class="nc" id="L635">            throw new IOException(&quot;Error building row with data deserialized from &quot; + in, e);</span>
+        }
+    }
+
+    private void readSimpleColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, Row.Builder builder, LivenessInfo rowLiveness)
+    throws IOException
+    {
+<span class="pc bpc" id="L642" title="1 of 2 branches missed.">        if (helper.includes(column))</span>
+        {
+<span class="fc" id="L644">            Cell cell = Cell.serializer.deserialize(in, rowLiveness, column, header, helper);</span>
+<span class="pc bpc" id="L645" title="1 of 4 branches missed.">            if (helper.includes(cell, rowLiveness) &amp;&amp; !helper.isDropped(cell, false))</span>
+<span class="fc" id="L646">                builder.addCell(cell);</span>
+<span class="fc" id="L647">        }</span>
+        else
+        {
+<span class="nc" id="L650">            Cell.serializer.skip(in, column, header);</span>
+        }
+<span class="fc" id="L652">    }</span>
+
+    private void readComplexColumn(ColumnDefinition column, DataInputPlus in, SerializationHeader header, SerializationHelper helper, boolean hasComplexDeletion, Row.Builder builder, LivenessInfo rowLiveness)
+    throws IOException
+    {
+<span class="pc bpc" id="L657" title="1 of 2 branches missed.">        if (helper.includes(column))</span>
+        {
+<span class="fc" id="L659">            helper.startOfComplexColumn(column);</span>
+<span class="fc bfc" id="L660" title="All 2 branches covered.">            if (hasComplexDeletion)</span>
+            {
+<span class="fc" id="L662">                DeletionTime complexDeletion = header.readDeletionTime(in);</span>
+<span class="pc bpc" id="L663" title="1 of 2 branches missed.">                if (!helper.isDroppedComplexDeletion(complexDeletion))</span>
+<span class="fc" id="L664">                    builder.addComplexDeletion(column, complexDeletion);</span>
+            }
+
+<span class="fc" id="L667">            int count = (int) in.readUnsignedVInt();</span>
+<span class="fc bfc" id="L668" title="All 2 branches covered.">            while (--count &gt;= 0)</span>
+            {
+<span class="fc" id="L670">                Cell cell = Cell.serializer.deserialize(in, rowLiveness, column, header, helper);</span>
+<span class="pc bpc" id="L671" title="2 of 4 branches missed.">                if (helper.includes(cell, rowLiveness) &amp;&amp; !helper.isDropped(cell, true))</span>
+<span class="fc" id="L672">                    builder.addCell(cell);</span>
+<span class="fc" id="L673">            }</span>
+
+<span class="fc" id="L675">            helper.endOfComplexColumn();</span>
+<span class="fc" id="L676">        }</span>
+        else
+        {
+<span class="nc" id="L679">            skipComplexColumn(in, column, header, hasComplexDeletion);</span>
+        }
+<span class="fc" id="L681">    }</span>
+
+    public void skipRowBody(DataInputPlus in) throws IOException
+    {
+<span class="fc" id="L685">        int rowSize = (int)in.readUnsignedVInt();</span>
+<span class="fc" id="L686">        in.skipBytesFully(rowSize);</span>
+<span class="fc" id="L687">    }</span>
+
+    public void skipStaticRow(DataInputPlus in, SerializationHeader header, SerializationHelper helper) throws IOException
+    {
+<span class="nc" id="L691">        int flags = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L692" title="All 8 branches missed.">        assert !isEndOfPartition(flags) &amp;&amp; kind(flags) == Unfiltered.Kind.ROW &amp;&amp; isExtended(flags) : &quot;Flags is &quot; + flags;</span>
+<span class="nc" id="L693">        int extendedFlags = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L694" title="All 4 branches missed.">        assert isStatic(extendedFlags);</span>
+<span class="nc" id="L695">        skipRowBody(in);</span>
+<span class="nc" id="L696">    }</span>
+
+    public void skipMarkerBody(DataInputPlus in) throws IOException
+    {
+<span class="nc" id="L700">        int markerSize = (int)in.readUnsignedVInt();</span>
+<span class="nc" id="L701">        in.skipBytesFully(markerSize);</span>
+<span class="nc" id="L702">    }</span>
+
+    private void skipComplexColumn(DataInputPlus in, ColumnDefinition column, SerializationHeader header, boolean hasComplexDeletion)
+    throws IOException
+    {
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        if (hasComplexDeletion)</span>
+<span class="nc" id="L708">            header.skipDeletionTime(in);</span>
+
+<span class="nc" id="L710">        int count = (int) in.readUnsignedVInt();</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">        while (--count &gt;= 0)</span>
+<span class="nc" id="L712">            Cell.serializer.skip(in, column, header);</span>
+<span class="nc" id="L713">    }</span>
+
+    public static boolean isEndOfPartition(int flags)
+    {
+<span class="fc bfc" id="L717" title="All 2 branches covered.">        return (flags &amp; END_OF_PARTITION) != 0;</span>
+    }
+
+    public static Unfiltered.Kind kind(int flags)
+    {
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">        return (flags &amp; IS_MARKER) != 0 ? Unfiltered.Kind.RANGE_TOMBSTONE_MARKER : Unfiltered.Kind.ROW;</span>
+    }
+
+    public static boolean isStatic(int extendedFlags)
+    {
+<span class="pc bpc" id="L727" title="1 of 2 branches missed.">        return (extendedFlags &amp; IS_STATIC) != 0;</span>
+    }
+
+    private static boolean isExtended(int flags)
+    {
+<span class="pc bpc" id="L732" title="1 of 2 branches missed.">        return (flags &amp; EXTENSION_FLAG) != 0;</span>
+    }
+
+    public static int readExtendedFlags(DataInputPlus in, int flags) throws IOException
+    {
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">        return isExtended(flags) ? in.readUnsignedByte() : 0;</span>
+    }
+
+    public static boolean hasExtendedFlags(Row row)
+    {
+<span class="pc bpc" id="L742" title="2 of 4 branches missed.">        return row.isStatic() || row.deletion().isShadowable();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

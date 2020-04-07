@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AggregationQueryPager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.pager</a> &gt; <span class="el_source">AggregationQueryPager.java</span></div><h1>AggregationQueryPager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service.pager;
+
+import java.nio.ByteBuffer;
+import java.util.NoSuchElementException;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.aggregation.GroupingState;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.service.ClientState;
+
+/**
+ * {@code QueryPager} that takes care of fetching the pages for aggregation queries.
+ * &lt;p&gt;
+ * For aggregation/group by queries, the user page size is in number of groups. But each group could be composed of very
+ * many rows so to avoid running into OOMs, this pager will page internal queries into sub-pages. So each call to
+ * {@link fetchPage} may (transparently) yield multiple internal queries (sub-pages).
+ */
+public final class AggregationQueryPager implements QueryPager
+{
+    private final DataLimits limits;
+
+    // The sub-pager, used to retrieve the next sub-page.
+    private QueryPager subPager;
+
+    public AggregationQueryPager(QueryPager subPager, DataLimits limits)
+<span class="nc" id="L47">    {</span>
+<span class="nc" id="L48">        this.subPager = subPager;</span>
+<span class="nc" id="L49">        this.limits = limits;</span>
+<span class="nc" id="L50">    }</span>
+
+    @Override
+    public PartitionIterator fetchPage(int pageSize,
+                                       ConsistencyLevel consistency,
+                                       ClientState clientState,
+                                       long queryStartNanoTime)
+    {
+<span class="nc bnc" id="L58" title="All 2 branches missed.">        if (limits.isGroupByLimit())</span>
+<span class="nc" id="L59">            return new GroupByPartitionIterator(pageSize, consistency, clientState, queryStartNanoTime);</span>
+
+<span class="nc" id="L61">        return new AggregationPartitionIterator(pageSize, consistency, clientState, queryStartNanoTime);</span>
+    }
+
+    @Override
+    public ReadExecutionController executionController()
+    {
+<span class="nc" id="L67">        return subPager.executionController();</span>
+    }
+
+    @Override
+    public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController)
+    {
+<span class="nc bnc" id="L73" title="All 2 branches missed.">        if (limits.isGroupByLimit())</span>
+<span class="nc" id="L74">            return new GroupByPartitionIterator(pageSize, executionController, System.nanoTime());</span>
+
+<span class="nc" id="L76">        return new AggregationPartitionIterator(pageSize, executionController, System.nanoTime());</span>
+    }
+
+    @Override
+    public boolean isExhausted()
+    {
+<span class="nc" id="L82">        return subPager.isExhausted();</span>
+    }
+
+    @Override
+    public int maxRemaining()
+    {
+<span class="nc" id="L88">        return subPager.maxRemaining();</span>
+    }
+
+    @Override
+    public PagingState state()
+    {
+<span class="nc" id="L94">        return subPager.state();</span>
+    }
+
+    @Override
+    public QueryPager withUpdatedLimit(DataLimits newLimits)
+    {
+<span class="nc" id="L100">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * &lt;code&gt;PartitionIterator&lt;/code&gt; that automatically fetch a new sub-page of data if needed when the current iterator is
+     * exhausted.
+     */
+    public class GroupByPartitionIterator implements PartitionIterator
+    {
+        /**
+         * The top-level page size in number of groups.
+         */
+        private final int pageSize;
+
+        // For &quot;normal&quot; queries
+        private final ConsistencyLevel consistency;
+        private final ClientState clientState;
+
+        // For internal queries
+        private final ReadExecutionController executionController;
+
+        /**
+         * The &lt;code&gt;PartitionIterator&lt;/code&gt; over the last page retrieved.
+         */
+        private PartitionIterator partitionIterator;
+
+        /**
+         * The next &lt;code&gt;RowIterator&lt;/code&gt; to be returned.
+         */
+        private RowIterator next;
+
+        /**
+         * Specify if all the data have been returned.
+         */
+        private boolean endOfData;
+
+        /**
+         * Keeps track if the partitionIterator has been closed or not.
+         */
+        private boolean closed;
+
+        /**
+         * The key of the last partition processed.
+         */
+        private ByteBuffer lastPartitionKey;
+
+        /**
+         * The clustering of the last row processed
+         */
+        private Clustering lastClustering;
+
+        /**
+         * The initial amount of row remaining
+         */
+        private int initialMaxRemaining;
+
+        private long queryStartNanoTime;
+
+        public GroupByPartitionIterator(int pageSize,
+                                         ConsistencyLevel consistency,
+                                         ClientState clientState,
+                                        long queryStartNanoTime)
+        {
+<span class="nc" id="L163">            this(pageSize, consistency, clientState, null, queryStartNanoTime);</span>
+<span class="nc" id="L164">        }</span>
+
+        public GroupByPartitionIterator(int pageSize,
+                                        ReadExecutionController executionController,
+                                        long queryStartNanoTime)
+       {
+<span class="nc" id="L170">           this(pageSize, null, null, executionController, queryStartNanoTime);</span>
+<span class="nc" id="L171">       }</span>
+
+        private GroupByPartitionIterator(int pageSize,
+                                         ConsistencyLevel consistency,
+                                         ClientState clientState,
+                                         ReadExecutionController executionController,
+                                         long queryStartNanoTime)
+<span class="nc" id="L178">        {</span>
+<span class="nc" id="L179">            this.pageSize = handlePagingOff(pageSize);</span>
+<span class="nc" id="L180">            this.consistency = consistency;</span>
+<span class="nc" id="L181">            this.clientState = clientState;</span>
+<span class="nc" id="L182">            this.executionController = executionController;</span>
+<span class="nc" id="L183">            this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="nc" id="L184">        }</span>
+
+        private int handlePagingOff(int pageSize)
+        {
+            // If the paging is off, the pageSize will be &lt;= 0. So we need to replace
+            // it by DataLimits.NO_LIMIT
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            return pageSize &lt;= 0 ? DataLimits.NO_LIMIT : pageSize;</span>
+        }
+
+        public final void close()
+        {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (!closed)</span>
+            {
+<span class="nc" id="L197">                closed = true;</span>
+<span class="nc" id="L198">                partitionIterator.close();</span>
+            }
+<span class="nc" id="L200">        }</span>
+
+        public final boolean hasNext()
+        {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            if (endOfData)</span>
+<span class="nc" id="L205">                return false;</span>
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (next != null)</span>
+<span class="nc" id="L208">                return true;</span>
+
+<span class="nc" id="L210">            fetchNextRowIterator();</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            return next != null;</span>
+        }
+
+        /**
+         * Loads the next &lt;code&gt;RowIterator&lt;/code&gt; to be returned.
+         */
+        private void fetchNextRowIterator()
+        {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (partitionIterator == null)</span>
+            {
+<span class="nc" id="L222">                initialMaxRemaining = subPager.maxRemaining();</span>
+<span class="nc" id="L223">                partitionIterator = fetchSubPage(pageSize);</span>
+            }
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            while (!partitionIterator.hasNext())</span>
+            {
+<span class="nc" id="L228">                partitionIterator.close();</span>
+
+<span class="nc" id="L230">                int counted = initialMaxRemaining - subPager.maxRemaining();</span>
+
+<span class="nc bnc" id="L232" title="All 4 branches missed.">                if (isDone(pageSize, counted) || subPager.isExhausted())</span>
+                {
+<span class="nc" id="L234">                    endOfData = true;</span>
+<span class="nc" id="L235">                    closed = true;</span>
+<span class="nc" id="L236">                    return;</span>
+                }
+
+<span class="nc" id="L239">                subPager = updatePagerLimit(subPager, limits, lastPartitionKey, lastClustering);</span>
+<span class="nc" id="L240">                partitionIterator = fetchSubPage(computeSubPageSize(pageSize, counted));</span>
+<span class="nc" id="L241">            }</span>
+
+<span class="nc" id="L243">            next = partitionIterator.next();</span>
+<span class="nc" id="L244">        }</span>
+
+        protected boolean isDone(int pageSize, int counted)
+        {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">            return counted == pageSize;</span>
+        }
+
+        /**
+         * Updates the pager with the new limits if needed.
+         *
+         * @param pager the pager previoulsy used
+         * @param limits the DataLimits
+         * @param lastPartitionKey the partition key of the last row returned
+         * @param lastClustering the clustering of the last row returned
+         * @return the pager to use to query the next page of data
+         */
+        protected QueryPager updatePagerLimit(QueryPager pager,
+                                              DataLimits limits,
+                                              ByteBuffer lastPartitionKey,
+                                              Clustering lastClustering)
+        {
+<span class="nc" id="L265">            GroupingState state = new GroupingState(lastPartitionKey, lastClustering);</span>
+<span class="nc" id="L266">            DataLimits newLimits = limits.forGroupByInternalPaging(state);</span>
+<span class="nc" id="L267">            return pager.withUpdatedLimit(newLimits);</span>
+        }
+
+        /**
+         * Computes the size of the next sub-page to retrieve.
+         *
+         * @param pageSize the top-level page size
+         * @param counted the number of result returned so far by the previous sub-pages
+         * @return the size of the next sub-page to retrieve
+         */
+        protected int computeSubPageSize(int pageSize, int counted)
+        {
+<span class="nc" id="L279">            return pageSize - counted;</span>
+        }
+
+        /**
+         * Fetchs the next sub-page.
+         *
+         * @param subPageSize the sub-page size in number of groups
+         * @return the next sub-page
+         */
+        private final PartitionIterator fetchSubPage(int subPageSize)
+        {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            return consistency != null ? subPager.fetchPage(subPageSize, consistency, clientState, queryStartNanoTime)</span>
+<span class="nc" id="L291">                                       : subPager.fetchPageInternal(subPageSize, executionController);</span>
+        }
+
+        public final RowIterator next()
+        {
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L297">                throw new NoSuchElementException();</span>
+
+<span class="nc" id="L299">            RowIterator iterator = new GroupByRowIterator(next);</span>
+<span class="nc" id="L300">            lastPartitionKey = iterator.partitionKey().getKey();</span>
+<span class="nc" id="L301">            next = null;</span>
+<span class="nc" id="L302">            return iterator;</span>
+        }
+
+        private class GroupByRowIterator implements RowIterator
+        {
+            /**
+             * The decorated &lt;code&gt;RowIterator&lt;/code&gt;.
+             */
+            private RowIterator rowIterator;
+
+            /**
+             * Keeps track if the decorated iterator has been closed or not.
+             */
+            private boolean closed;
+
+            public GroupByRowIterator(RowIterator delegate)
+<span class="nc" id="L318">            {</span>
+<span class="nc" id="L319">                this.rowIterator = delegate;</span>
+<span class="nc" id="L320">            }</span>
+
+            public CFMetaData metadata()
+            {
+<span class="nc" id="L324">                return rowIterator.metadata();</span>
+            }
+
+            public boolean isReverseOrder()
+            {
+<span class="nc" id="L329">                return rowIterator.isReverseOrder();</span>
+            }
+
+            public PartitionColumns columns()
+            {
+<span class="nc" id="L334">                return rowIterator.columns();</span>
+            }
+
+            public DecoratedKey partitionKey()
+            {
+<span class="nc" id="L339">                return rowIterator.partitionKey();</span>
+            }
+
+            public Row staticRow()
+            {
+<span class="nc" id="L344">                Row row = rowIterator.staticRow();</span>
+<span class="nc" id="L345">                lastClustering = null;</span>
+<span class="nc" id="L346">                return row;</span>
+            }
+
+            public boolean isEmpty()
+            {
+<span class="nc bnc" id="L351" title="All 4 branches missed.">                return this.rowIterator.isEmpty() &amp;&amp; !hasNext();</span>
+            }
+
+            public void close()
+            {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                if (!closed)</span>
+<span class="nc" id="L357">                    rowIterator.close();</span>
+<span class="nc" id="L358">            }</span>
+
+            public boolean hasNext()
+            {
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                if (rowIterator.hasNext())</span>
+<span class="nc" id="L363">                    return true;</span>
+
+<span class="nc" id="L365">                DecoratedKey partitionKey = rowIterator.partitionKey();</span>
+
+<span class="nc" id="L367">                rowIterator.close();</span>
+
+                // Fetch the next RowIterator
+<span class="nc" id="L370">                GroupByPartitionIterator.this.hasNext();</span>
+
+                // if the previous page was ending within the partition the
+                // next RowIterator is the continuation of this one
+<span class="nc bnc" id="L374" title="All 4 branches missed.">                if (next != null &amp;&amp; partitionKey.equals(next.partitionKey()))</span>
+                {
+<span class="nc" id="L376">                    rowIterator = next;</span>
+<span class="nc" id="L377">                    next = null;</span>
+<span class="nc" id="L378">                    return rowIterator.hasNext();</span>
+                }
+
+<span class="nc" id="L381">                closed = true;</span>
+<span class="nc" id="L382">                return false;</span>
+            }
+
+            public Row next()
+            {
+<span class="nc" id="L387">                Row row = this.rowIterator.next();</span>
+<span class="nc" id="L388">                lastClustering = row.clustering();</span>
+<span class="nc" id="L389">                return row;</span>
+            }
+        }
+    }
+
+    /**
+     * &lt;code&gt;PartitionIterator&lt;/code&gt; for queries without Group By but with aggregates.
+     * &lt;p&gt;For maintaining backward compatibility we are forced to use the {@link org.apache.cassandra.db.filter.DataLimits.CQLLimits} instead of the
+     * {@link org.apache.cassandra.db.filter.DataLimits.CQLGroupByLimits}. Due to that pages need to be fetched in a different way.&lt;/p&gt;
+     */
+    public final class AggregationPartitionIterator extends GroupByPartitionIterator
+    {
+        public AggregationPartitionIterator(int pageSize,
+                                            ConsistencyLevel consistency,
+                                            ClientState clientState,
+                                            long queryStartNanoTime)
+<span class="nc" id="L405">        {</span>
+<span class="nc" id="L406">            super(pageSize, consistency, clientState, queryStartNanoTime);</span>
+<span class="nc" id="L407">        }</span>
+
+        public AggregationPartitionIterator(int pageSize,
+                                            ReadExecutionController executionController,
+                                            long queryStartNanoTime)
+<span class="nc" id="L412">        {</span>
+<span class="nc" id="L413">            super(pageSize, executionController, queryStartNanoTime);</span>
+<span class="nc" id="L414">        }</span>
+
+        @Override
+        protected QueryPager updatePagerLimit(QueryPager pager,
+                                              DataLimits limits,
+                                              ByteBuffer lastPartitionKey,
+                                              Clustering lastClustering)
+        {
+<span class="nc" id="L422">            return pager;</span>
+        }
+
+        @Override
+        protected boolean isDone(int pageSize, int counted)
+        {
+<span class="nc" id="L428">            return false;</span>
+        }
+
+        @Override
+        protected int computeSubPageSize(int pageSize, int counted)
+        {
+<span class="nc" id="L434">            return pageSize;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

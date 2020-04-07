@@ -1,0 +1,1125 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LegacySchemaMigrator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.schema</a> &gt; <span class="el_source">LegacySchemaMigrator.java</span></div><h1>LegacySchemaMigrator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.schema;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.FieldIdentifier;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.SuperColumnCompatibility;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+import static org.apache.cassandra.utils.FBUtilities.fromJsonMap;
+
+/**
+ * This majestic class performs migration from legacy (pre-3.0) system.schema_* schema tables to the new and glorious
+ * system_schema keyspace.
+ *
+ * The goal is to not lose any information in the migration - including the timestamps.
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public final class LegacySchemaMigrator
+{
+    private LegacySchemaMigrator()
+    {
+    }
+
+<span class="fc" id="L64">    private static final Logger logger = LoggerFactory.getLogger(LegacySchemaMigrator.class);</span>
+
+<span class="fc" id="L66">    static final List&lt;CFMetaData&gt; LegacySchemaTables =</span>
+<span class="fc" id="L67">        ImmutableList.of(SystemKeyspace.LegacyKeyspaces,</span>
+                         SystemKeyspace.LegacyColumnfamilies,
+                         SystemKeyspace.LegacyColumns,
+                         SystemKeyspace.LegacyTriggers,
+                         SystemKeyspace.LegacyUsertypes,
+                         SystemKeyspace.LegacyFunctions,
+                         SystemKeyspace.LegacyAggregates);
+
+    public static void migrate()
+    {
+        // read metadata from the legacy schema tables
+<span class="fc" id="L78">        Collection&lt;Keyspace&gt; keyspaces = readSchema();</span>
+
+        // if already upgraded, or starting a new 3.0 node, abort early
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">        if (keyspaces.isEmpty())</span>
+        {
+<span class="fc" id="L83">            unloadLegacySchemaTables();</span>
+<span class="fc" id="L84">            return;</span>
+        }
+
+        // write metadata to the new schema tables
+<span class="nc" id="L88">        logger.info(&quot;Moving {} keyspaces from legacy schema tables to the new schema keyspace ({})&quot;,</span>
+<span class="nc" id="L89">                    keyspaces.size(),</span>
+                    SchemaConstants.SCHEMA_KEYSPACE_NAME);
+<span class="nc" id="L91">        keyspaces.forEach(LegacySchemaMigrator::storeKeyspaceInNewSchemaTables);</span>
+<span class="nc" id="L92">        keyspaces.forEach(LegacySchemaMigrator::migrateBuiltIndexesForKeyspace);</span>
+
+        // flush the new tables before truncating the old ones
+<span class="nc" id="L95">        SchemaKeyspace.flush();</span>
+
+        // truncate the original tables (will be snapshotted now, and will have been snapshotted by pre-flight checks)
+<span class="nc" id="L98">        logger.info(&quot;Truncating legacy schema tables&quot;);</span>
+<span class="nc" id="L99">        truncateLegacySchemaTables();</span>
+
+        // remove legacy schema tables from Schema, so that their presence doesn't give the users any wrong ideas
+<span class="nc" id="L102">        unloadLegacySchemaTables();</span>
+
+<span class="nc" id="L104">        logger.info(&quot;Completed migration of legacy schema tables&quot;);</span>
+<span class="nc" id="L105">    }</span>
+
+    private static void migrateBuiltIndexesForKeyspace(Keyspace keyspace)
+    {
+<span class="nc" id="L109">        keyspace.tables.forEach(LegacySchemaMigrator::migrateBuiltIndexesForTable);</span>
+<span class="nc" id="L110">    }</span>
+
+    private static void migrateBuiltIndexesForTable(Table table)
+    {
+<span class="nc" id="L114">        table.metadata.getIndexes().forEach((index) -&gt; migrateIndexBuildStatus(table.metadata.ksName,</span>
+                                                                               table.metadata.cfName,
+                                                                               index));
+<span class="nc" id="L117">    }</span>
+
+    private static void migrateIndexBuildStatus(String keyspace, String table, IndexMetadata index)
+    {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (SystemKeyspace.isIndexBuilt(keyspace, table + '.' + index.name))</span>
+        {
+<span class="nc" id="L123">            SystemKeyspace.setIndexBuilt(keyspace, index.name);</span>
+<span class="nc" id="L124">            SystemKeyspace.setIndexRemoved(keyspace, table + '.' + index.name);</span>
+        }
+<span class="nc" id="L126">    }</span>
+
+    static void unloadLegacySchemaTables()
+    {
+<span class="fc" id="L130">        KeyspaceMetadata systemKeyspace = Schema.instance.getKSMetaData(SchemaConstants.SYSTEM_KEYSPACE_NAME);</span>
+
+<span class="fc" id="L132">        Tables systemTables = systemKeyspace.tables;</span>
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        for (CFMetaData table : LegacySchemaTables)</span>
+<span class="fc" id="L134">            systemTables = systemTables.without(table.cfName);</span>
+
+<span class="fc" id="L136">        LegacySchemaTables.forEach(Schema.instance::unload);</span>
+<span class="fc" id="L137">        LegacySchemaTables.forEach((cfm) -&gt; org.apache.cassandra.db.Keyspace.openAndGetStore(cfm).invalidate());</span>
+
+<span class="fc" id="L139">        Schema.instance.setKeyspaceMetadata(systemKeyspace.withSwapped(systemTables));</span>
+<span class="fc" id="L140">    }</span>
+
+    private static void truncateLegacySchemaTables()
+    {
+<span class="nc" id="L144">        LegacySchemaTables.forEach(table -&gt; Schema.instance.getColumnFamilyStoreInstance(table.cfId).truncateBlocking());</span>
+<span class="nc" id="L145">    }</span>
+
+    private static void storeKeyspaceInNewSchemaTables(Keyspace keyspace)
+    {
+<span class="nc" id="L149">        logger.info(&quot;Migrating keyspace {}&quot;, keyspace);</span>
+
+<span class="nc" id="L151">        Mutation.SimpleBuilder builder = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace.name, keyspace.params, keyspace.timestamp);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        for (Table table : keyspace.tables)</span>
+<span class="nc" id="L153">            SchemaKeyspace.addTableToSchemaMutation(table.metadata, true, builder.timestamp(table.timestamp));</span>
+
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        for (Type type : keyspace.types)</span>
+<span class="nc" id="L156">            SchemaKeyspace.addTypeToSchemaMutation(type.metadata, builder.timestamp(type.timestamp));</span>
+
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        for (Function function : keyspace.functions)</span>
+<span class="nc" id="L159">            SchemaKeyspace.addFunctionToSchemaMutation(function.metadata, builder.timestamp(function.timestamp));</span>
+
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        for (Aggregate aggregate : keyspace.aggregates)</span>
+<span class="nc" id="L162">            SchemaKeyspace.addAggregateToSchemaMutation(aggregate.metadata, builder.timestamp(aggregate.timestamp));</span>
+
+<span class="nc" id="L164">        builder.build().apply();</span>
+<span class="nc" id="L165">    }</span>
+
+    /*
+     * Read all keyspaces metadata (including nested tables, types, and functions), with their modification timestamps
+     */
+    private static Collection&lt;Keyspace&gt; readSchema()
+    {
+<span class="fc" id="L172">        String query = format(&quot;SELECT keyspace_name FROM %s.%s&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.LEGACY_KEYSPACES);</span>
+<span class="fc" id="L173">        Collection&lt;String&gt; keyspaceNames = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L174">        query(query).forEach(row -&gt; keyspaceNames.add(row.getString(&quot;keyspace_name&quot;)));</span>
+<span class="fc" id="L175">        keyspaceNames.removeAll(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);</span>
+
+<span class="fc" id="L177">        Collection&lt;Keyspace&gt; keyspaces = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L178">        keyspaceNames.forEach(name -&gt; keyspaces.add(readKeyspace(name)));</span>
+<span class="fc" id="L179">        return keyspaces;</span>
+    }
+
+    private static Keyspace readKeyspace(String keyspaceName)
+    {
+<span class="nc" id="L184">        long timestamp = readKeyspaceTimestamp(keyspaceName);</span>
+<span class="nc" id="L185">        KeyspaceParams params = readKeyspaceParams(keyspaceName);</span>
+
+<span class="nc" id="L187">        Collection&lt;Table&gt; tables = readTables(keyspaceName);</span>
+<span class="nc" id="L188">        Collection&lt;Type&gt; types = readTypes(keyspaceName);</span>
+<span class="nc" id="L189">        Collection&lt;Function&gt; functions = readFunctions(keyspaceName);</span>
+<span class="nc" id="L190">        Functions.Builder functionsBuilder = Functions.builder();</span>
+<span class="nc" id="L191">        functions.forEach(udf -&gt; functionsBuilder.add(udf.metadata));</span>
+<span class="nc" id="L192">        Collection&lt;Aggregate&gt; aggregates = readAggregates(functionsBuilder.build(), keyspaceName);</span>
+
+<span class="nc" id="L194">        return new Keyspace(timestamp, keyspaceName, params, tables, types, functions, aggregates);</span>
+    }
+
+    /*
+     * Reading keyspace params
+     */
+
+    private static long readKeyspaceTimestamp(String keyspaceName)
+    {
+<span class="nc" id="L203">        String query = format(&quot;SELECT writeTime(durable_writes) AS timestamp FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_KEYSPACES);
+<span class="nc" id="L206">        return query(query, keyspaceName).one().getLong(&quot;timestamp&quot;);</span>
+    }
+
+    private static KeyspaceParams readKeyspaceParams(String keyspaceName)
+    {
+<span class="nc" id="L211">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_KEYSPACES);
+<span class="nc" id="L214">        UntypedResultSet.Row row = query(query, keyspaceName).one();</span>
+
+<span class="nc" id="L216">        boolean durableWrites = row.getBoolean(&quot;durable_writes&quot;);</span>
+
+<span class="nc" id="L218">        Map&lt;String, String&gt; replication = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L219">        replication.putAll(fromJsonMap(row.getString(&quot;strategy_options&quot;)));</span>
+<span class="nc" id="L220">        replication.put(ReplicationParams.CLASS, row.getString(&quot;strategy_class&quot;));</span>
+
+<span class="nc" id="L222">        return KeyspaceParams.create(durableWrites, replication);</span>
+    }
+
+    /*
+     * Reading tables
+     */
+
+    private static Collection&lt;Table&gt; readTables(String keyspaceName)
+    {
+<span class="nc" id="L231">        String query = format(&quot;SELECT columnfamily_name FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_COLUMNFAMILIES);
+<span class="nc" id="L234">        Collection&lt;String&gt; tableNames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L235">        query(query, keyspaceName).forEach(row -&gt; tableNames.add(row.getString(&quot;columnfamily_name&quot;)));</span>
+
+<span class="nc" id="L237">        Collection&lt;Table&gt; tables = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L238">        tableNames.forEach(name -&gt; tables.add(readTable(keyspaceName, name)));</span>
+<span class="nc" id="L239">        return tables;</span>
+    }
+
+    private static Table readTable(String keyspaceName, String tableName)
+    {
+<span class="nc" id="L244">        long timestamp = readTableTimestamp(keyspaceName, tableName);</span>
+<span class="nc" id="L245">        CFMetaData metadata = readTableMetadata(keyspaceName, tableName);</span>
+<span class="nc" id="L246">        return new Table(timestamp, metadata);</span>
+    }
+
+    private static long readTableTimestamp(String keyspaceName, String tableName)
+    {
+<span class="nc" id="L251">        String query = format(&quot;SELECT writeTime(type) AS timestamp FROM %s.%s WHERE keyspace_name = ? AND columnfamily_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_COLUMNFAMILIES);
+<span class="nc" id="L254">        return query(query, keyspaceName, tableName).one().getLong(&quot;timestamp&quot;);</span>
+    }
+
+    private static CFMetaData readTableMetadata(String keyspaceName, String tableName)
+    {
+<span class="nc" id="L259">        String tableQuery = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND columnfamily_name = ?&quot;,</span>
+                                   SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                                   SystemKeyspace.LEGACY_COLUMNFAMILIES);
+<span class="nc" id="L262">        UntypedResultSet.Row tableRow = query(tableQuery, keyspaceName, tableName).one();</span>
+
+<span class="nc" id="L264">        String columnsQuery = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND columnfamily_name = ?&quot;,</span>
+                                     SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                                     SystemKeyspace.LEGACY_COLUMNS);
+<span class="nc" id="L267">        UntypedResultSet columnRows = query(columnsQuery, keyspaceName, tableName);</span>
+
+<span class="nc" id="L269">        String triggersQuery = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND columnfamily_name = ?&quot;,</span>
+                                      SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                                      SystemKeyspace.LEGACY_TRIGGERS);
+<span class="nc" id="L272">        UntypedResultSet triggerRows = query(triggersQuery, keyspaceName, tableName);</span>
+
+<span class="nc" id="L274">        return decodeTableMetadata(tableName, tableRow, columnRows, triggerRows);</span>
+    }
+
+    private static CFMetaData decodeTableMetadata(String tableName,
+                                                  UntypedResultSet.Row tableRow,
+                                                  UntypedResultSet columnRows,
+                                                  UntypedResultSet triggerRows)
+    {
+<span class="nc" id="L282">        String ksName = tableRow.getString(&quot;keyspace_name&quot;);</span>
+<span class="nc" id="L283">        String cfName = tableRow.getString(&quot;columnfamily_name&quot;);</span>
+
+<span class="nc" id="L285">        AbstractType&lt;?&gt; rawComparator = TypeParser.parse(tableRow.getString(&quot;comparator&quot;));</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        AbstractType&lt;?&gt; subComparator = tableRow.has(&quot;subcomparator&quot;) ? TypeParser.parse(tableRow.getString(&quot;subcomparator&quot;)) : null;</span>
+
+<span class="nc" id="L288">        boolean isSuper = &quot;super&quot;.equals(tableRow.getString(&quot;type&quot;).toLowerCase(Locale.ENGLISH));</span>
+<span class="nc bnc" id="L289" title="All 4 branches missed.">        boolean isCompound = rawComparator instanceof CompositeType || isSuper;</span>
+
+        /*
+         * Determine whether or not the table is *really* dense
+         * We cannot trust is_dense value of true (see CASSANDRA-11502, that fixed the issue for 2.2 only, and not retroactively),
+         * but we can trust is_dense value of false.
+         */
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        Boolean rawIsDense = tableRow.has(&quot;is_dense&quot;) ? tableRow.getBoolean(&quot;is_dense&quot;) : null;</span>
+        boolean isDense;
+<span class="nc bnc" id="L298" title="All 4 branches missed.">        if (rawIsDense != null &amp;&amp; !rawIsDense)</span>
+<span class="nc" id="L299">            isDense = false;</span>
+        else
+<span class="nc" id="L301">            isDense = calculateIsDense(rawComparator, columnRows, isSuper);</span>
+
+        // now, if switched to sparse, remove redundant compact_value column and the last clustering column,
+        // directly copying CASSANDRA-11502 logic. See CASSANDRA-11315.
+<span class="nc bnc" id="L305" title="All 6 branches missed.">        Iterable&lt;UntypedResultSet.Row&gt; filteredColumnRows = !isDense &amp;&amp; (rawIsDense == null || rawIsDense)</span>
+<span class="nc" id="L306">                                                          ? filterOutRedundantRowsForSparse(columnRows, isSuper, isCompound)</span>
+                                                          : columnRows;
+
+        // We don't really use the default validator but as we have it for backward compatibility, we use it to know if it's a counter table
+<span class="nc" id="L310">        AbstractType&lt;?&gt; defaultValidator = TypeParser.parse(tableRow.getString(&quot;default_validator&quot;));</span>
+<span class="nc" id="L311">        boolean isCounter = defaultValidator instanceof CounterColumnType;</span>
+
+        /*
+         * With CASSANDRA-5202 we stopped inferring the cf id from the combination of keyspace/table names,
+         * and started storing the generated uuids in system.schema_columnfamilies.
+         *
+         * In 3.0 we SHOULD NOT see tables like that (2.0-created, non-upgraded).
+         * But in the off-chance that we do, we generate the deterministic uuid here.
+         */
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        UUID cfId = tableRow.has(&quot;cf_id&quot;)</span>
+<span class="nc" id="L321">                  ? tableRow.getUUID(&quot;cf_id&quot;)</span>
+<span class="nc" id="L322">                  : CFMetaData.generateLegacyCfId(ksName, cfName);</span>
+
+<span class="nc bnc" id="L324" title="All 6 branches missed.">        boolean isCQLTable = !isSuper &amp;&amp; !isDense &amp;&amp; isCompound;</span>
+<span class="nc bnc" id="L325" title="All 4 branches missed.">        boolean isStaticCompactTable = !isDense &amp;&amp; !isCompound;</span>
+
+        // Internally, compact tables have a specific layout, see CompactTables. But when upgrading from
+        // previous versions, they may not have the expected schema, so detect if we need to upgrade and do
+        // it in createColumnsFromColumnRows.
+        // We can remove this once we don't support upgrade from versions &lt; 3.0.
+<span class="nc bnc" id="L331" title="All 4 branches missed.">        boolean needsUpgrade = !isCQLTable &amp;&amp; checkNeedsUpgrade(filteredColumnRows, isSuper, isStaticCompactTable);</span>
+
+<span class="nc" id="L333">        List&lt;ColumnDefinition&gt; columnDefs = createColumnsFromColumnRows(filteredColumnRows,</span>
+                                                                        ksName,
+                                                                        cfName,
+                                                                        rawComparator,
+                                                                        subComparator,
+                                                                        isSuper,
+                                                                        isCQLTable,
+                                                                        isStaticCompactTable,
+                                                                        needsUpgrade);
+
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (needsUpgrade)</span>
+        {
+<span class="nc" id="L345">            addDefinitionForUpgrade(columnDefs,</span>
+                                    ksName,
+                                    cfName,
+                                    isStaticCompactTable,
+                                    isSuper,
+                                    rawComparator,
+                                    subComparator,
+                                    defaultValidator);
+        }
+
+<span class="nc" id="L355">        CFMetaData cfm = CFMetaData.create(ksName,</span>
+                                           cfName,
+                                           cfId,
+                                           isDense,
+                                           isCompound,
+                                           isSuper,
+                                           isCounter,
+                                           false, // legacy schema did not contain views
+                                           columnDefs,
+<span class="nc" id="L364">                                           DatabaseDescriptor.getPartitioner());</span>
+
+<span class="nc" id="L366">        Indexes indexes = createIndexesFromColumnRows(cfm,</span>
+                                                      filteredColumnRows,
+                                                      ksName,
+                                                      cfName,
+                                                      rawComparator,
+                                                      subComparator,
+                                                      isSuper,
+                                                      isCQLTable,
+                                                      isStaticCompactTable,
+                                                      needsUpgrade);
+<span class="nc" id="L376">        cfm.indexes(indexes);</span>
+
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (tableRow.has(&quot;dropped_columns&quot;))</span>
+<span class="nc" id="L379">            addDroppedColumns(cfm, rawComparator, tableRow.getMap(&quot;dropped_columns&quot;, UTF8Type.instance, LongType.instance));</span>
+
+<span class="nc" id="L381">        return cfm.params(decodeTableParams(tableRow))</span>
+<span class="nc" id="L382">                  .triggers(createTriggersFromTriggerRows(triggerRows));</span>
+    }
+
+    /*
+     * We call dense a CF for which each component of the comparator is a clustering column, i.e. no
+     * component is used to store a regular column names. In other words, non-composite static &quot;thrift&quot;
+     * and CQL3 CF are *not* dense.
+     * We save whether the table is dense or not during table creation through CQL, but we don't have this
+     * information for table just created through thrift, nor for table prior to CASSANDRA-7744, so this
+     * method does its best to infer whether the table is dense or not based on other elements.
+     */
+    private static boolean calculateIsDense(AbstractType&lt;?&gt; comparator, UntypedResultSet columnRows, boolean isSuper)
+    {
+        /*
+         * As said above, this method is only here because we need to deal with thrift upgrades.
+         * Once a CF has been &quot;upgraded&quot;, i.e. we've rebuilt and save its CQL3 metadata at least once,
+         * then we'll have saved the &quot;is_dense&quot; value and will be good to go.
+         *
+         * But non-upgraded thrift CF (and pre-7744 CF) will have no value for &quot;is_dense&quot;, so we need
+         * to infer that information without relying on it in that case. And for the most part this is
+         * easy, a CF that has at least one REGULAR definition is not dense. But the subtlety is that not
+         * having a REGULAR definition may not mean dense because of CQL3 definitions that have only the
+         * PRIMARY KEY defined.
+         *
+         * So we need to recognize those special case CQL3 table with only a primary key. If we have some
+         * clustering columns, we're fine as said above. So the only problem is that we cannot decide for
+         * sure if a CF without REGULAR columns nor CLUSTERING_COLUMN definition is meant to be dense, or if it
+         * has been created in CQL3 by say:
+         *    CREATE TABLE test (k int PRIMARY KEY)
+         * in which case it should not be dense. However, we can limit our margin of error by assuming we are
+         * in the latter case only if the comparator is exactly CompositeType(UTF8Type).
+         */
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        for (UntypedResultSet.Row columnRow : columnRows)</span>
+        {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (&quot;regular&quot;.equals(columnRow.getString(&quot;type&quot;)))</span>
+<span class="nc" id="L417">                return false;</span>
+<span class="nc" id="L418">        }</span>
+
+        // If we've checked the columns for supercf and found no regulars, it's dense. Relying on the emptiness
+        // of the value column is not enough due to index calculation.
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        if (isSuper)</span>
+<span class="nc" id="L423">            return true;</span>
+
+<span class="nc" id="L425">        int maxClusteringIdx = -1;</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        for (UntypedResultSet.Row columnRow : columnRows)</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if (&quot;clustering_key&quot;.equals(columnRow.getString(&quot;type&quot;)))</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">                maxClusteringIdx = Math.max(maxClusteringIdx, columnRow.has(&quot;component_index&quot;) ? columnRow.getInt(&quot;component_index&quot;) : 0);</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        return maxClusteringIdx &gt;= 0</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">             ? maxClusteringIdx == comparator.componentsCount() - 1</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">             : !isCQL3OnlyPKComparator(comparator);</span>
+    }
+
+    private static Iterable&lt;UntypedResultSet.Row&gt; filterOutRedundantRowsForSparse(UntypedResultSet columnRows, boolean isSuper, boolean isCompound)
+    {
+<span class="nc" id="L437">        Collection&lt;UntypedResultSet.Row&gt; filteredRows = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        for (UntypedResultSet.Row columnRow : columnRows)</span>
+        {
+<span class="nc" id="L440">            String kind = columnRow.getString(&quot;type&quot;);</span>
+
+<span class="nc bnc" id="L442" title="All 4 branches missed.">            if (!isSuper &amp;&amp; &quot;compact_value&quot;.equals(kind))</span>
+<span class="nc" id="L443">                continue;</span>
+
+<span class="nc bnc" id="L445" title="All 6 branches missed.">            if (&quot;clustering_key&quot;.equals(kind) &amp;&amp; !isSuper &amp;&amp; !isCompound)</span>
+<span class="nc" id="L446">                continue;</span>
+
+<span class="nc" id="L448">            filteredRows.add(columnRow);</span>
+<span class="nc" id="L449">        }</span>
+
+<span class="nc" id="L451">        return filteredRows;</span>
+    }
+
+    private static boolean isCQL3OnlyPKComparator(AbstractType&lt;?&gt; comparator)
+    {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        if (!(comparator instanceof CompositeType))</span>
+<span class="nc" id="L457">            return false;</span>
+
+<span class="nc" id="L459">        CompositeType ct = (CompositeType)comparator;</span>
+<span class="nc bnc" id="L460" title="All 4 branches missed.">        return ct.types.size() == 1 &amp;&amp; ct.types.get(0) instanceof UTF8Type;</span>
+    }
+
+    private static TableParams decodeTableParams(UntypedResultSet.Row row)
+    {
+<span class="nc" id="L465">        TableParams.Builder params = TableParams.builder();</span>
+
+<span class="nc" id="L467">        params.readRepairChance(row.getDouble(&quot;read_repair_chance&quot;))</span>
+<span class="nc" id="L468">              .dcLocalReadRepairChance(row.getDouble(&quot;local_read_repair_chance&quot;))</span>
+<span class="nc" id="L469">              .gcGraceSeconds(row.getInt(&quot;gc_grace_seconds&quot;));</span>
+
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        if (row.has(&quot;comment&quot;))</span>
+<span class="nc" id="L472">            params.comment(row.getString(&quot;comment&quot;));</span>
+
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if (row.has(&quot;memtable_flush_period_in_ms&quot;))</span>
+<span class="nc" id="L475">            params.memtableFlushPeriodInMs(row.getInt(&quot;memtable_flush_period_in_ms&quot;));</span>
+
+<span class="nc" id="L477">        params.caching(cachingFromRow(row.getString(&quot;caching&quot;)));</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        if (row.has(&quot;default_time_to_live&quot;))</span>
+<span class="nc" id="L480">            params.defaultTimeToLive(row.getInt(&quot;default_time_to_live&quot;));</span>
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (row.has(&quot;speculative_retry&quot;))</span>
+<span class="nc" id="L483">            params.speculativeRetry(SpeculativeRetryParam.fromString(row.getString(&quot;speculative_retry&quot;)));</span>
+
+<span class="nc" id="L485">        Map&lt;String, String&gt; compressionParameters = fromJsonMap(row.getString(&quot;compression_parameters&quot;));</span>
+<span class="nc" id="L486">        String crcCheckChance = compressionParameters.remove(&quot;crc_check_chance&quot;);</span>
+        //crc_check_chance was promoted from a compression property to a top-level property
+<span class="nc bnc" id="L488" title="All 2 branches missed.">        if (crcCheckChance != null)</span>
+<span class="nc" id="L489">            params.crcCheckChance(Double.parseDouble(crcCheckChance));</span>
+
+<span class="nc" id="L491">        params.compression(CompressionParams.fromMap(compressionParameters));</span>
+
+<span class="nc" id="L493">        params.compaction(compactionFromRow(row));</span>
+
+<span class="nc bnc" id="L495" title="All 2 branches missed.">        if (row.has(&quot;min_index_interval&quot;))</span>
+<span class="nc" id="L496">            params.minIndexInterval(row.getInt(&quot;min_index_interval&quot;));</span>
+
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        if (row.has(&quot;max_index_interval&quot;))</span>
+<span class="nc" id="L499">            params.maxIndexInterval(row.getInt(&quot;max_index_interval&quot;));</span>
+
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (row.has(&quot;bloom_filter_fp_chance&quot;))</span>
+<span class="nc" id="L502">            params.bloomFilterFpChance(row.getDouble(&quot;bloom_filter_fp_chance&quot;));</span>
+
+<span class="nc" id="L504">        return params.build();</span>
+    }
+
+
+    /**
+     *
+      * 2.1 and newer use JSON'ified map of caching parameters, but older versions had valid Strings
+      * NONE, KEYS_ONLY, ROWS_ONLY, and ALL
+      *
+      * @param caching, the string representing the table's caching options
+      * @return CachingParams object corresponding to the input string
+      */
+    @VisibleForTesting
+    public static CachingParams cachingFromRow(String caching)
+    {
+<span class="nc bnc" id="L519" title="All 5 branches missed.">        switch(caching)</span>
+        {
+            case &quot;NONE&quot;:
+<span class="nc" id="L522">                return CachingParams.CACHE_NOTHING;</span>
+            case &quot;KEYS_ONLY&quot;:
+<span class="nc" id="L524">                return CachingParams.CACHE_KEYS;</span>
+            case &quot;ROWS_ONLY&quot;:
+<span class="nc" id="L526">                return new CachingParams(false, Integer.MAX_VALUE);</span>
+            case &quot;ALL&quot;:
+<span class="nc" id="L528">                return CachingParams.CACHE_EVERYTHING;</span>
+            default:
+<span class="nc" id="L530">                return CachingParams.fromMap(fromJsonMap(caching));</span>
+        }
+    }
+
+    /*
+     * The method is needed - to migrate max_compaction_threshold and min_compaction_threshold
+     * to the compaction map, where they belong.
+     *
+     * We must use reflection to validate the options because not every compaction strategy respects and supports
+     * the threshold params (LCS doesn't, STCS and DTCS do).
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static CompactionParams compactionFromRow(UntypedResultSet.Row row)
+    {
+<span class="nc" id="L544">        Class&lt;? extends AbstractCompactionStrategy&gt; klass =</span>
+<span class="nc" id="L545">            CFMetaData.createCompactionStrategy(row.getString(&quot;compaction_strategy_class&quot;));</span>
+<span class="nc" id="L546">        Map&lt;String, String&gt; options = fromJsonMap(row.getString(&quot;compaction_strategy_options&quot;));</span>
+
+<span class="nc" id="L548">        int minThreshold = row.getInt(&quot;min_compaction_threshold&quot;);</span>
+<span class="nc" id="L549">        int maxThreshold = row.getInt(&quot;max_compaction_threshold&quot;);</span>
+
+<span class="nc" id="L551">        Map&lt;String, String&gt; optionsWithThresholds = new HashMap&lt;&gt;(options);</span>
+<span class="nc" id="L552">        optionsWithThresholds.putIfAbsent(CompactionParams.Option.MIN_THRESHOLD.toString(), Integer.toString(minThreshold));</span>
+<span class="nc" id="L553">        optionsWithThresholds.putIfAbsent(CompactionParams.Option.MAX_THRESHOLD.toString(), Integer.toString(maxThreshold));</span>
+
+        try
+        {
+<span class="nc" id="L557">            Map&lt;String, String&gt; unrecognizedOptions =</span>
+<span class="nc" id="L558">                (Map&lt;String, String&gt;) klass.getMethod(&quot;validateOptions&quot;, Map.class).invoke(null, optionsWithThresholds);</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (unrecognizedOptions.isEmpty())</span>
+<span class="nc" id="L561">                options = optionsWithThresholds;</span>
+        }
+<span class="nc" id="L563">        catch (Exception e)</span>
+        {
+<span class="nc" id="L565">            throw new RuntimeException(e);</span>
+<span class="nc" id="L566">        }</span>
+
+<span class="nc" id="L568">        return CompactionParams.create(klass, options);</span>
+    }
+
+    // Should only be called on compact tables
+    private static boolean checkNeedsUpgrade(Iterable&lt;UntypedResultSet.Row&gt; defs, boolean isSuper, boolean isStaticCompactTable)
+    {
+        // For SuperColumn tables, re-create a compact value column
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (isSuper)</span>
+<span class="nc" id="L576">            return true;</span>
+
+        // For static compact tables, we need to upgrade if the regular definitions haven't been converted to static yet,
+        // i.e. if we don't have a static definition yet.
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (isStaticCompactTable)</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">            return !hasKind(defs, ColumnDefinition.Kind.STATIC);</span>
+
+        // For dense compact tables, we need to upgrade if we don't have a compact value definition
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        return !hasRegularColumns(defs);</span>
+    }
+
+    private static boolean hasRegularColumns(Iterable&lt;UntypedResultSet.Row&gt; columnRows)
+    {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        for (UntypedResultSet.Row row : columnRows)</span>
+        {
+            /*
+             * We need to special case and ignore the empty compact column (pre-3.0, COMPACT STORAGE, primary-key only tables),
+             * since deserializeKind() will otherwise just return a REGULAR.
+             * We want the proper EmptyType regular column to be added by addDefinitionForUpgrade(), so we need
+             * checkNeedsUpgrade() to return true in this case.
+             * See CASSANDRA-9874.
+             */
+<span class="nc bnc" id="L598" title="All 2 branches missed.">            if (isEmptyCompactValueColumn(row))</span>
+<span class="nc" id="L599">                return false;</span>
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">            if (deserializeKind(row.getString(&quot;type&quot;)) == ColumnDefinition.Kind.REGULAR)</span>
+<span class="nc" id="L602">                return true;</span>
+<span class="nc" id="L603">        }</span>
+
+<span class="nc" id="L605">        return false;</span>
+    }
+
+    private static boolean isEmptyCompactValueColumn(UntypedResultSet.Row row)
+    {
+<span class="nc bnc" id="L610" title="All 4 branches missed.">        return &quot;compact_value&quot;.equals(row.getString(&quot;type&quot;)) &amp;&amp; row.getString(&quot;column_name&quot;).isEmpty();</span>
+    }
+
+    private static void addDefinitionForUpgrade(List&lt;ColumnDefinition&gt; defs,
+                                                String ksName,
+                                                String cfName,
+                                                boolean isStaticCompactTable,
+                                                boolean isSuper,
+                                                AbstractType&lt;?&gt; rawComparator,
+                                                AbstractType&lt;?&gt; subComparator,
+                                                AbstractType&lt;?&gt; defaultValidator)
+    {
+<span class="nc" id="L622">        CompactTables.DefaultNames names = CompactTables.defaultNameGenerator(defs);</span>
+
+<span class="nc bnc" id="L624" title="All 2 branches missed.">        if (isSuper)</span>
+        {
+<span class="nc" id="L626">            defs.add(ColumnDefinition.regularDef(ksName, cfName, SuperColumnCompatibility.SUPER_COLUMN_MAP_COLUMN_STR, MapType.getInstance(subComparator, defaultValidator, true)));</span>
+        }
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        else if (isStaticCompactTable)</span>
+        {
+<span class="nc" id="L630">            defs.add(ColumnDefinition.clusteringDef(ksName, cfName, names.defaultClusteringName(), rawComparator, 0));</span>
+<span class="nc" id="L631">            defs.add(ColumnDefinition.regularDef(ksName, cfName, names.defaultCompactValueName(), defaultValidator));</span>
+        }
+        else
+        {
+            // For dense compact tables, we get here if we don't have a compact value column, in which case we should add it
+            // (we use EmptyType to recognize that the compact value was not declared by the use (see CreateTableStatement too))
+<span class="nc" id="L637">            defs.add(ColumnDefinition.regularDef(ksName, cfName, names.defaultCompactValueName(), EmptyType.instance));</span>
+        }
+<span class="nc" id="L639">    }</span>
+
+    private static boolean hasKind(Iterable&lt;UntypedResultSet.Row&gt; defs, ColumnDefinition.Kind kind)
+    {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        for (UntypedResultSet.Row row : defs)</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            if (deserializeKind(row.getString(&quot;type&quot;)) == kind)</span>
+<span class="nc" id="L645">                return true;</span>
+
+<span class="nc" id="L647">        return false;</span>
+    }
+
+    /*
+     * Prior to 3.0 we used to not store the type of the dropped columns, relying on all collection info being
+     * present in the comparator, forever. That allowed us to perform certain validations in AlterTableStatement
+     * (namely not allowing to re-add incompatible collection columns, with the same name, but a different type).
+     *
+     * In 3.0, we no longer preserve the original comparator, and reconstruct it from the columns instead. That means
+     * that we should preserve the type of the dropped columns now, and, during migration, fetch the types from
+     * the original comparator if necessary.
+     */
+    private static void addDroppedColumns(CFMetaData cfm, AbstractType&lt;?&gt; comparator, Map&lt;String, Long&gt; droppedTimes)
+    {
+<span class="nc" id="L661">        AbstractType&lt;?&gt; last = comparator.getComponents().get(comparator.componentsCount() - 1);</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        Map&lt;ByteBuffer, CollectionType&gt; collections = last instanceof ColumnToCollectionType</span>
+                                                    ? ((ColumnToCollectionType) last).defined
+<span class="nc" id="L664">                                                    : Collections.emptyMap();</span>
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        for (Map.Entry&lt;String, Long&gt; entry : droppedTimes.entrySet())</span>
+        {
+<span class="nc" id="L668">            String name = entry.getKey();</span>
+<span class="nc" id="L669">            ByteBuffer nameBytes = UTF8Type.instance.decompose(name);</span>
+<span class="nc" id="L670">            long time = entry.getValue();</span>
+
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            AbstractType&lt;?&gt; type = collections.containsKey(nameBytes)</span>
+<span class="nc" id="L673">                                 ? collections.get(nameBytes)</span>
+                                 : BytesType.instance;
+
+<span class="nc" id="L676">            cfm.getDroppedColumns().put(nameBytes, new CFMetaData.DroppedColumn(name, null, type, time));</span>
+<span class="nc" id="L677">        }</span>
+<span class="nc" id="L678">    }</span>
+
+    private static List&lt;ColumnDefinition&gt; createColumnsFromColumnRows(Iterable&lt;UntypedResultSet.Row&gt; rows,
+                                                                      String keyspace,
+                                                                      String table,
+                                                                      AbstractType&lt;?&gt; rawComparator,
+                                                                      AbstractType&lt;?&gt; rawSubComparator,
+                                                                      boolean isSuper,
+                                                                      boolean isCQLTable,
+                                                                      boolean isStaticCompactTable,
+                                                                      boolean needsUpgrade)
+    {
+<span class="nc" id="L690">        List&lt;ColumnDefinition&gt; columns = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        for (UntypedResultSet.Row row : rows)</span>
+        {
+            // Skip the empty compact value column. Make addDefinitionForUpgrade() re-add the proper REGULAR one.
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            if (isEmptyCompactValueColumn(row))</span>
+<span class="nc" id="L696">                continue;</span>
+
+<span class="nc" id="L698">            columns.add(createColumnFromColumnRow(row,</span>
+                                                  keyspace,
+                                                  table,
+                                                  rawComparator,
+                                                  rawSubComparator,
+                                                  isSuper,
+                                                  isCQLTable,
+                                                  isStaticCompactTable,
+                                                  needsUpgrade));
+<span class="nc" id="L707">        }</span>
+
+<span class="nc" id="L709">        return columns;</span>
+    }
+
+    private static ColumnDefinition createColumnFromColumnRow(UntypedResultSet.Row row,
+                                                              String keyspace,
+                                                              String table,
+                                                              AbstractType&lt;?&gt; rawComparator,
+                                                              AbstractType&lt;?&gt; rawSubComparator,
+                                                              boolean isSuper,
+                                                              boolean isCQLTable,
+                                                              boolean isStaticCompactTable,
+                                                              boolean needsUpgrade)
+    {
+<span class="nc" id="L722">        String rawKind = row.getString(&quot;type&quot;);</span>
+
+<span class="nc" id="L724">        ColumnDefinition.Kind kind = deserializeKind(rawKind);</span>
+<span class="nc bnc" id="L725" title="All 6 branches missed.">        if (needsUpgrade &amp;&amp; isStaticCompactTable &amp;&amp; kind == ColumnDefinition.Kind.REGULAR)</span>
+<span class="nc" id="L726">            kind = ColumnDefinition.Kind.STATIC;</span>
+
+<span class="nc" id="L728">        int componentIndex = ColumnDefinition.NO_POSITION;</span>
+        // Note that the component_index is not useful for non-primary key parts (it never really in fact since there is
+        // no particular ordering of non-PK columns, we only used to use it as a simplification but that's not needed
+        // anymore)
+<span class="nc bnc" id="L732" title="All 2 branches missed.">        if (kind.isPrimaryKeyKind())</span>
+            // We use to not have a component index when there was a single partition key, we don't anymore (#10491)
+<span class="nc bnc" id="L734" title="All 2 branches missed.">            componentIndex = row.has(&quot;component_index&quot;) ? row.getInt(&quot;component_index&quot;) : 0;</span>
+
+        // Note: we save the column name as string, but we should not assume that it is an UTF8 name, we
+        // we need to use the comparator fromString method
+<span class="nc bnc" id="L738" title="All 2 branches missed.">        AbstractType&lt;?&gt; comparator = isCQLTable</span>
+                                     ? UTF8Type.instance
+<span class="nc" id="L740">                                     : CompactTables.columnDefinitionComparator(rawKind, isSuper, rawComparator, rawSubComparator);</span>
+<span class="nc" id="L741">        ColumnIdentifier name = ColumnIdentifier.getInterned(comparator.fromString(row.getString(&quot;column_name&quot;)), comparator);</span>
+
+<span class="nc" id="L743">        AbstractType&lt;?&gt; validator = parseType(row.getString(&quot;validator&quot;));</span>
+
+        // In the 2.x schema we didn't store UDT's with a FrozenType wrapper because they were implicitly frozen.  After
+        // CASSANDRA-7423 (non-frozen UDTs), this is no longer true, so we need to freeze UDTs and nested freezable
+        // types (UDTs and collections) to properly migrate the schema.  See CASSANDRA-11609 and CASSANDRA-11613.
+<span class="nc bnc" id="L748" title="All 4 branches missed.">        if (validator.isUDT() &amp;&amp; validator.isMultiCell())</span>
+<span class="nc" id="L749">            validator = validator.freeze();</span>
+        else
+<span class="nc" id="L751">            validator = validator.freezeNestedMulticellTypes();</span>
+
+<span class="nc" id="L753">        return new ColumnDefinition(keyspace, table, name, validator, componentIndex, kind);</span>
+    }
+
+    private static Indexes createIndexesFromColumnRows(CFMetaData cfm,
+                                                       Iterable&lt;UntypedResultSet.Row&gt; rows,
+                                                       String keyspace,
+                                                       String table,
+                                                       AbstractType&lt;?&gt; rawComparator,
+                                                       AbstractType&lt;?&gt; rawSubComparator,
+                                                       boolean isSuper,
+                                                       boolean isCQLTable,
+                                                       boolean isStaticCompactTable,
+                                                       boolean needsUpgrade)
+    {
+<span class="nc" id="L767">        Indexes.Builder indexes = Indexes.builder();</span>
+
+<span class="nc bnc" id="L769" title="All 2 branches missed.">        for (UntypedResultSet.Row row : rows)</span>
+        {
+<span class="nc" id="L771">            IndexMetadata.Kind kind = null;</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">            if (row.has(&quot;index_type&quot;))</span>
+<span class="nc" id="L773">                kind = IndexMetadata.Kind.valueOf(row.getString(&quot;index_type&quot;));</span>
+
+<span class="nc bnc" id="L775" title="All 2 branches missed.">            if (kind == null)</span>
+<span class="nc" id="L776">                continue;</span>
+
+<span class="nc" id="L778">            Map&lt;String, String&gt; indexOptions = null;</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">            if (row.has(&quot;index_options&quot;))</span>
+<span class="nc" id="L780">                indexOptions = fromJsonMap(row.getString(&quot;index_options&quot;));</span>
+
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            if (row.has(&quot;index_name&quot;))</span>
+            {
+<span class="nc" id="L784">                String indexName = row.getString(&quot;index_name&quot;);</span>
+
+<span class="nc" id="L786">                ColumnDefinition column = createColumnFromColumnRow(row,</span>
+                                                                    keyspace,
+                                                                    table,
+                                                                    rawComparator,
+                                                                    rawSubComparator,
+                                                                    isSuper,
+                                                                    isCQLTable,
+                                                                    isStaticCompactTable,
+                                                                    needsUpgrade);
+
+<span class="nc" id="L796">                indexes.add(IndexMetadata.fromLegacyMetadata(cfm, column, indexName, kind, indexOptions));</span>
+<span class="nc" id="L797">            }</span>
+            else
+            {
+<span class="nc" id="L800">                logger.error(&quot;Failed to find index name for legacy migration of index on {}.{}&quot;, keyspace, table);</span>
+            }
+<span class="nc" id="L802">        }</span>
+
+<span class="nc" id="L804">        return indexes.build();</span>
+    }
+
+    private static ColumnDefinition.Kind deserializeKind(String kind)
+    {
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        if (&quot;clustering_key&quot;.equalsIgnoreCase(kind))</span>
+<span class="nc" id="L810">            return ColumnDefinition.Kind.CLUSTERING;</span>
+
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (&quot;compact_value&quot;.equalsIgnoreCase(kind))</span>
+<span class="nc" id="L813">            return ColumnDefinition.Kind.REGULAR;</span>
+
+<span class="nc" id="L815">        return Enum.valueOf(ColumnDefinition.Kind.class, kind.toUpperCase());</span>
+    }
+
+    private static Triggers createTriggersFromTriggerRows(UntypedResultSet rows)
+    {
+<span class="nc" id="L820">        Triggers.Builder triggers = org.apache.cassandra.schema.Triggers.builder();</span>
+<span class="nc" id="L821">        rows.forEach(row -&gt; triggers.add(createTriggerFromTriggerRow(row)));</span>
+<span class="nc" id="L822">        return triggers.build();</span>
+    }
+
+    private static TriggerMetadata createTriggerFromTriggerRow(UntypedResultSet.Row row)
+    {
+<span class="nc" id="L827">        String name = row.getString(&quot;trigger_name&quot;);</span>
+<span class="nc" id="L828">        String classOption = row.getTextMap(&quot;trigger_options&quot;).get(&quot;class&quot;);</span>
+<span class="nc" id="L829">        return new TriggerMetadata(name, classOption);</span>
+    }
+
+    /*
+     * Reading user types
+     */
+
+    private static Collection&lt;Type&gt; readTypes(String keyspaceName)
+    {
+<span class="nc" id="L838">        String query = format(&quot;SELECT type_name FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_USERTYPES);
+<span class="nc" id="L841">        Collection&lt;String&gt; typeNames = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L842">        query(query, keyspaceName).forEach(row -&gt; typeNames.add(row.getString(&quot;type_name&quot;)));</span>
+
+<span class="nc" id="L844">        Collection&lt;Type&gt; types = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L845">        typeNames.forEach(name -&gt; types.add(readType(keyspaceName, name)));</span>
+<span class="nc" id="L846">        return types;</span>
+    }
+
+    private static Type readType(String keyspaceName, String typeName)
+    {
+<span class="nc" id="L851">        long timestamp = readTypeTimestamp(keyspaceName, typeName);</span>
+<span class="nc" id="L852">        UserType metadata = readTypeMetadata(keyspaceName, typeName);</span>
+<span class="nc" id="L853">        return new Type(timestamp, metadata);</span>
+    }
+
+    /*
+     * Unfortunately there is not a single REGULAR column in system.schema_usertypes, so annoyingly we cannot
+     * use the writeTime() CQL function, and must resort to a lower level.
+     */
+    private static long readTypeTimestamp(String keyspaceName, String typeName)
+    {
+<span class="nc" id="L862">        ColumnFamilyStore store = org.apache.cassandra.db.Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME)</span>
+<span class="nc" id="L863">                                                                  .getColumnFamilyStore(SystemKeyspace.LEGACY_USERTYPES);</span>
+
+<span class="nc" id="L865">        ClusteringComparator comparator = store.metadata.comparator;</span>
+<span class="nc" id="L866">        Slices slices = Slices.with(comparator, Slice.make(comparator, typeName));</span>
+<span class="nc" id="L867">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L868">        DecoratedKey key = store.metadata.decorateKey(AsciiType.instance.fromString(keyspaceName));</span>
+<span class="nc" id="L869">        SinglePartitionReadCommand command = SinglePartitionReadCommand.create(store.metadata, nowInSec, key, slices);</span>
+
+<span class="nc" id="L871">        try (ReadExecutionController controller = command.executionController();</span>
+<span class="nc" id="L872">             RowIterator partition = UnfilteredRowIterators.filter(command.queryMemtableAndDisk(store, controller), nowInSec))</span>
+        {
+<span class="nc" id="L874">            return partition.next().primaryKeyLivenessInfo().timestamp();</span>
+        }
+    }
+
+    private static UserType readTypeMetadata(String keyspaceName, String typeName)
+    {
+<span class="nc" id="L880">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND type_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_USERTYPES);
+<span class="nc" id="L883">        UntypedResultSet.Row row = query(query, keyspaceName, typeName).one();</span>
+
+<span class="nc" id="L885">        List&lt;FieldIdentifier&gt; names =</span>
+<span class="nc" id="L886">            row.getList(&quot;field_names&quot;, UTF8Type.instance)</span>
+<span class="nc" id="L887">               .stream()</span>
+<span class="nc" id="L888">               .map(t -&gt; FieldIdentifier.forInternalString(t))</span>
+<span class="nc" id="L889">               .collect(Collectors.toList());</span>
+
+<span class="nc" id="L891">        List&lt;AbstractType&lt;?&gt;&gt; types =</span>
+<span class="nc" id="L892">            row.getList(&quot;field_types&quot;, UTF8Type.instance)</span>
+<span class="nc" id="L893">               .stream()</span>
+<span class="nc" id="L894">               .map(LegacySchemaMigrator::parseType)</span>
+<span class="nc" id="L895">               .collect(Collectors.toList());</span>
+
+<span class="nc" id="L897">        return new UserType(keyspaceName, bytes(typeName), names, types, true);</span>
+    }
+
+    /*
+     * Reading UDFs
+     */
+
+    private static Collection&lt;Function&gt; readFunctions(String keyspaceName)
+    {
+<span class="nc" id="L906">        String query = format(&quot;SELECT function_name, signature FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_FUNCTIONS);
+<span class="nc" id="L909">        HashMultimap&lt;String, List&lt;String&gt;&gt; functionSignatures = HashMultimap.create();</span>
+<span class="nc" id="L910">        query(query, keyspaceName).forEach(row -&gt; functionSignatures.put(row.getString(&quot;function_name&quot;), row.getList(&quot;signature&quot;, UTF8Type.instance)));</span>
+
+<span class="nc" id="L912">        Collection&lt;Function&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L913">        functionSignatures.entries().forEach(pair -&gt; functions.add(readFunction(keyspaceName, pair.getKey(), pair.getValue())));</span>
+<span class="nc" id="L914">        return functions;</span>
+    }
+
+    private static Function readFunction(String keyspaceName, String functionName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L919">        long timestamp = readFunctionTimestamp(keyspaceName, functionName, signature);</span>
+<span class="nc" id="L920">        UDFunction metadata = readFunctionMetadata(keyspaceName, functionName, signature);</span>
+<span class="nc" id="L921">        return new Function(timestamp, metadata);</span>
+    }
+
+    private static long readFunctionTimestamp(String keyspaceName, String functionName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L926">        String query = format(&quot;SELECT writeTime(return_type) AS timestamp &quot; +</span>
+                              &quot;FROM %s.%s &quot; +
+                              &quot;WHERE keyspace_name = ? AND function_name = ? AND signature = ?&quot;,
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_FUNCTIONS);
+<span class="nc" id="L931">        return query(query, keyspaceName, functionName, signature).one().getLong(&quot;timestamp&quot;);</span>
+    }
+
+    private static UDFunction readFunctionMetadata(String keyspaceName, String functionName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L936">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND function_name = ? AND signature = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_FUNCTIONS);
+<span class="nc" id="L939">        UntypedResultSet.Row row = query(query, keyspaceName, functionName, signature).one();</span>
+
+<span class="nc" id="L941">        FunctionName name = new FunctionName(keyspaceName, functionName);</span>
+
+<span class="nc" id="L943">        List&lt;ColumnIdentifier&gt; argNames = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">        if (row.has(&quot;argument_names&quot;))</span>
+<span class="nc bnc" id="L945" title="All 2 branches missed.">            for (String arg : row.getList(&quot;argument_names&quot;, UTF8Type.instance))</span>
+<span class="nc" id="L946">                argNames.add(new ColumnIdentifier(arg, true));</span>
+
+<span class="nc" id="L948">        List&lt;AbstractType&lt;?&gt;&gt; argTypes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">        if (row.has(&quot;argument_types&quot;))</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">            for (String type : row.getList(&quot;argument_types&quot;, UTF8Type.instance))</span>
+<span class="nc" id="L951">                argTypes.add(parseType(type));</span>
+
+<span class="nc" id="L953">        AbstractType&lt;?&gt; returnType = parseType(row.getString(&quot;return_type&quot;));</span>
+
+<span class="nc" id="L955">        String language = row.getString(&quot;language&quot;);</span>
+<span class="nc" id="L956">        String body = row.getString(&quot;body&quot;);</span>
+<span class="nc" id="L957">        boolean calledOnNullInput = row.getBoolean(&quot;called_on_null_input&quot;);</span>
+
+        try
+        {
+<span class="nc" id="L961">            return UDFunction.create(name, argNames, argTypes, returnType, calledOnNullInput, language, body);</span>
+        }
+<span class="nc" id="L963">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L965">            return UDFunction.createBrokenFunction(name, argNames, argTypes, returnType, calledOnNullInput, language, body, e);</span>
+        }
+    }
+
+    /*
+     * Reading UDAs
+     */
+
+    private static Collection&lt;Aggregate&gt; readAggregates(Functions functions, String keyspaceName)
+    {
+<span class="nc" id="L975">        String query = format(&quot;SELECT aggregate_name, signature FROM %s.%s WHERE keyspace_name = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_AGGREGATES);
+<span class="nc" id="L978">        HashMultimap&lt;String, List&lt;String&gt;&gt; aggregateSignatures = HashMultimap.create();</span>
+<span class="nc" id="L979">        query(query, keyspaceName).forEach(row -&gt; aggregateSignatures.put(row.getString(&quot;aggregate_name&quot;), row.getList(&quot;signature&quot;, UTF8Type.instance)));</span>
+
+<span class="nc" id="L981">        Collection&lt;Aggregate&gt; aggregates = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L982">        aggregateSignatures.entries().forEach(pair -&gt; aggregates.add(readAggregate(functions, keyspaceName, pair.getKey(), pair.getValue())));</span>
+<span class="nc" id="L983">        return aggregates;</span>
+    }
+
+    private static Aggregate readAggregate(Functions functions, String keyspaceName, String aggregateName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L988">        long timestamp = readAggregateTimestamp(keyspaceName, aggregateName, signature);</span>
+<span class="nc" id="L989">        UDAggregate metadata = readAggregateMetadata(functions, keyspaceName, aggregateName, signature);</span>
+<span class="nc" id="L990">        return new Aggregate(timestamp, metadata);</span>
+    }
+
+    private static long readAggregateTimestamp(String keyspaceName, String aggregateName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L995">        String query = format(&quot;SELECT writeTime(return_type) AS timestamp &quot; +</span>
+                              &quot;FROM %s.%s &quot; +
+                              &quot;WHERE keyspace_name = ? AND aggregate_name = ? AND signature = ?&quot;,
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_AGGREGATES);
+<span class="nc" id="L1000">        return query(query, keyspaceName, aggregateName, signature).one().getLong(&quot;timestamp&quot;);</span>
+    }
+
+    private static UDAggregate readAggregateMetadata(Functions functions, String keyspaceName, String functionName, List&lt;String&gt; signature)
+    {
+<span class="nc" id="L1005">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND aggregate_name = ? AND signature = ?&quot;,</span>
+                              SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                              SystemKeyspace.LEGACY_AGGREGATES);
+<span class="nc" id="L1008">        UntypedResultSet.Row row = query(query, keyspaceName, functionName, signature).one();</span>
+
+<span class="nc" id="L1010">        FunctionName name = new FunctionName(keyspaceName, functionName);</span>
+
+<span class="nc" id="L1012">        List&lt;String&gt; types = row.getList(&quot;argument_types&quot;, UTF8Type.instance);</span>
+
+<span class="nc" id="L1014">        List&lt;AbstractType&lt;?&gt;&gt; argTypes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">        if (types != null)</span>
+        {
+<span class="nc" id="L1017">            argTypes = new ArrayList&lt;&gt;(types.size());</span>
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">            for (String type : types)</span>
+<span class="nc" id="L1019">                argTypes.add(parseType(type));</span>
+        }
+
+<span class="nc" id="L1022">        AbstractType&lt;?&gt; returnType = parseType(row.getString(&quot;return_type&quot;));</span>
+
+<span class="nc" id="L1024">        FunctionName stateFunc = new FunctionName(keyspaceName, row.getString(&quot;state_func&quot;));</span>
+<span class="nc" id="L1025">        AbstractType&lt;?&gt; stateType = parseType(row.getString(&quot;state_type&quot;));</span>
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">        FunctionName finalFunc = row.has(&quot;final_func&quot;) ? new FunctionName(keyspaceName, row.getString(&quot;final_func&quot;)) : null;</span>
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">        ByteBuffer initcond = row.has(&quot;initcond&quot;) ? row.getBytes(&quot;initcond&quot;) : null;</span>
+
+        try
+        {
+<span class="nc" id="L1031">            return UDAggregate.create(functions, name, argTypes, returnType, stateFunc, finalFunc, stateType, initcond);</span>
+        }
+<span class="nc" id="L1033">        catch (InvalidRequestException reason)</span>
+        {
+<span class="nc" id="L1035">            return UDAggregate.createBroken(name, argTypes, returnType, initcond, reason);</span>
+        }
+    }
+
+    private static UntypedResultSet query(String query, Object... values)
+    {
+<span class="fc" id="L1041">        return QueryProcessor.executeOnceInternal(query, values);</span>
+    }
+
+    private static AbstractType&lt;?&gt; parseType(String str)
+    {
+<span class="nc" id="L1046">        return TypeParser.parse(str);</span>
+    }
+
+    private static final class Keyspace
+    {
+        final long timestamp;
+        final String name;
+        final KeyspaceParams params;
+        final Collection&lt;Table&gt; tables;
+        final Collection&lt;Type&gt; types;
+        final Collection&lt;Function&gt; functions;
+        final Collection&lt;Aggregate&gt; aggregates;
+
+        Keyspace(long timestamp,
+                 String name,
+                 KeyspaceParams params,
+                 Collection&lt;Table&gt; tables,
+                 Collection&lt;Type&gt; types,
+                 Collection&lt;Function&gt; functions,
+                 Collection&lt;Aggregate&gt; aggregates)
+<span class="nc" id="L1066">        {</span>
+<span class="nc" id="L1067">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1068">            this.name = name;</span>
+<span class="nc" id="L1069">            this.params = params;</span>
+<span class="nc" id="L1070">            this.tables = tables;</span>
+<span class="nc" id="L1071">            this.types = types;</span>
+<span class="nc" id="L1072">            this.functions = functions;</span>
+<span class="nc" id="L1073">            this.aggregates = aggregates;</span>
+<span class="nc" id="L1074">        }</span>
+    }
+
+    private static final class Table
+    {
+        final long timestamp;
+        final CFMetaData metadata;
+
+        Table(long timestamp, CFMetaData metadata)
+<span class="nc" id="L1083">        {</span>
+<span class="nc" id="L1084">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1085">            this.metadata = metadata;</span>
+<span class="nc" id="L1086">        }</span>
+    }
+
+    private static final class Type
+    {
+        final long timestamp;
+        final UserType metadata;
+
+        Type(long timestamp, UserType metadata)
+<span class="nc" id="L1095">        {</span>
+<span class="nc" id="L1096">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1097">            this.metadata = metadata;</span>
+<span class="nc" id="L1098">        }</span>
+    }
+
+    private static final class Function
+    {
+        final long timestamp;
+        final UDFunction metadata;
+
+        Function(long timestamp, UDFunction metadata)
+<span class="nc" id="L1107">        {</span>
+<span class="nc" id="L1108">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1109">            this.metadata = metadata;</span>
+<span class="nc" id="L1110">        }</span>
+    }
+
+    private static final class Aggregate
+    {
+        final long timestamp;
+        final UDAggregate metadata;
+
+        Aggregate(long timestamp, UDAggregate metadata)
+<span class="nc" id="L1119">        {</span>
+<span class="nc" id="L1120">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1121">            this.metadata = metadata;</span>
+<span class="nc" id="L1122">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

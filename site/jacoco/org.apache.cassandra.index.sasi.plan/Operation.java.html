@@ -1,0 +1,506 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Operation.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.plan</a> &gt; <span class="el_source">Operation.java</span></div><h1>Operation.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.plan;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.ColumnDefinition.Kind;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sasi.disk.Token;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.utils.RangeIntersectionIterator;
+import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+import org.apache.cassandra.utils.FBUtilities;
+
+@SuppressWarnings(&quot;resource&quot;)
+public class Operation extends RangeIterator&lt;Long, Token&gt;
+{
+<span class="nc" id="L45">    public enum OperationType</span>
+    {
+<span class="nc" id="L47">        AND, OR;</span>
+
+        public boolean apply(boolean a, boolean b)
+        {
+<span class="nc bnc" id="L51" title="All 3 branches missed.">            switch (this)</span>
+            {
+                case OR:
+<span class="nc" id="L54">                    return a | b;</span>
+
+                case AND:
+<span class="nc" id="L57">                    return a &amp; b;</span>
+
+                default:
+<span class="nc" id="L60">                    throw new AssertionError();</span>
+            }
+        }
+    }
+
+    private final QueryController controller;
+
+    protected final OperationType op;
+    protected final ListMultimap&lt;ColumnDefinition, Expression&gt; expressions;
+    protected final RangeIterator&lt;Long, Token&gt; range;
+
+    protected Operation left, right;
+
+    private Operation(OperationType operation,
+                      QueryController controller,
+                      ListMultimap&lt;ColumnDefinition, Expression&gt; expressions,
+                      RangeIterator&lt;Long, Token&gt; range,
+                      Operation left, Operation right)
+    {
+<span class="nc" id="L79">        super(range);</span>
+
+<span class="nc" id="L81">        this.op = operation;</span>
+<span class="nc" id="L82">        this.controller = controller;</span>
+<span class="nc" id="L83">        this.expressions = expressions;</span>
+<span class="nc" id="L84">        this.range = range;</span>
+
+<span class="nc" id="L86">        this.left = left;</span>
+<span class="nc" id="L87">        this.right = right;</span>
+<span class="nc" id="L88">    }</span>
+
+    /**
+     * Recursive &quot;satisfies&quot; checks based on operation
+     * and data from the lower level members using depth-first search
+     * and bubbling the results back to the top level caller.
+     *
+     * Most of the work here is done by {@link #localSatisfiedBy(Unfiltered, Row, boolean)}
+     * see it's comment for details, if there are no local expressions
+     * assigned to Operation it will call satisfiedBy(Row) on it's children.
+     *
+     * Query: first_name = X AND (last_name = Y OR address = XYZ AND street = IL AND city = C) OR (state = 'CA' AND country = 'US')
+     * Row: key1: (first_name: X, last_name: Z, address: XYZ, street: IL, city: C, state: NY, country:US)
+     *
+     * #1                       OR
+     *                        /    \
+     * #2       (first_name) AND   AND (state, country)
+     *                          \
+     * #3            (last_name) OR
+     *                             \
+     * #4                          AND (address, street, city)
+     *
+     *
+     * Evaluation of the key1 is top-down depth-first search:
+     *
+     * --- going down ---
+     * Level #1 is evaluated, OR expression has to pull results from it's children which are at level #2 and OR them together,
+     * Level #2 AND (state, country) could be be evaluated right away, AND (first_name) refers to it's &quot;right&quot; child from level #3
+     * Level #3 OR (last_name) requests results from level #4
+     * Level #4 AND (address, street, city) does logical AND between it's 3 fields, returns result back to level #3.
+     * --- bubbling up ---
+     * Level #3 computes OR between AND (address, street, city) result and it's &quot;last_name&quot; expression
+     * Level #2 computes AND between &quot;first_name&quot; and result of level #3, AND (state, country) which is already computed
+     * Level #1 does OR between results of AND (first_name) and AND (state, country) and returns final result.
+     *
+     * @param currentCluster The row cluster to check.
+     * @param staticRow The static row associated with current cluster.
+     * @param allowMissingColumns allow columns value to be null.
+     * @return true if give Row satisfied all of the expressions in the tree,
+     *         false otherwise.
+     */
+    public boolean satisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+    {
+        boolean sideL, sideR;
+
+<span class="nc bnc" id="L133" title="All 4 branches missed.">        if (expressions == null || expressions.isEmpty())</span>
+        {
+<span class="nc bnc" id="L135" title="All 4 branches missed.">            sideL =  left != null &amp;&amp;  left.satisfiedBy(currentCluster, staticRow, allowMissingColumns);</span>
+<span class="nc bnc" id="L136" title="All 4 branches missed.">            sideR = right != null &amp;&amp; right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);</span>
+
+            // one of the expressions was skipped
+            // because it had no indexes attached
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (left == null)</span>
+<span class="nc" id="L141">                return sideR;</span>
+        }
+        else
+        {
+<span class="nc" id="L145">            sideL = localSatisfiedBy(currentCluster, staticRow, allowMissingColumns);</span>
+
+            // if there is no right it means that this expression
+            // is last in the sequence, we can just return result from local expressions
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (right == null)</span>
+<span class="nc" id="L150">                return sideL;</span>
+
+<span class="nc" id="L152">            sideR = right.satisfiedBy(currentCluster, staticRow, allowMissingColumns);</span>
+        }
+
+
+<span class="nc" id="L156">        return op.apply(sideL, sideR);</span>
+    }
+
+    /**
+     * Check every expression in the analyzed list to figure out if the
+     * columns in the give row match all of the based on the operation
+     * set to the current operation node.
+     *
+     * The algorithm is as follows: for every given expression from analyzed
+     * list get corresponding column from the Row:
+     *   - apply {@link Expression#isSatisfiedBy(ByteBuffer)}
+     *     method to figure out if it's satisfied;
+     *   - apply logical operation between boolean accumulator and current boolean result;
+     *   - if result == false and node's operation is AND return right away;
+     *
+     * After all of the expressions have been evaluated return resulting accumulator variable.
+     *
+     * Example:
+     *
+     * Operation = (op: AND, columns: [first_name = p, 5 &lt; age &lt; 7, last_name: y])
+     * Row = (first_name: pavel, last_name: y, age: 6, timestamp: 15)
+     *
+     * #1 get &quot;first_name&quot; = p (expressions)
+     *      - row-get &quot;first_name&quot;                      =&gt; &quot;pavel&quot;
+     *      - compare &quot;pavel&quot; against &quot;p&quot;               =&gt; true (current)
+     *      - set accumulator current                   =&gt; true (because this is expression #1)
+     *
+     * #2 get &quot;last_name&quot; = y (expressions)
+     *      - row-get &quot;last_name&quot;                       =&gt; &quot;y&quot;
+     *      - compare &quot;y&quot; against &quot;y&quot;                   =&gt; true (current)
+     *      - set accumulator to accumulator &amp; current  =&gt; true
+     *
+     * #3 get 5 &lt; &quot;age&quot; &lt; 7 (expressions)
+     *      - row-get &quot;age&quot;                             =&gt; &quot;6&quot;
+     *      - compare 5 &lt; 6 &lt; 7                         =&gt; true (current)
+     *      - set accumulator to accumulator &amp; current  =&gt; true
+     *
+     * #4 return accumulator =&gt; true (row satisfied all of the conditions)
+     *
+     * @param currentCluster The row cluster to check.
+     * @param staticRow The static row associated with current cluster.
+     * @param allowMissingColumns allow columns value to be null.
+     * @return true if give Row satisfied all of the analyzed expressions,
+     *         false otherwise.
+     */
+    private boolean localSatisfiedBy(Unfiltered currentCluster, Row staticRow, boolean allowMissingColumns)
+    {
+<span class="nc bnc" id="L203" title="All 4 branches missed.">        if (currentCluster == null || !currentCluster.isRow())</span>
+<span class="nc" id="L204">            return false;</span>
+
+<span class="nc" id="L206">        final int now = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L207">        boolean result = false;</span>
+<span class="nc" id="L208">        int idx = 0;</span>
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        for (ColumnDefinition column : expressions.keySet())</span>
+        {
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (column.kind == Kind.PARTITION_KEY)</span>
+<span class="nc" id="L213">                continue;</span>
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            ByteBuffer value = ColumnIndex.getValueOf(column, column.kind == Kind.STATIC ? staticRow : (Row) currentCluster, now);</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            boolean isMissingColumn = value == null;</span>
+
+<span class="nc bnc" id="L218" title="All 4 branches missed.">            if (!allowMissingColumns &amp;&amp; isMissingColumn)</span>
+<span class="nc" id="L219">                throw new IllegalStateException(&quot;All indexed columns should be included into the column slice, missing: &quot; + column);</span>
+
+<span class="nc" id="L221">            boolean isMatch = false;</span>
+            // If there is a column with multiple expressions that effectively means an OR
+            // e.g. comment = 'x y z' could be split into 'comment' EQ 'x', 'comment' EQ 'y', 'comment' EQ 'z'
+            // by analyzer, in situation like that we only need to check if at least one of expressions matches,
+            // and there is no hit on the NOT_EQ (if any) which are always at the end of the filter list.
+            // Loop always starts from the end of the list, which makes it possible to break after the last
+            // NOT_EQ condition on first EQ/RANGE condition satisfied, instead of checking every
+            // single expression in the column filter list.
+<span class="nc" id="L229">            List&lt;Expression&gt; filters = expressions.get(column);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            for (int i = filters.size() - 1; i &gt;= 0; i--)</span>
+            {
+<span class="nc" id="L232">                Expression expression = filters.get(i);</span>
+<span class="nc bnc" id="L233" title="All 4 branches missed.">                isMatch = !isMissingColumn &amp;&amp; expression.isSatisfiedBy(value);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                if (expression.getOp() == Op.NOT_EQ)</span>
+                {
+                    // since this is NOT_EQ operation we have to
+                    // inverse match flag (to check against other expressions),
+                    // and break in case of negative inverse because that means
+                    // that it's a positive hit on the not-eq clause.
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                    isMatch = !isMatch;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                    if (!isMatch)</span>
+<span class="nc" id="L242">                        break;</span>
+                } // if it was a match on EQ/RANGE or column is missing
+<span class="nc bnc" id="L244" title="All 4 branches missed.">                else if (isMatch || isMissingColumn)</span>
+<span class="nc" id="L245">                    break;</span>
+            }
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">            if (idx++ == 0)</span>
+            {
+<span class="nc" id="L250">                result = isMatch;</span>
+<span class="nc" id="L251">                continue;</span>
+            }
+
+<span class="nc" id="L254">            result = op.apply(result, isMatch);</span>
+
+            // exit early because we already got a single false
+<span class="nc bnc" id="L257" title="All 4 branches missed.">            if (op == OperationType.AND &amp;&amp; !result)</span>
+<span class="nc" id="L258">                return false;</span>
+<span class="nc" id="L259">        }</span>
+
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        return idx == 0 || result;</span>
+    }
+
+    @VisibleForTesting
+    protected static ListMultimap&lt;ColumnDefinition, Expression&gt; analyzeGroup(QueryController controller,
+                                                                             OperationType op,
+                                                                             List&lt;RowFilter.Expression&gt; expressions)
+    {
+<span class="nc" id="L269">        ListMultimap&lt;ColumnDefinition, Expression&gt; analyzed = ArrayListMultimap.create();</span>
+
+        // sort all of the expressions in the operation by name and priority of the logical operator
+        // this gives us an efficient way to handle inequality and combining into ranges without extra processing
+        // and converting expressions from one type to another.
+<span class="nc" id="L274">        Collections.sort(expressions, (a, b) -&gt; {</span>
+<span class="nc" id="L275">            int cmp = a.column().compareTo(b.column());</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">            return cmp == 0 ? -Integer.compare(getPriority(a.operator()), getPriority(b.operator())) : cmp;</span>
+        });
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        for (final RowFilter.Expression e : expressions)</span>
+        {
+<span class="nc" id="L281">            ColumnIndex columnIndex = controller.getIndex(e);</span>
+<span class="nc" id="L282">            List&lt;Expression&gt; perColumn = analyzed.get(e.column());</span>
+
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (columnIndex == null)</span>
+<span class="nc" id="L285">                columnIndex = new ColumnIndex(controller.getKeyValidator(), e.column(), null);</span>
+
+<span class="nc" id="L287">            AbstractAnalyzer analyzer = columnIndex.getAnalyzer();</span>
+<span class="nc" id="L288">            analyzer.reset(e.getIndexValue().duplicate());</span>
+
+            // EQ/LIKE_*/NOT_EQ can have multiple expressions e.g. text = &quot;Hello World&quot;,
+            // becomes text = &quot;Hello&quot; OR text = &quot;World&quot; because &quot;space&quot; is always interpreted as a split point (by analyzer),
+            // NOT_EQ is made an independent expression only in case of pre-existing multiple EQ expressions, or
+            // if there is no EQ operations and NOT_EQ is met or a single NOT_EQ expression present,
+            // in such case we know exactly that there would be no more EQ/RANGE expressions for given column
+            // since NOT_EQ has the lowest priority.
+<span class="nc" id="L296">            boolean isMultiExpression = false;</span>
+<span class="nc bnc" id="L297" title="All 4 branches missed.">            switch (e.operator())</span>
+            {
+                case EQ:
+<span class="nc" id="L300">                    isMultiExpression = false;</span>
+<span class="nc" id="L301">                    break;</span>
+
+                case LIKE_PREFIX:
+                case LIKE_SUFFIX:
+                case LIKE_CONTAINS:
+                case LIKE_MATCHES:
+<span class="nc" id="L307">                    isMultiExpression = true;</span>
+<span class="nc" id="L308">                    break;</span>
+
+                case NEQ:
+<span class="nc bnc" id="L311" title="All 4 branches missed.">                    isMultiExpression = (perColumn.size() == 0 || perColumn.size() &gt; 1</span>
+<span class="nc bnc" id="L312" title="All 4 branches missed.">                                     || (perColumn.size() == 1 &amp;&amp; perColumn.get(0).getOp() == Op.NOT_EQ));</span>
+                    break;
+            }
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (isMultiExpression)</span>
+            {
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                while (analyzer.hasNext())</span>
+                {
+<span class="nc" id="L320">                    final ByteBuffer token = analyzer.next();</span>
+<span class="nc" id="L321">                    perColumn.add(new Expression(controller, columnIndex).add(e.operator(), token));</span>
+<span class="nc" id="L322">                }</span>
+            }
+            else
+            // &quot;range&quot; or not-equals operator, combines both bounds together into the single expression,
+            // iff operation of the group is AND, otherwise we are forced to create separate expressions,
+            // not-equals is combined with the range iff operator is AND.
+            {
+                Expression range;
+<span class="nc bnc" id="L330" title="All 4 branches missed.">                if (perColumn.size() == 0 || op != OperationType.AND)</span>
+<span class="nc" id="L331">                    perColumn.add((range = new Expression(controller, columnIndex)));</span>
+                else
+<span class="nc" id="L333">                    range = Iterables.getLast(perColumn);</span>
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">                while (analyzer.hasNext())</span>
+<span class="nc" id="L336">                    range.add(e.operator(), analyzer.next());</span>
+            }
+<span class="nc" id="L338">        }</span>
+
+<span class="nc" id="L340">        return analyzed;</span>
+    }
+
+    private static int getPriority(Operator op)
+    {
+<span class="nc bnc" id="L345" title="All 6 branches missed.">        switch (op)</span>
+        {
+            case EQ:
+<span class="nc" id="L348">                return 5;</span>
+
+            case LIKE_PREFIX:
+            case LIKE_SUFFIX:
+            case LIKE_CONTAINS:
+            case LIKE_MATCHES:
+<span class="nc" id="L354">                return 4;</span>
+
+            case GTE:
+            case GT:
+<span class="nc" id="L358">                return 3;</span>
+
+            case LTE:
+            case LT:
+<span class="nc" id="L362">                return 2;</span>
+
+            case NEQ:
+<span class="nc" id="L365">                return 1;</span>
+
+            default:
+<span class="nc" id="L368">                return 0;</span>
+        }
+    }
+
+    protected Token computeNext()
+    {
+<span class="nc bnc" id="L374" title="All 4 branches missed.">        return range != null &amp;&amp; range.hasNext() ? range.next() : endOfData();</span>
+    }
+
+    protected void performSkipTo(Long nextToken)
+    {
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (range != null)</span>
+<span class="nc" id="L380">            range.skipTo(nextToken);</span>
+<span class="nc" id="L381">    }</span>
+
+    public void close() throws IOException
+    {
+<span class="nc" id="L385">        controller.releaseIndexes(this);</span>
+<span class="nc" id="L386">    }</span>
+
+    public static class Builder
+    {
+        private final QueryController controller;
+
+        protected final OperationType op;
+        protected final List&lt;RowFilter.Expression&gt; expressions;
+
+        protected Builder left, right;
+
+        public Builder(OperationType operation, QueryController controller, RowFilter.Expression... columns)
+<span class="nc" id="L398">        {</span>
+<span class="nc" id="L399">            this.op = operation;</span>
+<span class="nc" id="L400">            this.controller = controller;</span>
+<span class="nc" id="L401">            this.expressions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L402">            Collections.addAll(expressions, columns);</span>
+<span class="nc" id="L403">        }</span>
+
+        public Builder setRight(Builder operation)
+        {
+<span class="nc" id="L407">            this.right = operation;</span>
+<span class="nc" id="L408">            return this;</span>
+        }
+
+        public Builder setLeft(Builder operation)
+        {
+<span class="nc" id="L413">            this.left = operation;</span>
+<span class="nc" id="L414">            return this;</span>
+        }
+
+        public void add(RowFilter.Expression e)
+        {
+<span class="nc" id="L419">            expressions.add(e);</span>
+<span class="nc" id="L420">        }</span>
+
+        public void add(Collection&lt;RowFilter.Expression&gt; newExpressions)
+        {
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            if (expressions != null)</span>
+<span class="nc" id="L425">                expressions.addAll(newExpressions);</span>
+<span class="nc" id="L426">        }</span>
+
+        public Operation complete()
+        {
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            if (!expressions.isEmpty())</span>
+            {
+<span class="nc" id="L432">                ListMultimap&lt;ColumnDefinition, Expression&gt; analyzedExpressions = analyzeGroup(controller, op, expressions);</span>
+<span class="nc" id="L433">                RangeIterator.Builder&lt;Long, Token&gt; range = controller.getIndexes(op, analyzedExpressions.values());</span>
+
+<span class="nc" id="L435">                Operation rightOp = null;</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                if (right != null)</span>
+                {
+<span class="nc" id="L438">                    rightOp = right.complete();</span>
+<span class="nc" id="L439">                    range.add(rightOp);</span>
+                }
+
+<span class="nc" id="L442">                return new Operation(op, controller, analyzedExpressions, range.build(), null, rightOp);</span>
+            }
+            else
+            {
+<span class="nc" id="L446">                Operation leftOp = null, rightOp = null;</span>
+<span class="nc" id="L447">                boolean leftIndexes = false, rightIndexes = false;</span>
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                if (left != null)</span>
+                {
+<span class="nc" id="L451">                    leftOp = left.complete();</span>
+<span class="nc bnc" id="L452" title="All 4 branches missed.">                    leftIndexes = leftOp != null &amp;&amp; leftOp.range != null;</span>
+                }
+
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                if (right != null)</span>
+                {
+<span class="nc" id="L457">                    rightOp = right.complete();</span>
+<span class="nc bnc" id="L458" title="All 4 branches missed.">                    rightIndexes = rightOp != null &amp;&amp; rightOp.range != null;</span>
+                }
+
+                RangeIterator&lt;Long, Token&gt; join;
+                /**
+                 * Operation should allow one of it's sub-trees to wrap no indexes, that is related  to the fact that we
+                 * have to accept defined-but-not-indexed columns as well as key range as IndexExpressions.
+                 *
+                 * Two cases are possible:
+                 *
+                 * only left child produced indexed iterators, that could happen when there are two columns
+                 * or key range on the right:
+                 *
+                 *                AND
+                 *              /     \
+                 *            OR       \
+                 *           /   \     AND
+                 *          a     b   /   \
+                 *                  key   key
+                 *
+                 * only right child produced indexed iterators:
+                 *
+                 *               AND
+                 *              /    \
+                 *            AND     a
+                 *           /   \
+                 *         key  key
+                 */
+<span class="nc bnc" id="L486" title="All 4 branches missed.">                if (leftIndexes &amp;&amp; !rightIndexes)</span>
+<span class="nc" id="L487">                    join = leftOp;</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">                else if (!leftIndexes &amp;&amp; rightIndexes)</span>
+<span class="nc" id="L489">                    join = rightOp;</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">                else if (leftIndexes)</span>
+                {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                    RangeIterator.Builder&lt;Long, Token&gt; builder = op == OperationType.OR</span>
+<span class="nc" id="L493">                                                ? RangeUnionIterator.&lt;Long, Token&gt;builder()</span>
+<span class="nc" id="L494">                                                : RangeIntersectionIterator.&lt;Long, Token&gt;builder();</span>
+
+<span class="nc" id="L496">                    join = builder.add(leftOp).add(rightOp).build();</span>
+<span class="nc" id="L497">                }</span>
+                else
+<span class="nc" id="L499">                    throw new AssertionError(&quot;both sub-trees have 0 indexes.&quot;);</span>
+
+<span class="nc" id="L501">                return new Operation(op, controller, null, join, leftOp, rightOp);</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

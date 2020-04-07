@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamResultFuture.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamResultFuture.java</span></div><h1>StreamResultFuture.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import com.google.common.util.concurrent.AbstractFuture;
+import com.google.common.util.concurrent.Futures;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.net.IncomingStreamingConnection;
+import org.apache.cassandra.utils.FBUtilities;
+
+/**
+ * A future on the result ({@link StreamState}) of a streaming plan.
+ *
+ * In practice, this object also groups all the {@link StreamSession} for the streaming job
+ * involved. One StreamSession will be created for every peer involved and said session will
+ * handle every streaming (outgoing and incoming) to that peer for this job.
+ * &lt;p&gt;
+ * The future will return a result once every session is completed (successfully or not). If
+ * any session ended up with an error, the future will throw a StreamException.
+ * &lt;p&gt;
+ * You can attach {@link StreamEventHandler} to this object to listen on {@link StreamEvent}s to
+ * track progress of the streaming.
+ */
+public final class StreamResultFuture extends AbstractFuture&lt;StreamState&gt;
+{
+<span class="nc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(StreamResultFuture.class);</span>
+
+    public final UUID planId;
+    public final String description;
+    private final StreamCoordinator coordinator;
+<span class="nc" id="L53">    private final Collection&lt;StreamEventHandler&gt; eventListeners = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+    /**
+     * Create new StreamResult of given {@code planId} and type.
+     *
+     * Constructor is package private. You need to use {@link StreamPlan#execute()} to get the instance.
+     *
+     * @param planId Stream plan ID
+     * @param description Stream description
+     */
+    private StreamResultFuture(UUID planId, String description, StreamCoordinator coordinator)
+<span class="nc" id="L64">    {</span>
+<span class="nc" id="L65">        this.planId = planId;</span>
+<span class="nc" id="L66">        this.description = description;</span>
+<span class="nc" id="L67">        this.coordinator = coordinator;</span>
+
+        // if there is no session to listen to, we immediately set result for returning
+<span class="nc bnc" id="L70" title="All 4 branches missed.">        if (!coordinator.isReceiving() &amp;&amp; !coordinator.hasActiveSessions())</span>
+<span class="nc" id="L71">            set(getCurrentState());</span>
+<span class="nc" id="L72">    }</span>
+
+    private StreamResultFuture(UUID planId, String description, boolean keepSSTableLevels, boolean isIncremental)
+    {
+<span class="nc" id="L76">        this(planId, description, new StreamCoordinator(0, keepSSTableLevels, isIncremental,</span>
+                                                        new DefaultConnectionFactory(), false));
+<span class="nc" id="L78">    }</span>
+
+    static StreamResultFuture init(UUID planId, String description, Collection&lt;StreamEventHandler&gt; listeners,
+                                   StreamCoordinator coordinator)
+    {
+<span class="nc" id="L83">        StreamResultFuture future = createAndRegister(planId, description, coordinator);</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">        if (listeners != null)</span>
+        {
+<span class="nc bnc" id="L86" title="All 2 branches missed.">            for (StreamEventHandler listener : listeners)</span>
+<span class="nc" id="L87">                future.addEventListener(listener);</span>
+        }
+
+<span class="nc" id="L90">        logger.info(&quot;[Stream #{}] Executing streaming plan for {}&quot;, planId,  description);</span>
+
+        // Initialize and start all sessions
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        for (final StreamSession session : coordinator.getAllStreamSessions())</span>
+        {
+<span class="nc" id="L95">            session.init(future);</span>
+<span class="nc" id="L96">        }</span>
+
+<span class="nc" id="L98">        coordinator.connect(future);</span>
+
+<span class="nc" id="L100">        return future;</span>
+    }
+
+    public static synchronized StreamResultFuture initReceivingSide(int sessionIndex,
+                                                                    UUID planId,
+                                                                    String description,
+                                                                    InetAddress from,
+                                                                    IncomingStreamingConnection connection,
+                                                                    boolean isForOutgoing,
+                                                                    int version,
+                                                                    boolean keepSSTableLevel,
+                                                                    boolean isIncremental) throws IOException
+    {
+<span class="nc" id="L113">        StreamResultFuture future = StreamManager.instance.getReceivingStream(planId);</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (future == null)</span>
+        {
+<span class="nc" id="L116">            logger.info(&quot;[Stream #{} ID#{}] Creating new streaming plan for {}&quot;, planId, sessionIndex, description);</span>
+
+            // The main reason we create a StreamResultFuture on the receiving side is for JMX exposure.
+<span class="nc" id="L119">            future = new StreamResultFuture(planId, description, keepSSTableLevel, isIncremental);</span>
+<span class="nc" id="L120">            StreamManager.instance.registerReceiving(future);</span>
+        }
+<span class="nc" id="L122">        future.attachConnection(from, sessionIndex, connection, isForOutgoing, version);</span>
+<span class="nc" id="L123">        logger.info(&quot;[Stream #{}, ID#{}] Received streaming plan for {}&quot;, planId, sessionIndex, description);</span>
+<span class="nc" id="L124">        return future;</span>
+    }
+
+    private static StreamResultFuture createAndRegister(UUID planId, String description, StreamCoordinator coordinator)
+    {
+<span class="nc" id="L129">        StreamResultFuture future = new StreamResultFuture(planId, description, coordinator);</span>
+<span class="nc" id="L130">        StreamManager.instance.register(future);</span>
+<span class="nc" id="L131">        return future;</span>
+    }
+
+    private void attachConnection(InetAddress from, int sessionIndex, IncomingStreamingConnection connection, boolean isForOutgoing, int version) throws IOException
+    {
+<span class="nc" id="L136">        StreamSession session = coordinator.getOrCreateSessionById(from, sessionIndex, connection.socket.getInetAddress());</span>
+<span class="nc" id="L137">        session.init(this);</span>
+<span class="nc" id="L138">        session.handler.initiateOnReceivingSide(connection, isForOutgoing, version);</span>
+<span class="nc" id="L139">    }</span>
+
+    public void addEventListener(StreamEventHandler listener)
+    {
+<span class="nc" id="L143">        Futures.addCallback(this, listener);</span>
+<span class="nc" id="L144">        eventListeners.add(listener);</span>
+<span class="nc" id="L145">    }</span>
+
+    /**
+     * @return Current snapshot of streaming progress.
+     */
+    public StreamState getCurrentState()
+    {
+<span class="nc" id="L152">        return new StreamState(planId, description, coordinator.getAllSessionInfo());</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L159" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L160">        StreamResultFuture that = (StreamResultFuture) o;</span>
+<span class="nc" id="L161">        return planId.equals(that.planId);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L167">        return planId.hashCode();</span>
+    }
+
+    void handleSessionPrepared(StreamSession session)
+    {
+<span class="nc" id="L172">        SessionInfo sessionInfo = session.getSessionInfo();</span>
+<span class="nc" id="L173">        logger.info(&quot;[Stream #{} ID#{}] Prepare completed. Receiving {} files({}), sending {} files({})&quot;,</span>
+<span class="nc" id="L174">                              session.planId(),</span>
+<span class="nc" id="L175">                              session.sessionIndex(),</span>
+<span class="nc" id="L176">                              sessionInfo.getTotalFilesToReceive(),</span>
+<span class="nc" id="L177">                              FBUtilities.prettyPrintMemory(sessionInfo.getTotalSizeToReceive()),</span>
+<span class="nc" id="L178">                              sessionInfo.getTotalFilesToSend(),</span>
+<span class="nc" id="L179">                              FBUtilities.prettyPrintMemory(sessionInfo.getTotalSizeToSend()));</span>
+<span class="nc" id="L180">        StreamEvent.SessionPreparedEvent event = new StreamEvent.SessionPreparedEvent(planId, sessionInfo);</span>
+<span class="nc" id="L181">        coordinator.addSessionInfo(sessionInfo);</span>
+<span class="nc" id="L182">        fireStreamEvent(event);</span>
+<span class="nc" id="L183">    }</span>
+
+    void handleSessionComplete(StreamSession session)
+    {
+<span class="nc" id="L187">        logger.info(&quot;[Stream #{}] Session with {} is complete&quot;, session.planId(), session.peer);</span>
+<span class="nc" id="L188">        fireStreamEvent(new StreamEvent.SessionCompleteEvent(session));</span>
+<span class="nc" id="L189">        SessionInfo sessionInfo = session.getSessionInfo();</span>
+<span class="nc" id="L190">        coordinator.addSessionInfo(sessionInfo);</span>
+<span class="nc" id="L191">        maybeComplete();</span>
+<span class="nc" id="L192">    }</span>
+
+    public void handleProgress(ProgressInfo progress)
+    {
+<span class="nc" id="L196">        coordinator.updateProgress(progress);</span>
+<span class="nc" id="L197">        fireStreamEvent(new StreamEvent.ProgressEvent(planId, progress));</span>
+<span class="nc" id="L198">    }</span>
+
+    synchronized void fireStreamEvent(StreamEvent event)
+    {
+        // delegate to listener
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        for (StreamEventHandler listener : eventListeners)</span>
+<span class="nc" id="L204">            listener.handleStreamEvent(event);</span>
+<span class="nc" id="L205">    }</span>
+
+    private synchronized void maybeComplete()
+    {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (!coordinator.hasActiveSessions())</span>
+        {
+<span class="nc" id="L211">            StreamState finalState = getCurrentState();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (finalState.hasFailedSession())</span>
+            {
+<span class="nc" id="L214">                logger.warn(&quot;[Stream #{}] Stream failed&quot;, planId);</span>
+<span class="nc" id="L215">                setException(new StreamException(finalState, &quot;Stream failed&quot;));</span>
+            }
+            else
+            {
+<span class="nc" id="L219">                logger.info(&quot;[Stream #{}] All sessions completed&quot;, planId);</span>
+<span class="nc" id="L220">                set(finalState);</span>
+            }
+        }
+<span class="nc" id="L223">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

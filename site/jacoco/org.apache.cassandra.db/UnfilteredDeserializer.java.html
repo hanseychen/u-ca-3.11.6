@@ -1,0 +1,830 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UnfilteredDeserializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">UnfilteredDeserializer.java</span></div><h1>UnfilteredDeserializer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.io.IOError;
+import java.util.*;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.net.MessagingService;
+
+/**
+ * Helper class to deserialize Unfiltered object from disk efficiently.
+ *
+ * More precisely, this class is used by the low-level reader to ensure
+ * we don't do more work than necessary (i.e. we don't allocate/deserialize
+ * objects for things we don't care about).
+ */
+public abstract class UnfilteredDeserializer
+{
+    protected final CFMetaData metadata;
+    protected final DataInputPlus in;
+    protected final SerializationHelper helper;
+
+    protected UnfilteredDeserializer(CFMetaData metadata,
+                                     DataInputPlus in,
+                                     SerializationHelper helper)
+<span class="fc" id="L51">    {</span>
+<span class="fc" id="L52">        this.metadata = metadata;</span>
+<span class="fc" id="L53">        this.in = in;</span>
+<span class="fc" id="L54">        this.helper = helper;</span>
+<span class="fc" id="L55">    }</span>
+
+    public static UnfilteredDeserializer create(CFMetaData metadata,
+                                                DataInputPlus in,
+                                                SerializationHeader header,
+                                                SerializationHelper helper,
+                                                DeletionTime partitionDeletion,
+                                                boolean readAllAsDynamic)
+    {
+<span class="pc bpc" id="L64" title="1 of 2 branches missed.">        if (helper.version &gt;= MessagingService.VERSION_30)</span>
+<span class="fc" id="L65">            return new CurrentDeserializer(metadata, in, header, helper);</span>
+        else
+<span class="nc" id="L67">            return new OldFormatDeserializer(metadata, in, helper, partitionDeletion, readAllAsDynamic);</span>
+    }
+
+    /**
+     * Whether or not there is more atom to read.
+     */
+    public abstract boolean hasNext() throws IOException;
+
+    /**
+     * Compare the provided bound to the next atom to read on disk.
+     *
+     * This will not read/deserialize the whole atom but only what is necessary for the
+     * comparison. Whenever we know what to do with this atom (read it or skip it),
+     * readNext or skipNext should be called.
+     */
+    public abstract int compareNextTo(ClusteringBound bound) throws IOException;
+
+    /**
+     * Returns whether the next atom is a row or not.
+     */
+    public abstract boolean nextIsRow() throws IOException;
+
+    /**
+     * Returns whether the next atom is the static row or not.
+     */
+    public abstract boolean nextIsStatic() throws IOException;
+
+    /**
+     * Returns the next atom.
+     */
+    public abstract Unfiltered readNext() throws IOException;
+
+    /**
+     * Clears any state in this deserializer.
+     */
+    public abstract void clearState() throws IOException;
+
+    /**
+     * Skips the next atom.
+     */
+    public abstract void skipNext() throws IOException;
+
+
+    /**
+     * For the legacy layout deserializer, we have to deal with the fact that a row can span multiple index blocks and that
+     * the call to hasNext() reads the next element upfront. We must take that into account when we check in AbstractSSTableIterator if
+     * we're past the end of an index block boundary as that check expect to account for only consumed data (that is, if hasNext has
+     * been called and made us cross an index boundary but neither readNext() or skipNext() as yet been called, we shouldn't consider
+     * the index block boundary crossed yet).
+     *
+     * TODO: we don't care about this for the current file format because a row can never span multiple index blocks (further, hasNext()
+     * only just basically read 2 bytes from disk in that case). So once we drop backward compatibility with pre-3.0 sstable, we should
+     * remove this.
+     */
+    public abstract long bytesReadForUnconsumedData();
+
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">    private static class CurrentDeserializer extends UnfilteredDeserializer</span>
+    {
+        private final ClusteringPrefix.Deserializer clusteringDeserializer;
+        private final SerializationHeader header;
+
+        private int nextFlags;
+        private int nextExtendedFlags;
+        private boolean isReady;
+        private boolean isDone;
+
+        private final Row.Builder builder;
+
+        private CurrentDeserializer(CFMetaData metadata,
+                                    DataInputPlus in,
+                                    SerializationHeader header,
+                                    SerializationHelper helper)
+        {
+<span class="fc" id="L140">            super(metadata, in, helper);</span>
+<span class="fc" id="L141">            this.header = header;</span>
+<span class="fc" id="L142">            this.clusteringDeserializer = new ClusteringPrefix.Deserializer(metadata.comparator, in, header);</span>
+<span class="fc" id="L143">            this.builder = BTreeRow.sortedBuilder();</span>
+<span class="fc" id="L144">        }</span>
+
+        public boolean hasNext() throws IOException
+        {
+<span class="fc bfc" id="L148" title="All 2 branches covered.">            if (isReady)</span>
+<span class="fc" id="L149">                return true;</span>
+
+<span class="fc" id="L151">            prepareNext();</span>
+<span class="fc bfc" id="L152" title="All 2 branches covered.">            return !isDone;</span>
+        }
+
+        private void prepareNext() throws IOException
+        {
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">            if (isDone)</span>
+<span class="nc" id="L158">                return;</span>
+
+<span class="fc" id="L160">            nextFlags = in.readUnsignedByte();</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">            if (UnfilteredSerializer.isEndOfPartition(nextFlags))</span>
+            {
+<span class="fc" id="L163">                isDone = true;</span>
+<span class="fc" id="L164">                isReady = false;</span>
+<span class="fc" id="L165">                return;</span>
+            }
+
+<span class="fc" id="L168">            nextExtendedFlags = UnfilteredSerializer.readExtendedFlags(in, nextFlags);</span>
+
+<span class="fc" id="L170">            clusteringDeserializer.prepare(nextFlags, nextExtendedFlags);</span>
+<span class="fc" id="L171">            isReady = true;</span>
+<span class="fc" id="L172">        }</span>
+
+        public int compareNextTo(ClusteringBound bound) throws IOException
+        {
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">            if (!isReady)</span>
+<span class="nc" id="L177">                prepareNext();</span>
+
+<span class="pc bpc" id="L179" title="2 of 4 branches missed.">            assert !isDone;</span>
+
+<span class="fc" id="L181">            return clusteringDeserializer.compareNextTo(bound);</span>
+        }
+
+        public boolean nextIsRow() throws IOException
+        {
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">            if (!isReady)</span>
+<span class="nc" id="L187">                prepareNext();</span>
+
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">            return UnfilteredSerializer.kind(nextFlags) == Unfiltered.Kind.ROW;</span>
+        }
+
+        public boolean nextIsStatic() throws IOException
+        {
+            // This exists only for the sake of the OldFormatDeserializer
+<span class="nc" id="L195">            throw new UnsupportedOperationException();</span>
+        }
+
+        public Unfiltered readNext() throws IOException
+        {
+<span class="fc" id="L200">            isReady = false;</span>
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">            if (UnfilteredSerializer.kind(nextFlags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)</span>
+            {
+<span class="nc" id="L203">                ClusteringBoundOrBoundary bound = clusteringDeserializer.deserializeNextBound();</span>
+<span class="nc" id="L204">                return UnfilteredSerializer.serializer.deserializeMarkerBody(in, header, bound);</span>
+            }
+            else
+            {
+<span class="fc" id="L208">                builder.newRow(clusteringDeserializer.deserializeNextClustering());</span>
+<span class="fc" id="L209">                return UnfilteredSerializer.serializer.deserializeRowBody(in, header, helper, nextFlags, nextExtendedFlags, builder);</span>
+            }
+        }
+
+        public void skipNext() throws IOException
+        {
+<span class="fc" id="L215">            isReady = false;</span>
+<span class="fc" id="L216">            clusteringDeserializer.skipNext();</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (UnfilteredSerializer.kind(nextFlags) == Unfiltered.Kind.RANGE_TOMBSTONE_MARKER)</span>
+            {
+<span class="nc" id="L219">                UnfilteredSerializer.serializer.skipMarkerBody(in);</span>
+            }
+            else
+            {
+<span class="fc" id="L223">                UnfilteredSerializer.serializer.skipRowBody(in);</span>
+            }
+<span class="fc" id="L225">        }</span>
+
+        public void clearState()
+        {
+<span class="nc" id="L229">            isReady = false;</span>
+<span class="nc" id="L230">            isDone = false;</span>
+<span class="nc" id="L231">        }</span>
+
+        public long bytesReadForUnconsumedData()
+        {
+            // In theory, hasNext() does consume 2-3 bytes, but we don't care about this for the current file format so returning
+            // 0 to mean &quot;do nothing&quot;.
+<span class="nc" id="L237">            return 0;</span>
+        }
+    }
+
+    public static class OldFormatDeserializer extends UnfilteredDeserializer
+    {
+        private final boolean readAllAsDynamic;
+        private boolean skipStatic;
+
+        // The next Unfiltered to return, computed by hasNext()
+        private Unfiltered next;
+
+        // Saved position in the input after the next Unfiltered that will be consumed
+        private long nextConsumedPosition;
+
+        // A temporary storage for an Unfiltered that isn't returned next but should be looked at just afterwards
+        private Stash stash;
+
+<span class="nc" id="L255">        private boolean couldBeStartOfPartition = true;</span>
+
+        // The Unfiltered as read from the old format input
+        private final UnfilteredIterator iterator;
+
+        // The position in the input after the last data consumption (readNext/skipNext).
+        private long lastConsumedPosition;
+
+        // Tracks the size of the last LegacyAtom read from disk, because this needs to be accounted
+        // for when marking lastConsumedPosition after readNext/skipNext
+        // Reading/skipping an Unfiltered consumes LegacyAtoms from the underlying legacy atom iterator
+        // e.g. hasNext() -&gt; iterator.hasNext() -&gt; iterator.readRow() -&gt; atoms.next()
+        // The stop condition of the loop which groups legacy atoms into rows causes that AtomIterator
+        // to read in the first atom which doesn't belong in the row. So by that point, our position
+        // is actually past the end of the next Unfiltered. To compensate, we record the size of
+        // the last LegacyAtom read and subtract it from the current position when we calculate lastConsumedPosition.
+        // If we don't, then when reading an indexed block, we can over correct and may think that we've
+        // exhausted the block before we actually have.
+<span class="nc" id="L273">        private long bytesReadForNextAtom = 0L;</span>
+
+        private OldFormatDeserializer(CFMetaData metadata,
+                                      DataInputPlus in,
+                                      SerializationHelper helper,
+                                      DeletionTime partitionDeletion,
+                                      boolean readAllAsDynamic)
+        {
+<span class="nc" id="L281">            super(metadata, in, helper);</span>
+<span class="nc" id="L282">            this.iterator = new UnfilteredIterator(metadata, partitionDeletion, helper, this::readAtom);</span>
+<span class="nc" id="L283">            this.readAllAsDynamic = readAllAsDynamic;</span>
+<span class="nc" id="L284">            this.lastConsumedPosition = currentPosition();</span>
+<span class="nc" id="L285">        }</span>
+
+        private LegacyLayout.LegacyAtom readAtom()
+        {
+            while (true)
+            {
+                try
+                {
+<span class="nc" id="L293">                    long pos = currentPosition();</span>
+<span class="nc" id="L294">                    LegacyLayout.LegacyAtom atom = LegacyLayout.readLegacyAtom(metadata, in, readAllAsDynamic);</span>
+<span class="nc" id="L295">                    bytesReadForNextAtom = currentPosition() - pos;</span>
+<span class="nc" id="L296">                    return atom;</span>
+                }
+<span class="nc" id="L298">                catch (UnknownColumnException e)</span>
+                {
+                    // This is ok, see LegacyLayout.readLegacyAtom() for why this only happens in case were we're ok
+                    // skipping the cell. We do want to catch this at this level however because when that happen,
+                    // we should *not* count the byte of that discarded cell as part of the bytes for the atom
+                    // we will eventually return, as doing so could throw the logic bytesReadForNextAtom participates in.
+                }
+<span class="nc" id="L305">                catch (IOException e)</span>
+                {
+<span class="nc" id="L307">                    throw new IOError(e);</span>
+<span class="nc" id="L308">                }</span>
+            }
+        }
+
+        public void setSkipStatic()
+        {
+<span class="nc" id="L314">            this.skipStatic = true;</span>
+<span class="nc" id="L315">        }</span>
+
+        private boolean isStatic(Unfiltered unfiltered)
+        {
+<span class="nc bnc" id="L319" title="All 4 branches missed.">            return unfiltered.isRow() &amp;&amp; ((Row)unfiltered).isStatic();</span>
+        }
+
+        public boolean hasNext() throws IOException
+        {
+            try
+            {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                while (next == null)</span>
+                {
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                    if (null != stash)</span>
+                    {
+<span class="nc" id="L330">                        next = stash.unfiltered;</span>
+<span class="nc" id="L331">                        nextConsumedPosition = stash.consumedPosition;</span>
+<span class="nc" id="L332">                        stash = null;</span>
+                    }
+                    else
+                    {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                        if (!iterator.hasNext())</span>
+<span class="nc" id="L337">                            return false;</span>
+<span class="nc" id="L338">                        next = iterator.next();</span>
+<span class="nc" id="L339">                        nextConsumedPosition = currentPosition() - bytesReadForNextAtom;</span>
+                    }
+
+                    /*
+                     * The sstable iterators assume that if there is one, the static row is the first thing this deserializer will return.
+                     * However, in the old format, a range tombstone with an empty start would sort before any static cell. So we should
+                     * detect that case and return the static parts first if necessary.
+                     */
+<span class="nc bnc" id="L347" title="All 8 branches missed.">                    if (couldBeStartOfPartition &amp;&amp; next.isRangeTombstoneMarker() &amp;&amp; next.clustering().size() == 0 &amp;&amp; iterator.hasNext())</span>
+                    {
+<span class="nc" id="L349">                        Unfiltered unfiltered = iterator.next();</span>
+<span class="nc" id="L350">                        long consumedPosition = currentPosition() - bytesReadForNextAtom;</span>
+
+<span class="nc" id="L352">                        stash = new Stash(unfiltered, consumedPosition);</span>
+
+                        /*
+                         * reorder next and stash (see the comment above that explains why), but retain their positions
+                         * it's ok to do so since consumedPosition value is only used to determine if we have gone past
+                         * the end of the index ‘block’; since the edge case requires that the first value be the ‘bottom’
+                         * RT bound (i.e. with no byte buffers), this has a small and well-defined size, and it must be
+                         * the case that both unfiltered are in the same index ‘block’ if we began at the beginning of it.
+                         * if we don't do this, however, we risk aborting early and not returning the BOTTOM rt bound,
+                         * if the static row is large enough to cross block boundaries.
+                         */
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                        if (isStatic(unfiltered))</span>
+                        {
+<span class="nc" id="L365">                            stash.unfiltered = next;</span>
+<span class="nc" id="L366">                            next = unfiltered;</span>
+                        }
+                    }
+<span class="nc" id="L369">                    couldBeStartOfPartition = false;</span>
+
+                    // When reading old tables, we sometimes want to skip static data (due to how staticly defined column of compact
+                    // tables are handled).
+<span class="nc bnc" id="L373" title="All 4 branches missed.">                    if (skipStatic &amp;&amp; isStatic(next))</span>
+<span class="nc" id="L374">                        next = null;</span>
+                }
+
+<span class="nc" id="L377">                return true;</span>
+            }
+<span class="nc" id="L379">            catch (IOError e)</span>
+            {
+<span class="nc bnc" id="L381" title="All 4 branches missed.">                if (e.getCause() != null &amp;&amp; e.getCause() instanceof IOException)</span>
+<span class="nc" id="L382">                    throw (IOException)e.getCause();</span>
+<span class="nc" id="L383">                throw e;</span>
+            }
+        }
+
+        public int compareNextTo(ClusteringBound bound) throws IOException
+        {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L390">                throw new IllegalStateException();</span>
+<span class="nc" id="L391">            return metadata.comparator.compare(next.clustering(), bound);</span>
+        }
+
+        public boolean nextIsRow() throws IOException
+        {
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L397">                throw new IllegalStateException();</span>
+<span class="nc" id="L398">            return next.isRow();</span>
+        }
+
+        public boolean nextIsStatic() throws IOException
+        {
+<span class="nc bnc" id="L403" title="All 4 branches missed.">            return nextIsRow() &amp;&amp; ((Row)next).isStatic();</span>
+        }
+
+        private long currentPosition()
+        {
+            // We return a bogus value if the input is not file based, but check we never rely
+            // on that value in that case in bytesReadForUnconsumedData
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            return in instanceof FileDataInput ? ((FileDataInput)in).getFilePointer() : 0;</span>
+        }
+
+        public Unfiltered readNext() throws IOException
+        {
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L416">                throw new IllegalStateException();</span>
+<span class="nc" id="L417">            Unfiltered toReturn = next;</span>
+<span class="nc" id="L418">            next = null;</span>
+<span class="nc" id="L419">            lastConsumedPosition = nextConsumedPosition;</span>
+<span class="nc" id="L420">            return toReturn;</span>
+        }
+
+        public void skipNext() throws IOException
+        {
+<span class="nc" id="L425">            readNext();</span>
+<span class="nc" id="L426">        }</span>
+
+        // in case we had to reorder an empty RT bound with a static row, this won't be returning the precise unconsumed size,
+        // that corresponds to the last returned Unfiltered, but use the natural order in the sstable instead
+        public long bytesReadForUnconsumedData()
+        {
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            if (!(in instanceof FileDataInput))</span>
+<span class="nc" id="L433">                throw new AssertionError();</span>
+
+<span class="nc" id="L435">            return currentPosition() - lastConsumedPosition;</span>
+        }
+
+        public void clearState()
+        {
+<span class="nc" id="L440">            next = null;</span>
+<span class="nc" id="L441">            stash = null;</span>
+<span class="nc" id="L442">            couldBeStartOfPartition = true;</span>
+<span class="nc" id="L443">            iterator.clearState();</span>
+<span class="nc" id="L444">            lastConsumedPosition = currentPosition();</span>
+<span class="nc" id="L445">            bytesReadForNextAtom = 0L;</span>
+<span class="nc" id="L446">        }</span>
+
+        private static final class Stash
+        {
+            private Unfiltered unfiltered;
+            long consumedPosition;
+
+            private Stash(Unfiltered unfiltered, long consumedPosition)
+<span class="nc" id="L454">            {</span>
+<span class="nc" id="L455">                this.unfiltered = unfiltered;</span>
+<span class="nc" id="L456">                this.consumedPosition = consumedPosition;</span>
+<span class="nc" id="L457">            }</span>
+        }
+
+        // Groups atoms from the input into proper Unfiltered.
+        // Note: this could use guava AbstractIterator except that we want to be able to clear
+        // the internal state of the iterator so it's cleaner to do it ourselves.
+        @VisibleForTesting
+        static class UnfilteredIterator implements PeekingIterator&lt;Unfiltered&gt;
+        {
+            private final AtomIterator atoms;
+            private final LegacyLayout.CellGrouper grouper;
+            private final TombstoneTracker tombstoneTracker;
+            private final CFMetaData metadata;
+            private final SerializationHelper helper;
+
+            private Unfiltered next;
+
+            UnfilteredIterator(CFMetaData metadata,
+                               DeletionTime partitionDeletion,
+                               SerializationHelper helper,
+                               Supplier&lt;LegacyLayout.LegacyAtom&gt; atomReader)
+<span class="nc" id="L478">            {</span>
+<span class="nc" id="L479">                this.metadata = metadata;</span>
+<span class="nc" id="L480">                this.helper = helper;</span>
+<span class="nc" id="L481">                this.grouper = new LegacyLayout.CellGrouper(metadata, helper);</span>
+<span class="nc" id="L482">                this.tombstoneTracker = new TombstoneTracker(partitionDeletion);</span>
+<span class="nc" id="L483">                this.atoms = new AtomIterator(atomReader);</span>
+<span class="nc" id="L484">            }</span>
+
+            private boolean isRow(LegacyLayout.LegacyAtom atom)
+            {
+<span class="nc bnc" id="L488" title="All 2 branches missed.">                if (atom.isCell())</span>
+<span class="nc" id="L489">                    return true;</span>
+
+<span class="nc" id="L491">                LegacyLayout.LegacyRangeTombstone tombstone = atom.asRangeTombstone();</span>
+<span class="nc bnc" id="L492" title="All 4 branches missed.">                return tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata);</span>
+            }
+
+
+            public boolean hasNext()
+            {
+                // Note that we loop on next == null because TombstoneTracker.openNew() could return null below or the atom might be shadowed.
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                while (next == null)</span>
+                {
+<span class="nc bnc" id="L501" title="All 2 branches missed.">                    if (atoms.hasNext())</span>
+                    {
+                        // If there is a range tombstone to open strictly before the next row/RT, we need to return that open (or boundary) marker first.
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                        if (tombstoneTracker.hasOpeningMarkerBefore(atoms.peek()))</span>
+                        {
+<span class="nc" id="L506">                            next = tombstoneTracker.popOpeningMarker();</span>
+                        }
+                        // If a range tombstone closes strictly before the next row/RT, we need to return that close (or boundary) marker first.
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                        else if (tombstoneTracker.hasClosingMarkerBefore(atoms.peek()))</span>
+                        {
+<span class="nc" id="L511">                            next = tombstoneTracker.popClosingMarker();</span>
+                        }
+                        else
+                        {
+<span class="nc" id="L515">                            LegacyLayout.LegacyAtom atom = atoms.next();</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                            if (tombstoneTracker.isShadowed(atom))</span>
+<span class="nc" id="L517">                                continue;</span>
+
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                            if (isRow(atom))</span>
+<span class="nc" id="L520">                                next = readRow(atom);</span>
+                            else
+<span class="nc" id="L522">                                tombstoneTracker.openNew(atom.asRangeTombstone());</span>
+<span class="nc" id="L523">                        }</span>
+                    }
+<span class="nc bnc" id="L525" title="All 2 branches missed.">                    else if (tombstoneTracker.hasOpenTombstones())</span>
+                    {
+<span class="nc" id="L527">                        next = tombstoneTracker.popMarker();</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L531">                        return false;</span>
+                    }
+                }
+<span class="nc" id="L534">                return true;</span>
+            }
+
+            private Unfiltered readRow(LegacyLayout.LegacyAtom first)
+            {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                LegacyLayout.CellGrouper grouper = first.isStatic()</span>
+<span class="nc" id="L540">                                                 ? LegacyLayout.CellGrouper.staticGrouper(metadata, helper)</span>
+                                                 : this.grouper;
+<span class="nc" id="L542">                grouper.reset();</span>
+<span class="nc" id="L543">                grouper.addAtom(first);</span>
+                // As long as atoms are part of the same row, consume them. Note that the call to addAtom() uses
+                // atoms.peek() so that the atom is only consumed (by next) if it's part of the row (addAtom returns true)
+<span class="nc bnc" id="L546" title="All 4 branches missed.">                while (atoms.hasNext() &amp;&amp; grouper.addAtom(atoms.peek()))</span>
+                {
+<span class="nc" id="L548">                    atoms.next();</span>
+                }
+<span class="nc" id="L550">                return grouper.getRow();</span>
+            }
+
+            public Unfiltered next()
+            {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                if (!hasNext())</span>
+<span class="nc" id="L556">                    throw new UnsupportedOperationException();</span>
+<span class="nc" id="L557">                Unfiltered toReturn = next;</span>
+<span class="nc" id="L558">                next = null;</span>
+<span class="nc" id="L559">                return toReturn;</span>
+            }
+
+            public Unfiltered peek()
+            {
+<span class="nc bnc" id="L564" title="All 2 branches missed.">                if (!hasNext())</span>
+<span class="nc" id="L565">                    throw new UnsupportedOperationException();</span>
+<span class="nc" id="L566">                return next;</span>
+            }
+
+            public void clearState()
+            {
+<span class="nc" id="L571">                atoms.clearState();</span>
+<span class="nc" id="L572">                tombstoneTracker.clearState();</span>
+<span class="nc" id="L573">                next = null;</span>
+<span class="nc" id="L574">            }</span>
+
+            public void remove()
+            {
+<span class="nc" id="L578">                throw new UnsupportedOperationException();</span>
+            }
+
+            // Wraps the input of the deserializer to provide an iterator (and skip shadowed atoms).
+            // Note: this could use guava AbstractIterator except that we want to be able to clear
+            // the internal state of the iterator so it's cleaner to do it ourselves.
+            private static class AtomIterator implements PeekingIterator&lt;LegacyLayout.LegacyAtom&gt;
+            {
+                private final Supplier&lt;LegacyLayout.LegacyAtom&gt; atomReader;
+                private boolean isDone;
+                private LegacyLayout.LegacyAtom next;
+
+                private AtomIterator(Supplier&lt;LegacyLayout.LegacyAtom&gt; atomReader)
+<span class="nc" id="L591">                {</span>
+<span class="nc" id="L592">                    this.atomReader = atomReader;</span>
+<span class="nc" id="L593">                }</span>
+
+                public boolean hasNext()
+                {
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                    if (isDone)</span>
+<span class="nc" id="L598">                        return false;</span>
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                    if (next == null)</span>
+                    {
+<span class="nc" id="L602">                        next = atomReader.get();</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">                        if (next == null)</span>
+                        {
+<span class="nc" id="L605">                            isDone = true;</span>
+<span class="nc" id="L606">                            return false;</span>
+                        }
+                    }
+<span class="nc" id="L609">                    return true;</span>
+                }
+
+                public LegacyLayout.LegacyAtom next()
+                {
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                    if (!hasNext())</span>
+<span class="nc" id="L615">                        throw new UnsupportedOperationException();</span>
+<span class="nc" id="L616">                    LegacyLayout.LegacyAtom toReturn = next;</span>
+<span class="nc" id="L617">                    next = null;</span>
+<span class="nc" id="L618">                    return toReturn;</span>
+                }
+
+                public LegacyLayout.LegacyAtom peek()
+                {
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                    if (!hasNext())</span>
+<span class="nc" id="L624">                        throw new UnsupportedOperationException();</span>
+<span class="nc" id="L625">                    return next;</span>
+                }
+
+                public void clearState()
+                {
+<span class="nc" id="L630">                    this.next = null;</span>
+<span class="nc" id="L631">                    this.isDone = false;</span>
+<span class="nc" id="L632">                }</span>
+
+                public void remove()
+                {
+<span class="nc" id="L636">                    throw new UnsupportedOperationException();</span>
+                }
+            }
+
+            /**
+             * Tracks which range tombstones are open when deserializing the old format.
+             * &lt;p&gt;
+             * This is a bit tricky because in the old of format we could have duplicated tombstones, overlapping ones,
+             * shadowed ones, etc.., but we should generate from that a &quot;flat&quot; output where at most one non-shadoowed
+             * range is open at any given time and without empty range.
+             * &lt;p&gt;
+             * One consequence of that is that we have to be careful to not generate markers too soon. For instance,
+             * we might get a range tombstone [1, 1]@3 followed by [1, 10]@5. So if we generate an opening marker on
+             * the first tombstone (so INCL_START(1)@3), we're screwed when we get to the 2nd range tombstone: we really
+             * should ignore the first tombstone in that that and generate INCL_START(1)@5 (assuming obviously we don't
+             * have one more range tombstone starting at 1 in the stream). This is why we have the
+             * {@link #hasOpeningMarkerBefore} method: in practice, we remember when a marker should be opened, but only
+             * generate that opening marker when we're sure that we won't get anything shadowing that marker.
+             * &lt;p&gt;
+             * For closing marker, we also have a {@link #hasClosingMarkerBefore} because in the old format the closing
+             * markers comes with the opening one, but we should generate them &quot;in order&quot; in the new format.
+             */
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            private class TombstoneTracker</span>
+            {
+                private final DeletionTime partitionDeletion;
+
+                // As explained in the javadoc, we need to wait to generate an opening marker until we're sure we have
+                // seen anything that could shadow it. So this remember a marker that needs to be opened but hasn't
+                // been yet. This is truly returned when hasOpeningMarkerBefore tells us it's safe to.
+                private RangeTombstoneMarker openMarkerToReturn;
+
+                // Open tombstones sorted by their closing bound (i.e. first tombstone is the first to close).
+                // As we only track non-fully-shadowed ranges, the first range is necessarily the currently
+                // open tombstone (the one with the higher timestamp).
+                private final SortedSet&lt;LegacyLayout.LegacyRangeTombstone&gt; openTombstones;
+
+                public TombstoneTracker(DeletionTime partitionDeletion)
+<span class="nc" id="L673">                {</span>
+<span class="nc" id="L674">                    this.partitionDeletion = partitionDeletion;</span>
+<span class="nc" id="L675">                    this.openTombstones = new TreeSet&lt;&gt;((rt1, rt2) -&gt; metadata.comparator.compare(rt1.stop.bound, rt2.stop.bound));</span>
+<span class="nc" id="L676">                }</span>
+
+                /**
+                 * Checks if the provided atom is fully shadowed by the open tombstones of this tracker (or the partition deletion).
+                 */
+                public boolean isShadowed(LegacyLayout.LegacyAtom atom)
+                {
+<span class="nc bnc" id="L683" title="All 4 branches missed.">                    assert !hasClosingMarkerBefore(atom);</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">                    long timestamp = atom.isCell() ? atom.asCell().timestamp : atom.asRangeTombstone().deletionTime.markedForDeleteAt();</span>
+
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                    if (partitionDeletion.deletes(timestamp))</span>
+<span class="nc" id="L687">                        return true;</span>
+
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                    SortedSet&lt;LegacyLayout.LegacyRangeTombstone&gt; coveringTombstones = isRow(atom) ? openTombstones : openTombstones.tailSet(atom.asRangeTombstone());</span>
+<span class="nc" id="L690">                    return Iterables.any(coveringTombstones, tombstone -&gt; tombstone.deletionTime.deletes(timestamp));</span>
+                }
+
+                /**
+                 * Whether there is an outstanding opening marker that should be returned before we process the provided row/RT.
+                 */
+                public boolean hasOpeningMarkerBefore(LegacyLayout.LegacyAtom atom)
+                {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                    return openMarkerToReturn != null</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">                           &amp;&amp; metadata.comparator.compare(openMarkerToReturn.openBound(false), atom.clustering()) &lt; 0;</span>
+                }
+
+                public Unfiltered popOpeningMarker()
+                {
+<span class="nc bnc" id="L704" title="All 4 branches missed.">                    assert openMarkerToReturn != null;</span>
+<span class="nc" id="L705">                    Unfiltered toReturn = openMarkerToReturn;</span>
+<span class="nc" id="L706">                    openMarkerToReturn = null;</span>
+<span class="nc" id="L707">                    return toReturn;</span>
+                }
+
+                /**
+                 * Whether the currently open marker closes stricly before the provided row/RT.
+                 */
+                public boolean hasClosingMarkerBefore(LegacyLayout.LegacyAtom atom)
+                {
+<span class="nc bnc" id="L715" title="All 2 branches missed.">                    return !openTombstones.isEmpty()</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">                           &amp;&amp; metadata.comparator.compare(openTombstones.first().stop.bound, atom.clustering()) &lt; 0;</span>
+                }
+
+                /**
+                 * Returns the unfiltered corresponding to closing the currently open marker (and update the tracker accordingly).
+                 */
+                public Unfiltered popClosingMarker()
+                {
+<span class="nc bnc" id="L724" title="All 4 branches missed.">                    assert !openTombstones.isEmpty();</span>
+
+<span class="nc" id="L726">                    Iterator&lt;LegacyLayout.LegacyRangeTombstone&gt; iter = openTombstones.iterator();</span>
+<span class="nc" id="L727">                    LegacyLayout.LegacyRangeTombstone first = iter.next();</span>
+<span class="nc" id="L728">                    iter.remove();</span>
+
+                    // If that was the last open tombstone, we just want to close it. Otherwise, we have a boundary with the
+                    // next tombstone
+<span class="nc bnc" id="L732" title="All 2 branches missed.">                    if (!iter.hasNext())</span>
+<span class="nc" id="L733">                        return new RangeTombstoneBoundMarker(first.stop.bound, first.deletionTime);</span>
+
+<span class="nc" id="L735">                    LegacyLayout.LegacyRangeTombstone next = iter.next();</span>
+<span class="nc" id="L736">                    return RangeTombstoneBoundaryMarker.makeBoundary(false, first.stop.bound, first.stop.bound.invert(), first.deletionTime, next.deletionTime);</span>
+                }
+
+                 /**
+                  * Pop whatever next marker needs to be popped. This should be called as many time as necessary (until
+                  * {@link #hasOpenTombstones} returns {@false}) when all atoms have been consumed to &quot;empty&quot; the tracker.
+                  */
+                 public Unfiltered popMarker()
+                 {
+<span class="nc bnc" id="L745" title="All 4 branches missed.">                     assert hasOpenTombstones();</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                     return openMarkerToReturn == null ? popClosingMarker() : popOpeningMarker();</span>
+                 }
+
+                /**
+                 * Update the tracker given the provided newly open tombstone. This potentially update openMarkerToReturn
+                 * to account for th new opening.
+                 *
+                 * Note that this method assumes that:
+                 +  1) the added tombstone is not fully shadowed: !isShadowed(tombstone).
+                 +  2) there is no marker to open that open strictly before this new tombstone: !hasOpeningMarkerBefore(tombstone).
+                 +  3) no opened tombstone closes before that tombstone: !hasClosingMarkerBefore(tombstone).
+                 + One can check that this is only called after the condition above have been checked in UnfilteredIterator.hasNext above.
+                 */
+                public void openNew(LegacyLayout.LegacyRangeTombstone tombstone)
+                {
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                    if (openTombstones.isEmpty())</span>
+                    {
+                        // If we have an openMarkerToReturn, the corresponding RT must be in openTombstones (or we wouldn't know when to close it)
+<span class="nc bnc" id="L764" title="All 4 branches missed.">                        assert openMarkerToReturn == null;</span>
+<span class="nc" id="L765">                        openTombstones.add(tombstone);</span>
+<span class="nc" id="L766">                        openMarkerToReturn = new RangeTombstoneBoundMarker(tombstone.start.bound, tombstone.deletionTime);</span>
+<span class="nc" id="L767">                        return;</span>
+                    }
+
+<span class="nc bnc" id="L770" title="All 2 branches missed.">                    if (openMarkerToReturn != null)</span>
+                    {
+                        // If the new opening supersedes the one we're about to return, we need to update the one to return.
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                        if (tombstone.deletionTime.supersedes(openMarkerToReturn.openDeletionTime(false)))</span>
+<span class="nc" id="L774">                            openMarkerToReturn = openMarkerToReturn.withNewOpeningDeletionTime(false, tombstone.deletionTime);</span>
+                    }
+                    else
+                    {
+                        // We have no openMarkerToReturn set yet so set it now if needs be.
+                        // Since openTombstones isn't empty, it means we have a currently ongoing deletion. And if the new tombstone
+                        // supersedes that ongoing deletion, we need to close the opening  deletion and open with the new one.
+<span class="nc" id="L781">                        DeletionTime currentOpenDeletion = openTombstones.first().deletionTime;</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">                        if (tombstone.deletionTime.supersedes(currentOpenDeletion))</span>
+<span class="nc" id="L783">                            openMarkerToReturn = RangeTombstoneBoundaryMarker.makeBoundary(false, tombstone.start.bound.invert(), tombstone.start.bound, currentOpenDeletion, tombstone.deletionTime);</span>
+                    }
+
+                    // In all cases, we know !isShadowed(tombstone) so we need to add the tombstone (note however that we may not have set openMarkerToReturn if the
+                    // new tombstone doesn't supersedes the current deletion _but_ extend past the marker currently open)
+<span class="nc" id="L788">                    add(tombstone);</span>
+<span class="nc" id="L789">                }</span>
+
+                /**
+                 * Adds a new tombstone to openTombstones, removing anything that would be shadowed by this new tombstone.
+                 */
+                private void add(LegacyLayout.LegacyRangeTombstone tombstone)
+                {
+                    // First, remove existing tombstone that is shadowed by this tombstone.
+<span class="nc" id="L797">                    Iterator&lt;LegacyLayout.LegacyRangeTombstone&gt; iter = openTombstones.iterator();</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                    while (iter.hasNext())</span>
+                    {
+
+<span class="nc" id="L801">                        LegacyLayout.LegacyRangeTombstone existing = iter.next();</span>
+                        // openTombstones is ordered by stop bound and the new tombstone can't be shadowing anything that
+                        // stop after it.
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                        if (metadata.comparator.compare(tombstone.stop.bound, existing.stop.bound) &lt; 0)</span>
+<span class="nc" id="L805">                            break;</span>
+
+                        // Note that we remove an existing tombstone even if it is equal to the new one because in that case,
+                        // either the existing strictly stops before the new one and we don't want it, or it stops exactly
+                        // like the new one but we're going to inconditionally add the new one anyway.
+<span class="nc bnc" id="L810" title="All 2 branches missed.">                        if (!existing.deletionTime.supersedes(tombstone.deletionTime))</span>
+<span class="nc" id="L811">                            iter.remove();</span>
+<span class="nc" id="L812">                    }</span>
+<span class="nc" id="L813">                    openTombstones.add(tombstone);</span>
+<span class="nc" id="L814">                }</span>
+
+                public boolean hasOpenTombstones()
+                {
+<span class="nc bnc" id="L818" title="All 4 branches missed.">                    return openMarkerToReturn != null || !openTombstones.isEmpty();</span>
+                }
+
+                public void clearState()
+                {
+<span class="nc" id="L823">                    openMarkerToReturn = null;</span>
+<span class="nc" id="L824">                    openTombstones.clear();</span>
+<span class="nc" id="L825">                }</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

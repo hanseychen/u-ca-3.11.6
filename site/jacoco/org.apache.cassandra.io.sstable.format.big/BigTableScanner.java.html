@@ -1,0 +1,475 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BigTableScanner.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format.big</a> &gt; <span class="el_source">BigTableScanner.java</span></div><h1>BigTableScanner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.format.big;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Iterators;
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.AbstractBounds.Boundary;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.dht.AbstractBounds.isEmpty;
+import static org.apache.cassandra.dht.AbstractBounds.maxLeft;
+import static org.apache.cassandra.dht.AbstractBounds.minRight;
+
+<span class="pc bpc" id="L52" title="1 of 2 branches missed.">public class BigTableScanner implements ISSTableScanner</span>
+{
+<span class="fc" id="L54">    private final AtomicBoolean isClosed = new AtomicBoolean(false);</span>
+    protected final RandomAccessReader dfile;
+    protected final RandomAccessReader ifile;
+    public final SSTableReader sstable;
+
+    private final Iterator&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; rangeIterator;
+    private AbstractBounds&lt;PartitionPosition&gt; currentRange;
+
+    private final ColumnFilter columns;
+    private final DataRange dataRange;
+    private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+    private final boolean isForThrift;
+    private final SSTableReadsListener listener;
+<span class="fc" id="L67">    private long startScan = -1;</span>
+<span class="fc" id="L68">    private long bytesScanned = 0;</span>
+
+    protected Iterator&lt;UnfilteredRowIterator&gt; iterator;
+
+    // Full scan of the sstables
+    public static ISSTableScanner getScanner(SSTableReader sstable, RateLimiter limiter)
+    {
+<span class="fc" id="L75">        return new BigTableScanner(sstable,</span>
+<span class="fc" id="L76">                                   ColumnFilter.all(sstable.metadata),</span>
+                                   limiter,
+<span class="fc" id="L78">                                   Iterators.singletonIterator(fullRange(sstable)));</span>
+    }
+
+    public static ISSTableScanner getScanner(SSTableReader sstable,
+                                             ColumnFilter columns,
+                                             DataRange dataRange,
+                                             RateLimiter limiter,
+                                             boolean isForThrift,
+                                             SSTableReadsListener listener)
+    {
+<span class="fc" id="L88">        return new BigTableScanner(sstable, columns, dataRange, limiter, isForThrift, makeBounds(sstable, dataRange).iterator(), listener);</span>
+    }
+
+    public static ISSTableScanner getScanner(SSTableReader sstable, Collection&lt;Range&lt;Token&gt;&gt; tokenRanges, RateLimiter limiter)
+    {
+        // We want to avoid allocating a SSTableScanner if the range don't overlap the sstable (#5249)
+<span class="nc" id="L94">        List&lt;Pair&lt;Long, Long&gt;&gt; positions = sstable.getPositionsForRanges(tokenRanges);</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        if (positions.isEmpty())</span>
+<span class="nc" id="L96">            return new EmptySSTableScanner(sstable);</span>
+
+<span class="nc" id="L98">        return new BigTableScanner(sstable,</span>
+<span class="nc" id="L99">                                   ColumnFilter.all(sstable.metadata),</span>
+                                   limiter,
+<span class="nc" id="L101">                                   makeBounds(sstable, tokenRanges).iterator());</span>
+    }
+
+    public static ISSTableScanner getScanner(SSTableReader sstable, Iterator&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; rangeIterator)
+    {
+<span class="nc" id="L106">        return new BigTableScanner(sstable, ColumnFilter.all(sstable.metadata), null, rangeIterator);</span>
+    }
+
+    private BigTableScanner(SSTableReader sstable,
+                            ColumnFilter columns,
+                            RateLimiter limiter,
+                            Iterator&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; rangeIterator)
+    {
+<span class="fc" id="L114">        this(sstable, columns, null, limiter, false, rangeIterator, SSTableReadsListener.NOOP_LISTENER);</span>
+<span class="fc" id="L115">    }</span>
+
+    private BigTableScanner(SSTableReader sstable,
+                            ColumnFilter columns,
+                            DataRange dataRange,
+                            RateLimiter limiter,
+                            boolean isForThrift,
+                            Iterator&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; rangeIterator,
+                            SSTableReadsListener listener)
+<span class="fc" id="L124">    {</span>
+<span class="pc bpc" id="L125" title="2 of 4 branches missed.">        assert sstable != null;</span>
+
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">        this.dfile = limiter == null ? sstable.openDataReader() : sstable.openDataReader(limiter);</span>
+<span class="fc" id="L128">        this.ifile = sstable.openIndexReader();</span>
+<span class="fc" id="L129">        this.sstable = sstable;</span>
+<span class="fc" id="L130">        this.columns = columns;</span>
+<span class="fc" id="L131">        this.dataRange = dataRange;</span>
+<span class="fc" id="L132">        this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata,</span>
+                                                                                                        sstable.descriptor.version,
+                                                                                                        sstable.header);
+<span class="fc" id="L135">        this.isForThrift = isForThrift;</span>
+<span class="fc" id="L136">        this.rangeIterator = rangeIterator;</span>
+<span class="fc" id="L137">        this.listener = listener;</span>
+<span class="fc" id="L138">    }</span>
+
+    private static List&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; makeBounds(SSTableReader sstable, Collection&lt;Range&lt;Token&gt;&gt; tokenRanges)
+    {
+<span class="nc" id="L142">        List&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; boundsList = new ArrayList&lt;&gt;(tokenRanges.size());</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : Range.normalize(tokenRanges))</span>
+<span class="nc" id="L144">            addRange(sstable, Range.makeRowRange(range), boundsList);</span>
+<span class="nc" id="L145">        return boundsList;</span>
+    }
+
+    private static List&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; makeBounds(SSTableReader sstable, DataRange dataRange)
+    {
+<span class="fc" id="L150">        List&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; boundsList = new ArrayList&lt;&gt;(2);</span>
+<span class="fc" id="L151">        addRange(sstable, dataRange.keyRange(), boundsList);</span>
+<span class="fc" id="L152">        return boundsList;</span>
+    }
+
+    private static AbstractBounds&lt;PartitionPosition&gt; fullRange(SSTableReader sstable)
+    {
+<span class="fc" id="L157">        return new Bounds&lt;PartitionPosition&gt;(sstable.first, sstable.last);</span>
+    }
+
+    private static void addRange(SSTableReader sstable, AbstractBounds&lt;PartitionPosition&gt; requested, List&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; boundsList)
+    {
+<span class="pc bpc" id="L162" title="2 of 4 branches missed.">        if (requested instanceof Range &amp;&amp; ((Range)requested).isWrapAround())</span>
+        {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">            if (requested.right.compareTo(sstable.first) &gt;= 0)</span>
+            {
+                // since we wrap, we must contain the whole sstable prior to stopKey()
+<span class="nc" id="L167">                Boundary&lt;PartitionPosition&gt; left = new Boundary&lt;PartitionPosition&gt;(sstable.first, true);</span>
+                Boundary&lt;PartitionPosition&gt; right;
+<span class="nc" id="L169">                right = requested.rightBoundary();</span>
+<span class="nc" id="L170">                right = minRight(right, sstable.last, true);</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                if (!isEmpty(left, right))</span>
+<span class="nc" id="L172">                    boundsList.add(AbstractBounds.bounds(left, right));</span>
+            }
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">            if (requested.left.compareTo(sstable.last) &lt;= 0)</span>
+            {
+                // since we wrap, we must contain the whole sstable after dataRange.startKey()
+<span class="fc" id="L177">                Boundary&lt;PartitionPosition&gt; right = new Boundary&lt;PartitionPosition&gt;(sstable.last, true);</span>
+                Boundary&lt;PartitionPosition&gt; left;
+<span class="fc" id="L179">                left = requested.leftBoundary();</span>
+<span class="fc" id="L180">                left = maxLeft(left, sstable.first, true);</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">                if (!isEmpty(left, right))</span>
+<span class="fc" id="L182">                    boundsList.add(AbstractBounds.bounds(left, right));</span>
+<span class="fc" id="L183">            }</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L187" title="All 6 branches missed.">            assert requested.left.compareTo(requested.right) &lt;= 0 || requested.right.isMinimum();</span>
+            Boundary&lt;PartitionPosition&gt; left, right;
+<span class="nc" id="L189">            left = requested.leftBoundary();</span>
+<span class="nc" id="L190">            right = requested.rightBoundary();</span>
+<span class="nc" id="L191">            left = maxLeft(left, sstable.first, true);</span>
+            // apparently isWrapAround() doesn't count Bounds that extend to the limit (min) as wrapping
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            right = requested.right.isMinimum() ? new Boundary&lt;PartitionPosition&gt;(sstable.last, true)</span>
+<span class="nc" id="L194">                                                    : minRight(right, sstable.last, true);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (!isEmpty(left, right))</span>
+<span class="nc" id="L196">                boundsList.add(AbstractBounds.bounds(left, right));</span>
+        }
+<span class="fc" id="L198">    }</span>
+
+    private void seekToCurrentRangeStart()
+    {
+<span class="fc" id="L202">        long indexPosition = sstable.getIndexScanPosition(currentRange.left);</span>
+<span class="fc" id="L203">        ifile.seek(indexPosition);</span>
+        try
+        {
+
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">            while (!ifile.isEOF())</span>
+            {
+<span class="fc" id="L209">                indexPosition = ifile.getFilePointer();</span>
+<span class="fc" id="L210">                DecoratedKey indexDecoratedKey = sstable.decorateKey(ByteBufferUtil.readWithShortLength(ifile));</span>
+<span class="pc bpc" id="L211" title="2 of 4 branches missed.">                if (indexDecoratedKey.compareTo(currentRange.left) &gt; 0 || currentRange.contains(indexDecoratedKey))</span>
+                {
+                    // Found, just read the dataPosition and seek into index and data files
+<span class="fc" id="L214">                    long dataPosition = RowIndexEntry.Serializer.readPosition(ifile, sstable.descriptor.version);</span>
+<span class="fc" id="L215">                    ifile.seek(indexPosition);</span>
+<span class="fc" id="L216">                    dfile.seek(dataPosition);</span>
+<span class="fc" id="L217">                    break;</span>
+                }
+                else
+                {
+<span class="nc" id="L221">                    RowIndexEntry.Serializer.skip(ifile, sstable.descriptor.version);</span>
+                }
+<span class="nc" id="L223">            }</span>
+        }
+<span class="nc" id="L225">        catch (IOException e)</span>
+        {
+<span class="nc" id="L227">            sstable.markSuspect();</span>
+<span class="nc" id="L228">            throw new CorruptSSTableException(e, sstable.getFilename());</span>
+<span class="fc" id="L229">        }</span>
+<span class="fc" id="L230">    }</span>
+
+    public void close()
+    {
+        try
+        {
+<span class="fc bfc" id="L236" title="All 2 branches covered.">            if (isClosed.compareAndSet(false, true))</span>
+<span class="fc" id="L237">                FileUtils.close(dfile, ifile);</span>
+        }
+<span class="nc" id="L239">        catch (IOException e)</span>
+        {
+<span class="nc" id="L241">            sstable.markSuspect();</span>
+<span class="nc" id="L242">            throw new CorruptSSTableException(e, sstable.getFilename());</span>
+<span class="fc" id="L243">        }</span>
+<span class="fc" id="L244">    }</span>
+
+    public long getLengthInBytes()
+    {
+<span class="fc" id="L248">        return dfile.length();</span>
+    }
+
+    public long getCurrentPosition()
+    {
+<span class="nc" id="L253">        return dfile.getFilePointer();</span>
+    }
+
+    public long getBytesScanned()
+    {
+<span class="fc" id="L258">        return bytesScanned;</span>
+    }
+
+    public long getCompressedLengthInBytes()
+    {
+<span class="fc" id="L263">        return sstable.onDiskLength();</span>
+    }
+
+    public String getBackingFiles()
+    {
+<span class="nc" id="L268">        return sstable.toString();</span>
+    }
+
+    public boolean isForThrift()
+    {
+<span class="fc" id="L273">        return isForThrift;</span>
+    }
+
+    public CFMetaData metadata()
+    {
+<span class="fc" id="L278">        return sstable.metadata;</span>
+    }
+
+    public boolean hasNext()
+    {
+<span class="fc bfc" id="L283" title="All 2 branches covered.">        if (iterator == null)</span>
+<span class="fc" id="L284">            iterator = createIterator();</span>
+<span class="fc" id="L285">        return iterator.hasNext();</span>
+    }
+
+    public UnfilteredRowIterator next()
+    {
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">        if (iterator == null)</span>
+<span class="nc" id="L291">            iterator = createIterator();</span>
+<span class="fc" id="L292">        return iterator.next();</span>
+    }
+
+    public void remove()
+    {
+<span class="nc" id="L297">        throw new UnsupportedOperationException();</span>
+    }
+
+    private Iterator&lt;UnfilteredRowIterator&gt; createIterator()
+    {
+<span class="fc" id="L302">        listener.onScanningStarted(sstable);</span>
+<span class="fc" id="L303">        return new KeyScanningIterator();</span>
+    }
+
+<span class="fc" id="L306">    protected class KeyScanningIterator extends AbstractIterator&lt;UnfilteredRowIterator&gt;</span>
+    {
+        private DecoratedKey nextKey;
+        private RowIndexEntry nextEntry;
+        private DecoratedKey currentKey;
+        private RowIndexEntry currentEntry;
+
+        protected UnfilteredRowIterator computeNext()
+        {
+            try
+            {
+<span class="fc bfc" id="L317" title="All 2 branches covered.">                if (nextEntry == null)</span>
+                {
+                    do
+                    {
+<span class="fc bfc" id="L321" title="All 2 branches covered.">                        if (startScan != -1)</span>
+<span class="fc" id="L322">                            bytesScanned += dfile.getFilePointer() - startScan;</span>
+
+                        // we're starting the first range or we just passed the end of the previous range
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                        if (!rangeIterator.hasNext())</span>
+<span class="fc" id="L326">                            return endOfData();</span>
+
+<span class="fc" id="L328">                        currentRange = rangeIterator.next();</span>
+<span class="fc" id="L329">                        seekToCurrentRangeStart();</span>
+<span class="fc" id="L330">                        startScan = dfile.getFilePointer();</span>
+
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">                        if (ifile.isEOF())</span>
+<span class="nc" id="L333">                            return endOfData();</span>
+
+<span class="fc" id="L335">                        currentKey = sstable.decorateKey(ByteBufferUtil.readWithShortLength(ifile));</span>
+<span class="fc" id="L336">                        currentEntry = rowIndexEntrySerializer.deserialize(ifile, ifile.getFilePointer());</span>
+<span class="pc bpc" id="L337" title="1 of 2 branches missed.">                    } while (!currentRange.contains(currentKey));</span>
+                }
+                else
+                {
+                    // we're in the middle of a range
+<span class="fc" id="L342">                    currentKey = nextKey;</span>
+<span class="fc" id="L343">                    currentEntry = nextEntry;</span>
+                }
+
+<span class="fc bfc" id="L346" title="All 2 branches covered.">                if (ifile.isEOF())</span>
+                {
+<span class="fc" id="L348">                    nextEntry = null;</span>
+<span class="fc" id="L349">                    nextKey = null;</span>
+                }
+                else
+                {
+                    // we need the position of the start of the next key, regardless of whether it falls in the current range
+<span class="fc" id="L354">                    nextKey = sstable.decorateKey(ByteBufferUtil.readWithShortLength(ifile));</span>
+<span class="fc" id="L355">                    nextEntry = rowIndexEntrySerializer.deserialize(ifile, ifile.getFilePointer());</span>
+
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">                    if (!currentRange.contains(nextKey))</span>
+                    {
+<span class="nc" id="L359">                        nextKey = null;</span>
+<span class="nc" id="L360">                        nextEntry = null;</span>
+                    }
+                }
+
+                /*
+                 * For a given partition key, we want to avoid hitting the data
+                 * file unless we're explicitely asked to. This is important
+                 * for PartitionRangeReadCommand#checkCacheFilter.
+                 */
+<span class="fc" id="L369">                return new LazilyInitializedUnfilteredRowIterator(currentKey)</span>
+<span class="fc" id="L370">                {</span>
+                    protected UnfilteredRowIterator initializeIterator()
+                    {
+
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">                        if (startScan != -1)</span>
+<span class="fc" id="L375">                            bytesScanned += dfile.getFilePointer() - startScan;</span>
+
+                        try
+                        {
+<span class="fc bfc" id="L379" title="All 2 branches covered.">                            if (dataRange == null)</span>
+                            {
+<span class="fc" id="L381">                                dfile.seek(currentEntry.position);</span>
+<span class="fc" id="L382">                                startScan = dfile.getFilePointer();</span>
+<span class="fc" id="L383">                                ByteBufferUtil.skipShortLength(dfile); // key</span>
+<span class="fc" id="L384">                                return SSTableIdentityIterator.create(sstable, dfile, partitionKey());</span>
+                            }
+                            else
+                            {
+<span class="fc" id="L388">                                startScan = dfile.getFilePointer();</span>
+                            }
+
+<span class="fc" id="L391">                            ClusteringIndexFilter filter = dataRange.clusteringIndexFilter(partitionKey());</span>
+<span class="fc" id="L392">                            return sstable.iterator(dfile, partitionKey(), currentEntry, filter.getSlices(BigTableScanner.this.metadata()), columns, filter.isReversed(), isForThrift);</span>
+                        }
+<span class="nc" id="L394">                        catch (CorruptSSTableException | IOException e)</span>
+                        {
+<span class="nc" id="L396">                            sstable.markSuspect();</span>
+<span class="nc" id="L397">                            throw new CorruptSSTableException(e, sstable.getFilename());</span>
+                        }
+                    }
+                };
+            }
+<span class="nc" id="L402">            catch (CorruptSSTableException | IOException e)</span>
+            {
+<span class="nc" id="L404">                sstable.markSuspect();</span>
+<span class="nc" id="L405">                throw new CorruptSSTableException(e, sstable.getFilename());</span>
+            }
+        }
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L413">        return getClass().getSimpleName() + &quot;(&quot; +</span>
+               &quot;dfile=&quot; + dfile +
+               &quot; ifile=&quot; + ifile +
+               &quot; sstable=&quot; + sstable +
+               &quot;)&quot;;
+    }
+
+    public static class EmptySSTableScanner extends AbstractUnfilteredPartitionIterator implements ISSTableScanner
+    {
+        private final SSTableReader sstable;
+
+        public EmptySSTableScanner(SSTableReader sstable)
+<span class="nc" id="L425">        {</span>
+<span class="nc" id="L426">            this.sstable = sstable;</span>
+<span class="nc" id="L427">        }</span>
+
+        public long getLengthInBytes()
+        {
+<span class="nc" id="L431">            return 0;</span>
+        }
+
+        public long getCurrentPosition()
+        {
+<span class="nc" id="L436">            return 0;</span>
+        }
+
+        public long getBytesScanned()
+        {
+<span class="nc" id="L441">            return 0;</span>
+        }
+
+        public long getCompressedLengthInBytes()
+        {
+<span class="nc" id="L446">            return 0;</span>
+        }
+
+        public String getBackingFiles()
+        {
+<span class="nc" id="L451">            return sstable.getFilename();</span>
+        }
+
+        public boolean isForThrift()
+        {
+<span class="nc" id="L456">            return false;</span>
+        }
+
+        public CFMetaData metadata()
+        {
+<span class="nc" id="L461">            return sstable.metadata;</span>
+        }
+
+        public boolean hasNext()
+        {
+<span class="nc" id="L466">            return false;</span>
+        }
+
+        public UnfilteredRowIterator next()
+        {
+<span class="nc" id="L471">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

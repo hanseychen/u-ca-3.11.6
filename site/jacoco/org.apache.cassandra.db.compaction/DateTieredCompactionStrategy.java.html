@@ -1,0 +1,513 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DateTieredCompactionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">DateTieredCompactionStrategy.java</span></div><h1>DateTieredCompactionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.collect.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.utils.Pair;
+import org.codehaus.jackson.JsonNode;
+import org.codehaus.jackson.node.JsonNodeFactory;
+import org.codehaus.jackson.node.ObjectNode;
+
+import static com.google.common.collect.Iterables.filter;
+
+/**
+ * @deprecated in favour of {@link TimeWindowCompactionStrategy}
+ */
+<span class="nc bnc" id="L45" title="All 2 branches missed.">@Deprecated</span>
+public class DateTieredCompactionStrategy extends AbstractCompactionStrategy
+{
+<span class="nc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(DateTieredCompactionStrategy.class);</span>
+
+    private final DateTieredCompactionStrategyOptions options;
+    protected volatile int estimatedRemainingTasks;
+<span class="nc" id="L52">    private final Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();</span>
+    private long lastExpiredCheck;
+    private final SizeTieredCompactionStrategyOptions stcsOptions;
+
+    public DateTieredCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options)
+    {
+<span class="nc" id="L58">        super(cfs, options);</span>
+<span class="nc" id="L59">        this.estimatedRemainingTasks = 0;</span>
+<span class="nc" id="L60">        this.options = new DateTieredCompactionStrategyOptions(options);</span>
+<span class="nc bnc" id="L61" title="All 4 branches missed.">        if (!options.containsKey(AbstractCompactionStrategy.TOMBSTONE_COMPACTION_INTERVAL_OPTION) &amp;&amp; !options.containsKey(AbstractCompactionStrategy.TOMBSTONE_THRESHOLD_OPTION))</span>
+        {
+<span class="nc" id="L63">            disableTombstoneCompactions = true;</span>
+<span class="nc" id="L64">            logger.trace(&quot;Disabling tombstone compactions for DTCS&quot;);</span>
+        }
+        else
+<span class="nc" id="L67">            logger.trace(&quot;Enabling tombstone compactions for DTCS&quot;);</span>
+
+<span class="nc" id="L69">        this.stcsOptions = new SizeTieredCompactionStrategyOptions(options);</span>
+<span class="nc" id="L70">    }</span>
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;)
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    {
+<span class="nc" id="L76">        List&lt;SSTableReader&gt; previousCandidate = null;</span>
+        while (true)
+        {
+<span class="nc" id="L79">            List&lt;SSTableReader&gt; latestBucket = getNextBackgroundSSTables(gcBefore);</span>
+
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            if (latestBucket.isEmpty())</span>
+<span class="nc" id="L82">                return null;</span>
+
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+<span class="nc bnc" id="L86" title="All 2 branches missed.">            if (latestBucket.equals(previousCandidate))</span>
+            {
+<span class="nc" id="L88">                logger.warn(&quot;Could not acquire references for compacting SSTables {} which is not a problem per se,&quot; +</span>
+                            &quot;unless it happens frequently, in which case it must be reported. Will retry later.&quot;,
+                            latestBucket);
+<span class="nc" id="L91">                return null;</span>
+            }
+
+<span class="nc" id="L94">            LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            if (modifier != null)</span>
+<span class="nc" id="L96">                return new CompactionTask(cfs, modifier, gcBefore);</span>
+<span class="nc" id="L97">            previousCandidate = latestBucket;</span>
+<span class="nc" id="L98">        }</span>
+    }
+
+    /**
+     *
+     * @param gcBefore
+     * @return
+     */
+    private synchronized List&lt;SSTableReader&gt; getNextBackgroundSSTables(final int gcBefore)
+    {
+        Set&lt;SSTableReader&gt; uncompacting;
+<span class="nc" id="L109">        synchronized (sstables)</span>
+        {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (sstables.isEmpty())</span>
+<span class="nc" id="L112">                return Collections.emptyList();</span>
+
+<span class="nc" id="L114">            uncompacting = ImmutableSet.copyOf(filter(cfs.getUncompactingSSTables(), sstables::contains));</span>
+<span class="nc" id="L115">        }</span>
+
+<span class="nc" id="L117">        Set&lt;SSTableReader&gt; expired = Collections.emptySet();</span>
+        // we only check for expired sstables every 10 minutes (by default) due to it being an expensive operation
+<span class="nc bnc" id="L119" title="All 2 branches missed.">        if (System.currentTimeMillis() - lastExpiredCheck &gt; options.expiredSSTableCheckFrequency)</span>
+        {
+            // Find fully expired SSTables. Those will be included no matter what.
+<span class="nc" id="L122">            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, cfs.getOverlappingLiveSSTables(uncompacting), gcBefore);</span>
+<span class="nc" id="L123">            lastExpiredCheck = System.currentTimeMillis();</span>
+        }
+<span class="nc" id="L125">        Set&lt;SSTableReader&gt; candidates = Sets.newHashSet(filterSuspectSSTables(uncompacting));</span>
+
+<span class="nc" id="L127">        List&lt;SSTableReader&gt; compactionCandidates = new ArrayList&lt;&gt;(getNextNonExpiredSSTables(Sets.difference(candidates, expired), gcBefore));</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (!expired.isEmpty())</span>
+        {
+<span class="nc" id="L130">            logger.trace(&quot;Including expired sstables: {}&quot;, expired);</span>
+<span class="nc" id="L131">            compactionCandidates.addAll(expired);</span>
+        }
+<span class="nc" id="L133">        return compactionCandidates;</span>
+    }
+
+    private List&lt;SSTableReader&gt; getNextNonExpiredSSTables(Iterable&lt;SSTableReader&gt; nonExpiringSSTables, final int gcBefore)
+    {
+<span class="nc" id="L138">        int base = cfs.getMinimumCompactionThreshold();</span>
+<span class="nc" id="L139">        long now = getNow();</span>
+<span class="nc" id="L140">        List&lt;SSTableReader&gt; mostInteresting = getCompactionCandidates(nonExpiringSSTables, now, base);</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (mostInteresting != null)</span>
+        {
+<span class="nc" id="L143">            return mostInteresting;</span>
+        }
+
+        // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
+        // ratio is greater than threshold.
+<span class="nc" id="L148">        List&lt;SSTableReader&gt; sstablesWithTombstones = Lists.newArrayList();</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        for (SSTableReader sstable : nonExpiringSSTables)</span>
+        {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            if (worthDroppingTombstones(sstable, gcBefore))</span>
+<span class="nc" id="L152">                sstablesWithTombstones.add(sstable);</span>
+<span class="nc" id="L153">        }</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (sstablesWithTombstones.isEmpty())</span>
+<span class="nc" id="L155">            return Collections.emptyList();</span>
+
+<span class="nc" id="L157">        return Collections.singletonList(Collections.min(sstablesWithTombstones, SSTableReader.sizeComparator));</span>
+    }
+
+    private List&lt;SSTableReader&gt; getCompactionCandidates(Iterable&lt;SSTableReader&gt; candidateSSTables, long now, int base)
+    {
+<span class="nc" id="L162">        Iterable&lt;SSTableReader&gt; candidates = filterOldSSTables(Lists.newArrayList(candidateSSTables), options.maxSSTableAge, now);</span>
+
+<span class="nc" id="L164">        List&lt;List&lt;SSTableReader&gt;&gt; buckets = getBuckets(createSSTableAndMinTimestampPairs(candidates), options.baseTime, base, now, options.maxWindowSize);</span>
+<span class="nc" id="L165">        logger.debug(&quot;Compaction buckets are {}&quot;, buckets);</span>
+<span class="nc" id="L166">        updateEstimatedCompactionsByTasks(buckets);</span>
+<span class="nc" id="L167">        List&lt;SSTableReader&gt; mostInteresting = newestBucket(buckets,</span>
+<span class="nc" id="L168">                                                           cfs.getMinimumCompactionThreshold(),</span>
+<span class="nc" id="L169">                                                           cfs.getMaximumCompactionThreshold(),</span>
+                                                           now,
+                                                           options.baseTime,
+                                                           options.maxWindowSize,
+                                                           stcsOptions);
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (!mostInteresting.isEmpty())</span>
+<span class="nc" id="L175">            return mostInteresting;</span>
+<span class="nc" id="L176">        return null;</span>
+    }
+
+    /**
+     * Gets the timestamp that DateTieredCompactionStrategy considers to be the &quot;current time&quot;.
+     * @return the maximum timestamp across all SSTables.
+     * @throws java.util.NoSuchElementException if there are no SSTables.
+     */
+    private long getNow()
+    {
+        // no need to convert to collection if had an Iterables.max(), but not present in standard toolkit, and not worth adding
+<span class="nc" id="L187">        List&lt;SSTableReader&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L188">        Iterables.addAll(list, cfs.getSSTables(SSTableSet.LIVE));</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        if (list.isEmpty())</span>
+<span class="nc" id="L190">            return 0;</span>
+<span class="nc" id="L191">        return Collections.max(list, (o1, o2) -&gt; Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp()))</span>
+<span class="nc" id="L192">                          .getMaxTimestamp();</span>
+    }
+
+    /**
+     * Removes all sstables with max timestamp older than maxSSTableAge.
+     * @param sstables all sstables to consider
+     * @param maxSSTableAge the age in milliseconds when an SSTable stops participating in compactions
+     * @param now current time. SSTables with max timestamp less than (now - maxSSTableAge) are filtered.
+     * @return a list of sstables with the oldest sstables excluded
+     */
+    @VisibleForTesting
+    static Iterable&lt;SSTableReader&gt; filterOldSSTables(List&lt;SSTableReader&gt; sstables, long maxSSTableAge, long now)
+    {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if (maxSSTableAge == 0)</span>
+<span class="nc" id="L206">            return sstables;</span>
+<span class="nc" id="L207">        final long cutoff = now - maxSSTableAge;</span>
+<span class="nc" id="L208">        return filter(sstables, new Predicate&lt;SSTableReader&gt;()</span>
+<span class="nc" id="L209">        {</span>
+            @Override
+            public boolean apply(SSTableReader sstable)
+            {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                return sstable.getMaxTimestamp() &gt;= cutoff;</span>
+            }
+        });
+    }
+
+    public static List&lt;Pair&lt;SSTableReader, Long&gt;&gt; createSSTableAndMinTimestampPairs(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L220">        List&lt;Pair&lt;SSTableReader, Long&gt;&gt; sstableMinTimestampPairs = Lists.newArrayListWithCapacity(Iterables.size(sstables));</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L222">            sstableMinTimestampPairs.add(Pair.create(sstable, sstable.getMinTimestamp()));</span>
+<span class="nc" id="L223">        return sstableMinTimestampPairs;</span>
+    }
+
+    @Override
+    public synchronized void addSSTable(SSTableReader sstable)
+    {
+<span class="nc" id="L229">        sstables.add(sstable);</span>
+<span class="nc" id="L230">    }</span>
+
+    @Override
+    public synchronized void removeSSTable(SSTableReader sstable)
+    {
+<span class="nc" id="L235">        sstables.remove(sstable);</span>
+<span class="nc" id="L236">    }</span>
+
+    /**
+     * A target time span used for bucketing SSTables based on timestamps.
+     */
+    private static class Target
+    {
+        // How big a range of timestamps fit inside the target.
+        public final long size;
+        // A timestamp t hits the target iff t / size == divPosition.
+        public final long divPosition;
+
+        public final long maxWindowSize;
+
+        public Target(long size, long divPosition, long maxWindowSize)
+<span class="nc" id="L251">        {</span>
+<span class="nc" id="L252">            this.size = size;</span>
+<span class="nc" id="L253">            this.divPosition = divPosition;</span>
+<span class="nc" id="L254">            this.maxWindowSize = maxWindowSize;</span>
+<span class="nc" id="L255">        }</span>
+
+        /**
+         * Compares the target to a timestamp.
+         * @param timestamp the timestamp to compare.
+         * @return a negative integer, zero, or a positive integer as the target lies before, covering, or after than the timestamp.
+         */
+        public int compareToTimestamp(long timestamp)
+        {
+<span class="nc" id="L264">            return Long.compare(divPosition, timestamp / size);</span>
+        }
+
+        /**
+         * Tells if the timestamp hits the target.
+         * @param timestamp the timestamp to test.
+         * @return &lt;code&gt;true&lt;/code&gt; iff timestamp / size == divPosition.
+         */
+        public boolean onTarget(long timestamp)
+        {
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            return compareToTimestamp(timestamp) == 0;</span>
+        }
+
+        /**
+         * Gets the next target, which represents an earlier time span.
+         * @param base The number of contiguous targets that will have the same size. Targets following those will be &lt;code&gt;base&lt;/code&gt; times as big.
+         * @return
+         */
+        public Target nextTarget(int base)
+        {
+<span class="nc bnc" id="L284" title="All 4 branches missed.">            if (divPosition % base &gt; 0 || size * base &gt; maxWindowSize)</span>
+<span class="nc" id="L285">                return new Target(size, divPosition - 1, maxWindowSize);</span>
+            else
+<span class="nc" id="L287">                return new Target(size * base, divPosition / base - 1, maxWindowSize);</span>
+        }
+    }
+
+
+    /**
+     * Group files with similar min timestamp into buckets. Files with recent min timestamps are grouped together into
+     * buckets designated to short timespans while files with older timestamps are grouped into buckets representing
+     * longer timespans.
+     * @param files pairs consisting of a file and its min timestamp
+     * @param timeUnit
+     * @param base
+     * @param now
+     * @return a list of buckets of files. The list is ordered such that the files with newest timestamps come first.
+     *         Each bucket is also a list of files ordered from newest to oldest.
+     */
+    @VisibleForTesting
+    static &lt;T&gt; List&lt;List&lt;T&gt;&gt; getBuckets(Collection&lt;Pair&lt;T, Long&gt;&gt; files, long timeUnit, int base, long now, long maxWindowSize)
+    {
+        // Sort files by age. Newest first.
+<span class="nc" id="L307">        final List&lt;Pair&lt;T, Long&gt;&gt; sortedFiles = Lists.newArrayList(files);</span>
+<span class="nc" id="L308">        Collections.sort(sortedFiles, Collections.reverseOrder(new Comparator&lt;Pair&lt;T, Long&gt;&gt;()</span>
+<span class="nc" id="L309">        {</span>
+            public int compare(Pair&lt;T, Long&gt; p1, Pair&lt;T, Long&gt; p2)
+            {
+<span class="nc" id="L312">                return p1.right.compareTo(p2.right);</span>
+            }
+        }));
+
+<span class="nc" id="L316">        List&lt;List&lt;T&gt;&gt; buckets = Lists.newArrayList();</span>
+<span class="nc" id="L317">        Target target = getInitialTarget(now, timeUnit, maxWindowSize);</span>
+<span class="nc" id="L318">        PeekingIterator&lt;Pair&lt;T, Long&gt;&gt; it = Iterators.peekingIterator(sortedFiles.iterator());</span>
+
+        outerLoop:
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        while (it.hasNext())</span>
+        {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            while (!target.onTarget(it.peek().right))</span>
+            {
+                // If the file is too new for the target, skip it.
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                if (target.compareToTimestamp(it.peek().right) &lt; 0)</span>
+                {
+<span class="nc" id="L328">                    it.next();</span>
+
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    if (!it.hasNext())</span>
+<span class="nc" id="L331">                        break outerLoop;</span>
+                }
+                else // If the file is too old for the target, switch targets.
+<span class="nc" id="L334">                    target = target.nextTarget(base);</span>
+            }
+<span class="nc" id="L336">            List&lt;T&gt; bucket = Lists.newArrayList();</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            while (target.onTarget(it.peek().right))</span>
+            {
+<span class="nc" id="L339">                bucket.add(it.next().left);</span>
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                if (!it.hasNext())</span>
+<span class="nc" id="L342">                    break;</span>
+            }
+<span class="nc" id="L344">            buckets.add(bucket);</span>
+<span class="nc" id="L345">        }</span>
+
+<span class="nc" id="L347">        return buckets;</span>
+    }
+
+    @VisibleForTesting
+    static Target getInitialTarget(long now, long timeUnit, long maxWindowSize)
+    {
+<span class="nc" id="L353">        return new Target(timeUnit, now / timeUnit, maxWindowSize);</span>
+    }
+
+
+    private void updateEstimatedCompactionsByTasks(List&lt;List&lt;SSTableReader&gt;&gt; tasks)
+    {
+<span class="nc" id="L359">        int n = 0;</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        for (List&lt;SSTableReader&gt; bucket : tasks)</span>
+        {
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            for (List&lt;SSTableReader&gt; stcsBucket : getSTCSBuckets(bucket, stcsOptions))</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                if (stcsBucket.size() &gt;= cfs.getMinimumCompactionThreshold())</span>
+<span class="nc" id="L364">                    n += Math.ceil((double)stcsBucket.size() / cfs.getMaximumCompactionThreshold());</span>
+<span class="nc" id="L365">        }</span>
+<span class="nc" id="L366">        estimatedRemainingTasks = n;</span>
+<span class="nc" id="L367">        cfs.getCompactionStrategyManager().compactionLogger.pending(this, n);</span>
+<span class="nc" id="L368">    }</span>
+
+
+    /**
+     * @param buckets list of buckets, sorted from newest to oldest, from which to return the newest bucket within thresholds.
+     * @param minThreshold minimum number of sstables in a bucket to qualify.
+     * @param maxThreshold maximum number of sstables to compact at once (the returned bucket will be trimmed down to this).
+     * @return a bucket (list) of sstables to compact.
+     */
+    @VisibleForTesting
+    static List&lt;SSTableReader&gt; newestBucket(List&lt;List&lt;SSTableReader&gt;&gt; buckets, int minThreshold, int maxThreshold, long now, long baseTime, long maxWindowSize, SizeTieredCompactionStrategyOptions stcsOptions)
+    {
+        // If the &quot;incoming window&quot; has at least minThreshold SSTables, choose that one.
+        // For any other bucket, at least 2 SSTables is enough.
+        // In any case, limit to maxThreshold SSTables.
+<span class="nc" id="L383">        Target incomingWindow = getInitialTarget(now, baseTime, maxWindowSize);</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        for (List&lt;SSTableReader&gt; bucket : buckets)</span>
+        {
+<span class="nc" id="L386">            boolean inFirstWindow = incomingWindow.onTarget(bucket.get(0).getMinTimestamp());</span>
+<span class="nc bnc" id="L387" title="All 6 branches missed.">            if (bucket.size() &gt;= minThreshold || (bucket.size() &gt;= 2 &amp;&amp; !inFirstWindow))</span>
+            {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                List&lt;SSTableReader&gt; stcsSSTables = getSSTablesForSTCS(bucket, inFirstWindow ? minThreshold : 2, maxThreshold, stcsOptions);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                if (!stcsSSTables.isEmpty())</span>
+<span class="nc" id="L391">                    return stcsSSTables;</span>
+            }
+<span class="nc" id="L393">        }</span>
+<span class="nc" id="L394">        return Collections.emptyList();</span>
+    }
+
+    private static List&lt;SSTableReader&gt; getSSTablesForSTCS(Collection&lt;SSTableReader&gt; sstables, int minThreshold, int maxThreshold, SizeTieredCompactionStrategyOptions stcsOptions)
+    {
+<span class="nc" id="L399">        List&lt;SSTableReader&gt; s = SizeTieredCompactionStrategy.mostInterestingBucket(getSTCSBuckets(sstables, stcsOptions), minThreshold, maxThreshold);</span>
+<span class="nc" id="L400">        logger.debug(&quot;Got sstables {} for STCS from {}&quot;, s, sstables);</span>
+<span class="nc" id="L401">        return s;</span>
+    }
+
+    private static List&lt;List&lt;SSTableReader&gt;&gt; getSTCSBuckets(Collection&lt;SSTableReader&gt; sstables, SizeTieredCompactionStrategyOptions stcsOptions)
+    {
+<span class="nc" id="L406">        List&lt;Pair&lt;SSTableReader,Long&gt;&gt; pairs = SizeTieredCompactionStrategy.createSSTableAndLengthPairs(AbstractCompactionStrategy.filterSuspectSSTables(sstables));</span>
+<span class="nc" id="L407">        return SizeTieredCompactionStrategy.getBuckets(pairs,</span>
+                                                       stcsOptions.bucketHigh,
+                                                       stcsOptions.bucketLow,
+                                                       stcsOptions.minSSTableSize);
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;)
+    public synchronized Collection&lt;AbstractCompactionTask&gt; getMaximalTask(int gcBefore, boolean splitOutput)
+    {
+<span class="nc" id="L417">        Iterable&lt;SSTableReader&gt; filteredSSTables = filterSuspectSSTables(sstables);</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (Iterables.isEmpty(filteredSSTables))</span>
+<span class="nc" id="L419">            return null;</span>
+<span class="nc" id="L420">        LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        if (txn == null)</span>
+<span class="nc" id="L422">            return null;</span>
+<span class="nc" id="L423">        return Collections.&lt;AbstractCompactionTask&gt;singleton(new CompactionTask(cfs, txn, gcBefore));</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;)
+    public synchronized AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, int gcBefore)
+    {
+<span class="nc bnc" id="L430" title="All 4 branches missed.">        assert !sstables.isEmpty(); // checked for by CM.submitUserDefined</span>
+
+<span class="nc" id="L432">        LifecycleTransaction modifier = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (modifier == null)</span>
+        {
+<span class="nc" id="L435">            logger.trace(&quot;Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem&quot;, sstables);</span>
+<span class="nc" id="L436">            return null;</span>
+        }
+
+<span class="nc" id="L439">        return new CompactionTask(cfs, modifier, gcBefore).setUserDefined(true);</span>
+    }
+
+    public int getEstimatedRemainingTasks()
+    {
+<span class="nc" id="L444">        return estimatedRemainingTasks;</span>
+    }
+
+    public long getMaxSSTableBytes()
+    {
+<span class="nc" id="L449">        return Long.MAX_VALUE;</span>
+    }
+
+    /**
+     * DTCS should not group sstables for anticompaction - this can mix new and old data
+     */
+    @Override
+    public Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupSSTablesForAntiCompaction(Collection&lt;SSTableReader&gt; sstablesToGroup)
+    {
+<span class="nc" id="L458">        Collection&lt;Collection&lt;SSTableReader&gt;&gt; groups = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        for (SSTableReader sstable : sstablesToGroup)</span>
+        {
+<span class="nc" id="L461">            groups.add(Collections.singleton(sstable));</span>
+<span class="nc" id="L462">        }</span>
+<span class="nc" id="L463">        return groups;</span>
+    }
+
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options) throws ConfigurationException
+    {
+<span class="nc" id="L468">        Map&lt;String, String&gt; uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);</span>
+<span class="nc" id="L469">        uncheckedOptions = DateTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);</span>
+
+<span class="nc" id="L471">        uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());</span>
+<span class="nc" id="L472">        uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());</span>
+
+<span class="nc" id="L474">        uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);</span>
+
+<span class="nc" id="L476">        return uncheckedOptions;</span>
+    }
+
+    public CompactionLogger.Strategy strategyLogger()
+    {
+<span class="nc" id="L481">        return new CompactionLogger.Strategy()</span>
+<span class="nc" id="L482">        {</span>
+            public JsonNode sstable(SSTableReader sstable)
+            {
+<span class="nc" id="L485">                ObjectNode node = JsonNodeFactory.instance.objectNode();</span>
+<span class="nc" id="L486">                node.put(&quot;min_timestamp&quot;, sstable.getMinTimestamp());</span>
+<span class="nc" id="L487">                node.put(&quot;max_timestamp&quot;, sstable.getMaxTimestamp());</span>
+<span class="nc" id="L488">                return node;</span>
+            }
+
+            public JsonNode options()
+            {
+<span class="nc" id="L493">                ObjectNode node = JsonNodeFactory.instance.objectNode();</span>
+<span class="nc" id="L494">                TimeUnit resolution = DateTieredCompactionStrategy.this.options.timestampResolution;</span>
+<span class="nc" id="L495">                node.put(DateTieredCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY,</span>
+<span class="nc" id="L496">                         resolution.toString());</span>
+<span class="nc" id="L497">                node.put(DateTieredCompactionStrategyOptions.BASE_TIME_KEY,</span>
+<span class="nc" id="L498">                         resolution.toSeconds(DateTieredCompactionStrategy.this.options.baseTime));</span>
+<span class="nc" id="L499">                node.put(DateTieredCompactionStrategyOptions.MAX_WINDOW_SIZE_KEY,</span>
+<span class="nc" id="L500">                         resolution.toSeconds(DateTieredCompactionStrategy.this.options.maxWindowSize));</span>
+<span class="nc" id="L501">                return node;</span>
+            }
+        };
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L508">        return String.format(&quot;DateTieredCompactionStrategy[%s/%s]&quot;,</span>
+<span class="nc" id="L509">                cfs.getMinimumCompactionThreshold(),</span>
+<span class="nc" id="L510">                cfs.getMaximumCompactionThreshold());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

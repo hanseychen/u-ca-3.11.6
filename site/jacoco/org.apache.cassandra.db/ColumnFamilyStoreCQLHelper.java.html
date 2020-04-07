@@ -1,0 +1,443 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnFamilyStoreCQLHelper.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">ColumnFamilyStoreCQLHelper.java</span></div><h1>ColumnFamilyStoreCQLHelper.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.statements.*;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.utils.*;
+
+/**
+ * Helper methods to represent CFMetadata and related objects in CQL format
+ */
+<span class="nc" id="L39">public class ColumnFamilyStoreCQLHelper</span>
+{
+    public static List&lt;String&gt; dumpReCreateStatements(CFMetaData metadata)
+    {
+<span class="nc" id="L43">        List&lt;String&gt; l = new ArrayList&lt;&gt;();</span>
+        // Types come first, as table can't be created without them
+<span class="nc" id="L45">        l.addAll(ColumnFamilyStoreCQLHelper.getUserTypesAsCQL(metadata));</span>
+        // Record re-create schema statements
+<span class="nc" id="L47">        l.add(ColumnFamilyStoreCQLHelper.getCFMetadataAsCQL(metadata, true));</span>
+        // Dropped columns (and re-additions)
+<span class="nc" id="L49">        l.addAll(ColumnFamilyStoreCQLHelper.getDroppedColumnsAsCQL(metadata));</span>
+        // Indexes applied as last, since otherwise they may interfere with column drops / re-additions
+<span class="nc" id="L51">        l.addAll(ColumnFamilyStoreCQLHelper.getIndexesAsCQL(metadata));</span>
+<span class="nc" id="L52">        return l;</span>
+    }
+
+    private static List&lt;ColumnDefinition&gt; getClusteringColumns(CFMetaData metadata)
+    {
+<span class="nc" id="L57">        List&lt;ColumnDefinition&gt; cds = new ArrayList&lt;&gt;(metadata.clusteringColumns().size());</span>
+
+<span class="nc bnc" id="L59" title="All 2 branches missed.">        if (!metadata.isStaticCompactTable())</span>
+<span class="nc bnc" id="L60" title="All 2 branches missed.">            for (ColumnDefinition cd : metadata.clusteringColumns())</span>
+<span class="nc" id="L61">                cds.add(cd);</span>
+
+<span class="nc" id="L63">        return cds;</span>
+    }
+
+    private static List&lt;ColumnDefinition&gt; getPartitionColumns(CFMetaData metadata)
+    {
+<span class="nc" id="L68">        List&lt;ColumnDefinition&gt; cds = new ArrayList&lt;&gt;(metadata.partitionColumns().size());</span>
+
+<span class="nc bnc" id="L70" title="All 2 branches missed.">        for (ColumnDefinition cd : metadata.partitionColumns().statics)</span>
+<span class="nc" id="L71">            cds.add(cd);</span>
+
+<span class="nc bnc" id="L73" title="All 2 branches missed.">        if (metadata.isDense())</span>
+        {
+            // remove an empty type
+<span class="nc bnc" id="L76" title="All 2 branches missed.">            for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">                if (!cd.type.equals(EmptyType.instance))</span>
+<span class="nc" id="L78">                    cds.add(cd);</span>
+        }
+        // &quot;regular&quot; columns are not exposed for static compact tables
+<span class="nc bnc" id="L81" title="All 2 branches missed.">        else if (!metadata.isStaticCompactTable())</span>
+        {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            for (ColumnDefinition cd : metadata.partitionColumns().withoutStatics())</span>
+<span class="nc" id="L84">                cds.add(cd);</span>
+        }
+
+<span class="nc" id="L87">        return cds;</span>
+    }
+
+    /**
+     * Build a CQL String representation of Column Family Metadata
+     */
+    @VisibleForTesting
+    public static String getCFMetadataAsCQL(CFMetaData metadata, boolean includeDroppedColumns)
+    {
+<span class="nc" id="L96">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        if (!isCqlCompatible(metadata))</span>
+        {
+<span class="nc" id="L99">            sb.append(String.format(&quot;/*\nWarning: Table %s.%s omitted because it has constructs not compatible with CQL (was created via legacy API).\n&quot;,</span>
+                                    metadata.ksName,
+                                    metadata.cfName));
+<span class="nc" id="L102">            sb.append(&quot;\nApproximate structure, for reference:&quot;);</span>
+<span class="nc" id="L103">            sb.append(&quot;\n(this should not be used to reproduce this schema)\n\n&quot;);</span>
+        }
+
+<span class="nc" id="L106">        sb.append(&quot;CREATE TABLE IF NOT EXISTS &quot;);</span>
+<span class="nc" id="L107">        sb.append(quoteIdentifier(metadata.ksName)).append('.').append(quoteIdentifier(metadata.cfName)).append(&quot; (&quot;);</span>
+
+<span class="nc" id="L109">        List&lt;ColumnDefinition&gt; partitionKeyColumns = metadata.partitionKeyColumns();</span>
+<span class="nc" id="L110">        List&lt;ColumnDefinition&gt; clusteringColumns = getClusteringColumns(metadata);</span>
+<span class="nc" id="L111">        List&lt;ColumnDefinition&gt; partitionColumns = getPartitionColumns(metadata);</span>
+
+<span class="nc" id="L113">        Consumer&lt;StringBuilder&gt; cdCommaAppender = commaAppender(&quot;\n\t&quot;);</span>
+<span class="nc" id="L114">        sb.append(&quot;\n\t&quot;);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        for (ColumnDefinition cfd: partitionKeyColumns)</span>
+        {
+<span class="nc" id="L117">            cdCommaAppender.accept(sb);</span>
+<span class="nc" id="L118">            sb.append(toCQL(cfd));</span>
+<span class="nc bnc" id="L119" title="All 4 branches missed.">            if (partitionKeyColumns.size() == 1 &amp;&amp; clusteringColumns.size() == 0)</span>
+<span class="nc" id="L120">                sb.append(&quot; PRIMARY KEY&quot;);</span>
+<span class="nc" id="L121">        }</span>
+
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        for (ColumnDefinition cfd: clusteringColumns)</span>
+        {
+<span class="nc" id="L125">            cdCommaAppender.accept(sb);</span>
+<span class="nc" id="L126">            sb.append(toCQL(cfd));</span>
+<span class="nc" id="L127">        }</span>
+
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        for (ColumnDefinition cfd: partitionColumns)</span>
+        {
+<span class="nc" id="L131">            cdCommaAppender.accept(sb);</span>
+<span class="nc" id="L132">            sb.append(toCQL(cfd, metadata.isStaticCompactTable()));</span>
+<span class="nc" id="L133">        }</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (includeDroppedColumns)</span>
+        {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">            for (Map.Entry&lt;ByteBuffer, CFMetaData.DroppedColumn&gt; entry: metadata.getDroppedColumns().entrySet())</span>
+            {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">                if (metadata.getColumnDefinition(entry.getKey()) != null)</span>
+<span class="nc" id="L140">                    continue;</span>
+
+<span class="nc" id="L142">                CFMetaData.DroppedColumn droppedColumn = entry.getValue();</span>
+<span class="nc" id="L143">                cdCommaAppender.accept(sb);</span>
+<span class="nc" id="L144">                sb.append(quoteIdentifier(droppedColumn.name));</span>
+<span class="nc" id="L145">                sb.append(' ');</span>
+<span class="nc" id="L146">                sb.append(droppedColumn.type.asCQL3Type().toString());</span>
+<span class="nc" id="L147">            }</span>
+        }
+
+<span class="nc bnc" id="L150" title="All 4 branches missed.">        if (clusteringColumns.size() &gt; 0 || partitionKeyColumns.size() &gt; 1)</span>
+        {
+<span class="nc" id="L152">            sb.append(&quot;,\n\tPRIMARY KEY (&quot;);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (partitionKeyColumns.size() &gt; 1)</span>
+            {
+<span class="nc" id="L155">                sb.append(&quot;(&quot;);</span>
+<span class="nc" id="L156">                Consumer&lt;StringBuilder&gt; pkCommaAppender = commaAppender(&quot; &quot;);</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                for (ColumnDefinition cfd : partitionKeyColumns)</span>
+                {
+<span class="nc" id="L159">                    pkCommaAppender.accept(sb);</span>
+<span class="nc" id="L160">                    sb.append(quoteIdentifier(cfd.name.toString()));</span>
+<span class="nc" id="L161">                }</span>
+<span class="nc" id="L162">                sb.append(&quot;)&quot;);</span>
+<span class="nc" id="L163">            }</span>
+            else
+            {
+<span class="nc" id="L166">                sb.append(quoteIdentifier(partitionKeyColumns.get(0).name.toString()));</span>
+            }
+
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            for (ColumnDefinition cfd : metadata.clusteringColumns())</span>
+<span class="nc" id="L170">                sb.append(&quot;, &quot;).append(quoteIdentifier(cfd.name.toString()));</span>
+
+<span class="nc" id="L172">            sb.append(')');</span>
+        }
+<span class="nc" id="L174">        sb.append(&quot;)\n\t&quot;);</span>
+<span class="nc" id="L175">        sb.append(&quot;WITH &quot;);</span>
+
+<span class="nc" id="L177">        sb.append(&quot;ID = &quot;).append(metadata.cfId).append(&quot;\n\tAND &quot;);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (metadata.isCompactTable())</span>
+<span class="nc" id="L180">            sb.append(&quot;COMPACT STORAGE\n\tAND &quot;);</span>
+
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (clusteringColumns.size() &gt; 0)</span>
+        {
+<span class="nc" id="L184">            sb.append(&quot;CLUSTERING ORDER BY (&quot;);</span>
+
+<span class="nc" id="L186">            Consumer&lt;StringBuilder&gt; cOrderCommaAppender = commaAppender(&quot; &quot;);</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            for (ColumnDefinition cd : clusteringColumns)</span>
+            {
+<span class="nc" id="L189">                cOrderCommaAppender.accept(sb);</span>
+<span class="nc" id="L190">                sb.append(quoteIdentifier(cd.name.toString())).append(' ').append(cd.clusteringOrder().toString());</span>
+<span class="nc" id="L191">            }</span>
+<span class="nc" id="L192">            sb.append(&quot;)\n\tAND &quot;);</span>
+        }
+
+<span class="nc" id="L195">        sb.append(toCQL(metadata.params));</span>
+<span class="nc" id="L196">        sb.append(&quot;;&quot;);</span>
+
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (!isCqlCompatible(metadata))</span>
+        {
+<span class="nc" id="L200">            sb.append(&quot;\n*/&quot;);</span>
+        }
+<span class="nc" id="L202">        return sb.toString();</span>
+    }
+
+    /**
+     * Build a CQL String representation of User Types used in the given Column Family.
+     *
+     * Type order is ensured as types are built incrementally: from the innermost (most nested)
+     * to the outermost.
+     */
+    @VisibleForTesting
+    public static List&lt;String&gt; getUserTypesAsCQL(CFMetaData metadata)
+    {
+<span class="nc" id="L214">        List&lt;AbstractType&gt; types = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L215">        Set&lt;AbstractType&gt; typeSet = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        for (ColumnDefinition cd: Iterables.concat(metadata.partitionKeyColumns(), metadata.clusteringColumns(), metadata.partitionColumns()))</span>
+        {
+<span class="nc" id="L218">            AbstractType type = cd.type;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (type.isUDT())</span>
+<span class="nc" id="L220">                resolveUserType((UserType) type, typeSet, types);</span>
+<span class="nc" id="L221">        }</span>
+
+<span class="nc" id="L223">        List&lt;String&gt; typeStrings = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (AbstractType type: types)</span>
+<span class="nc" id="L225">            typeStrings.add(toCQL((UserType) type));</span>
+<span class="nc" id="L226">        return typeStrings;</span>
+    }
+
+    /**
+     * Build a CQL String representation of Dropped Columns in the given Column Family.
+     *
+     * If the column was dropped once, but is now re-created `ADD` will be appended accordingly.
+     */
+    @VisibleForTesting
+    public static List&lt;String&gt; getDroppedColumnsAsCQL(CFMetaData metadata)
+    {
+<span class="nc" id="L237">        List&lt;String&gt; droppedColumns = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        for (Map.Entry&lt;ByteBuffer, CFMetaData.DroppedColumn&gt; entry: metadata.getDroppedColumns().entrySet())</span>
+        {
+<span class="nc" id="L241">            CFMetaData.DroppedColumn column = entry.getValue();</span>
+<span class="nc" id="L242">            droppedColumns.add(toCQLDrop(metadata.ksName, metadata.cfName, column));</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">            if (metadata.getColumnDefinition(entry.getKey()) != null)</span>
+<span class="nc" id="L244">                droppedColumns.add(toCQLAdd(metadata.ksName, metadata.cfName, metadata.getColumnDefinition(entry.getKey())));</span>
+<span class="nc" id="L245">        }</span>
+
+<span class="nc" id="L247">        return droppedColumns;</span>
+    }
+
+    /**
+     * Build a CQL String representation of Indexes on columns in the given Column Family
+     */
+    @VisibleForTesting
+    public static List&lt;String&gt; getIndexesAsCQL(CFMetaData metadata)
+    {
+<span class="nc" id="L256">        List&lt;String&gt; indexes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        for (IndexMetadata indexMetadata: metadata.getIndexes())</span>
+<span class="nc" id="L258">            indexes.add(toCQL(metadata.ksName, metadata.cfName, indexMetadata));</span>
+<span class="nc" id="L259">        return indexes;</span>
+    }
+
+    private static String toCQL(String keyspace, String cf, IndexMetadata indexMetadata)
+    {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        if (indexMetadata.isCustom())</span>
+        {
+<span class="nc" id="L266">            Map&lt;String, String&gt; options = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L267">            indexMetadata.options.forEach((k, v) -&gt; {</span>
+<span class="nc bnc" id="L268" title="All 4 branches missed.">                if (!k.equals(IndexTarget.TARGET_OPTION_NAME) &amp;&amp; !k.equals(IndexTarget.CUSTOM_INDEX_OPTION_NAME))</span>
+<span class="nc" id="L269">                    options.put(k, v);</span>
+<span class="nc" id="L270">            });</span>
+
+<span class="nc" id="L272">            return String.format(&quot;CREATE CUSTOM INDEX %s ON %s.%s (%s) USING '%s'%s;&quot;,</span>
+<span class="nc" id="L273">                                 quoteIdentifier(indexMetadata.name),</span>
+<span class="nc" id="L274">                                 quoteIdentifier(keyspace),</span>
+<span class="nc" id="L275">                                 quoteIdentifier(cf),</span>
+<span class="nc" id="L276">                                 indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME),</span>
+<span class="nc" id="L277">                                 indexMetadata.options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME),</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                                 options.isEmpty() ? &quot;&quot; : &quot; WITH OPTIONS &quot; + toCQL(options));</span>
+        }
+        else
+        {
+<span class="nc" id="L282">            return String.format(&quot;CREATE INDEX %s ON %s.%s (%s);&quot;,</span>
+<span class="nc" id="L283">                                 quoteIdentifier(indexMetadata.name),</span>
+<span class="nc" id="L284">                                 quoteIdentifier(keyspace),</span>
+<span class="nc" id="L285">                                 quoteIdentifier(cf),</span>
+<span class="nc" id="L286">                                 indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME));</span>
+        }
+    }
+    private static String toCQL(UserType userType)
+    {
+<span class="nc" id="L291">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L292">        sb.append(String.format(&quot;CREATE TYPE %s.%s(&quot;,</span>
+<span class="nc" id="L293">                                quoteIdentifier(userType.keyspace),</span>
+<span class="nc" id="L294">                                quoteIdentifier(userType.getNameAsString())));</span>
+
+<span class="nc" id="L296">        Consumer&lt;StringBuilder&gt; commaAppender = commaAppender(&quot; &quot;);</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        for (int i = 0; i &lt; userType.size(); i++)</span>
+        {
+<span class="nc" id="L299">            commaAppender.accept(sb);</span>
+<span class="nc" id="L300">            sb.append(String.format(&quot;%s %s&quot;,</span>
+<span class="nc" id="L301">                                    userType.fieldNameAsString(i),</span>
+<span class="nc" id="L302">                                    userType.fieldType(i).asCQL3Type()));</span>
+        }
+<span class="nc" id="L304">        sb.append(&quot;);&quot;);</span>
+<span class="nc" id="L305">        return sb.toString();</span>
+    }
+
+    private static String toCQL(TableParams tableParams)
+    {
+<span class="nc" id="L310">        StringBuilder builder = new StringBuilder();</span>
+
+<span class="nc" id="L312">        builder.append(&quot;bloom_filter_fp_chance = &quot;).append(tableParams.bloomFilterFpChance);</span>
+<span class="nc" id="L313">        builder.append(&quot;\n\tAND dclocal_read_repair_chance = &quot;).append(tableParams.dcLocalReadRepairChance);</span>
+<span class="nc" id="L314">        builder.append(&quot;\n\tAND crc_check_chance = &quot;).append(tableParams.crcCheckChance);</span>
+<span class="nc" id="L315">        builder.append(&quot;\n\tAND default_time_to_live = &quot;).append(tableParams.defaultTimeToLive);</span>
+<span class="nc" id="L316">        builder.append(&quot;\n\tAND gc_grace_seconds = &quot;).append(tableParams.gcGraceSeconds);</span>
+<span class="nc" id="L317">        builder.append(&quot;\n\tAND min_index_interval = &quot;).append(tableParams.minIndexInterval);</span>
+<span class="nc" id="L318">        builder.append(&quot;\n\tAND max_index_interval = &quot;).append(tableParams.maxIndexInterval);</span>
+<span class="nc" id="L319">        builder.append(&quot;\n\tAND memtable_flush_period_in_ms = &quot;).append(tableParams.memtableFlushPeriodInMs);</span>
+<span class="nc" id="L320">        builder.append(&quot;\n\tAND read_repair_chance = &quot;).append(tableParams.readRepairChance);</span>
+<span class="nc" id="L321">        builder.append(&quot;\n\tAND speculative_retry = '&quot;).append(tableParams.speculativeRetry).append(&quot;'&quot;);</span>
+<span class="nc" id="L322">        builder.append(&quot;\n\tAND comment = &quot;).append(singleQuote(tableParams.comment));</span>
+<span class="nc" id="L323">        builder.append(&quot;\n\tAND caching = &quot;).append(toCQL(tableParams.caching.asMap()));</span>
+<span class="nc" id="L324">        builder.append(&quot;\n\tAND compaction = &quot;).append(toCQL(tableParams.compaction.asMap()));</span>
+<span class="nc" id="L325">        builder.append(&quot;\n\tAND compression = &quot;).append(toCQL(tableParams.compression.asMap()));</span>
+<span class="nc" id="L326">        builder.append(&quot;\n\tAND cdc = &quot;).append(tableParams.cdc);</span>
+
+<span class="nc" id="L328">        builder.append(&quot;\n\tAND extensions = { &quot;);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        for (Map.Entry&lt;String, ByteBuffer&gt; entry : tableParams.extensions.entrySet())</span>
+        {
+<span class="nc" id="L331">            builder.append(singleQuote(entry.getKey()));</span>
+<span class="nc" id="L332">            builder.append(&quot;: &quot;);</span>
+<span class="nc" id="L333">            builder.append(&quot;0x&quot;).append(ByteBufferUtil.bytesToHex(entry.getValue()));</span>
+<span class="nc" id="L334">        }</span>
+<span class="nc" id="L335">        builder.append(&quot; }&quot;);</span>
+<span class="nc" id="L336">        return builder.toString();</span>
+    }
+
+    private static String toCQL(Map&lt;?, ?&gt; map)
+    {
+<span class="nc" id="L341">        StringBuilder builder = new StringBuilder(&quot;{ &quot;);</span>
+
+<span class="nc" id="L343">        boolean isFirst = true;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        for (Map.Entry entry: map.entrySet())</span>
+        {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            if (isFirst)</span>
+<span class="nc" id="L347">                isFirst = false;</span>
+            else
+<span class="nc" id="L349">                builder.append(&quot;, &quot;);</span>
+<span class="nc" id="L350">            builder.append(singleQuote(entry.getKey().toString()));</span>
+<span class="nc" id="L351">            builder.append(&quot;: &quot;);</span>
+<span class="nc" id="L352">            builder.append(singleQuote(entry.getValue().toString()));</span>
+<span class="nc" id="L353">        }</span>
+
+<span class="nc" id="L355">        builder.append(&quot; }&quot;);</span>
+<span class="nc" id="L356">        return builder.toString();</span>
+    }
+
+    private static String toCQL(ColumnDefinition cd)
+    {
+<span class="nc" id="L361">        return toCQL(cd, false);</span>
+    }
+
+    private static String toCQL(ColumnDefinition cd, boolean isStaticCompactTable)
+    {
+<span class="nc" id="L366">        return String.format(&quot;%s %s%s&quot;,</span>
+<span class="nc" id="L367">                             quoteIdentifier(cd.name.toString()),</span>
+<span class="nc" id="L368">                             cd.type.asCQL3Type().toString(),</span>
+<span class="nc bnc" id="L369" title="All 4 branches missed.">                             cd.isStatic() &amp;&amp; !isStaticCompactTable ? &quot; static&quot; : &quot;&quot;);</span>
+    }
+
+    private static String toCQLAdd(String keyspace, String cf, ColumnDefinition cd)
+    {
+<span class="nc" id="L374">        return String.format(&quot;ALTER TABLE %s.%s ADD %s %s%s;&quot;,</span>
+<span class="nc" id="L375">                             quoteIdentifier(keyspace),</span>
+<span class="nc" id="L376">                             quoteIdentifier(cf),</span>
+<span class="nc" id="L377">                             quoteIdentifier(cd.name.toString()),</span>
+<span class="nc" id="L378">                             cd.type.asCQL3Type().toString(),</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                             cd.isStatic() ? &quot; static&quot; : &quot;&quot;);</span>
+    }
+
+    private static String toCQLDrop(String keyspace, String cf, CFMetaData.DroppedColumn droppedColumn)
+    {
+<span class="nc" id="L384">        return String.format(&quot;ALTER TABLE %s.%s DROP %s USING TIMESTAMP %s;&quot;,</span>
+<span class="nc" id="L385">                             quoteIdentifier(keyspace),</span>
+<span class="nc" id="L386">                             quoteIdentifier(cf),</span>
+<span class="nc" id="L387">                             quoteIdentifier(droppedColumn.name),</span>
+<span class="nc" id="L388">                             droppedColumn.droppedTime);</span>
+    }
+
+    private static void resolveUserType(UserType type, Set&lt;AbstractType&gt; typeSet, List&lt;AbstractType&gt; types)
+    {
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        for (AbstractType subType: type.fieldTypes())</span>
+<span class="nc bnc" id="L394" title="All 4 branches missed.">            if (!typeSet.contains(subType) &amp;&amp; subType.isUDT())</span>
+<span class="nc" id="L395">                resolveUserType((UserType) subType, typeSet, types);</span>
+
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (!typeSet.contains(type))</span>
+        {
+<span class="nc" id="L399">            typeSet.add(type);</span>
+<span class="nc" id="L400">            types.add(type);</span>
+        }
+<span class="nc" id="L402">    }</span>
+
+    private static String singleQuote(String s)
+    {
+<span class="nc" id="L406">        return String.format(&quot;'%s'&quot;, s.replaceAll(&quot;'&quot;, &quot;''&quot;));</span>
+    }
+
+    private static Consumer&lt;StringBuilder&gt; commaAppender(String afterComma)
+    {
+<span class="nc" id="L411">        AtomicBoolean isFirst = new AtomicBoolean(true);</span>
+<span class="nc" id="L412">        return new Consumer&lt;StringBuilder&gt;()</span>
+<span class="nc" id="L413">        {</span>
+            public void accept(StringBuilder stringBuilder)
+            {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                if (!isFirst.getAndSet(false))</span>
+<span class="nc" id="L417">                    stringBuilder.append(',').append(afterComma);</span>
+<span class="nc" id="L418">            }</span>
+        };
+    }
+
+    private static String quoteIdentifier(String id)
+    {
+<span class="nc" id="L424">        return ColumnIdentifier.maybeQuote(id);</span>
+    }
+
+    /**
+     * Whether or not the given metadata is compatible / representable with CQL Language
+     */
+    public static boolean isCqlCompatible(CFMetaData metaData)
+    {
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (metaData.isSuper())</span>
+<span class="nc" id="L433">            return false;</span>
+
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if (metaData.isCompactTable()</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            &amp;&amp; metaData.partitionColumns().withoutStatics().size() &gt; 1</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">            &amp;&amp; metaData.clusteringColumns().size() &gt;= 1)</span>
+<span class="nc" id="L438">            return false;</span>
+
+<span class="nc" id="L440">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

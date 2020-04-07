@@ -1,0 +1,400 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConsistencyLevel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">ConsistencyLevel.java</span></div><h1>ConsistencyLevel.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ReadRepairDecision;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.NetworkTopologyStrategy;
+import org.apache.cassandra.transport.ProtocolException;
+
+<span class="fc" id="L40">public enum ConsistencyLevel</span>
+{
+<span class="fc" id="L42">    ANY         (0),</span>
+<span class="fc" id="L43">    ONE         (1),</span>
+<span class="fc" id="L44">    TWO         (2),</span>
+<span class="fc" id="L45">    THREE       (3),</span>
+<span class="fc" id="L46">    QUORUM      (4),</span>
+<span class="fc" id="L47">    ALL         (5),</span>
+<span class="fc" id="L48">    LOCAL_QUORUM(6, true),</span>
+<span class="fc" id="L49">    EACH_QUORUM (7),</span>
+<span class="fc" id="L50">    SERIAL      (8),</span>
+<span class="fc" id="L51">    LOCAL_SERIAL(9),</span>
+<span class="fc" id="L52">    LOCAL_ONE   (10, true);</span>
+
+<span class="fc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(ConsistencyLevel.class);</span>
+
+    // Used by the binary protocol
+    public final int code;
+    private final boolean isDCLocal;
+    private static final ConsistencyLevel[] codeIdx;
+    static
+    {
+<span class="fc" id="L62">        int maxCode = -1;</span>
+<span class="fc bfc" id="L63" title="All 2 branches covered.">        for (ConsistencyLevel cl : ConsistencyLevel.values())</span>
+<span class="fc" id="L64">            maxCode = Math.max(maxCode, cl.code);</span>
+<span class="fc" id="L65">        codeIdx = new ConsistencyLevel[maxCode + 1];</span>
+<span class="fc bfc" id="L66" title="All 2 branches covered.">        for (ConsistencyLevel cl : ConsistencyLevel.values())</span>
+        {
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">            if (codeIdx[cl.code] != null)</span>
+<span class="nc" id="L69">                throw new IllegalStateException(&quot;Duplicate code&quot;);</span>
+<span class="fc" id="L70">            codeIdx[cl.code] = cl;</span>
+        }
+<span class="fc" id="L72">    }</span>
+
+    private ConsistencyLevel(int code)
+    {
+<span class="fc" id="L76">        this(code, false);</span>
+<span class="fc" id="L77">    }</span>
+
+    private ConsistencyLevel(int code, boolean isDCLocal)
+<span class="fc" id="L80">    {</span>
+<span class="fc" id="L81">        this.code = code;</span>
+<span class="fc" id="L82">        this.isDCLocal = isDCLocal;</span>
+<span class="fc" id="L83">    }</span>
+
+    public static ConsistencyLevel fromCode(int code)
+    {
+<span class="nc bnc" id="L87" title="All 4 branches missed.">        if (code &lt; 0 || code &gt;= codeIdx.length)</span>
+<span class="nc" id="L88">            throw new ProtocolException(String.format(&quot;Unknown code %d for a consistency level&quot;, code));</span>
+<span class="nc" id="L89">        return codeIdx[code];</span>
+    }
+
+    private int quorumFor(Keyspace keyspace)
+    {
+<span class="fc" id="L94">        return (keyspace.getReplicationStrategy().getReplicationFactor() / 2) + 1;</span>
+    }
+
+    private int localQuorumFor(Keyspace keyspace, String dc)
+    {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        return (keyspace.getReplicationStrategy() instanceof NetworkTopologyStrategy)</span>
+<span class="nc" id="L100">             ? (((NetworkTopologyStrategy) keyspace.getReplicationStrategy()).getReplicationFactor(dc) / 2) + 1</span>
+<span class="nc" id="L101">             : quorumFor(keyspace);</span>
+    }
+
+    public int blockFor(Keyspace keyspace)
+    {
+<span class="pc bpc" id="L106" title="7 of 9 branches missed.">        switch (this)</span>
+        {
+            case ONE:
+            case LOCAL_ONE:
+<span class="fc" id="L110">                return 1;</span>
+            case ANY:
+<span class="nc" id="L112">                return 1;</span>
+            case TWO:
+<span class="nc" id="L114">                return 2;</span>
+            case THREE:
+<span class="nc" id="L116">                return 3;</span>
+            case QUORUM:
+            case SERIAL:
+<span class="fc" id="L119">                return quorumFor(keyspace);</span>
+            case ALL:
+<span class="nc" id="L121">                return keyspace.getReplicationStrategy().getReplicationFactor();</span>
+            case LOCAL_QUORUM:
+            case LOCAL_SERIAL:
+<span class="nc" id="L124">                return localQuorumFor(keyspace, DatabaseDescriptor.getLocalDataCenter());</span>
+            case EACH_QUORUM:
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                if (keyspace.getReplicationStrategy() instanceof NetworkTopologyStrategy)</span>
+                {
+<span class="nc" id="L128">                    NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();</span>
+<span class="nc" id="L129">                    int n = 0;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">                    for (String dc : strategy.getDatacenters())</span>
+<span class="nc" id="L131">                        n += localQuorumFor(keyspace, dc);</span>
+<span class="nc" id="L132">                    return n;</span>
+                }
+                else
+                {
+<span class="nc" id="L136">                    return quorumFor(keyspace);</span>
+                }
+            default:
+<span class="nc" id="L139">                throw new UnsupportedOperationException(&quot;Invalid consistency level: &quot; + toString());</span>
+        }
+    }
+
+    public boolean isDatacenterLocal()
+    {
+<span class="fc" id="L145">        return isDCLocal;</span>
+    }
+
+    public boolean isLocal(InetAddress endpoint)
+    {
+<span class="nc" id="L150">        return DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(endpoint));</span>
+    }
+
+    public int countLocalEndpoints(Iterable&lt;InetAddress&gt; liveEndpoints)
+    {
+<span class="nc" id="L155">        int count = 0;</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        for (InetAddress endpoint : liveEndpoints)</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            if (isLocal(endpoint))</span>
+<span class="nc" id="L158">                count++;</span>
+<span class="nc" id="L159">        return count;</span>
+    }
+
+    private Map&lt;String, Integer&gt; countPerDCEndpoints(Keyspace keyspace, Iterable&lt;InetAddress&gt; liveEndpoints)
+    {
+<span class="nc" id="L164">        NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();</span>
+
+<span class="nc" id="L166">        Map&lt;String, Integer&gt; dcEndpoints = new HashMap&lt;String, Integer&gt;();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        for (String dc: strategy.getDatacenters())</span>
+<span class="nc" id="L168">            dcEndpoints.put(dc, 0);</span>
+
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        for (InetAddress endpoint : liveEndpoints)</span>
+        {
+<span class="nc" id="L172">            String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(endpoint);</span>
+<span class="nc" id="L173">            dcEndpoints.put(dc, dcEndpoints.get(dc) + 1);</span>
+<span class="nc" id="L174">        }</span>
+<span class="nc" id="L175">        return dcEndpoints;</span>
+    }
+
+    public List&lt;InetAddress&gt; filterForQuery(Keyspace keyspace, List&lt;InetAddress&gt; liveEndpoints)
+    {
+<span class="fc" id="L180">        return filterForQuery(keyspace, liveEndpoints, ReadRepairDecision.NONE);</span>
+    }
+
+    public List&lt;InetAddress&gt; filterForQuery(Keyspace keyspace, List&lt;InetAddress&gt; liveEndpoints, ReadRepairDecision readRepair)
+    {
+        /*
+         * If we are doing an each quorum query, we have to make sure that the endpoints we select
+         * provide a quorum for each data center. If we are not using a NetworkTopologyStrategy,
+         * we should fall through and grab a quorum in the replication strategy.
+         */
+<span class="pc bpc" id="L190" title="3 of 4 branches missed.">        if (this == EACH_QUORUM &amp;&amp; keyspace.getReplicationStrategy() instanceof NetworkTopologyStrategy)</span>
+<span class="nc" id="L191">            return filterForEachQuorum(keyspace, liveEndpoints, readRepair);</span>
+
+        /*
+         * Endpoints are expected to be restricted to live replicas, sorted by snitch preference.
+         * For LOCAL_QUORUM, move local-DC replicas in front first as we need them there whether
+         * we do read repair (since the first replica gets the data read) or not (since we'll take
+         * the blockFor first ones).
+         */
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">        if (isDCLocal)</span>
+<span class="nc" id="L200">            Collections.sort(liveEndpoints, DatabaseDescriptor.getLocalComparator());</span>
+
+<span class="pc bpc" id="L202" title="3 of 4 branches missed.">        switch (readRepair)</span>
+        {
+            case NONE:
+<span class="fc" id="L205">                return liveEndpoints.subList(0, Math.min(liveEndpoints.size(), blockFor(keyspace)));</span>
+            case GLOBAL:
+<span class="nc" id="L207">                return liveEndpoints;</span>
+            case DC_LOCAL:
+<span class="nc" id="L209">                List&lt;InetAddress&gt; local = new ArrayList&lt;InetAddress&gt;();</span>
+<span class="nc" id="L210">                List&lt;InetAddress&gt; other = new ArrayList&lt;InetAddress&gt;();</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                for (InetAddress add : liveEndpoints)</span>
+                {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                    if (isLocal(add))</span>
+<span class="nc" id="L214">                        local.add(add);</span>
+                    else
+<span class="nc" id="L216">                        other.add(add);</span>
+<span class="nc" id="L217">                }</span>
+                // check if blockfor more than we have localep's
+<span class="nc" id="L219">                int blockFor = blockFor(keyspace);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                if (local.size() &lt; blockFor)</span>
+<span class="nc" id="L221">                    local.addAll(other.subList(0, Math.min(blockFor - local.size(), other.size())));</span>
+<span class="nc" id="L222">                return local;</span>
+            default:
+<span class="nc" id="L224">                throw new AssertionError();</span>
+        }
+    }
+
+    private List&lt;InetAddress&gt; filterForEachQuorum(Keyspace keyspace, List&lt;InetAddress&gt; liveEndpoints, ReadRepairDecision readRepair)
+    {
+<span class="nc" id="L230">        NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) keyspace.getReplicationStrategy();</span>
+
+        // quickly drop out if read repair is GLOBAL, since we just use all of the live endpoints
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (readRepair == ReadRepairDecision.GLOBAL)</span>
+<span class="nc" id="L234">            return liveEndpoints;</span>
+
+<span class="nc" id="L236">        Map&lt;String, List&lt;InetAddress&gt;&gt; dcsEndpoints = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        for (String dc: strategy.getDatacenters())</span>
+<span class="nc" id="L238">            dcsEndpoints.put(dc, new ArrayList&lt;&gt;());</span>
+
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (InetAddress add : liveEndpoints)</span>
+        {
+<span class="nc" id="L242">            String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(add);</span>
+<span class="nc" id="L243">            dcsEndpoints.get(dc).add(add);</span>
+<span class="nc" id="L244">        }</span>
+
+<span class="nc" id="L246">        List&lt;InetAddress&gt; waitSet = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        for (Map.Entry&lt;String, List&lt;InetAddress&gt;&gt; dcEndpoints : dcsEndpoints.entrySet())</span>
+        {
+<span class="nc" id="L249">            List&lt;InetAddress&gt; dcEndpoint = dcEndpoints.getValue();</span>
+<span class="nc bnc" id="L250" title="All 4 branches missed.">            if (readRepair == ReadRepairDecision.DC_LOCAL &amp;&amp; dcEndpoints.getKey().equals(DatabaseDescriptor.getLocalDataCenter()))</span>
+<span class="nc" id="L251">                waitSet.addAll(dcEndpoint);</span>
+            else
+<span class="nc" id="L253">                waitSet.addAll(dcEndpoint.subList(0, Math.min(localQuorumFor(keyspace, dcEndpoints.getKey()), dcEndpoint.size())));</span>
+<span class="nc" id="L254">        }</span>
+
+<span class="nc" id="L256">        return waitSet;</span>
+    }
+
+    public boolean isSufficientLiveNodes(Keyspace keyspace, Iterable&lt;InetAddress&gt; liveEndpoints)
+    {
+<span class="pc bpc" id="L261" title="4 of 5 branches missed.">        switch (this)</span>
+        {
+            case ANY:
+                // local hint is acceptable, and local node is always live
+<span class="nc" id="L265">                return true;</span>
+            case LOCAL_ONE:
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                return countLocalEndpoints(liveEndpoints) &gt;= 1;</span>
+            case LOCAL_QUORUM:
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                return countLocalEndpoints(liveEndpoints) &gt;= blockFor(keyspace);</span>
+            case EACH_QUORUM:
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                if (keyspace.getReplicationStrategy() instanceof NetworkTopologyStrategy)</span>
+                {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                    for (Map.Entry&lt;String, Integer&gt; entry : countPerDCEndpoints(keyspace, liveEndpoints).entrySet())</span>
+                    {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">                        if (entry.getValue() &lt; localQuorumFor(keyspace, entry.getKey()))</span>
+<span class="nc" id="L276">                            return false;</span>
+<span class="nc" id="L277">                    }</span>
+<span class="nc" id="L278">                    return true;</span>
+                }
+                // Fallthough on purpose for SimpleStrategy
+            default:
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">                return Iterables.size(liveEndpoints) &gt;= blockFor(keyspace);</span>
+        }
+    }
+
+    public void assureSufficientLiveNodes(Keyspace keyspace, Iterable&lt;InetAddress&gt; liveEndpoints) throws UnavailableException
+    {
+<span class="fc" id="L288">        int blockFor = blockFor(keyspace);</span>
+<span class="pc bpc" id="L289" title="4 of 5 branches missed.">        switch (this)</span>
+        {
+            case ANY:
+                // local hint is acceptable, and local node is always live
+<span class="nc" id="L293">                break;</span>
+            case LOCAL_ONE:
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                if (countLocalEndpoints(liveEndpoints) == 0)</span>
+<span class="nc" id="L296">                    throw new UnavailableException(this, 1, 0);</span>
+                break;
+            case LOCAL_QUORUM:
+<span class="nc" id="L299">                int localLive = countLocalEndpoints(liveEndpoints);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (localLive &lt; blockFor)</span>
+                {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+                    {
+<span class="nc" id="L304">                        StringBuilder builder = new StringBuilder(&quot;Local replicas [&quot;);</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                        for (InetAddress endpoint : liveEndpoints)</span>
+                        {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                            if (isLocal(endpoint))</span>
+<span class="nc" id="L308">                                builder.append(endpoint).append(&quot;,&quot;);</span>
+<span class="nc" id="L309">                        }</span>
+<span class="nc" id="L310">                        builder.append(&quot;] are insufficient to satisfy LOCAL_QUORUM requirement of &quot;).append(blockFor).append(&quot; live nodes in '&quot;).append(DatabaseDescriptor.getLocalDataCenter()).append(&quot;'&quot;);</span>
+<span class="nc" id="L311">                        logger.trace(builder.toString());</span>
+                    }
+<span class="nc" id="L313">                    throw new UnavailableException(this, blockFor, localLive);</span>
+                }
+                break;
+            case EACH_QUORUM:
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                if (keyspace.getReplicationStrategy() instanceof NetworkTopologyStrategy)</span>
+                {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                    for (Map.Entry&lt;String, Integer&gt; entry : countPerDCEndpoints(keyspace, liveEndpoints).entrySet())</span>
+                    {
+<span class="nc" id="L321">                        int dcBlockFor = localQuorumFor(keyspace, entry.getKey());</span>
+<span class="nc" id="L322">                        int dcLive = entry.getValue();</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                        if (dcLive &lt; dcBlockFor)</span>
+<span class="nc" id="L324">                            throw new UnavailableException(this, entry.getKey(), dcBlockFor, dcLive);</span>
+<span class="nc" id="L325">                    }</span>
+<span class="nc" id="L326">                    break;</span>
+                }
+                // Fallthough on purpose for SimpleStrategy
+            default:
+<span class="fc" id="L330">                int live = Iterables.size(liveEndpoints);</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">                if (live &lt; blockFor)</span>
+                {
+<span class="nc" id="L333">                    logger.trace(&quot;Live nodes {} do not satisfy ConsistencyLevel ({} required)&quot;, Iterables.toString(liveEndpoints), blockFor);</span>
+<span class="nc" id="L334">                    throw new UnavailableException(this, blockFor, live);</span>
+                }
+                break;
+        }
+<span class="fc" id="L338">    }</span>
+
+    public void validateForRead(String keyspaceName) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        switch (this)</span>
+        {
+            case ANY:
+<span class="nc" id="L345">                throw new InvalidRequestException(&quot;ANY ConsistencyLevel is only supported for writes&quot;);</span>
+        }
+<span class="fc" id="L347">    }</span>
+
+    public void validateForWrite(String keyspaceName) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        switch (this)</span>
+        {
+            case SERIAL:
+            case LOCAL_SERIAL:
+<span class="nc" id="L355">                throw new InvalidRequestException(&quot;You must use conditional updates for serializable writes&quot;);</span>
+        }
+<span class="fc" id="L357">    }</span>
+
+    // This is the same than validateForWrite really, but we include a slightly different error message for SERIAL/LOCAL_SERIAL
+    public void validateForCasCommit(String keyspaceName) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L362" title="All 3 branches missed.">        switch (this)</span>
+        {
+            case EACH_QUORUM:
+<span class="nc" id="L365">                requireNetworkTopologyStrategy(keyspaceName);</span>
+<span class="nc" id="L366">                break;</span>
+            case SERIAL:
+            case LOCAL_SERIAL:
+<span class="nc" id="L369">                throw new InvalidRequestException(this + &quot; is not supported as conditional update commit consistency. Use ANY if you mean \&quot;make sure it is accepted but I don't care how many replicas commit it for non-SERIAL reads\&quot;&quot;);</span>
+        }
+<span class="nc" id="L371">    }</span>
+
+    public void validateForCas() throws InvalidRequestException
+    {
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (!isSerialConsistency())</span>
+<span class="nc" id="L376">            throw new InvalidRequestException(&quot;Invalid consistency for conditional update. Must be one of SERIAL or LOCAL_SERIAL&quot;);</span>
+<span class="nc" id="L377">    }</span>
+
+    public boolean isSerialConsistency()
+    {
+<span class="pc bpc" id="L381" title="2 of 4 branches missed.">        return this == SERIAL || this == LOCAL_SERIAL;</span>
+    }
+
+    public void validateCounterForWrite(CFMetaData metadata) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (this == ConsistencyLevel.ANY)</span>
+<span class="nc" id="L387">            throw new InvalidRequestException(&quot;Consistency level ANY is not yet supported for counter table &quot; + metadata.cfName);</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (isSerialConsistency())</span>
+<span class="nc" id="L390">            throw new InvalidRequestException(&quot;Counter operations are inherently non-serializable&quot;);</span>
+<span class="nc" id="L391">    }</span>
+
+    private void requireNetworkTopologyStrategy(String keyspaceName) throws InvalidRequestException
+    {
+<span class="nc" id="L395">        AbstractReplicationStrategy strategy = Keyspace.open(keyspaceName).getReplicationStrategy();</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (!(strategy instanceof NetworkTopologyStrategy))</span>
+<span class="nc" id="L397">            throw new InvalidRequestException(String.format(&quot;consistency level %s not compatible with replication strategy (%s)&quot;, this, strategy.getClass().getName()));</span>
+<span class="nc" id="L398">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

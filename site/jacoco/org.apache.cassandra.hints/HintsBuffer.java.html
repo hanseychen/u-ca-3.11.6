@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsBuffer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsBuffer.java</span></div><h1>HintsBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.CRC32;
+
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputBufferFixed;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+
+/**
+ * A shared buffer that temporarily holds the serialized hints before they are flushed to disk.
+ *
+ * Consists of :
+ * - a ByteBuffer holding the serialized hints (length, length checksum and total checksum included)
+ * - a pointer to the current allocation offset
+ * - an {@link OpOrder} appendOrder for {@link HintsWriteExecutor} to wait on for all writes completion
+ * - a map of (host id -&gt; offset queue) for the hints written
+ *
+ * It's possible to write a single hint for two or more hosts at the same time, in which case the same offset will be put
+ * into two or more offset queues.
+ */
+final class HintsBuffer
+{
+    // hint entry overhead in bytes (int length, int length checksum, int body checksum)
+    static final int ENTRY_OVERHEAD_SIZE = 12;
+    static final int CLOSED = -1;
+
+    private final ByteBuffer slab; // the underlying backing ByteBuffer for all the serialized hints
+    private final AtomicInteger position; // the position in the slab that we currently allocate from
+
+    private final ConcurrentMap&lt;UUID, Queue&lt;Integer&gt;&gt; offsets;
+    private final OpOrder appendOrder;
+
+    private HintsBuffer(ByteBuffer slab)
+<span class="fc" id="L64">    {</span>
+<span class="fc" id="L65">        this.slab = slab;</span>
+
+<span class="fc" id="L67">        position = new AtomicInteger();</span>
+<span class="fc" id="L68">        offsets = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L69">        appendOrder = new OpOrder();</span>
+<span class="fc" id="L70">    }</span>
+
+    static HintsBuffer create(int slabSize)
+    {
+<span class="fc" id="L74">        return new HintsBuffer(ByteBuffer.allocateDirect(slabSize));</span>
+    }
+
+    boolean isClosed()
+    {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        return position.get() == CLOSED;</span>
+    }
+
+    int capacity()
+    {
+<span class="nc" id="L84">        return slab.capacity();</span>
+    }
+
+    int remaining()
+    {
+<span class="nc" id="L89">        int pos = position.get();</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        return pos == CLOSED ? 0 : capacity() - pos;</span>
+    }
+
+    HintsBuffer recycle()
+    {
+<span class="nc" id="L95">        slab.clear();</span>
+<span class="nc" id="L96">        return new HintsBuffer(slab);</span>
+    }
+
+    void free()
+    {
+<span class="nc" id="L101">        FileUtils.clean(slab);</span>
+<span class="nc" id="L102">    }</span>
+
+    /**
+     * Wait for any appends started before this method was called.
+     */
+    void waitForModifications()
+    {
+<span class="fc" id="L109">        appendOrder.awaitNewBarrier(); // issue a barrier and wait for it</span>
+<span class="fc" id="L110">    }</span>
+
+    Set&lt;UUID&gt; hostIds()
+    {
+<span class="fc" id="L114">        return offsets.keySet();</span>
+    }
+
+    /**
+     * Coverts the queue of offsets for the selected host id into an iterator of hints encoded as ByteBuffers.
+     */
+    Iterator&lt;ByteBuffer&gt; consumingHintsIterator(UUID hostId)
+    {
+<span class="nc" id="L122">        final Queue&lt;Integer&gt; bufferOffsets = offsets.get(hostId);</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (bufferOffsets == null)</span>
+<span class="nc" id="L125">            return Collections.emptyIterator();</span>
+
+<span class="nc" id="L127">        return new AbstractIterator&lt;ByteBuffer&gt;()</span>
+<span class="nc" id="L128">        {</span>
+<span class="nc" id="L129">            private final ByteBuffer flyweight = slab.duplicate();</span>
+
+            protected ByteBuffer computeNext()
+            {
+<span class="nc" id="L133">                Integer offset = bufferOffsets.poll();</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">                if (offset == null)</span>
+<span class="nc" id="L136">                    return endOfData();</span>
+
+<span class="nc" id="L138">                int totalSize = slab.getInt(offset) + ENTRY_OVERHEAD_SIZE;</span>
+
+<span class="nc" id="L140">                return (ByteBuffer) flyweight.clear().position(offset).limit(offset + totalSize);</span>
+            }
+        };
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    Allocation allocate(int hintSize)
+    {
+<span class="nc" id="L148">        int totalSize = hintSize + ENTRY_OVERHEAD_SIZE;</span>
+
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (totalSize &gt; slab.capacity() / 2)</span>
+        {
+<span class="nc" id="L152">            throw new IllegalArgumentException(String.format(&quot;Hint of %s bytes is too large - the maximum size is %s&quot;,</span>
+<span class="nc" id="L153">                                                             hintSize,</span>
+<span class="nc" id="L154">                                                             slab.capacity() / 2));</span>
+        }
+
+<span class="nc" id="L157">        OpOrder.Group opGroup = appendOrder.start(); // will eventually be closed by the receiver of the allocation</span>
+        try
+        {
+<span class="nc" id="L160">            return allocate(totalSize, opGroup);</span>
+        }
+<span class="nc" id="L162">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L164">            opGroup.close();</span>
+<span class="nc" id="L165">            throw t;</span>
+        }
+    }
+
+    private Allocation allocate(int totalSize, OpOrder.Group opGroup)
+    {
+<span class="nc" id="L171">        int offset = allocateBytes(totalSize);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (offset &lt; 0)</span>
+        {
+<span class="nc" id="L174">            opGroup.close();</span>
+<span class="nc" id="L175">            return null;</span>
+        }
+<span class="nc" id="L177">        return new Allocation(offset, totalSize, opGroup);</span>
+    }
+
+    private int allocateBytes(int totalSize)
+    {
+        while (true)
+        {
+<span class="nc" id="L184">            int prev = position.get();</span>
+<span class="nc" id="L185">            int next = prev + totalSize;</span>
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            if (prev == CLOSED) // the slab has been 'closed'</span>
+<span class="nc" id="L188">                return CLOSED;</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if (next &gt; slab.capacity())</span>
+            {
+<span class="nc" id="L192">                position.set(CLOSED); // mark the slab as no longer allocating if we've exceeded its capacity</span>
+<span class="nc" id="L193">                return CLOSED;</span>
+            }
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            if (position.compareAndSet(prev, next))</span>
+<span class="nc" id="L197">                return prev;</span>
+<span class="nc" id="L198">        }</span>
+    }
+
+    private void put(UUID hostId, int offset)
+    {
+        // we intentionally don't just return offsets.computeIfAbsent() because it's expensive compared to simple get(),
+        // and the method is on a really hot path
+<span class="nc" id="L205">        Queue&lt;Integer&gt; queue = offsets.get(hostId);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (queue == null)</span>
+<span class="nc" id="L207">            queue = offsets.computeIfAbsent(hostId, (id) -&gt; new ConcurrentLinkedQueue&lt;&gt;());</span>
+<span class="nc" id="L208">        queue.offer(offset);</span>
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * A placeholder for hint serialization. Should always be used in a try-with-resources block.
+     */
+    final class Allocation implements AutoCloseable
+    {
+        private final Integer offset;
+        private final int totalSize;
+        private final OpOrder.Group opGroup;
+
+        Allocation(int offset, int totalSize, OpOrder.Group opGroup)
+<span class="nc" id="L221">        {</span>
+<span class="nc" id="L222">            this.offset = offset;</span>
+<span class="nc" id="L223">            this.totalSize = totalSize;</span>
+<span class="nc" id="L224">            this.opGroup = opGroup;</span>
+<span class="nc" id="L225">        }</span>
+
+        void write(Iterable&lt;UUID&gt; hostIds, Hint hint)
+        {
+<span class="nc" id="L229">            write(hint);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            for (UUID hostId : hostIds)</span>
+<span class="nc" id="L231">                put(hostId, offset);</span>
+<span class="nc" id="L232">        }</span>
+
+        public void close()
+        {
+<span class="nc" id="L236">            opGroup.close();</span>
+<span class="nc" id="L237">        }</span>
+
+        private void write(Hint hint)
+        {
+<span class="nc" id="L241">            ByteBuffer buffer = (ByteBuffer) slab.duplicate().position(offset).limit(offset + totalSize);</span>
+<span class="nc" id="L242">            CRC32 crc = new CRC32();</span>
+<span class="nc" id="L243">            int hintSize = totalSize - ENTRY_OVERHEAD_SIZE;</span>
+<span class="nc" id="L244">            try (DataOutputBuffer dop = new DataOutputBufferFixed(buffer))</span>
+            {
+<span class="nc" id="L246">                dop.writeInt(hintSize);</span>
+<span class="nc" id="L247">                updateChecksumInt(crc, hintSize);</span>
+<span class="nc" id="L248">                dop.writeInt((int) crc.getValue());</span>
+
+<span class="nc" id="L250">                Hint.serializer.serialize(hint, dop, MessagingService.current_version);</span>
+<span class="nc" id="L251">                updateChecksum(crc, buffer, buffer.position() - hintSize, hintSize);</span>
+<span class="nc" id="L252">                dop.writeInt((int) crc.getValue());</span>
+            }
+<span class="nc" id="L254">            catch (IOException e)</span>
+            {
+<span class="nc" id="L256">                throw new AssertionError(); // cannot happen</span>
+<span class="nc" id="L257">            }</span>
+<span class="nc" id="L258">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

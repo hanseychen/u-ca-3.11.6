@@ -1,0 +1,529 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnFilter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.filter</a> &gt; <span class="el_source">ColumnFilter.java</span></div><h1>ColumnFilter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.filter;
+
+import java.io.IOException;
+import java.util.*;
+
+import com.google.common.collect.SortedSetMultimap;
+import com.google.common.collect.TreeMultimap;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+
+/**
+ * Represents which (non-PK) columns (and optionally which sub-part of a column for complex columns) are selected
+ * by a query.
+ *
+ * We distinguish 2 sets of columns in practice: the _fetched_ columns, which are the columns that we (may, see
+ * below) need to fetch internally, and the _queried_ columns, which are the columns that the user has selected
+ * in its request.
+ *
+ * The reason for distinguishing those 2 sets is that due to the CQL semantic (see #6588 for more details), we
+ * often need to internally fetch all columns for the queried table, but can still do some optimizations for those
+ * columns that are not directly queried by the user (see #10657 for more details).
+ *
+ * Note that in practice:
+ *   - the _queried_ columns set is always included in the _fetched_ one.
+ *   - whenever those sets are different, we know the _fetched_ set contains all columns for the table, so we
+ *     don't have to record this set, we just keep a pointer to the table metadata. The only set we concretely
+ *     store is thus the _queried_ one.
+ *   - in the special case of a {@code SELECT *} query, we want to query all columns, and _fetched_ == _queried.
+ *     As this is a common case, we special case it by keeping the _queried_ set {@code null} (and we retrieve
+ *     the columns through the metadata pointer).
+ *
+ * For complex columns, this class optionally allows to specify a subset of the cells to query for each column.
+ * We can either select individual cells by path name, or a slice of them. Note that this is a sub-selection of
+ * _queried_ cells, so if _fetched_ != _queried_, then the cell selected by this sub-selection are considered
+ * queried and the other ones are considered fetched (and if a column has some sub-selection, it must be a queried
+ * column, which is actually enforced by the Builder below).
+ */
+<span class="pc bpc" id="L62" title="1 of 2 branches missed.">public class ColumnFilter</span>
+{
+<span class="fc" id="L64">    public static final Serializer serializer = new Serializer();</span>
+
+    // True if _fetched_ is all the columns, in which case metadata must not be null. If false,
+    // then _fetched_ == _queried_ and we only store _queried_.
+    private final boolean isFetchAll;
+
+    private final PartitionColumns fetched;
+    private final PartitionColumns queried; // can be null if isFetchAll and _fetched_ == _queried_
+    private final SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections; // can be null
+
+    private ColumnFilter(boolean isFetchAll,
+                         PartitionColumns fetched,
+                         PartitionColumns queried,
+                         SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections)
+<span class="fc" id="L78">    {</span>
+<span class="pc bpc" id="L79" title="2 of 6 branches missed.">        assert !isFetchAll || fetched != null;</span>
+<span class="pc bpc" id="L80" title="2 of 6 branches missed.">        assert isFetchAll || queried != null;</span>
+<span class="fc" id="L81">        this.isFetchAll = isFetchAll;</span>
+<span class="fc bfc" id="L82" title="All 2 branches covered.">        this.fetched = isFetchAll ? fetched : queried;</span>
+<span class="fc" id="L83">        this.queried = queried;</span>
+<span class="fc" id="L84">        this.subSelections = subSelections;</span>
+<span class="fc" id="L85">    }</span>
+
+    /**
+     * A filter that includes all columns for the provided table.
+     */
+    public static ColumnFilter all(CFMetaData metadata)
+    {
+<span class="fc" id="L92">        return new ColumnFilter(true, metadata.partitionColumns(), null, null);</span>
+    }
+
+    /**
+     * A filter that only fetches/queries the provided columns.
+     * &lt;p&gt;
+     * Note that this shouldn't be used for CQL queries in general as all columns should be queried to
+     * preserve CQL semantic (see class javadoc). This is ok for some internal queries however (and
+     * for #6588 if/when we implement it).
+     */
+    public static ColumnFilter selection(PartitionColumns columns)
+    {
+<span class="fc" id="L104">        return new ColumnFilter(false, null, columns, null);</span>
+    }
+
+	/**
+     * A filter that fetches all columns for the provided table, but returns
+     * only the queried ones.
+     */
+    public static ColumnFilter selection(CFMetaData metadata, PartitionColumns queried)
+    {
+<span class="nc" id="L113">        return new ColumnFilter(true, metadata.partitionColumns(), queried, null);</span>
+    }
+
+    /**
+     * The columns that needs to be fetched internally for this filter.
+     *
+     * @return the columns to fetch for this filter.
+     */
+    public PartitionColumns fetchedColumns()
+    {
+<span class="fc" id="L123">        return fetched;</span>
+    }
+
+    /**
+     * The columns actually queried by the user.
+     * &lt;p&gt;
+     * Note that this is in general not all the columns that are fetched internally (see {@link #fetchedColumns}).
+     */
+    public PartitionColumns queriedColumns()
+    {
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        return queried == null ? fetched : queried;</span>
+    }
+
+    public boolean fetchesAllColumns()
+    {
+<span class="fc" id="L138">        return isFetchAll;</span>
+    }
+
+    /**
+     * Whether _fetched_ == _queried_ for this filter, and so if the {@code isQueried()} methods
+     * can return {@code false} for some column/cell.
+     */
+    public boolean allFetchedColumnsAreQueried()
+    {
+<span class="pc bpc" id="L147" title="2 of 6 branches missed.">        return !isFetchAll || (queried == null &amp;&amp; subSelections == null);</span>
+    }
+
+    /**
+     * Whether the provided column is fetched by this filter.
+     */
+    public boolean fetches(ColumnDefinition column)
+    {
+<span class="pc bpc" id="L155" title="3 of 4 branches missed.">        return isFetchAll || queried.contains(column);</span>
+    }
+
+    /**
+     * Whether the provided column, which is assumed to be _fetched_ by this filter (so the caller must guarantee
+     * that {@code fetches(column) == true}, is also _queried_ by the user.
+     *
+     * !WARNING! please be sure to understand the difference between _fetched_ and _queried_
+     * columns that this class made before using this method. If unsure, you probably want
+     * to use the {@link #fetches} method.
+     */
+    public boolean fetchedColumnIsQueried(ColumnDefinition column)
+    {
+<span class="pc bpc" id="L168" title="1 of 6 branches missed.">        return !isFetchAll || queried == null || queried.contains(column);</span>
+    }
+
+    /**
+     * Whether the provided complex cell (identified by its column and path), which is assumed to be _fetched_ by
+     * this filter, is also _queried_ by the user.
+     *
+     * !WARNING! please be sure to understand the difference between _fetched_ and _queried_
+     * columns that this class made before using this method. If unsure, you probably want
+     * to use the {@link #fetches} method.
+     */
+    public boolean fetchedCellIsQueried(ColumnDefinition column, CellPath path)
+    {
+<span class="nc bnc" id="L181" title="All 4 branches missed.">        assert path != null;</span>
+<span class="nc bnc" id="L182" title="All 4 branches missed.">        if (!isFetchAll || subSelections == null)</span>
+<span class="nc" id="L183">            return true;</span>
+
+<span class="nc" id="L185">        SortedSet&lt;ColumnSubselection&gt; s = subSelections.get(column.name);</span>
+        // No subsection for this column means everything is queried
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (s.isEmpty())</span>
+<span class="nc" id="L188">            return true;</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        for (ColumnSubselection subSel : s)</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            if (subSel.compareInclusionOf(path) == 0)</span>
+<span class="nc" id="L192">                return true;</span>
+
+<span class="nc" id="L194">        return false;</span>
+    }
+
+    /**
+     * Creates a new {@code Tester} to efficiently test the inclusion of cells of complex column
+     * {@code column}.
+     *
+     * @return the created tester or {@code null} if all the cells from the provided column
+     * are queried.
+     */
+    public Tester newTester(ColumnDefinition column)
+    {
+<span class="pc bpc" id="L206" title="3 of 4 branches missed.">        if (subSelections == null || !column.isComplex())</span>
+<span class="fc" id="L207">            return null;</span>
+
+<span class="nc" id="L209">        SortedSet&lt;ColumnSubselection&gt; s = subSelections.get(column.name);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (s.isEmpty())</span>
+<span class="nc" id="L211">            return null;</span>
+
+<span class="nc" id="L213">        return new Tester(isFetchAll, s.iterator());</span>
+    }
+
+    /**
+     * Returns a {@code ColumnFilter}} builder that fetches all columns (and queries the columns
+     * added to the builder, or everything if no column is added).
+     */
+    public static Builder allColumnsBuilder(CFMetaData metadata)
+    {
+<span class="fc" id="L222">        return new Builder(metadata);</span>
+    }
+
+    /**
+     * Returns a {@code ColumnFilter} builder that only fetches the columns/cells added to the builder.
+     */
+    public static Builder selectionBuilder()
+    {
+<span class="nc" id="L230">        return new Builder(null);</span>
+    }
+
+    public static class Tester
+    {
+        private final boolean isFetchAll;
+        private ColumnSubselection current;
+        private final Iterator&lt;ColumnSubselection&gt; iterator;
+
+        private Tester(boolean isFetchAll, Iterator&lt;ColumnSubselection&gt; iterator)
+<span class="nc" id="L240">        {</span>
+<span class="nc" id="L241">            this.isFetchAll = isFetchAll;</span>
+<span class="nc" id="L242">            this.iterator = iterator;</span>
+<span class="nc" id="L243">        }</span>
+
+        public boolean fetches(CellPath path)
+        {
+<span class="nc bnc" id="L247" title="All 4 branches missed.">            return isFetchAll || hasSubselection(path);</span>
+        }
+
+        /**
+         * Must only be called if {@code fetches(path) == true}.
+         */
+        public boolean fetchedCellIsQueried(CellPath path)
+        {
+<span class="nc bnc" id="L255" title="All 4 branches missed.">            return !isFetchAll || hasSubselection(path);</span>
+        }
+
+        private boolean hasSubselection(CellPath path)
+        {
+<span class="nc bnc" id="L260" title="All 4 branches missed.">            while (current != null || iterator.hasNext())</span>
+            {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                if (current == null)</span>
+<span class="nc" id="L263">                    current = iterator.next();</span>
+
+<span class="nc" id="L265">                int cmp = current.compareInclusionOf(path);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                if (cmp == 0) // The path is included</span>
+<span class="nc" id="L267">                    return true;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                else if (cmp &lt; 0) // The path is before this sub-selection, it's not included by any</span>
+<span class="nc" id="L269">                    return false;</span>
+
+                // the path is after this sub-selection, we need to check the next one.
+<span class="nc" id="L272">                current = null;</span>
+<span class="nc" id="L273">            }</span>
+<span class="nc" id="L274">            return false;</span>
+        }
+    }
+
+    /**
+     * A builder for a {@code ColumnFilter} object.
+     *
+     * Note that the columns added to this build are the _queried_ column. Whether or not all columns
+     * are _fetched_ depends on which constructor you've used to obtained this builder, allColumnsBuilder (all
+     * columns are fetched) or selectionBuilder (only the queried columns are fetched).
+     *
+     * Note that for a allColumnsBuilder, if no queried columns are added, this is interpreted as querying
+     * all columns, not querying none (but if you know you want to query all columns, prefer
+     * {@link ColumnFilter#all(CFMetaData)}. For selectionBuilder, adding no queried columns means no column will be
+     * fetched (so the builder will return {@code PartitionColumns.NONE}).
+     */
+    public static class Builder
+    {
+        private final CFMetaData metadata; // null if we don't fetch all columns
+        private PartitionColumns.Builder queriedBuilder;
+        private List&lt;ColumnSubselection&gt; subSelections;
+
+        private Builder(CFMetaData metadata)
+<span class="fc" id="L297">        {</span>
+<span class="fc" id="L298">            this.metadata = metadata;</span>
+<span class="fc" id="L299">        }</span>
+
+        public Builder add(ColumnDefinition c)
+        {
+<span class="fc bfc" id="L303" title="All 2 branches covered.">            if (queriedBuilder == null)</span>
+<span class="fc" id="L304">                queriedBuilder = PartitionColumns.builder();</span>
+<span class="fc" id="L305">            queriedBuilder.add(c);</span>
+<span class="fc" id="L306">            return this;</span>
+        }
+
+        public Builder addAll(Iterable&lt;ColumnDefinition&gt; columns)
+        {
+<span class="fc bfc" id="L311" title="All 2 branches covered.">            if (queriedBuilder == null)</span>
+<span class="fc" id="L312">                queriedBuilder = PartitionColumns.builder();</span>
+<span class="fc" id="L313">            queriedBuilder.addAll(columns);</span>
+<span class="fc" id="L314">            return this;</span>
+        }
+
+        private Builder addSubSelection(ColumnSubselection subSelection)
+        {
+<span class="nc" id="L319">            add(subSelection.column());</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            if (subSelections == null)</span>
+<span class="nc" id="L321">                subSelections = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L322">            subSelections.add(subSelection);</span>
+<span class="nc" id="L323">            return this;</span>
+        }
+
+        public Builder slice(ColumnDefinition c, CellPath from, CellPath to)
+        {
+<span class="nc" id="L328">            return addSubSelection(ColumnSubselection.slice(c, from, to));</span>
+        }
+
+        public Builder select(ColumnDefinition c, CellPath elt)
+        {
+<span class="nc" id="L333">            return addSubSelection(ColumnSubselection.element(c, elt));</span>
+        }
+
+        public ColumnFilter build()
+        {
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">            boolean isFetchAll = metadata != null;</span>
+
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">            PartitionColumns queried = queriedBuilder == null ? null : queriedBuilder.build();</span>
+            // It's only ok to have queried == null in ColumnFilter if isFetchAll. So deal with the case of a selectionBuilder
+            // with nothing selected (we can at least happen on some backward compatible queries - CASSANDRA-10471).
+<span class="pc bpc" id="L343" title="3 of 4 branches missed.">            if (!isFetchAll &amp;&amp; queried == null)</span>
+<span class="nc" id="L344">                queried = PartitionColumns.NONE;</span>
+
+<span class="fc" id="L346">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; s = null;</span>
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">            if (subSelections != null)</span>
+            {
+<span class="nc" id="L349">                s = TreeMultimap.create(Comparator.&lt;ColumnIdentifier&gt;naturalOrder(), Comparator.&lt;ColumnSubselection&gt;naturalOrder());</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">                for (ColumnSubselection subSelection : subSelections)</span>
+<span class="nc" id="L351">                    s.put(subSelection.column().name, subSelection);</span>
+            }
+
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">            return new ColumnFilter(isFetchAll, isFetchAll ? metadata.partitionColumns() : null, queried, s);</span>
+        }
+    }
+
+    @Override
+    public boolean equals(Object other)
+    {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        if (other == this)</span>
+<span class="nc" id="L362">            return true;</span>
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (!(other instanceof ColumnFilter))</span>
+<span class="nc" id="L365">            return false;</span>
+
+<span class="nc" id="L367">        ColumnFilter otherCf = (ColumnFilter) other;</span>
+
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        return otherCf.isFetchAll == this.isFetchAll &amp;&amp;</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">               Objects.equals(otherCf.fetched, this.fetched) &amp;&amp;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">               Objects.equals(otherCf.queried, this.queried) &amp;&amp;</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">               Objects.equals(otherCf.subSelections, this.subSelections);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (isFetchAll)</span>
+<span class="nc" id="L379">            return &quot;*&quot;;</span>
+
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (queried.isEmpty())</span>
+<span class="nc" id="L382">            return &quot;&quot;;</span>
+
+<span class="nc" id="L384">        Iterator&lt;ColumnDefinition&gt; defs = queried.selectOrderIterator();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (!defs.hasNext())</span>
+<span class="nc" id="L386">            return &quot;&lt;none&gt;&quot;;</span>
+
+<span class="nc" id="L388">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        while (defs.hasNext())</span>
+        {
+<span class="nc" id="L391">            appendColumnDef(sb, defs.next());</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (defs.hasNext())</span>
+<span class="nc" id="L393">                sb.append(&quot;, &quot;);</span>
+        }
+<span class="nc" id="L395">        return sb.toString();</span>
+    }
+
+    private void appendColumnDef(StringBuilder sb, ColumnDefinition column)
+    {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (subSelections == null)</span>
+        {
+<span class="nc" id="L402">            sb.append(column.name);</span>
+<span class="nc" id="L403">            return;</span>
+        }
+
+<span class="nc" id="L406">        SortedSet&lt;ColumnSubselection&gt; s = subSelections.get(column.name);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        if (s.isEmpty())</span>
+        {
+<span class="nc" id="L409">            sb.append(column.name);</span>
+<span class="nc" id="L410">            return;</span>
+        }
+
+<span class="nc" id="L413">        int i = 0;</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        for (ColumnSubselection subSel : s)</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            sb.append(i++ == 0 ? &quot;&quot; : &quot;, &quot;).append(column.name).append(subSel);</span>
+<span class="nc" id="L416">    }</span>
+
+<span class="fc" id="L418">    public static class Serializer</span>
+    {
+        private static final int IS_FETCH_ALL_MASK       = 0x01;
+        private static final int HAS_QUERIED_MASK      = 0x02;
+        private static final int HAS_SUB_SELECTIONS_MASK = 0x04;
+
+        private static int makeHeaderByte(ColumnFilter selection)
+        {
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">            return (selection.isFetchAll ? IS_FETCH_ALL_MASK : 0)</span>
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">                 | (selection.queried != null ? HAS_QUERIED_MASK : 0)</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">                 | (selection.subSelections != null ? HAS_SUB_SELECTIONS_MASK : 0);</span>
+        }
+
+        public void serialize(ColumnFilter selection, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L433">            out.writeByte(makeHeaderByte(selection));</span>
+
+<span class="pc bpc" id="L435" title="2 of 4 branches missed.">            if (version &gt;= MessagingService.VERSION_3014 &amp;&amp; selection.isFetchAll)</span>
+            {
+<span class="fc" id="L437">                Columns.serializer.serialize(selection.fetched.statics, out);</span>
+<span class="fc" id="L438">                Columns.serializer.serialize(selection.fetched.regulars, out);</span>
+            }
+
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">            if (selection.queried != null)</span>
+            {
+<span class="nc" id="L443">                Columns.serializer.serialize(selection.queried.statics, out);</span>
+<span class="nc" id="L444">                Columns.serializer.serialize(selection.queried.regulars, out);</span>
+            }
+
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">            if (selection.subSelections != null)</span>
+            {
+<span class="nc" id="L449">                out.writeUnsignedVInt(selection.subSelections.size());</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                for (ColumnSubselection subSel : selection.subSelections.values())</span>
+<span class="nc" id="L451">                    ColumnSubselection.serializer.serialize(subSel, out, version);</span>
+            }
+<span class="fc" id="L453">        }</span>
+
+        public ColumnFilter deserialize(DataInputPlus in, int version, CFMetaData metadata) throws IOException
+        {
+<span class="fc" id="L457">            int header = in.readUnsignedByte();</span>
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">            boolean isFetchAll = (header &amp; IS_FETCH_ALL_MASK) != 0;</span>
+<span class="pc bpc" id="L459" title="1 of 2 branches missed.">            boolean hasQueried = (header &amp; HAS_QUERIED_MASK) != 0;</span>
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">            boolean hasSubSelections = (header &amp; HAS_SUB_SELECTIONS_MASK) != 0;</span>
+
+<span class="fc" id="L462">            PartitionColumns fetched = null;</span>
+<span class="fc" id="L463">            PartitionColumns queried = null;</span>
+
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">            if (isFetchAll)</span>
+            {
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">                if (version &gt;= MessagingService.VERSION_3014)</span>
+                {
+<span class="fc" id="L469">                    Columns statics = Columns.serializer.deserialize(in, metadata);</span>
+<span class="fc" id="L470">                    Columns regulars = Columns.serializer.deserialize(in, metadata);</span>
+<span class="fc" id="L471">                    fetched = new PartitionColumns(statics, regulars);</span>
+<span class="fc" id="L472">                }</span>
+                else
+                {
+<span class="nc" id="L475">                    fetched = metadata.partitionColumns();</span>
+                }
+            }
+
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">            if (hasQueried)</span>
+            {
+<span class="nc" id="L481">                Columns statics = Columns.serializer.deserialize(in, metadata);</span>
+<span class="nc" id="L482">                Columns regulars = Columns.serializer.deserialize(in, metadata);</span>
+<span class="nc" id="L483">                queried = new PartitionColumns(statics, regulars);</span>
+            }
+
+<span class="fc" id="L486">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections = null;</span>
+<span class="pc bpc" id="L487" title="1 of 2 branches missed.">            if (hasSubSelections)</span>
+            {
+<span class="nc" id="L489">                subSelections = TreeMultimap.create(Comparator.&lt;ColumnIdentifier&gt;naturalOrder(), Comparator.&lt;ColumnSubselection&gt;naturalOrder());</span>
+<span class="nc" id="L490">                int size = (int)in.readUnsignedVInt();</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                for (int i = 0; i &lt; size; i++)</span>
+                {
+<span class="nc" id="L493">                    ColumnSubselection subSel = ColumnSubselection.serializer.deserialize(in, version, metadata);</span>
+<span class="nc" id="L494">                    subSelections.put(subSel.column().name, subSel);</span>
+                }
+            }
+
+<span class="fc" id="L498">            return new ColumnFilter(isFetchAll, fetched, queried, subSelections);</span>
+        }
+
+        public long serializedSize(ColumnFilter selection, int version)
+        {
+<span class="fc" id="L503">            long size = 1; // header byte</span>
+
+<span class="pc bpc" id="L505" title="2 of 4 branches missed.">            if (version &gt;= MessagingService.VERSION_3014 &amp;&amp; selection.isFetchAll)</span>
+            {
+<span class="fc" id="L507">                size += Columns.serializer.serializedSize(selection.fetched.statics);</span>
+<span class="fc" id="L508">                size += Columns.serializer.serializedSize(selection.fetched.regulars);</span>
+            }
+
+<span class="pc bpc" id="L511" title="1 of 2 branches missed.">            if (selection.queried != null)</span>
+            {
+<span class="nc" id="L513">                size += Columns.serializer.serializedSize(selection.queried.statics);</span>
+<span class="nc" id="L514">                size += Columns.serializer.serializedSize(selection.queried.regulars);</span>
+            }
+
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">            if (selection.subSelections != null)</span>
+            {
+
+<span class="nc" id="L520">                size += TypeSizes.sizeofUnsignedVInt(selection.subSelections.size());</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                for (ColumnSubselection subSel : selection.subSelections.values())</span>
+<span class="nc" id="L522">                    size += ColumnSubselection.serializer.serializedSize(subSel, version);</span>
+            }
+
+<span class="fc" id="L525">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SizeTieredCompactionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">SizeTieredCompactionStrategy.java</span></div><h1>SizeTieredCompactionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.util.*;
+import java.util.Map.Entry;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
+import org.apache.cassandra.db.compaction.writers.SplittingSizeTieredCompactionWriter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.utils.Pair;
+
+import static com.google.common.collect.Iterables.filter;
+
+<span class="pc bpc" id="L40" title="1 of 2 branches missed.">public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy</span>
+{
+<span class="fc" id="L42">    private static final Logger logger = LoggerFactory.getLogger(SizeTieredCompactionStrategy.class);</span>
+
+<span class="fc" id="L44">    private static final Comparator&lt;Pair&lt;List&lt;SSTableReader&gt;,Double&gt;&gt; bucketsByHotnessComparator = new Comparator&lt;Pair&lt;List&lt;SSTableReader&gt;, Double&gt;&gt;()</span>
+<span class="fc" id="L45">    {</span>
+        public int compare(Pair&lt;List&lt;SSTableReader&gt;, Double&gt; o1, Pair&lt;List&lt;SSTableReader&gt;, Double&gt; o2)
+        {
+<span class="nc" id="L48">            int comparison = Double.compare(o1.right, o2.right);</span>
+<span class="nc bnc" id="L49" title="All 2 branches missed.">            if (comparison != 0)</span>
+<span class="nc" id="L50">                return comparison;</span>
+
+            // break ties by compacting the smallest sstables first (this will probably only happen for
+            // system tables and new/unread sstables)
+<span class="nc" id="L54">            return Long.compare(avgSize(o1.left), avgSize(o2.left));</span>
+        }
+
+        private long avgSize(List&lt;SSTableReader&gt; sstables)
+        {
+<span class="nc" id="L59">            long n = 0;</span>
+<span class="nc bnc" id="L60" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L61">                n += sstable.bytesOnDisk();</span>
+<span class="nc" id="L62">            return n / sstables.size();</span>
+        }
+    };
+
+    protected SizeTieredCompactionStrategyOptions sizeTieredOptions;
+    protected volatile int estimatedRemainingTasks;
+<span class="fc" id="L68">    @VisibleForTesting</span>
+    protected final Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();
+
+    public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options)
+    {
+<span class="fc" id="L73">        super(cfs, options);</span>
+<span class="fc" id="L74">        this.estimatedRemainingTasks = 0;</span>
+<span class="fc" id="L75">        this.sizeTieredOptions = new SizeTieredCompactionStrategyOptions(options);</span>
+<span class="fc" id="L76">    }</span>
+
+    private synchronized List&lt;SSTableReader&gt; getNextBackgroundSSTables(final int gcBefore)
+    {
+        // make local copies so they can't be changed out from under us mid-method
+<span class="fc" id="L81">        int minThreshold = cfs.getMinimumCompactionThreshold();</span>
+<span class="fc" id="L82">        int maxThreshold = cfs.getMaximumCompactionThreshold();</span>
+
+<span class="fc" id="L84">        Iterable&lt;SSTableReader&gt; candidates = filterSuspectSSTables(filter(cfs.getUncompactingSSTables(), sstables::contains));</span>
+
+<span class="fc" id="L86">        List&lt;List&lt;SSTableReader&gt;&gt; buckets = getBuckets(createSSTableAndLengthPairs(candidates), sizeTieredOptions.bucketHigh, sizeTieredOptions.bucketLow, sizeTieredOptions.minSSTableSize);</span>
+<span class="fc" id="L87">        logger.trace(&quot;Compaction buckets are {}&quot;, buckets);</span>
+<span class="fc" id="L88">        estimatedRemainingTasks = getEstimatedCompactionsByTasks(cfs, buckets);</span>
+<span class="fc" id="L89">        cfs.getCompactionStrategyManager().compactionLogger.pending(this, estimatedRemainingTasks);</span>
+<span class="fc" id="L90">        List&lt;SSTableReader&gt; mostInteresting = mostInterestingBucket(buckets, minThreshold, maxThreshold);</span>
+<span class="fc bfc" id="L91" title="All 2 branches covered.">        if (!mostInteresting.isEmpty())</span>
+<span class="fc" id="L92">            return mostInteresting;</span>
+
+        // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
+        // ratio is greater than threshold.
+<span class="fc" id="L96">        List&lt;SSTableReader&gt; sstablesWithTombstones = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L97" title="All 2 branches covered.">        for (SSTableReader sstable : candidates)</span>
+        {
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">            if (worthDroppingTombstones(sstable, gcBefore))</span>
+<span class="nc" id="L100">                sstablesWithTombstones.add(sstable);</span>
+<span class="fc" id="L101">        }</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">        if (sstablesWithTombstones.isEmpty())</span>
+<span class="fc" id="L103">            return Collections.emptyList();</span>
+
+<span class="nc" id="L105">        return Collections.singletonList(Collections.max(sstablesWithTombstones, SSTableReader.sizeComparator));</span>
+    }
+
+
+    /**
+     * @param buckets list of buckets from which to return the most interesting, where &quot;interesting&quot; is the total hotness for reads
+     * @param minThreshold minimum number of sstables in a bucket to qualify as interesting
+     * @param maxThreshold maximum number of sstables to compact at once (the returned bucket will be trimmed down to this)
+     * @return a bucket (list) of sstables to compact
+     */
+    public static List&lt;SSTableReader&gt; mostInterestingBucket(List&lt;List&lt;SSTableReader&gt;&gt; buckets, int minThreshold, int maxThreshold)
+    {
+        // skip buckets containing less than minThreshold sstables, and limit other buckets to maxThreshold sstables
+<span class="fc" id="L118">        final List&lt;Pair&lt;List&lt;SSTableReader&gt;, Double&gt;&gt; prunedBucketsAndHotness = new ArrayList&lt;&gt;(buckets.size());</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        for (List&lt;SSTableReader&gt; bucket : buckets)</span>
+        {
+<span class="fc" id="L121">            Pair&lt;List&lt;SSTableReader&gt;, Double&gt; bucketAndHotness = trimToThresholdWithHotness(bucket, maxThreshold);</span>
+<span class="pc bpc" id="L122" title="1 of 4 branches missed.">            if (bucketAndHotness != null &amp;&amp; bucketAndHotness.left.size() &gt;= minThreshold)</span>
+<span class="fc" id="L123">                prunedBucketsAndHotness.add(bucketAndHotness);</span>
+<span class="fc" id="L124">        }</span>
+<span class="fc bfc" id="L125" title="All 2 branches covered.">        if (prunedBucketsAndHotness.isEmpty())</span>
+<span class="fc" id="L126">            return Collections.emptyList();</span>
+
+<span class="fc" id="L128">        Pair&lt;List&lt;SSTableReader&gt;, Double&gt; hottest = Collections.max(prunedBucketsAndHotness, bucketsByHotnessComparator);</span>
+<span class="fc" id="L129">        return hottest.left;</span>
+    }
+
+    /**
+     * Returns a (bucket, hotness) pair or null if there were not enough sstables in the bucket to meet minThreshold.
+     * If there are more than maxThreshold sstables, the coldest sstables will be trimmed to meet the threshold.
+     **/
+    @VisibleForTesting
+    static Pair&lt;List&lt;SSTableReader&gt;, Double&gt; trimToThresholdWithHotness(List&lt;SSTableReader&gt; bucket, int maxThreshold)
+    {
+        // Sort by sstable hotness (descending). We first build a map because the hotness may change during the sort.
+<span class="fc" id="L140">        final Map&lt;SSTableReader, Double&gt; hotnessSnapshot = getHotnessMap(bucket);</span>
+<span class="fc" id="L141">        Collections.sort(bucket, new Comparator&lt;SSTableReader&gt;()</span>
+<span class="fc" id="L142">        {</span>
+            public int compare(SSTableReader o1, SSTableReader o2)
+            {
+<span class="fc" id="L145">                return -1 * Double.compare(hotnessSnapshot.get(o1), hotnessSnapshot.get(o2));</span>
+            }
+        });
+
+        // and then trim the coldest sstables off the end to meet the maxThreshold
+<span class="fc" id="L150">        List&lt;SSTableReader&gt; prunedBucket = bucket.subList(0, Math.min(bucket.size(), maxThreshold));</span>
+
+        // bucket hotness is the sum of the hotness of all sstable members
+<span class="fc" id="L153">        double bucketHotness = 0.0;</span>
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        for (SSTableReader sstr : prunedBucket)</span>
+<span class="fc" id="L155">            bucketHotness += hotness(sstr);</span>
+
+<span class="fc" id="L157">        return Pair.create(prunedBucket, bucketHotness);</span>
+    }
+
+    private static Map&lt;SSTableReader, Double&gt; getHotnessMap(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L162">        Map&lt;SSTableReader, Double&gt; hotness = new HashMap&lt;&gt;(sstables.size());</span>
+<span class="fc bfc" id="L163" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+<span class="fc" id="L164">            hotness.put(sstable, hotness(sstable));</span>
+<span class="fc" id="L165">        return hotness;</span>
+    }
+
+    /**
+     * Returns the reads per second per key for this sstable, or 0.0 if the sstable has no read meter
+     */
+    private static double hotness(SSTableReader sstr)
+    {
+        // system tables don't have read meters, just use 0.0 for the hotness
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">        return sstr.getReadMeter() == null ? 0.0 : sstr.getReadMeter().twoHourRate() / sstr.estimatedKeys();</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    {
+<span class="fc" id="L180">        List&lt;SSTableReader&gt; previousCandidate = null;</span>
+        while (true)
+        {
+<span class="fc" id="L183">            List&lt;SSTableReader&gt; hottestBucket = getNextBackgroundSSTables(gcBefore);</span>
+
+<span class="fc bfc" id="L185" title="All 2 branches covered.">            if (hottestBucket.isEmpty())</span>
+<span class="fc" id="L186">                return null;</span>
+
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">            if (hottestBucket.equals(previousCandidate))</span>
+            {
+<span class="nc" id="L192">                logger.warn(&quot;Could not acquire references for compacting SSTables {} which is not a problem per se,&quot; +</span>
+                            &quot;unless it happens frequently, in which case it must be reported. Will retry later.&quot;,
+                            hottestBucket);
+<span class="nc" id="L195">                return null;</span>
+            }
+
+<span class="fc" id="L198">            LifecycleTransaction transaction = cfs.getTracker().tryModify(hottestBucket, OperationType.COMPACTION);</span>
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">            if (transaction != null)</span>
+<span class="fc" id="L200">                return new CompactionTask(cfs, transaction, gcBefore);</span>
+<span class="nc" id="L201">            previousCandidate = hottestBucket;</span>
+<span class="nc" id="L202">        }</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public synchronized Collection&lt;AbstractCompactionTask&gt; getMaximalTask(final int gcBefore, boolean splitOutput)
+    {
+<span class="nc" id="L208">        Iterable&lt;SSTableReader&gt; filteredSSTables = filterSuspectSSTables(sstables);</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (Iterables.isEmpty(filteredSSTables))</span>
+<span class="nc" id="L210">            return null;</span>
+<span class="nc" id="L211">        LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (txn == null)</span>
+<span class="nc" id="L213">            return null;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        if (splitOutput)</span>
+<span class="nc" id="L215">            return Arrays.&lt;AbstractCompactionTask&gt;asList(new SplittingCompactionTask(cfs, txn, gcBefore));</span>
+<span class="nc" id="L216">        return Arrays.&lt;AbstractCompactionTask&gt;asList(new CompactionTask(cfs, txn, gcBefore));</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, final int gcBefore)
+    {
+<span class="nc bnc" id="L222" title="All 4 branches missed.">        assert !sstables.isEmpty(); // checked for by CM.submitUserDefined</span>
+
+<span class="nc" id="L224">        LifecycleTransaction transaction = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (transaction == null)</span>
+        {
+<span class="nc" id="L227">            logger.trace(&quot;Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem&quot;, sstables);</span>
+<span class="nc" id="L228">            return null;</span>
+        }
+
+<span class="nc" id="L231">        return new CompactionTask(cfs, transaction, gcBefore).setUserDefined(true);</span>
+    }
+
+    public int getEstimatedRemainingTasks()
+    {
+<span class="fc" id="L236">        return estimatedRemainingTasks;</span>
+    }
+
+    public static List&lt;Pair&lt;SSTableReader, Long&gt;&gt; createSSTableAndLengthPairs(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L241">        List&lt;Pair&lt;SSTableReader, Long&gt;&gt; sstableLengthPairs = new ArrayList&lt;&gt;(Iterables.size(sstables));</span>
+<span class="fc bfc" id="L242" title="All 2 branches covered.">        for(SSTableReader sstable : sstables)</span>
+<span class="fc" id="L243">            sstableLengthPairs.add(Pair.create(sstable, sstable.onDiskLength()));</span>
+<span class="fc" id="L244">        return sstableLengthPairs;</span>
+    }
+
+    /*
+     * Group files of similar size into buckets.
+     */
+    public static &lt;T&gt; List&lt;List&lt;T&gt;&gt; getBuckets(Collection&lt;Pair&lt;T, Long&gt;&gt; files, double bucketHigh, double bucketLow, long minSSTableSize)
+    {
+        // Sort the list in order to get deterministic results during the grouping below
+<span class="fc" id="L253">        List&lt;Pair&lt;T, Long&gt;&gt; sortedFiles = new ArrayList&lt;Pair&lt;T, Long&gt;&gt;(files);</span>
+<span class="fc" id="L254">        Collections.sort(sortedFiles, new Comparator&lt;Pair&lt;T, Long&gt;&gt;()</span>
+<span class="fc" id="L255">        {</span>
+            public int compare(Pair&lt;T, Long&gt; p1, Pair&lt;T, Long&gt; p2)
+            {
+<span class="fc" id="L258">                return p1.right.compareTo(p2.right);</span>
+            }
+        });
+
+<span class="fc" id="L262">        Map&lt;Long, List&lt;T&gt;&gt; buckets = new HashMap&lt;Long, List&lt;T&gt;&gt;();</span>
+
+        outer:
+<span class="fc bfc" id="L265" title="All 2 branches covered.">        for (Pair&lt;T, Long&gt; pair: sortedFiles)</span>
+        {
+<span class="fc" id="L267">            long size = pair.right;</span>
+
+            // look for a bucket containing similar-sized files:
+            // group in the same bucket if it's w/in 50% of the average for this bucket,
+            // or this file and the bucket are all considered &quot;small&quot; (less than `minSSTableSize`)
+<span class="fc bfc" id="L272" title="All 2 branches covered.">            for (Entry&lt;Long, List&lt;T&gt;&gt; entry : buckets.entrySet())</span>
+            {
+<span class="fc" id="L274">                List&lt;T&gt; bucket = entry.getValue();</span>
+<span class="fc" id="L275">                long oldAverageSize = entry.getKey();</span>
+<span class="pc bpc" id="L276" title="3 of 8 branches missed.">                if ((size &gt; (oldAverageSize * bucketLow) &amp;&amp; size &lt; (oldAverageSize * bucketHigh))</span>
+                    || (size &lt; minSSTableSize &amp;&amp; oldAverageSize &lt; minSSTableSize))
+                {
+                    // remove and re-add under new new average size
+<span class="fc" id="L280">                    buckets.remove(oldAverageSize);</span>
+<span class="fc" id="L281">                    long totalSize = bucket.size() * oldAverageSize;</span>
+<span class="fc" id="L282">                    long newAverageSize = (totalSize + size) / (bucket.size() + 1);</span>
+<span class="fc" id="L283">                    bucket.add(pair.left);</span>
+<span class="fc" id="L284">                    buckets.put(newAverageSize, bucket);</span>
+<span class="fc" id="L285">                    continue outer;</span>
+                }
+<span class="nc" id="L287">            }</span>
+
+            // no similar bucket found; put it in a new one
+<span class="fc" id="L290">            ArrayList&lt;T&gt; bucket = new ArrayList&lt;T&gt;();</span>
+<span class="fc" id="L291">            bucket.add(pair.left);</span>
+<span class="fc" id="L292">            buckets.put(size, bucket);</span>
+<span class="fc" id="L293">        }</span>
+
+<span class="fc" id="L295">        return new ArrayList&lt;List&lt;T&gt;&gt;(buckets.values());</span>
+    }
+
+    public static int getEstimatedCompactionsByTasks(ColumnFamilyStore cfs, List&lt;List&lt;SSTableReader&gt;&gt; tasks)
+    {
+<span class="fc" id="L300">        int n = 0;</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">        for (List&lt;SSTableReader&gt; bucket : tasks)</span>
+        {
+<span class="fc bfc" id="L303" title="All 2 branches covered.">            if (bucket.size() &gt;= cfs.getMinimumCompactionThreshold())</span>
+<span class="fc" id="L304">                n += Math.ceil((double)bucket.size() / cfs.getMaximumCompactionThreshold());</span>
+<span class="fc" id="L305">        }</span>
+<span class="fc" id="L306">        return n;</span>
+    }
+
+    public long getMaxSSTableBytes()
+    {
+<span class="fc" id="L311">        return Long.MAX_VALUE;</span>
+    }
+
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options) throws ConfigurationException
+    {
+<span class="fc" id="L316">        Map&lt;String, String&gt; uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);</span>
+<span class="fc" id="L317">        uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);</span>
+
+<span class="fc" id="L319">        uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());</span>
+<span class="fc" id="L320">        uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());</span>
+
+<span class="fc" id="L322">        return uncheckedOptions;</span>
+    }
+
+    @Override
+    public boolean shouldDefragment()
+    {
+<span class="fc" id="L328">        return true;</span>
+    }
+
+    @Override
+    public synchronized void addSSTable(SSTableReader added)
+    {
+<span class="fc" id="L334">        sstables.add(added);</span>
+<span class="fc" id="L335">    }</span>
+
+    @Override
+    public synchronized void removeSSTable(SSTableReader sstable)
+    {
+<span class="fc" id="L340">        sstables.remove(sstable);</span>
+<span class="fc" id="L341">    }</span>
+
+    public String toString()
+    {
+<span class="nc" id="L345">        return String.format(&quot;SizeTieredCompactionStrategy[%s/%s]&quot;,</span>
+<span class="nc" id="L346">            cfs.getMinimumCompactionThreshold(),</span>
+<span class="nc" id="L347">            cfs.getMaximumCompactionThreshold());</span>
+    }
+
+    private static class SplittingCompactionTask extends CompactionTask
+    {
+        public SplittingCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, int gcBefore)
+        {
+<span class="nc" id="L354">            super(cfs, txn, gcBefore);</span>
+<span class="nc" id="L355">        }</span>
+
+        @Override
+        public CompactionAwareWriter getCompactionAwareWriter(ColumnFamilyStore cfs,
+                                                              Directories directories,
+                                                              LifecycleTransaction txn,
+                                                              Set&lt;SSTableReader&gt; nonExpiredSSTables)
+        {
+<span class="nc" id="L363">            return new SplittingSizeTieredCompactionWriter(cfs, directories, txn, nonExpiredSSTables);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

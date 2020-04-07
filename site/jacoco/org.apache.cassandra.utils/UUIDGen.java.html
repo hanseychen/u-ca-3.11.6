@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UUIDGen.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">UUIDGen.java</span></div><h1>UUIDGen.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.Collection;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Ints;
+
+/**
+ * The goods are here: www.ietf.org/rfc/rfc4122.txt.
+ */
+<span class="pc bpc" id="L37" title="1 of 2 branches missed.">public class UUIDGen</span>
+{
+    // A grand day! millis at 00:00:00.000 15 Oct 1582.
+    private static final long START_EPOCH = -12219292800000L;
+<span class="fc" id="L41">    private static final long clockSeqAndNode = makeClockSeqAndNode();</span>
+
+    /*
+     * The min and max possible lsb for a UUID.
+     * Note that his is not 0 and all 1's because Cassandra TimeUUIDType
+     * compares the lsb parts as a signed byte array comparison. So the min
+     * value is 8 times -128 and the max is 8 times +127.
+     *
+     * Note that we ignore the uuid variant (namely, MIN_CLOCK_SEQ_AND_NODE
+     * have variant 2 as it should, but MAX_CLOCK_SEQ_AND_NODE have variant 0).
+     * I don't think that has any practical consequence and is more robust in
+     * case someone provides a UUID with a broken variant.
+     */
+    private static final long MIN_CLOCK_SEQ_AND_NODE = 0x8080808080808080L;
+    private static final long MAX_CLOCK_SEQ_AND_NODE = 0x7f7f7f7f7f7f7f7fL;
+
+<span class="fc" id="L57">    private static final SecureRandom secureRandom = new SecureRandom();</span>
+
+    // placement of this singleton is important.  It needs to be instantiated *AFTER* the other statics.
+<span class="fc" id="L60">    private static final UUIDGen instance = new UUIDGen();</span>
+
+<span class="fc" id="L62">    private AtomicLong lastNanos = new AtomicLong();</span>
+
+    private UUIDGen()
+<span class="fc" id="L65">    {</span>
+        // make sure someone didn't whack the clockSeqAndNode by changing the order of instantiation.
+<span class="pc bpc" id="L67" title="1 of 2 branches missed.">        if (clockSeqAndNode == 0) throw new RuntimeException(&quot;singleton instantiation is misplaced.&quot;);</span>
+<span class="fc" id="L68">    }</span>
+
+    /**
+     * Creates a type 1 UUID (time-based UUID).
+     *
+     * @return a UUID instance
+     */
+    public static UUID getTimeUUID()
+    {
+<span class="fc" id="L77">        return new UUID(instance.createTimeSafe(), clockSeqAndNode);</span>
+    }
+
+    /**
+     * Creates a type 1 UUID (time-based UUID) with the timestamp of @param when, in milliseconds.
+     *
+     * @return a UUID instance
+     */
+    public static UUID getTimeUUID(long when)
+    {
+<span class="nc" id="L87">        return new UUID(createTime(fromUnixTimestamp(when)), clockSeqAndNode);</span>
+    }
+
+    /**
+     * Returns a version 1 UUID using the provided timestamp and the local clock and sequence.
+     * &lt;p&gt;
+     * Note that this method is generally only safe to use if you can guarantee that the provided
+     * parameter is unique across calls (otherwise the returned UUID won't be unique accross calls).
+     *
+     * @param whenInMicros a unix time in microseconds.
+     * @return a new UUID {@code id} such that {@code microsTimestamp(id) == whenInMicros}. Please not that
+     * multiple calls to this method with the same value of {@code whenInMicros} will return the &lt;b&gt;same&lt;/b&gt;
+     * UUID.
+     */
+    public static UUID getTimeUUIDFromMicros(long whenInMicros)
+    {
+<span class="nc" id="L103">        long whenInMillis = whenInMicros / 1000;</span>
+<span class="nc" id="L104">        long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;</span>
+<span class="nc" id="L105">        return getTimeUUID(whenInMillis, nanos);</span>
+    }
+
+    /**
+     * Similar to {@link getTimeUUIDFromMicros}, but randomize (using SecureRandom) the clock and sequence.
+     * &lt;p&gt;
+     * If you can guarantee that the {@code whenInMicros} argument is unique (for this JVM instance) for
+     * every call, then you should prefer {@link getTimeUUIDFromMicros} which is faster. If you can't
+     * guarantee this however, this method will ensure the returned UUID are still unique (accross calls)
+     * through randomization.
+     *
+     * @param whenInMicros a unix time in microseconds.
+     * @return a new UUID {@code id} such that {@code microsTimestamp(id) == whenInMicros}. The UUID returned
+     * by different calls will be unique even if {@code whenInMicros} is not.
+     */
+    public static UUID getRandomTimeUUIDFromMicros(long whenInMicros)
+    {
+<span class="nc" id="L122">        long whenInMillis = whenInMicros / 1000;</span>
+<span class="nc" id="L123">        long nanos = (whenInMicros - (whenInMillis * 1000)) * 10;</span>
+<span class="nc" id="L124">        return new UUID(createTime(fromUnixTimestamp(whenInMillis, nanos)), secureRandom.nextLong());</span>
+    }
+
+    public static UUID getTimeUUID(long when, long nanos)
+    {
+<span class="nc" id="L129">        return new UUID(createTime(fromUnixTimestamp(when, nanos)), clockSeqAndNode);</span>
+    }
+
+    @VisibleForTesting
+    public static UUID getTimeUUID(long when, long nanos, long clockSeqAndNode)
+    {
+<span class="nc" id="L135">        return new UUID(createTime(fromUnixTimestamp(when, nanos)), clockSeqAndNode);</span>
+    }
+
+    /** creates a type 1 uuid from raw bytes. */
+    public static UUID getUUID(ByteBuffer raw)
+    {
+<span class="fc" id="L141">        return new UUID(raw.getLong(raw.position()), raw.getLong(raw.position() + 8));</span>
+    }
+
+    public static ByteBuffer toByteBuffer(UUID uuid)
+    {
+<span class="fc" id="L146">        ByteBuffer buffer = ByteBuffer.allocate(16);</span>
+<span class="fc" id="L147">        buffer.putLong(uuid.getMostSignificantBits());</span>
+<span class="fc" id="L148">        buffer.putLong(uuid.getLeastSignificantBits());</span>
+<span class="fc" id="L149">        buffer.flip();</span>
+<span class="fc" id="L150">        return buffer;</span>
+    }
+
+    /** decomposes a uuid into raw bytes. */
+    public static byte[] decompose(UUID uuid)
+    {
+<span class="fc" id="L156">        long most = uuid.getMostSignificantBits();</span>
+<span class="fc" id="L157">        long least = uuid.getLeastSignificantBits();</span>
+<span class="fc" id="L158">        byte[] b = new byte[16];</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">        for (int i = 0; i &lt; 8; i++)</span>
+        {
+<span class="fc" id="L161">            b[i] = (byte)(most &gt;&gt;&gt; ((7-i) * 8));</span>
+<span class="fc" id="L162">            b[8+i] = (byte)(least &gt;&gt;&gt; ((7-i) * 8));</span>
+        }
+<span class="fc" id="L164">        return b;</span>
+    }
+
+    /**
+     * Returns a 16 byte representation of a type 1 UUID (a time-based UUID),
+     * based on the current system time.
+     *
+     * @return a type 1 UUID represented as a byte[]
+     */
+    public static byte[] getTimeUUIDBytes()
+    {
+<span class="nc" id="L175">        return createTimeUUIDBytes(instance.createTimeSafe());</span>
+    }
+
+    /**
+     * Returns the smaller possible type 1 UUID having the provided timestamp.
+     *
+     * &lt;b&gt;Warning:&lt;/b&gt; this method should only be used for querying as this
+     * doesn't at all guarantee the uniqueness of the resulting UUID.
+     */
+    public static UUID minTimeUUID(long timestamp)
+    {
+<span class="fc" id="L186">        return new UUID(createTime(fromUnixTimestamp(timestamp)), MIN_CLOCK_SEQ_AND_NODE);</span>
+    }
+
+    /**
+     * Returns the biggest possible type 1 UUID having the provided timestamp.
+     *
+     * &lt;b&gt;Warning:&lt;/b&gt; this method should only be used for querying as this
+     * doesn't at all guarantee the uniqueness of the resulting UUID.
+     */
+    public static UUID maxTimeUUID(long timestamp)
+    {
+        // unix timestamp are milliseconds precision, uuid timestamp are 100's
+        // nanoseconds precision. If we ask for the biggest uuid have unix
+        // timestamp 1ms, then we should not extend 100's nanoseconds
+        // precision by taking 10000, but rather 19999.
+<span class="fc" id="L201">        long uuidTstamp = fromUnixTimestamp(timestamp + 1) - 1;</span>
+<span class="fc" id="L202">        return new UUID(createTime(uuidTstamp), MAX_CLOCK_SEQ_AND_NODE);</span>
+    }
+
+    /**
+     * @param uuid
+     * @return milliseconds since Unix epoch
+     */
+    public static long unixTimestamp(UUID uuid)
+    {
+<span class="nc" id="L211">        return (uuid.timestamp() / 10000) + START_EPOCH;</span>
+    }
+
+    /**
+     * @param uuid
+     * @return seconds since Unix epoch
+     */
+    public static int unixTimestampInSec(UUID uuid)
+    {
+<span class="nc" id="L220">        return Ints.checkedCast(TimeUnit.MILLISECONDS.toSeconds(unixTimestamp(uuid)));</span>
+    }
+
+    /**
+     * @param uuid
+     * @return microseconds since Unix epoch
+     */
+    public static long microsTimestamp(UUID uuid)
+    {
+<span class="nc" id="L229">        return (uuid.timestamp() / 10) + START_EPOCH * 1000;</span>
+    }
+
+    /**
+     * @param timestamp milliseconds since Unix epoch
+     * @return
+     */
+    private static long fromUnixTimestamp(long timestamp)
+    {
+<span class="fc" id="L238">        return fromUnixTimestamp(timestamp, 0L);</span>
+    }
+
+    private static long fromUnixTimestamp(long timestamp, long nanos)
+    {
+<span class="fc" id="L243">        return ((timestamp - START_EPOCH) * 10000) + nanos;</span>
+    }
+
+    /**
+     * Converts a 100-nanoseconds precision timestamp into the 16 byte representation
+     * of a type 1 UUID (a time-based UUID).
+     *
+     * To specify a 100-nanoseconds precision timestamp, one should provide a milliseconds timestamp and
+     * a number {@code 0 &lt;= n &lt; 10000} such that n*100 is the number of nanoseconds within that millisecond.
+     *
+     * &lt;p&gt;&lt;i&gt;&lt;b&gt;Warning:&lt;/b&gt; This method is not guaranteed to return unique UUIDs; Multiple
+     * invocations using identical timestamps will result in identical UUIDs.&lt;/i&gt;&lt;/p&gt;
+     *
+     * @return a type 1 UUID represented as a byte[]
+     */
+    public static byte[] getTimeUUIDBytes(long timeMillis, int nanos)
+    {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (nanos &gt;= 10000)</span>
+<span class="nc" id="L261">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L262">        return createTimeUUIDBytes(instance.createTimeUnsafe(timeMillis, nanos));</span>
+    }
+
+    private static byte[] createTimeUUIDBytes(long msb)
+    {
+<span class="nc" id="L267">        long lsb = clockSeqAndNode;</span>
+<span class="nc" id="L268">        byte[] uuidBytes = new byte[16];</span>
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        for (int i = 0; i &lt; 8; i++)</span>
+<span class="nc" id="L271">            uuidBytes[i] = (byte) (msb &gt;&gt;&gt; 8 * (7 - i));</span>
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        for (int i = 8; i &lt; 16; i++)</span>
+<span class="nc" id="L274">            uuidBytes[i] = (byte) (lsb &gt;&gt;&gt; 8 * (7 - i));</span>
+
+<span class="nc" id="L276">        return uuidBytes;</span>
+    }
+
+    /**
+     * Returns a milliseconds-since-epoch value for a type-1 UUID.
+     *
+     * @param uuid a type-1 (time-based) UUID
+     * @return the number of milliseconds since the unix epoch
+     * @throws IllegalArgumentException if the UUID is not version 1
+     */
+    public static long getAdjustedTimestamp(UUID uuid)
+    {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (uuid.version() != 1)</span>
+<span class="nc" id="L289">            throw new IllegalArgumentException(&quot;incompatible with uuid version: &quot;+uuid.version());</span>
+<span class="nc" id="L290">        return (uuid.timestamp() / 10000) + START_EPOCH;</span>
+    }
+
+    private static long makeClockSeqAndNode()
+    {
+<span class="fc" id="L295">        long clock = new SecureRandom().nextLong();</span>
+
+<span class="fc" id="L297">        long lsb = 0;</span>
+<span class="fc" id="L298">        lsb |= 0x8000000000000000L;                 // variant (2 bits)</span>
+<span class="fc" id="L299">        lsb |= (clock &amp; 0x0000000000003FFFL) &lt;&lt; 48; // clock sequence (14 bits)</span>
+<span class="fc" id="L300">        lsb |= makeNode();                          // 6 bytes</span>
+<span class="fc" id="L301">        return lsb;</span>
+    }
+
+    // needs to return two different values for the same when.
+    // we can generate at most 10k UUIDs per ms.
+    private long createTimeSafe()
+    {
+        long newLastNanos;
+        while (true)
+        {
+            //Generate a candidate value for new lastNanos
+<span class="fc" id="L312">            newLastNanos = (System.currentTimeMillis() - START_EPOCH) * 10000;</span>
+<span class="fc" id="L313">            long originalLastNanos = lastNanos.get();</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">            if (newLastNanos &gt; originalLastNanos)</span>
+            {
+                //Slow path once per millisecond do a CAS
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">                if (lastNanos.compareAndSet(originalLastNanos, newLastNanos))</span>
+                {
+<span class="fc" id="L319">                    break;</span>
+                }
+            }
+            else
+            {
+                //Fast path do an atomic increment
+                //Or when falling behind this will move time forward past the clock if necessary
+<span class="nc" id="L326">                newLastNanos = lastNanos.incrementAndGet();</span>
+<span class="nc" id="L327">                break;</span>
+            }
+<span class="nc" id="L329">        }</span>
+<span class="fc" id="L330">        return createTime(newLastNanos);</span>
+    }
+
+    private long createTimeUnsafe(long when, int nanos)
+    {
+<span class="nc" id="L335">        long nanosSince = ((when - START_EPOCH) * 10000) + nanos;</span>
+<span class="nc" id="L336">        return createTime(nanosSince);</span>
+    }
+
+    private static long createTime(long nanosSince)
+    {
+<span class="fc" id="L341">        long msb = 0L;</span>
+<span class="fc" id="L342">        msb |= (0x00000000ffffffffL &amp; nanosSince) &lt;&lt; 32;</span>
+<span class="fc" id="L343">        msb |= (0x0000ffff00000000L &amp; nanosSince) &gt;&gt;&gt; 16;</span>
+<span class="fc" id="L344">        msb |= (0xffff000000000000L &amp; nanosSince) &gt;&gt;&gt; 48;</span>
+<span class="fc" id="L345">        msb |= 0x0000000000001000L; // sets the version to 1.</span>
+<span class="fc" id="L346">        return msb;</span>
+    }
+
+    private static long makeNode()
+    {
+       /*
+        * We don't have access to the MAC address but need to generate a node part
+        * that identify this host as uniquely as possible.
+        * The spec says that one option is to take as many source that identify
+        * this node as possible and hash them together. That's what we do here by
+        * gathering all the ip of this host.
+        * Note that FBUtilities.getBroadcastAddress() should be enough to uniquely
+        * identify the node *in the cluster* but it triggers DatabaseDescriptor
+        * instanciation and the UUID generator is used in Stress for instance,
+        * where we don't want to require the yaml.
+        */
+<span class="fc" id="L362">        Collection&lt;InetAddress&gt; localAddresses = FBUtilities.getAllLocalAddresses();</span>
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">        if (localAddresses.isEmpty())</span>
+<span class="nc" id="L364">            throw new RuntimeException(&quot;Cannot generate the node component of the UUID because cannot retrieve any IP addresses.&quot;);</span>
+
+        // ideally, we'd use the MAC address, but java doesn't expose that.
+<span class="fc" id="L367">        byte[] hash = hash(localAddresses);</span>
+<span class="fc" id="L368">        long node = 0;</span>
+<span class="fc bfc" id="L369" title="All 2 branches covered.">        for (int i = 0; i &lt; Math.min(6, hash.length); i++)</span>
+<span class="fc" id="L370">            node |= (0x00000000000000ff &amp; (long)hash[i]) &lt;&lt; (5-i)*8;</span>
+<span class="pc bpc" id="L371" title="2 of 4 branches missed.">        assert (0xff00000000000000L &amp; node) == 0;</span>
+
+        // Since we don't use the mac address, the spec says that multicast
+        // bit (least significant bit of the first octet of the node ID) must be 1.
+<span class="fc" id="L375">        return node | 0x0000010000000000L;</span>
+    }
+
+    private static byte[] hash(Collection&lt;InetAddress&gt; data)
+    {
+        try
+        {
+            // Identify the host.
+<span class="fc" id="L383">            MessageDigest messageDigest = MessageDigest.getInstance(&quot;MD5&quot;);</span>
+<span class="fc bfc" id="L384" title="All 2 branches covered.">            for(InetAddress addr : data)</span>
+<span class="fc" id="L385">                messageDigest.update(addr.getAddress());</span>
+
+            // Identify the process on the load: we use both the PID and class loader hash.
+<span class="fc" id="L388">            long pid = NativeLibrary.getProcessID();</span>
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">            if (pid &lt; 0)</span>
+<span class="nc" id="L390">                pid = new Random(System.currentTimeMillis()).nextLong();</span>
+<span class="fc" id="L391">            FBUtilities.updateWithLong(messageDigest, pid);</span>
+
+<span class="fc" id="L393">            ClassLoader loader = UUIDGen.class.getClassLoader();</span>
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">            int loaderId = loader != null ? System.identityHashCode(loader) : 0;</span>
+<span class="fc" id="L395">            FBUtilities.updateWithInt(messageDigest, loaderId);</span>
+
+<span class="fc" id="L397">            return messageDigest.digest();</span>
+        }
+<span class="nc" id="L399">        catch (NoSuchAlgorithmException nsae)</span>
+        {
+<span class="nc" id="L401">            throw new RuntimeException(&quot;MD5 digest algorithm is not available&quot;, nsae);</span>
+        }
+    }
+}
+
+// for the curious, here is how I generated START_EPOCH
+//        Calendar c = Calendar.getInstance(TimeZone.getTimeZone(&quot;GMT-0&quot;));
+//        c.set(Calendar.YEAR, 1582);
+//        c.set(Calendar.MONTH, Calendar.OCTOBER);
+//        c.set(Calendar.DAY_OF_MONTH, 15);
+//        c.set(Calendar.HOUR_OF_DAY, 0);
+//        c.set(Calendar.MINUTE, 0);
+//        c.set(Calendar.SECOND, 0);
+//        c.set(Calendar.MILLISECOND, 0);
+//        long START_EPOCH = c.getTimeInMillis();
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

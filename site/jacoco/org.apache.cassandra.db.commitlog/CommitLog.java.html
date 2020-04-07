@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitLog.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">CommitLog.java</span></div><h1>CommitLog.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.zip.CRC32;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.compress.ICompressor;
+import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputBufferFixed;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.metrics.CommitLogMetrics;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.MBeanWrapper;
+
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.CommitLogSegmentFileComparator;
+import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+
+/*
+ * Commit Log tracks every write operation into the system. The aim of the commit log is to be able to
+ * successfully recover data that was not stored to disk via the Memtable.
+ */
+<span class="pc bpc" id="L60" title="1 of 2 branches missed.">public class CommitLog implements CommitLogMBean</span>
+{
+<span class="fc" id="L62">    private static final Logger logger = LoggerFactory.getLogger(CommitLog.class);</span>
+
+<span class="fc" id="L64">    public static final CommitLog instance = CommitLog.construct();</span>
+
+    // we only permit records HALF the size of a commit log, to ensure we don't spin allocating many mostly
+    // empty segments when writing large records
+<span class="fc" id="L68">    final long MAX_MUTATION_SIZE = DatabaseDescriptor.getMaxMutationSize();</span>
+
+    final public AbstractCommitLogSegmentManager segmentManager;
+
+    public final CommitLogArchiver archiver;
+    final CommitLogMetrics metrics;
+    final AbstractCommitLogService executor;
+
+    volatile Configuration configuration;
+
+    private static CommitLog construct()
+    {
+<span class="fc" id="L80">        CommitLog log = new CommitLog(CommitLogArchiver.construct());</span>
+
+<span class="fc" id="L82">        MBeanWrapper.instance.registerMBean(log, &quot;org.apache.cassandra.db:type=Commitlog&quot;);</span>
+<span class="fc" id="L83">        return log.start();</span>
+    }
+
+    @VisibleForTesting
+    CommitLog(CommitLogArchiver archiver)
+<span class="fc" id="L88">    {</span>
+<span class="fc" id="L89">        this.configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),</span>
+<span class="fc" id="L90">                                               DatabaseDescriptor.getEncryptionContext());</span>
+<span class="fc" id="L91">        DatabaseDescriptor.createAllDirectories();</span>
+
+<span class="fc" id="L93">        this.archiver = archiver;</span>
+<span class="fc" id="L94">        metrics = new CommitLogMetrics();</span>
+
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">        executor = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch</span>
+                ? new BatchCommitLogService(this)
+                : new PeriodicCommitLogService(this);
+
+<span class="pc bpc" id="L100" title="1 of 2 branches missed.">        segmentManager = DatabaseDescriptor.isCDCEnabled()</span>
+<span class="pc" id="L101">                         ? new CommitLogSegmentManagerCDC(this, DatabaseDescriptor.getCommitLogLocation())</span>
+<span class="fc" id="L102">                         : new CommitLogSegmentManagerStandard(this, DatabaseDescriptor.getCommitLogLocation());</span>
+
+        // register metrics
+<span class="fc" id="L105">        metrics.attach(executor, segmentManager);</span>
+<span class="fc" id="L106">    }</span>
+
+    CommitLog start()
+    {
+<span class="fc" id="L110">        segmentManager.start();</span>
+<span class="fc" id="L111">        executor.start();</span>
+<span class="fc" id="L112">        return this;</span>
+    }
+
+    /**
+     * Perform recovery on commit logs located in the directory specified by the config file.
+     *
+     * @return the number of mutations replayed
+     * @throws IOException
+     */
+    public int recoverSegmentsOnDisk() throws IOException
+    {
+<span class="pc bpc" id="L123" title="2 of 4 branches missed.">        FilenameFilter unmanagedFilesFilter = (dir, name) -&gt; CommitLogDescriptor.isValid(name) &amp;&amp; CommitLogSegment.shouldReplay(name);</span>
+
+        // submit all files for this segment manager for archiving prior to recovery - CASSANDRA-6904
+        // The files may have already been archived by normal CommitLog operation. This may cause errors in this
+        // archiving pass, which we should not treat as serious. 
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">        for (File file : new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter))</span>
+        {
+<span class="nc" id="L130">            archiver.maybeArchive(file.getPath(), file.getName());</span>
+<span class="nc" id="L131">            archiver.maybeWaitForArchiving(file.getName());</span>
+        }
+
+<span class="pc bpc" id="L134" title="2 of 4 branches missed.">        assert archiver.archivePending.isEmpty() : &quot;Not all commit log archive tasks were completed before restore&quot;;</span>
+<span class="fc" id="L135">        archiver.maybeRestoreArchive();</span>
+
+        // List the files again as archiver may have added segments.
+<span class="fc" id="L138">        File[] files = new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter);</span>
+<span class="fc" id="L139">        int replayed = 0;</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">        if (files.length == 0)</span>
+        {
+<span class="fc" id="L142">            logger.info(&quot;No commitlog files found; skipping replay&quot;);</span>
+        }
+        else
+        {
+<span class="nc" id="L146">            Arrays.sort(files, new CommitLogSegmentFileComparator());</span>
+<span class="nc" id="L147">            logger.info(&quot;Replaying {}&quot;, StringUtils.join(files, &quot;, &quot;));</span>
+<span class="nc" id="L148">            replayed = recoverFiles(files);</span>
+<span class="nc" id="L149">            logger.info(&quot;Log replay complete, {} replayed mutations&quot;, replayed);</span>
+
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            for (File f : files)</span>
+<span class="nc" id="L152">                segmentManager.handleReplayedSegment(f);</span>
+        }
+
+<span class="fc" id="L155">        return replayed;</span>
+    }
+
+    /**
+     * Perform recovery on a list of commit log files.
+     *
+     * @param clogs   the list of commit log files to replay
+     * @return the number of mutations replayed
+     */
+    public int recoverFiles(File... clogs) throws IOException
+    {
+<span class="nc" id="L166">        CommitLogReplayer replayer = CommitLogReplayer.construct(this);</span>
+<span class="nc" id="L167">        replayer.replayFiles(clogs);</span>
+<span class="nc" id="L168">        return replayer.blockForWrites();</span>
+    }
+
+    public void recoverPath(String path) throws IOException
+    {
+<span class="nc" id="L173">        CommitLogReplayer replayer = CommitLogReplayer.construct(this);</span>
+<span class="nc" id="L174">        replayer.replayPath(new File(path), false);</span>
+<span class="nc" id="L175">        replayer.blockForWrites();</span>
+<span class="nc" id="L176">    }</span>
+
+    /**
+     * Perform recovery on a single commit log. Kept w/sub-optimal name due to coupling w/MBean / JMX
+     */
+    public void recover(String path) throws IOException
+    {
+<span class="nc" id="L183">        recoverPath(path);</span>
+<span class="nc" id="L184">    }</span>
+
+    /**
+     * @return a CommitLogPosition which, if {@code &gt;= one} returned from add(), implies add() was started
+     * (but not necessarily finished) prior to this call
+     */
+    public CommitLogPosition getCurrentPosition()
+    {
+<span class="fc" id="L192">        return segmentManager.getCurrentPosition();</span>
+    }
+
+    /**
+     * Flushes all dirty CFs, waiting for them to free and recycle any segments they were retaining
+     */
+    public void forceRecycleAllSegments(Iterable&lt;UUID&gt; droppedCfs)
+    {
+<span class="nc" id="L200">        segmentManager.forceRecycleAll(droppedCfs);</span>
+<span class="nc" id="L201">    }</span>
+
+    /**
+     * Flushes all dirty CFs, waiting for them to free and recycle any segments they were retaining
+     */
+    public void forceRecycleAllSegments()
+    {
+<span class="nc" id="L208">        segmentManager.forceRecycleAll(Collections.&lt;UUID&gt;emptyList());</span>
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * Forces a disk flush on the commit log files that need it.  Blocking.
+     */
+    public void sync(boolean flush) throws IOException
+    {
+<span class="fc" id="L216">        segmentManager.sync(flush);</span>
+<span class="fc" id="L217">    }</span>
+
+    /**
+     * Preempts the CLExecutor, telling to to sync immediately
+     */
+    public void requestExtraSync()
+    {
+<span class="fc" id="L224">        executor.requestExtraSync();</span>
+<span class="fc" id="L225">    }</span>
+
+    /**
+     * Add a Mutation to the commit log. If CDC is enabled, this can fail.
+     *
+     * @param mutation the Mutation to add to the log
+     * @throws WriteTimeoutException
+     */
+    public CommitLogPosition add(Mutation mutation) throws WriteTimeoutException
+    {
+<span class="pc bpc" id="L235" title="2 of 4 branches missed.">        assert mutation != null;</span>
+
+<span class="fc" id="L237">        try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())</span>
+        {
+<span class="fc" id="L239">            Mutation.serializer.serialize(mutation, dob, MessagingService.current_version);</span>
+<span class="fc" id="L240">            int size = dob.getLength();</span>
+
+<span class="fc" id="L242">            int totalSize = size + ENTRY_OVERHEAD_SIZE;</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">            if (totalSize &gt; MAX_MUTATION_SIZE)</span>
+            {
+<span class="nc" id="L245">                throw new IllegalArgumentException(String.format(&quot;Mutation of %s is too large for the maximum size of %s&quot;,</span>
+<span class="nc" id="L246">                                                                 FBUtilities.prettyPrintMemory(totalSize),</span>
+<span class="nc" id="L247">                                                                 FBUtilities.prettyPrintMemory(MAX_MUTATION_SIZE)));</span>
+            }
+
+<span class="fc" id="L250">            Allocation alloc = segmentManager.allocate(mutation, totalSize);</span>
+
+<span class="fc" id="L252">            CRC32 checksum = new CRC32();</span>
+<span class="fc" id="L253">            final ByteBuffer buffer = alloc.getBuffer();</span>
+<span class="fc" id="L254">            try (BufferedDataOutputStreamPlus dos = new DataOutputBufferFixed(buffer))</span>
+            {
+                // checksummed length
+<span class="fc" id="L257">                dos.writeInt(size);</span>
+<span class="fc" id="L258">                updateChecksumInt(checksum, size);</span>
+<span class="fc" id="L259">                buffer.putInt((int) checksum.getValue());</span>
+
+                // checksummed mutation
+<span class="fc" id="L262">                dos.write(dob.getData(), 0, size);</span>
+<span class="fc" id="L263">                updateChecksum(checksum, buffer, buffer.position() - size, size);</span>
+<span class="fc" id="L264">                buffer.putInt((int) checksum.getValue());</span>
+            }
+<span class="nc" id="L266">            catch (IOException e)</span>
+            {
+<span class="nc" id="L268">                throw new FSWriteError(e, alloc.getSegment().getPath());</span>
+            }
+            finally
+            {
+<span class="fc" id="L272">                alloc.markWritten();</span>
+            }
+
+<span class="fc" id="L275">            executor.finishWriteFor(alloc);</span>
+<span class="fc" id="L276">            return alloc.getCommitLogPosition();</span>
+        }
+<span class="nc" id="L278">        catch (IOException e)</span>
+        {
+<span class="nc" id="L280">            throw new FSWriteError(e, segmentManager.allocatingFrom().getPath());</span>
+        }
+    }
+
+    /**
+     * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position
+     * given. Discards any commit log segments that are no longer used.
+     *
+     * @param cfId    the column family ID that was flushed
+     * @param lowerBound the lowest covered replay position of the flush
+     * @param lowerBound the highest covered replay position of the flush
+     */
+    public void discardCompletedSegments(final UUID cfId, final CommitLogPosition lowerBound, final CommitLogPosition upperBound)
+    {
+<span class="fc" id="L294">        logger.trace(&quot;discard completed log segments for {}-{}, table {}&quot;, lowerBound, upperBound, cfId);</span>
+
+        // Go thru the active segment files, which are ordered oldest to newest, marking the
+        // flushed CF as clean, until we reach the segment file containing the CommitLogPosition passed
+        // in the arguments. Any segments that become unused after they are marked clean will be
+        // recycled or discarded.
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">        for (Iterator&lt;CommitLogSegment&gt; iter = segmentManager.getActiveSegments().iterator(); iter.hasNext();)</span>
+        {
+<span class="fc" id="L302">            CommitLogSegment segment = iter.next();</span>
+<span class="fc" id="L303">            segment.markClean(cfId, lowerBound, upperBound);</span>
+
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">            if (segment.isUnused())</span>
+            {
+<span class="nc" id="L307">                logger.debug(&quot;Commit log segment {} is unused&quot;, segment);</span>
+<span class="nc" id="L308">                segmentManager.archiveAndDiscard(segment);</span>
+            }
+            else
+            {
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L313">                    logger.trace(&quot;Not safe to delete{} commit log segment {}; dirty is {}&quot;,</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                            (iter.hasNext() ? &quot;&quot; : &quot; active&quot;), segment, segment.dirtyString());</span>
+            }
+
+            // Don't mark or try to delete any newer segments once we've reached the one containing the
+            // position of the flush.
+<span class="pc bpc" id="L319" title="1 of 2 branches missed.">            if (segment.contains(upperBound))</span>
+<span class="fc" id="L320">                break;</span>
+<span class="nc" id="L321">        }</span>
+<span class="fc" id="L322">    }</span>
+
+    @Override
+    public String getArchiveCommand()
+    {
+<span class="nc" id="L327">        return archiver.archiveCommand;</span>
+    }
+
+    @Override
+    public String getRestoreCommand()
+    {
+<span class="nc" id="L333">        return archiver.restoreCommand;</span>
+    }
+
+    @Override
+    public String getRestoreDirectories()
+    {
+<span class="nc" id="L339">        return archiver.restoreDirectories;</span>
+    }
+
+    @Override
+    public long getRestorePointInTime()
+    {
+<span class="nc" id="L345">        return archiver.restorePointInTime;</span>
+    }
+
+    @Override
+    public String getRestorePrecision()
+    {
+<span class="nc" id="L351">        return archiver.precision.toString();</span>
+    }
+
+    public List&lt;String&gt; getActiveSegmentNames()
+    {
+<span class="nc" id="L356">        List&lt;String&gt; segmentNames = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        for (CommitLogSegment seg : segmentManager.getActiveSegments())</span>
+<span class="nc" id="L358">            segmentNames.add(seg.getName());</span>
+<span class="nc" id="L359">        return segmentNames;</span>
+    }
+
+    public List&lt;String&gt; getArchivingSegmentNames()
+    {
+<span class="nc" id="L364">        return new ArrayList&lt;&gt;(archiver.archivePending.keySet());</span>
+    }
+
+    @Override
+    public long getActiveContentSize()
+    {
+<span class="nc" id="L370">        long size = 0;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        for (CommitLogSegment seg : segmentManager.getActiveSegments())</span>
+<span class="nc" id="L372">            size += seg.contentSize();</span>
+<span class="nc" id="L373">        return size;</span>
+    }
+
+    @Override
+    public long getActiveOnDiskSize()
+    {
+<span class="nc" id="L379">        return segmentManager.onDiskSize();</span>
+    }
+
+    @Override
+    public Map&lt;String, Double&gt; getActiveSegmentCompressionRatios()
+    {
+<span class="nc" id="L385">        Map&lt;String, Double&gt; segmentRatios = new TreeMap&lt;&gt;();</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        for (CommitLogSegment seg : segmentManager.getActiveSegments())</span>
+<span class="nc" id="L387">            segmentRatios.put(seg.getName(), 1.0 * seg.onDiskSize() / seg.contentSize());</span>
+<span class="nc" id="L388">        return segmentRatios;</span>
+    }
+
+    /**
+     * Shuts down the threads used by the commit log, blocking until completion.
+     * TODO this should accept a timeout, and throw TimeoutException
+     */
+    public void shutdownBlocking() throws InterruptedException
+    {
+<span class="nc" id="L397">        executor.shutdown();</span>
+<span class="nc" id="L398">        executor.awaitTermination();</span>
+<span class="nc" id="L399">        segmentManager.shutdown();</span>
+<span class="nc" id="L400">        segmentManager.awaitTermination();</span>
+<span class="nc" id="L401">    }</span>
+
+    /**
+     * FOR TESTING PURPOSES
+     * @return the number of files recovered
+     */
+    public int resetUnsafe(boolean deleteSegments) throws IOException
+    {
+<span class="nc" id="L409">        stopUnsafe(deleteSegments);</span>
+<span class="nc" id="L410">        resetConfiguration();</span>
+<span class="nc" id="L411">        return restartUnsafe();</span>
+    }
+
+    /**
+     * FOR TESTING PURPOSES.
+     */
+    public void resetConfiguration()
+    {
+<span class="nc" id="L419">        configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),</span>
+<span class="nc" id="L420">                                          DatabaseDescriptor.getEncryptionContext());</span>
+<span class="nc" id="L421">    }</span>
+
+    /**
+     */
+    public void stopUnsafe(boolean deleteSegments)
+    {
+<span class="nc" id="L427">        executor.shutdown();</span>
+        try
+        {
+<span class="nc" id="L430">            executor.awaitTermination();</span>
+        }
+<span class="nc" id="L432">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L434">            throw new RuntimeException(e);</span>
+<span class="nc" id="L435">        }</span>
+<span class="nc" id="L436">        segmentManager.stopUnsafe(deleteSegments);</span>
+<span class="nc" id="L437">        CommitLogSegment.resetReplayLimit();</span>
+<span class="nc bnc" id="L438" title="All 4 branches missed.">        if (DatabaseDescriptor.isCDCEnabled() &amp;&amp; deleteSegments)</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            for (File f : new File(DatabaseDescriptor.getCDCLogLocation()).listFiles())</span>
+<span class="nc" id="L440">                FileUtils.deleteWithConfirm(f);</span>
+
+<span class="nc" id="L442">    }</span>
+
+    /**
+     * FOR TESTING PURPOSES
+     */
+    public int restartUnsafe() throws IOException
+    {
+<span class="nc" id="L449">        return start().recoverSegmentsOnDisk();</span>
+    }
+
+    @VisibleForTesting
+    public static boolean handleCommitError(String message, Throwable t)
+    {
+<span class="nc" id="L455">        JVMStabilityInspector.inspectCommitLogThrowable(t);</span>
+<span class="nc bnc" id="L456" title="All 4 branches missed.">        switch (DatabaseDescriptor.getCommitFailurePolicy())</span>
+        {
+            // Needed here for unit tests to not fail on default assertion
+            case die:
+            case stop:
+<span class="nc" id="L461">                StorageService.instance.stopTransports();</span>
+                //$FALL-THROUGH$
+            case stop_commit:
+<span class="nc" id="L464">                logger.error(String.format(&quot;%s. Commit disk failure policy is %s; terminating thread&quot;, message, DatabaseDescriptor.getCommitFailurePolicy()), t);</span>
+<span class="nc" id="L465">                return false;</span>
+            case ignore:
+<span class="nc" id="L467">                logger.error(message, t);</span>
+<span class="nc" id="L468">                return true;</span>
+            default:
+<span class="nc" id="L470">                throw new AssertionError(DatabaseDescriptor.getCommitFailurePolicy());</span>
+        }
+    }
+
+    public static final class Configuration
+    {
+        /**
+         * The compressor class.
+         */
+        private final ParameterizedClass compressorClass;
+
+        /**
+         * The compressor used to compress the segments.
+         */
+        private final ICompressor compressor;
+
+        /**
+         * The encryption context used to encrypt the segments.
+         */
+        private EncryptionContext encryptionContext;
+
+        public Configuration(ParameterizedClass compressorClass, EncryptionContext encryptionContext)
+<span class="fc" id="L492">        {</span>
+<span class="fc" id="L493">            this.compressorClass = compressorClass;</span>
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">            this.compressor = compressorClass != null ? CompressionParams.createCompressor(compressorClass) : null;</span>
+<span class="fc" id="L495">            this.encryptionContext = encryptionContext;</span>
+<span class="fc" id="L496">        }</span>
+
+        /**
+         * Checks if the segments must be compressed.
+         * @return &lt;code&gt;true&lt;/code&gt; if the segments must be compressed, &lt;code&gt;false&lt;/code&gt; otherwise.
+         */
+        public boolean useCompression()
+        {
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">            return compressor != null;</span>
+        }
+
+        /**
+         * Checks if the segments must be encrypted.
+         * @return &lt;code&gt;true&lt;/code&gt; if the segments must be encrypted, &lt;code&gt;false&lt;/code&gt; otherwise.
+         */
+        public boolean useEncryption()
+        {
+<span class="fc" id="L513">            return encryptionContext.isEnabled();</span>
+        }
+
+        /**
+         * Returns the compressor used to compress the segments.
+         * @return the compressor used to compress the segments
+         */
+        public ICompressor getCompressor()
+        {
+<span class="nc" id="L522">            return compressor;</span>
+        }
+
+        /**
+         * Returns the compressor class.
+         * @return the compressor class
+         */
+        public ParameterizedClass getCompressorClass()
+        {
+<span class="fc" id="L531">            return compressorClass;</span>
+        }
+
+        /**
+         * Returns the compressor name.
+         * @return the compressor name.
+         */
+        public String getCompressorName()
+        {
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            return useCompression() ? compressor.getClass().getSimpleName() : &quot;none&quot;;</span>
+        }
+
+        /**
+         * Returns the encryption context used to encrypt the segments.
+         * @return the encryption context used to encrypt the segments
+         */
+        public EncryptionContext getEncryptionContext()
+        {
+<span class="fc" id="L549">            return encryptionContext;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

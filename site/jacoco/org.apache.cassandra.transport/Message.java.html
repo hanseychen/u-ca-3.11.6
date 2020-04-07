@@ -1,0 +1,841 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Message.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">Message.java</span></div><h1>Message.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.transport;
+
+import java.util.ArrayList;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.*;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import io.netty.handler.codec.MessageToMessageEncoder;
+
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.LocalAwareExecutorService;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.net.ResourceLimits;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.transport.messages.*;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+import static org.apache.cassandra.concurrent.SharedExecutorPool.SHARED;
+
+/**
+ * A message from the CQL binary protocol.
+ */
+public abstract class Message
+{
+<span class="fc" id="L62">    protected static final Logger logger = LoggerFactory.getLogger(Message.class);</span>
+
+    /**
+     * When we encounter an unexpected IOException we look for these {@link Throwable#getMessage() messages}
+     * (because we have no better way to distinguish) and log them at DEBUG rather than INFO, since they
+     * are generally caused by unclean client disconnects rather than an actual problem.
+     */
+<span class="fc" id="L69">    private static final Set&lt;String&gt; ioExceptionsAtDebugLevel = ImmutableSet.&lt;String&gt;builder().</span>
+<span class="fc" id="L70">            add(&quot;Connection reset by peer&quot;).</span>
+<span class="fc" id="L71">            add(&quot;Broken pipe&quot;).</span>
+<span class="fc" id="L72">            add(&quot;Connection timed out&quot;).</span>
+<span class="fc" id="L73">            build();</span>
+
+    public interface Codec&lt;M extends Message&gt; extends CBCodec&lt;M&gt; {}
+
+<span class="fc" id="L77">    public enum Direction</span>
+    {
+<span class="fc" id="L79">        REQUEST, RESPONSE;</span>
+
+        public static Direction extractFromVersion(int versionWithDirection)
+        {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            return (versionWithDirection &amp; 0x80) == 0 ? REQUEST : RESPONSE;</span>
+        }
+
+        public int addToVersion(int rawVersion)
+        {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">            return this == REQUEST ? (rawVersion &amp; 0x7F) : (rawVersion | 0x80);</span>
+        }
+    }
+
+<span class="fc" id="L92">    public enum Type</span>
+    {
+<span class="fc" id="L94">        ERROR          (0,  Direction.RESPONSE, ErrorMessage.codec),</span>
+<span class="fc" id="L95">        STARTUP        (1,  Direction.REQUEST,  StartupMessage.codec),</span>
+<span class="fc" id="L96">        READY          (2,  Direction.RESPONSE, ReadyMessage.codec),</span>
+<span class="fc" id="L97">        AUTHENTICATE   (3,  Direction.RESPONSE, AuthenticateMessage.codec),</span>
+<span class="fc" id="L98">        CREDENTIALS    (4,  Direction.REQUEST,  CredentialsMessage.codec),</span>
+<span class="fc" id="L99">        OPTIONS        (5,  Direction.REQUEST,  OptionsMessage.codec),</span>
+<span class="fc" id="L100">        SUPPORTED      (6,  Direction.RESPONSE, SupportedMessage.codec),</span>
+<span class="fc" id="L101">        QUERY          (7,  Direction.REQUEST,  QueryMessage.codec),</span>
+<span class="fc" id="L102">        RESULT         (8,  Direction.RESPONSE, ResultMessage.codec),</span>
+<span class="fc" id="L103">        PREPARE        (9,  Direction.REQUEST,  PrepareMessage.codec),</span>
+<span class="fc" id="L104">        EXECUTE        (10, Direction.REQUEST,  ExecuteMessage.codec),</span>
+<span class="fc" id="L105">        REGISTER       (11, Direction.REQUEST,  RegisterMessage.codec),</span>
+<span class="fc" id="L106">        EVENT          (12, Direction.RESPONSE, EventMessage.codec),</span>
+<span class="fc" id="L107">        BATCH          (13, Direction.REQUEST,  BatchMessage.codec),</span>
+<span class="fc" id="L108">        AUTH_CHALLENGE (14, Direction.RESPONSE, AuthChallenge.codec),</span>
+<span class="fc" id="L109">        AUTH_RESPONSE  (15, Direction.REQUEST,  AuthResponse.codec),</span>
+<span class="fc" id="L110">        AUTH_SUCCESS   (16, Direction.RESPONSE, AuthSuccess.codec);</span>
+
+        public final int opcode;
+        public final Direction direction;
+        public final Codec&lt;?&gt; codec;
+
+        private static final Type[] opcodeIdx;
+        static
+        {
+<span class="fc" id="L119">            int maxOpcode = -1;</span>
+<span class="fc bfc" id="L120" title="All 2 branches covered.">            for (Type type : Type.values())</span>
+<span class="fc" id="L121">                maxOpcode = Math.max(maxOpcode, type.opcode);</span>
+<span class="fc" id="L122">            opcodeIdx = new Type[maxOpcode + 1];</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">            for (Type type : Type.values())</span>
+            {
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">                if (opcodeIdx[type.opcode] != null)</span>
+<span class="nc" id="L126">                    throw new IllegalStateException(&quot;Duplicate opcode&quot;);</span>
+<span class="fc" id="L127">                opcodeIdx[type.opcode] = type;</span>
+            }
+<span class="fc" id="L129">        }</span>
+
+        Type(int opcode, Direction direction, Codec&lt;?&gt; codec)
+<span class="fc" id="L132">        {</span>
+<span class="fc" id="L133">            this.opcode = opcode;</span>
+<span class="fc" id="L134">            this.direction = direction;</span>
+<span class="fc" id="L135">            this.codec = codec;</span>
+<span class="fc" id="L136">        }</span>
+
+        public static Type fromOpcode(int opcode, Direction direction)
+        {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (opcode &gt;= opcodeIdx.length)</span>
+<span class="nc" id="L141">                throw new ProtocolException(String.format(&quot;Unknown opcode %d&quot;, opcode));</span>
+<span class="nc" id="L142">            Type t = opcodeIdx[opcode];</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            if (t == null)</span>
+<span class="nc" id="L144">                throw new ProtocolException(String.format(&quot;Unknown opcode %d&quot;, opcode));</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            if (t.direction != direction)</span>
+<span class="nc" id="L146">                throw new ProtocolException(String.format(&quot;Wrong protocol direction (expected %s, got %s) for opcode %d (%s)&quot;,</span>
+                                                          t.direction,
+                                                          direction,
+<span class="nc" id="L149">                                                          opcode,</span>
+                                                          t));
+<span class="nc" id="L151">            return t;</span>
+        }
+    }
+
+    public final Type type;
+    protected Connection connection;
+    private int streamId;
+    private Frame sourceFrame;
+    private Map&lt;String, ByteBuffer&gt; customPayload;
+<span class="fc" id="L160">    protected ProtocolVersion forcedProtocolVersion = null;</span>
+
+    protected Message(Type type)
+<span class="fc" id="L163">    {</span>
+<span class="fc" id="L164">        this.type = type;</span>
+<span class="fc" id="L165">    }</span>
+
+    public void attach(Connection connection)
+    {
+<span class="nc" id="L169">        this.connection = connection;</span>
+<span class="nc" id="L170">    }</span>
+
+    public Connection connection()
+    {
+<span class="nc" id="L174">        return connection;</span>
+    }
+
+    public Message setStreamId(int streamId)
+    {
+<span class="fc" id="L179">        this.streamId = streamId;</span>
+<span class="fc" id="L180">        return this;</span>
+    }
+
+    public int getStreamId()
+    {
+<span class="nc" id="L185">        return streamId;</span>
+    }
+
+    public void setSourceFrame(Frame sourceFrame)
+    {
+<span class="nc" id="L190">        this.sourceFrame = sourceFrame;</span>
+<span class="nc" id="L191">    }</span>
+
+    public Frame getSourceFrame()
+    {
+<span class="nc" id="L195">        return sourceFrame;</span>
+    }
+
+    public Map&lt;String, ByteBuffer&gt; getCustomPayload()
+    {
+<span class="nc" id="L200">        return customPayload;</span>
+    }
+
+    public void setCustomPayload(Map&lt;String, ByteBuffer&gt; customPayload)
+    {
+<span class="nc" id="L205">        this.customPayload = customPayload;</span>
+<span class="nc" id="L206">    }</span>
+
+    public static abstract class Request extends Message
+    {
+        protected boolean tracingRequested;
+
+        protected Request(Type type)
+        {
+<span class="nc" id="L214">            super(type);</span>
+
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (type.direction != Direction.REQUEST)</span>
+<span class="nc" id="L217">                throw new IllegalArgumentException();</span>
+<span class="nc" id="L218">        }</span>
+
+        public abstract Response execute(QueryState queryState, long queryStartNanoTime);
+
+        public void setTracingRequested()
+        {
+<span class="nc" id="L224">            this.tracingRequested = true;</span>
+<span class="nc" id="L225">        }</span>
+
+        public boolean isTracingRequested()
+        {
+<span class="nc" id="L229">            return tracingRequested;</span>
+        }
+    }
+
+    public static abstract class Response extends Message
+    {
+        protected UUID tracingId;
+        protected List&lt;String&gt; warnings;
+
+        protected Response(Type type)
+        {
+<span class="fc" id="L240">            super(type);</span>
+
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">            if (type.direction != Direction.RESPONSE)</span>
+<span class="nc" id="L243">                throw new IllegalArgumentException();</span>
+<span class="fc" id="L244">        }</span>
+
+        public Message setTracingId(UUID tracingId)
+        {
+<span class="nc" id="L248">            this.tracingId = tracingId;</span>
+<span class="nc" id="L249">            return this;</span>
+        }
+
+        public UUID getTracingId()
+        {
+<span class="nc" id="L254">            return tracingId;</span>
+        }
+
+        public Message setWarnings(List&lt;String&gt; warnings)
+        {
+<span class="nc" id="L259">            this.warnings = warnings;</span>
+<span class="nc" id="L260">            return this;</span>
+        }
+
+        public List&lt;String&gt; getWarnings()
+        {
+<span class="nc" id="L265">            return warnings;</span>
+        }
+    }
+
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">    @ChannelHandler.Sharable</span>
+<span class="fc" id="L270">    public static class ProtocolDecoder extends MessageToMessageDecoder&lt;Frame&gt;</span>
+    {
+        public void decode(ChannelHandlerContext ctx, Frame frame, List results)
+        {
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            boolean isRequest = frame.header.type.direction == Direction.REQUEST;</span>
+<span class="nc" id="L275">            boolean isTracing = frame.header.flags.contains(Frame.Header.Flag.TRACING);</span>
+<span class="nc" id="L276">            boolean isCustomPayload = frame.header.flags.contains(Frame.Header.Flag.CUSTOM_PAYLOAD);</span>
+<span class="nc" id="L277">            boolean hasWarning = frame.header.flags.contains(Frame.Header.Flag.WARNING);</span>
+
+<span class="nc bnc" id="L279" title="All 4 branches missed.">            UUID tracingId = isRequest || !isTracing ? null : CBUtil.readUUID(frame.body);</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">            List&lt;String&gt; warnings = isRequest || !hasWarning ? null : CBUtil.readStringList(frame.body);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            Map&lt;String, ByteBuffer&gt; customPayload = !isCustomPayload ? null : CBUtil.readBytesMap(frame.body);</span>
+
+            try
+            {
+<span class="nc bnc" id="L285" title="All 4 branches missed.">                if (isCustomPayload &amp;&amp; frame.header.version.isSmallerThan(ProtocolVersion.V4))</span>
+<span class="nc" id="L286">                    throw new ProtocolException(&quot;Received frame with CUSTOM_PAYLOAD flag for native protocol version &lt; 4&quot;);</span>
+
+<span class="nc" id="L288">                Message message = frame.header.type.codec.decode(frame.body, frame.header.version);</span>
+<span class="nc" id="L289">                message.setStreamId(frame.header.streamId);</span>
+<span class="nc" id="L290">                message.setSourceFrame(frame);</span>
+<span class="nc" id="L291">                message.setCustomPayload(customPayload);</span>
+
+<span class="nc bnc" id="L293" title="All 2 branches missed.">                if (isRequest)</span>
+                {
+<span class="nc bnc" id="L295" title="All 4 branches missed.">                    assert message instanceof Request;</span>
+<span class="nc" id="L296">                    Request req = (Request)message;</span>
+<span class="nc" id="L297">                    Connection connection = ctx.channel().attr(Connection.attributeKey).get();</span>
+<span class="nc" id="L298">                    req.attach(connection);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                    if (isTracing)</span>
+<span class="nc" id="L300">                        req.setTracingRequested();</span>
+<span class="nc" id="L301">                }</span>
+                else
+                {
+<span class="nc bnc" id="L304" title="All 4 branches missed.">                    assert message instanceof Response;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    if (isTracing)</span>
+<span class="nc" id="L306">                        ((Response)message).setTracingId(tracingId);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                    if (hasWarning)</span>
+<span class="nc" id="L308">                        ((Response)message).setWarnings(warnings);</span>
+                }
+
+<span class="nc" id="L311">                results.add(message);</span>
+            }
+<span class="nc" id="L313">            catch (Throwable ex)</span>
+            {
+<span class="nc" id="L315">                frame.release();</span>
+                // Remember the streamId
+<span class="nc" id="L317">                throw ErrorMessage.wrap(ex, frame.header.streamId);</span>
+<span class="nc" id="L318">            }</span>
+<span class="nc" id="L319">        }</span>
+    }
+
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">    @ChannelHandler.Sharable</span>
+    public static class ProtocolEncoder extends MessageToMessageEncoder&lt;Message&gt;
+    {
+        private final ProtocolVersionLimit versionCap;
+
+        ProtocolEncoder(ProtocolVersionLimit versionCap)
+<span class="fc" id="L328">        {</span>
+<span class="fc" id="L329">            this.versionCap = versionCap;</span>
+<span class="fc" id="L330">        }</span>
+
+        public void encode(ChannelHandlerContext ctx, Message message, List results)
+        {
+<span class="nc" id="L334">            Connection connection = ctx.channel().attr(Connection.attributeKey).get();</span>
+            // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            ProtocolVersion version = connection == null ? versionCap.getMaxVersion() : connection.getVersion();</span>
+
+<span class="nc" id="L338">            EnumSet&lt;Frame.Header.Flag&gt; flags = EnumSet.noneOf(Frame.Header.Flag.class);</span>
+
+<span class="nc" id="L340">            Codec&lt;Message&gt; codec = (Codec&lt;Message&gt;)message.type.codec;</span>
+            try
+            {
+<span class="nc" id="L343">                int messageSize = codec.encodedSize(message, version);</span>
+                ByteBuf body;
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                if (message instanceof Response)</span>
+                {
+<span class="nc" id="L347">                    UUID tracingId = ((Response)message).getTracingId();</span>
+<span class="nc" id="L348">                    Map&lt;String, ByteBuffer&gt; customPayload = message.getCustomPayload();</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">                    if (tracingId != null)</span>
+<span class="nc" id="L350">                        messageSize += CBUtil.sizeOfUUID(tracingId);</span>
+<span class="nc" id="L351">                    List&lt;String&gt; warnings = ((Response)message).getWarnings();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                    if (warnings != null)</span>
+                    {
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                        if (version.isSmallerThan(ProtocolVersion.V4))</span>
+<span class="nc" id="L355">                            throw new ProtocolException(&quot;Must not send frame with WARNING flag for native protocol version &lt; 4&quot;);</span>
+<span class="nc" id="L356">                        messageSize += CBUtil.sizeOfStringList(warnings);</span>
+                    }
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                    if (customPayload != null)</span>
+                    {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">                        if (version.isSmallerThan(ProtocolVersion.V4))</span>
+<span class="nc" id="L361">                            throw new ProtocolException(&quot;Must not send frame with CUSTOM_PAYLOAD flag for native protocol version &lt; 4&quot;);</span>
+<span class="nc" id="L362">                        messageSize += CBUtil.sizeOfBytesMap(customPayload);</span>
+                    }
+<span class="nc" id="L364">                    body = CBUtil.allocator.buffer(messageSize);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                    if (tracingId != null)</span>
+                    {
+<span class="nc" id="L367">                        CBUtil.writeUUID(tracingId, body);</span>
+<span class="nc" id="L368">                        flags.add(Frame.Header.Flag.TRACING);</span>
+                    }
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                    if (warnings != null)</span>
+                    {
+<span class="nc" id="L372">                        CBUtil.writeStringList(warnings, body);</span>
+<span class="nc" id="L373">                        flags.add(Frame.Header.Flag.WARNING);</span>
+                    }
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                    if (customPayload != null)</span>
+                    {
+<span class="nc" id="L377">                        CBUtil.writeBytesMap(customPayload, body);</span>
+<span class="nc" id="L378">                        flags.add(Frame.Header.Flag.CUSTOM_PAYLOAD);</span>
+                    }
+<span class="nc" id="L380">                }</span>
+                else
+                {
+<span class="nc bnc" id="L383" title="All 4 branches missed.">                    assert message instanceof Request;</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                    if (((Request)message).isTracingRequested())</span>
+<span class="nc" id="L385">                        flags.add(Frame.Header.Flag.TRACING);</span>
+<span class="nc" id="L386">                    Map&lt;String, ByteBuffer&gt; payload = message.getCustomPayload();</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                    if (payload != null)</span>
+<span class="nc" id="L388">                        messageSize += CBUtil.sizeOfBytesMap(payload);</span>
+<span class="nc" id="L389">                    body = CBUtil.allocator.buffer(messageSize);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                    if (payload != null)</span>
+                    {
+<span class="nc" id="L392">                        CBUtil.writeBytesMap(payload, body);</span>
+<span class="nc" id="L393">                        flags.add(Frame.Header.Flag.CUSTOM_PAYLOAD);</span>
+                    }
+                }
+
+                try
+                {
+<span class="nc" id="L399">                    codec.encode(message, body, version);</span>
+                }
+<span class="nc" id="L401">                catch (Throwable e)</span>
+                {
+<span class="nc" id="L403">                    body.release();</span>
+<span class="nc" id="L404">                    throw e;</span>
+<span class="nc" id="L405">                }</span>
+
+                // if the driver attempted to connect with a protocol version lower than the minimum supported
+                // version, respond with a protocol error message with the correct frame header for that version
+<span class="nc bnc" id="L409" title="All 2 branches missed.">                ProtocolVersion responseVersion = message.forcedProtocolVersion == null</span>
+                                    ? version
+                                    : message.forcedProtocolVersion;
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">                if (responseVersion.isBeta())</span>
+<span class="nc" id="L414">                    flags.add(Frame.Header.Flag.USE_BETA);</span>
+
+<span class="nc" id="L416">                results.add(Frame.create(message.type, message.getStreamId(), responseVersion, flags, body));</span>
+            }
+<span class="nc" id="L418">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L420">                throw ErrorMessage.wrap(e, message.getStreamId());</span>
+<span class="nc" id="L421">            }</span>
+<span class="nc" id="L422">        }</span>
+    }
+
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">    public static class Dispatcher extends SimpleChannelInboundHandler&lt;Request&gt;</span>
+    {
+<span class="fc" id="L427">        private static final LocalAwareExecutorService requestExecutor = SHARED.newExecutor(DatabaseDescriptor.getNativeTransportMaxThreads(),</span>
+                                                                                            Integer.MAX_VALUE,
+                                                                                            &quot;transport&quot;,
+                                                                                            &quot;Native-Transport-Requests&quot;);
+
+        /**
+         * Current count of *request* bytes that are live on the channel.
+         *
+         * Note: should only be accessed while on the netty event loop.
+         */
+        private long channelPayloadBytesInFlight;
+
+        private final Server.EndpointPayloadTracker endpointPayloadTracker;
+
+        private boolean paused;
+
+        private static class FlushItem
+        {
+            final ChannelHandlerContext ctx;
+            final Object response;
+            final Frame sourceFrame;
+            final Dispatcher dispatcher;
+
+            private FlushItem(ChannelHandlerContext ctx, Object response, Frame sourceFrame, Dispatcher dispatcher)
+<span class="nc" id="L451">            {</span>
+<span class="nc" id="L452">                this.ctx = ctx;</span>
+<span class="nc" id="L453">                this.sourceFrame = sourceFrame;</span>
+<span class="nc" id="L454">                this.response = response;</span>
+<span class="nc" id="L455">                this.dispatcher = dispatcher;</span>
+<span class="nc" id="L456">            }</span>
+
+            public void release()
+            {
+<span class="nc" id="L460">                dispatcher.releaseItem(this);</span>
+<span class="nc" id="L461">            }</span>
+        }
+
+        private static abstract class Flusher implements Runnable
+        {
+            final EventLoop eventLoop;
+<span class="nc" id="L467">            final ConcurrentLinkedQueue&lt;FlushItem&gt; queued = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L468">            final AtomicBoolean scheduled = new AtomicBoolean(false);</span>
+<span class="nc" id="L469">            final HashSet&lt;ChannelHandlerContext&gt; channels = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L470">            final List&lt;FlushItem&gt; flushed = new ArrayList&lt;&gt;();</span>
+
+            void start()
+            {
+<span class="nc bnc" id="L474" title="All 4 branches missed.">                if (!scheduled.get() &amp;&amp; scheduled.compareAndSet(false, true))</span>
+                {
+<span class="nc" id="L476">                    this.eventLoop.execute(this);</span>
+                }
+<span class="nc" id="L478">            }</span>
+
+            public Flusher(EventLoop eventLoop)
+<span class="nc" id="L481">            {</span>
+<span class="nc" id="L482">                this.eventLoop = eventLoop;</span>
+<span class="nc" id="L483">            }</span>
+        }
+
+        private static final class LegacyFlusher extends Flusher
+        {
+<span class="nc" id="L488">            int runsSinceFlush = 0;</span>
+<span class="nc" id="L489">            int runsWithNoWork = 0;</span>
+
+            private LegacyFlusher(EventLoop eventLoop)
+            {
+<span class="nc" id="L493">                super(eventLoop);</span>
+<span class="nc" id="L494">            }</span>
+
+            public void run()
+            {
+
+<span class="nc" id="L499">                boolean doneWork = false;</span>
+                FlushItem flush;
+<span class="nc bnc" id="L501" title="All 2 branches missed.">                while ( null != (flush = queued.poll()) )</span>
+                {
+<span class="nc" id="L503">                    channels.add(flush.ctx);</span>
+<span class="nc" id="L504">                    flush.ctx.write(flush.response, flush.ctx.voidPromise());</span>
+<span class="nc" id="L505">                    flushed.add(flush);</span>
+<span class="nc" id="L506">                    doneWork = true;</span>
+                }
+
+<span class="nc" id="L509">                runsSinceFlush++;</span>
+
+<span class="nc bnc" id="L511" title="All 6 branches missed.">                if (!doneWork || runsSinceFlush &gt; 2 || flushed.size() &gt; 50)</span>
+                {
+<span class="nc bnc" id="L513" title="All 2 branches missed.">                    for (ChannelHandlerContext channel : channels)</span>
+<span class="nc" id="L514">                        channel.flush();</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                    for (FlushItem item : flushed)</span>
+<span class="nc" id="L516">                        item.release();</span>
+
+<span class="nc" id="L518">                    channels.clear();</span>
+<span class="nc" id="L519">                    flushed.clear();</span>
+<span class="nc" id="L520">                    runsSinceFlush = 0;</span>
+                }
+
+<span class="nc bnc" id="L523" title="All 2 branches missed.">                if (doneWork)</span>
+                {
+<span class="nc" id="L525">                    runsWithNoWork = 0;</span>
+                }
+                else
+                {
+                    // either reschedule or cancel
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                    if (++runsWithNoWork &gt; 5)</span>
+                    {
+<span class="nc" id="L532">                        scheduled.set(false);</span>
+<span class="nc bnc" id="L533" title="All 4 branches missed.">                        if (queued.isEmpty() || !scheduled.compareAndSet(false, true))</span>
+<span class="nc" id="L534">                            return;</span>
+                    }
+                }
+
+<span class="nc" id="L538">                eventLoop.schedule(this, 10000, TimeUnit.NANOSECONDS);</span>
+<span class="nc" id="L539">            }</span>
+        }
+
+        private static final class ImmediateFlusher extends Flusher
+        {
+            private ImmediateFlusher(EventLoop eventLoop)
+            {
+<span class="nc" id="L546">                super(eventLoop);</span>
+<span class="nc" id="L547">            }</span>
+
+            public void run()
+            {
+<span class="nc" id="L551">                boolean doneWork = false;</span>
+                FlushItem flush;
+<span class="nc" id="L553">                scheduled.set(false);</span>
+
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                while (null != (flush = queued.poll()))</span>
+                {
+<span class="nc" id="L557">                    channels.add(flush.ctx);</span>
+<span class="nc" id="L558">                    flush.ctx.write(flush.response, flush.ctx.voidPromise());</span>
+<span class="nc" id="L559">                    flushed.add(flush);</span>
+<span class="nc" id="L560">                    doneWork = true;</span>
+                }
+
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                if (doneWork)</span>
+                {
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                    for (ChannelHandlerContext channel : channels)</span>
+<span class="nc" id="L566">                        channel.flush();</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                    for (FlushItem item : flushed)</span>
+<span class="nc" id="L568">                        item.release();</span>
+
+<span class="nc" id="L570">                    channels.clear();</span>
+<span class="nc" id="L571">                    flushed.clear();</span>
+                }
+<span class="nc" id="L573">            }</span>
+        }
+
+<span class="fc" id="L576">        private static final ConcurrentMap&lt;EventLoop, Flusher&gt; flusherLookup = new ConcurrentHashMap&lt;&gt;();</span>
+
+        private final boolean useLegacyFlusher;
+
+        public Dispatcher(boolean useLegacyFlusher, Server.EndpointPayloadTracker endpointPayloadTracker)
+        {
+<span class="fc" id="L582">            super(false);</span>
+<span class="fc" id="L583">            this.useLegacyFlusher = useLegacyFlusher;</span>
+<span class="fc" id="L584">            this.endpointPayloadTracker = endpointPayloadTracker;</span>
+<span class="fc" id="L585">        }</span>
+
+        @Override
+        public void channelRead0(ChannelHandlerContext ctx, Request request)
+        {
+            // if we decide to handle this message, process it outside of the netty event loop
+<span class="nc bnc" id="L591" title="All 2 branches missed.">            if (shouldHandleRequest(ctx, request))</span>
+<span class="nc" id="L592">                requestExecutor.submit(() -&gt; processRequest(ctx, request));</span>
+<span class="nc" id="L593">        }</span>
+
+        /** This check for inflight payload to potentially discard the request should have been ideally in one of the
+         * first handlers in the pipeline (Frame::decode()). However, incase of any exception thrown between that
+         * handler (where inflight payload is incremented) and this handler (Dispatcher::channelRead0) (where inflight
+         * payload in decremented), inflight payload becomes erroneous. ExceptionHandler is not sufficient for this
+         * purpose since it does not have the frame associated with the exception.
+         *
+         * Note: this method should execute on the netty event loop.
+         */
+        private boolean shouldHandleRequest(ChannelHandlerContext ctx, Request request)
+        {
+<span class="nc" id="L605">            long frameSize = request.getSourceFrame().header.bodySizeInBytes;</span>
+
+<span class="nc" id="L607">            ResourceLimits.EndpointAndGlobal endpointAndGlobalPayloadsInFlight = endpointPayloadTracker.endpointAndGlobalPayloadsInFlight;</span>
+
+            // check for overloaded state by trying to allocate framesize to inflight payload trackers
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            if (endpointAndGlobalPayloadsInFlight.tryAllocate(frameSize) != ResourceLimits.Outcome.SUCCESS)</span>
+            {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">                if (request.connection.isThrowOnOverload())</span>
+                {
+                    // discard the request and throw an exception
+<span class="nc" id="L615">                    ClientMetrics.instance.markRequestDiscarded();</span>
+<span class="nc" id="L616">                    logger.trace(&quot;Discarded request of size: {}. InflightChannelRequestPayload: {}, InflightEndpointRequestPayload: {}, InflightOverallRequestPayload: {}, Request: {}&quot;,</span>
+<span class="nc" id="L617">                                 frameSize,</span>
+<span class="nc" id="L618">                                 channelPayloadBytesInFlight,</span>
+<span class="nc" id="L619">                                 endpointAndGlobalPayloadsInFlight.endpoint().using(),</span>
+<span class="nc" id="L620">                                 endpointAndGlobalPayloadsInFlight.global().using(),</span>
+                                 request);
+<span class="nc" id="L622">                    throw ErrorMessage.wrap(new OverloadedException(&quot;Server is in overloaded state. Cannot accept more requests at this point&quot;),</span>
+<span class="nc" id="L623">                                            request.getSourceFrame().header.streamId);</span>
+                }
+                else
+                {
+                    // set backpressure on the channel, and handle the request
+<span class="nc" id="L628">                    endpointAndGlobalPayloadsInFlight.allocate(frameSize);</span>
+<span class="nc" id="L629">                    ctx.channel().config().setAutoRead(false);</span>
+<span class="nc" id="L630">                    ClientMetrics.instance.pauseConnection();</span>
+<span class="nc" id="L631">                    paused = true;</span>
+                }
+            }
+
+<span class="nc" id="L635">            channelPayloadBytesInFlight += frameSize;</span>
+<span class="nc" id="L636">            return true;</span>
+        }
+
+        /**
+         * Note: this method will be used in the {@link Flusher#run()}, which executes on the netty event loop
+         * ({@link Dispatcher#flusherLookup}). Thus, we assume the semantics and visibility of variables
+         * of being on the event loop.
+         */
+        private void releaseItem(FlushItem item)
+        {
+<span class="nc" id="L646">            long itemSize = item.sourceFrame.header.bodySizeInBytes;</span>
+<span class="nc" id="L647">            item.sourceFrame.release();</span>
+
+            // since the request has been processed, decrement inflight payload at channel, endpoint and global levels
+<span class="nc" id="L650">            channelPayloadBytesInFlight -= itemSize;</span>
+<span class="nc" id="L651">            ResourceLimits.Outcome endpointGlobalReleaseOutcome = endpointPayloadTracker.endpointAndGlobalPayloadsInFlight.release(itemSize);</span>
+
+            // now check to see if we need to reenable the channel's autoRead.
+            // If the current payload side is zero, we must reenable autoread as
+            // 1) we allow no other thread/channel to do it, and
+            // 2) there's no other events following this one (becuase we're at zero bytes in flight),
+            // so no successive to trigger the other clause in this if-block
+<span class="nc" id="L658">            ChannelConfig config = item.ctx.channel().config();</span>
+<span class="nc bnc" id="L659" title="All 6 branches missed.">            if (paused &amp;&amp; (channelPayloadBytesInFlight == 0 || endpointGlobalReleaseOutcome == ResourceLimits.Outcome.BELOW_LIMIT))</span>
+            {
+<span class="nc" id="L661">                paused = false;</span>
+<span class="nc" id="L662">                ClientMetrics.instance.unpauseConnection();</span>
+<span class="nc" id="L663">                config.setAutoRead(true);</span>
+            }
+<span class="nc" id="L665">        }</span>
+
+        /**
+         * Note: this method is not expected to execute on the netty event loop.
+         */
+        void processRequest(ChannelHandlerContext ctx, Request request)
+        {
+            final Response response;
+            final ServerConnection connection;
+<span class="nc" id="L674">            long queryStartNanoTime = System.nanoTime();</span>
+
+            try
+            {
+<span class="nc bnc" id="L678" title="All 4 branches missed.">                assert request.connection() instanceof ServerConnection;</span>
+<span class="nc" id="L679">                connection = (ServerConnection)request.connection();</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">                if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))</span>
+<span class="nc" id="L681">                    ClientWarn.instance.captureWarnings();</span>
+
+<span class="nc" id="L683">                QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion(), request.getStreamId());</span>
+
+<span class="nc" id="L685">                logger.trace(&quot;Received: {}, v={}&quot;, request, connection.getVersion());</span>
+<span class="nc" id="L686">                response = request.execute(qstate, queryStartNanoTime);</span>
+<span class="nc" id="L687">                response.setStreamId(request.getStreamId());</span>
+<span class="nc" id="L688">                response.setWarnings(ClientWarn.instance.getWarnings());</span>
+<span class="nc" id="L689">                response.attach(connection);</span>
+<span class="nc" id="L690">                connection.applyStateTransition(request.type, response.type);</span>
+            }
+<span class="nc" id="L692">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L694">                JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc" id="L695">                UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), true);</span>
+<span class="nc" id="L696">                flush(new FlushItem(ctx, ErrorMessage.fromException(t, handler).setStreamId(request.getStreamId()), request.getSourceFrame(), this));</span>
+<span class="nc" id="L697">                return;</span>
+            }
+            finally
+            {
+<span class="nc" id="L701">                ClientWarn.instance.resetWarnings();</span>
+            }
+
+<span class="nc" id="L704">            logger.trace(&quot;Responding: {}, v={}&quot;, response, connection.getVersion());</span>
+<span class="nc" id="L705">            flush(new FlushItem(ctx, response, request.getSourceFrame(), this));</span>
+<span class="nc" id="L706">        }</span>
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx)
+        {
+<span class="fc" id="L711">            endpointPayloadTracker.release();</span>
+<span class="pc bpc" id="L712" title="1 of 2 branches missed.">            if (paused)</span>
+            {
+<span class="nc" id="L714">                paused = false;</span>
+<span class="nc" id="L715">                ClientMetrics.instance.unpauseConnection();</span>
+            }
+<span class="fc" id="L717">            ctx.fireChannelInactive();</span>
+<span class="fc" id="L718">        }</span>
+
+        private void flush(FlushItem item)
+        {
+<span class="nc" id="L722">            EventLoop loop = item.ctx.channel().eventLoop();</span>
+<span class="nc" id="L723">            Flusher flusher = flusherLookup.get(loop);</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            if (flusher == null)</span>
+            {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                Flusher created = useLegacyFlusher ? new LegacyFlusher(loop) : new ImmediateFlusher(loop);</span>
+<span class="nc" id="L727">                Flusher alt = flusherLookup.putIfAbsent(loop, flusher = created);</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">                if (alt != null)</span>
+<span class="nc" id="L729">                    flusher = alt;</span>
+            }
+
+<span class="nc" id="L732">            flusher.queued.add(item);</span>
+<span class="nc" id="L733">            flusher.start();</span>
+<span class="nc" id="L734">        }</span>
+
+        public static void shutdown()
+        {
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            if (requestExecutor != null)</span>
+            {
+<span class="nc" id="L740">                requestExecutor.shutdown();</span>
+            }
+<span class="nc" id="L742">        }</span>
+    }
+
+    @ChannelHandler.Sharable
+<span class="fc" id="L746">    public static final class ExceptionHandler extends ChannelInboundHandlerAdapter</span>
+    {
+
+        @Override
+        public void exceptionCaught(final ChannelHandlerContext ctx, Throwable cause)
+        {
+            // Provide error message to client in case channel is still open
+<span class="nc" id="L753">            UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), false);</span>
+<span class="nc" id="L754">            ErrorMessage errorMessage = ErrorMessage.fromException(cause, handler);</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">            if (ctx.channel().isOpen())</span>
+            {
+<span class="nc" id="L757">                ChannelFuture future = ctx.writeAndFlush(errorMessage);</span>
+                // On protocol exception, close the channel as soon as the message have been sent
+<span class="nc bnc" id="L759" title="All 2 branches missed.">                if (cause instanceof ProtocolException)</span>
+                {
+<span class="nc" id="L761">                    future.addListener(new ChannelFutureListener()</span>
+<span class="nc" id="L762">                    {</span>
+                        public void operationComplete(ChannelFuture future)
+                        {
+<span class="nc" id="L765">                            ctx.close();</span>
+<span class="nc" id="L766">                        }</span>
+                    });
+                }
+            }
+<span class="nc" id="L770">        }</span>
+    }
+
+    /**
+     * Include the channel info in the logged information for unexpected errors, and (if {@link #alwaysLogAtError} is
+     * false then choose the log level based on the type of exception (some are clearly client issues and shouldn't be
+     * logged at server ERROR level)
+     */
+    static final class UnexpectedChannelExceptionHandler implements Predicate&lt;Throwable&gt;
+    {
+        private final Channel channel;
+        private final boolean alwaysLogAtError;
+
+        UnexpectedChannelExceptionHandler(Channel channel, boolean alwaysLogAtError)
+<span class="nc" id="L784">        {</span>
+<span class="nc" id="L785">            this.channel = channel;</span>
+<span class="nc" id="L786">            this.alwaysLogAtError = alwaysLogAtError;</span>
+<span class="nc" id="L787">        }</span>
+
+        @Override
+        public boolean apply(Throwable exception)
+        {
+            String message;
+            try
+            {
+<span class="nc" id="L795">                message = &quot;Unexpected exception during request; channel = &quot; + channel;</span>
+            }
+<span class="nc" id="L797">            catch (Exception ignore)</span>
+            {
+                // We don't want to make things worse if String.valueOf() throws an exception
+<span class="nc" id="L800">                message = &quot;Unexpected exception during request; channel = &lt;unprintable&gt;&quot;;</span>
+<span class="nc" id="L801">            }</span>
+
+<span class="nc bnc" id="L803" title="All 4 branches missed.">            if (!alwaysLogAtError &amp;&amp; exception instanceof IOException)</span>
+            {
+<span class="nc" id="L805">                String errorMessage = exception.getMessage();</span>
+<span class="nc" id="L806">                boolean logAtTrace = false;</span>
+
+<span class="nc bnc" id="L808" title="All 2 branches missed.">                for (String ioException : ioExceptionsAtDebugLevel)</span>
+                {
+                    // exceptions thrown from the netty epoll transport add the name of the function that failed
+                    // to the exception string (which is simply wrapping a JDK exception), so we can't do a simple/naive comparison
+<span class="nc bnc" id="L812" title="All 2 branches missed.">                    if (errorMessage.contains(ioException))</span>
+                    {
+<span class="nc" id="L814">                        logAtTrace = true;</span>
+<span class="nc" id="L815">                        break;</span>
+                    }
+<span class="nc" id="L817">                }</span>
+
+<span class="nc bnc" id="L819" title="All 2 branches missed.">                if (logAtTrace)</span>
+                {
+                    // Likely unclean client disconnects
+<span class="nc" id="L822">                    logger.trace(message, exception);</span>
+                }
+                else
+                {
+                    // Generally unhandled IO exceptions are network issues, not actual ERRORS
+<span class="nc" id="L827">                    logger.info(message, exception);</span>
+                }
+<span class="nc" id="L829">            }</span>
+            else
+            {
+                // Anything else is probably a bug in server of client binary protocol handling
+<span class="nc" id="L833">                logger.error(message, exception);</span>
+            }
+
+            // We handled the exception.
+<span class="nc" id="L837">            return true;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

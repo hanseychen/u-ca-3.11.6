@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MetadataCollector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.metadata</a> &gt; <span class="el_source">MetadataCollector.java</span></div><h1>MetadataCollector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.metadata;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Maps;
+
+import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
+import com.clearspring.analytics.stream.cardinality.ICardinality;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.partitions.PartitionStatisticsCollector;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.EstimatedHistogram;
+import org.apache.cassandra.utils.MurmurHash;
+import org.apache.cassandra.utils.StreamingHistogram;
+
+public class MetadataCollector implements PartitionStatisticsCollector
+{
+    public static final double NO_COMPRESSION_RATIO = -1.0;
+<span class="fc" id="L50">    private static final ByteBuffer[] EMPTY_CLUSTERING = new ByteBuffer[0];</span>
+
+    static EstimatedHistogram defaultCellPerPartitionCountHistogram()
+    {
+        // EH of 114 can track a max value of 2395318855, i.e., &gt; 2B columns
+<span class="fc" id="L55">        return new EstimatedHistogram(114);</span>
+    }
+
+    static EstimatedHistogram defaultPartitionSizeHistogram()
+    {
+        // EH of 150 can track a max value of 1697806495183, i.e., &gt; 1.5PB
+<span class="fc" id="L61">        return new EstimatedHistogram(150);</span>
+    }
+
+    static StreamingHistogram.StreamingHistogramBuilder defaultTombstoneDropTimeHistogramBuilder()
+    {
+<span class="fc" id="L66">        return new StreamingHistogram.StreamingHistogramBuilder(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE, SSTable.TOMBSTONE_HISTOGRAM_SPOOL_SIZE, SSTable.TOMBSTONE_HISTOGRAM_TTL_ROUND_SECONDS);</span>
+    }
+
+    public static StatsMetadata defaultStatsMetadata()
+    {
+<span class="nc" id="L71">        return new StatsMetadata(defaultPartitionSizeHistogram(),</span>
+<span class="nc" id="L72">                                 defaultCellPerPartitionCountHistogram(),</span>
+<span class="nc" id="L73">                                 IntervalSet.empty(),</span>
+                                 Long.MIN_VALUE,
+                                 Long.MAX_VALUE,
+                                 Integer.MAX_VALUE,
+                                 Integer.MAX_VALUE,
+                                 0,
+                                 Integer.MAX_VALUE,
+                                 NO_COMPRESSION_RATIO,
+<span class="nc" id="L81">                                 defaultTombstoneDropTimeHistogramBuilder().build(),</span>
+                                 0,
+<span class="nc" id="L83">                                 Collections.&lt;ByteBuffer&gt;emptyList(),</span>
+<span class="nc" id="L84">                                 Collections.&lt;ByteBuffer&gt;emptyList(),</span>
+                                 true,
+                                 ActiveRepairService.UNREPAIRED_SSTABLE,
+                                 -1,
+                                 -1);
+    }
+
+<span class="fc" id="L91">    protected EstimatedHistogram estimatedPartitionSize = defaultPartitionSizeHistogram();</span>
+    // TODO: cound the number of row per partition (either with the number of cells, or instead)
+<span class="fc" id="L93">    protected EstimatedHistogram estimatedCellPerPartitionCount = defaultCellPerPartitionCountHistogram();</span>
+<span class="fc" id="L94">    protected IntervalSet&lt;CommitLogPosition&gt; commitLogIntervals = IntervalSet.empty();</span>
+<span class="fc" id="L95">    protected final MinMaxLongTracker timestampTracker = new MinMaxLongTracker();</span>
+<span class="fc" id="L96">    protected final MinMaxIntTracker localDeletionTimeTracker = new MinMaxIntTracker(Cell.NO_DELETION_TIME, Cell.NO_DELETION_TIME);</span>
+<span class="fc" id="L97">    protected final MinMaxIntTracker ttlTracker = new MinMaxIntTracker(Cell.NO_TTL, Cell.NO_TTL);</span>
+<span class="fc" id="L98">    protected double compressionRatio = NO_COMPRESSION_RATIO;</span>
+<span class="fc" id="L99">    protected StreamingHistogram.StreamingHistogramBuilder estimatedTombstoneDropTime = defaultTombstoneDropTimeHistogramBuilder();</span>
+    protected int sstableLevel;
+<span class="fc" id="L101">    private ClusteringPrefix minClustering = null;</span>
+<span class="fc" id="L102">    private ClusteringPrefix maxClustering = null;</span>
+<span class="fc" id="L103">    protected boolean hasLegacyCounterShards = false;</span>
+    protected long totalColumnsSet;
+    protected long totalRows;
+
+    /**
+     * Default cardinality estimation method is to use HyperLogLog++.
+     * Parameter here(p=13, sp=25) should give reasonable estimation
+     * while lowering bytes required to hold information.
+     * See CASSANDRA-5906 for detail.
+     */
+<span class="fc" id="L113">    protected ICardinality cardinality = new HyperLogLogPlus(13, 25);</span>
+    private final ClusteringComparator comparator;
+
+    public MetadataCollector(ClusteringComparator comparator)
+<span class="fc" id="L117">    {</span>
+<span class="fc" id="L118">        this.comparator = comparator;</span>
+
+<span class="fc" id="L120">    }</span>
+
+    public MetadataCollector(Iterable&lt;SSTableReader&gt; sstables, ClusteringComparator comparator, int level)
+    {
+<span class="fc" id="L124">        this(comparator);</span>
+
+<span class="fc" id="L126">        IntervalSet.Builder&lt;CommitLogPosition&gt; intervals = new IntervalSet.Builder&lt;&gt;();</span>
+<span class="fc bfc" id="L127" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc" id="L129">            intervals.addAll(sstable.getSSTableMetadata().commitLogIntervals);</span>
+<span class="fc" id="L130">        }</span>
+
+<span class="fc" id="L132">        commitLogIntervals(intervals.build());</span>
+<span class="fc" id="L133">        sstableLevel(level);</span>
+<span class="fc" id="L134">    }</span>
+
+    public MetadataCollector addKey(ByteBuffer key)
+    {
+<span class="fc" id="L138">        long hashed = MurmurHash.hash2_64(key, key.position(), key.remaining(), 0);</span>
+<span class="fc" id="L139">        cardinality.offerHashed(hashed);</span>
+<span class="fc" id="L140">        return this;</span>
+    }
+
+    public MetadataCollector addPartitionSizeInBytes(long partitionSize)
+    {
+<span class="fc" id="L145">        estimatedPartitionSize.add(partitionSize);</span>
+<span class="fc" id="L146">        return this;</span>
+    }
+
+    public MetadataCollector addCellPerPartitionCount(long cellCount)
+    {
+<span class="fc" id="L151">        estimatedCellPerPartitionCount.add(cellCount);</span>
+<span class="fc" id="L152">        return this;</span>
+    }
+
+    public MetadataCollector mergeTombstoneHistogram(StreamingHistogram histogram)
+    {
+<span class="nc" id="L157">        estimatedTombstoneDropTime.merge(histogram);</span>
+<span class="nc" id="L158">        return this;</span>
+    }
+
+    /**
+     * Ratio is compressed/uncompressed and it is
+     * if you have 1.x then compression isn't helping
+     */
+    public MetadataCollector addCompressionRatio(long compressed, long uncompressed)
+    {
+<span class="fc" id="L167">        compressionRatio = (double) compressed/uncompressed;</span>
+<span class="fc" id="L168">        return this;</span>
+    }
+
+    public void update(LivenessInfo newInfo)
+    {
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        if (newInfo.isEmpty())</span>
+<span class="fc" id="L174">            return;</span>
+
+<span class="fc" id="L176">        updateTimestamp(newInfo.timestamp());</span>
+<span class="fc" id="L177">        updateTTL(newInfo.ttl());</span>
+<span class="fc" id="L178">        updateLocalDeletionTime(newInfo.localExpirationTime());</span>
+<span class="fc" id="L179">    }</span>
+
+    public void update(Cell cell)
+    {
+<span class="fc" id="L183">        updateTimestamp(cell.timestamp());</span>
+<span class="fc" id="L184">        updateTTL(cell.ttl());</span>
+<span class="fc" id="L185">        updateLocalDeletionTime(cell.localDeletionTime());</span>
+<span class="fc" id="L186">    }</span>
+
+    public void update(DeletionTime dt)
+    {
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        if (!dt.isLive())</span>
+        {
+<span class="fc" id="L192">            updateTimestamp(dt.markedForDeleteAt());</span>
+<span class="fc" id="L193">            updateLocalDeletionTime(dt.localDeletionTime());</span>
+        }
+<span class="fc" id="L195">    }</span>
+
+    public void updateColumnSetPerRow(long columnSetInRow)
+    {
+<span class="fc" id="L199">        totalColumnsSet += columnSetInRow;</span>
+<span class="fc" id="L200">        ++totalRows;</span>
+<span class="fc" id="L201">    }</span>
+
+    private void updateTimestamp(long newTimestamp)
+    {
+<span class="fc" id="L205">        timestampTracker.update(newTimestamp);</span>
+<span class="fc" id="L206">    }</span>
+
+    private void updateLocalDeletionTime(int newLocalDeletionTime)
+    {
+<span class="fc" id="L210">        localDeletionTimeTracker.update(newLocalDeletionTime);</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">        if (newLocalDeletionTime != Cell.NO_DELETION_TIME)</span>
+<span class="fc" id="L212">            estimatedTombstoneDropTime.update(newLocalDeletionTime);</span>
+<span class="fc" id="L213">    }</span>
+
+    private void updateTTL(int newTTL)
+    {
+<span class="fc" id="L217">        ttlTracker.update(newTTL);</span>
+<span class="fc" id="L218">    }</span>
+
+    public MetadataCollector commitLogIntervals(IntervalSet&lt;CommitLogPosition&gt; commitLogIntervals)
+    {
+<span class="fc" id="L222">        this.commitLogIntervals = commitLogIntervals;</span>
+<span class="fc" id="L223">        return this;</span>
+    }
+
+    public MetadataCollector sstableLevel(int sstableLevel)
+    {
+<span class="fc" id="L228">        this.sstableLevel = sstableLevel;</span>
+<span class="fc" id="L229">        return this;</span>
+    }
+
+    public MetadataCollector updateClusteringValues(ClusteringPrefix clustering)
+    {
+<span class="fc bfc" id="L234" title="All 4 branches covered.">        minClustering = minClustering == null || comparator.compare(clustering, minClustering) &lt; 0 ? clustering.minimize() : minClustering;</span>
+<span class="fc bfc" id="L235" title="All 4 branches covered.">        maxClustering = maxClustering == null || comparator.compare(clustering, maxClustering) &gt; 0 ? clustering.minimize() : maxClustering;</span>
+<span class="fc" id="L236">        return this;</span>
+    }
+
+    public void updateHasLegacyCounterShards(boolean hasLegacyCounterShards)
+    {
+<span class="nc bnc" id="L241" title="All 4 branches missed.">        this.hasLegacyCounterShards = this.hasLegacyCounterShards || hasLegacyCounterShards;</span>
+<span class="nc" id="L242">    }</span>
+
+    public Map&lt;MetadataType, MetadataComponent&gt; finalizeMetadata(String partitioner, double bloomFilterFPChance, long repairedAt, SerializationHeader header)
+    {
+<span class="pc bpc" id="L246" title="1 of 4 branches missed.">        Preconditions.checkState((minClustering == null &amp;&amp; maxClustering == null)</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">                                 || comparator.compare(maxClustering, minClustering) &gt;= 0);</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">        ByteBuffer[] minValues = minClustering != null ? minClustering.getRawValues() : EMPTY_CLUSTERING;</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">        ByteBuffer[] maxValues = maxClustering != null ? maxClustering.getRawValues() : EMPTY_CLUSTERING;</span>
+<span class="fc" id="L250">        Map&lt;MetadataType, MetadataComponent&gt; components = new EnumMap&lt;&gt;(MetadataType.class);</span>
+<span class="fc" id="L251">        components.put(MetadataType.VALIDATION, new ValidationMetadata(partitioner, bloomFilterFPChance));</span>
+<span class="fc" id="L252">        components.put(MetadataType.STATS, new StatsMetadata(estimatedPartitionSize,</span>
+                                                             estimatedCellPerPartitionCount,
+                                                             commitLogIntervals,
+<span class="fc" id="L255">                                                             timestampTracker.min(),</span>
+<span class="fc" id="L256">                                                             timestampTracker.max(),</span>
+<span class="fc" id="L257">                                                             localDeletionTimeTracker.min(),</span>
+<span class="fc" id="L258">                                                             localDeletionTimeTracker.max(),</span>
+<span class="fc" id="L259">                                                             ttlTracker.min(),</span>
+<span class="fc" id="L260">                                                             ttlTracker.max(),</span>
+                                                             compressionRatio,
+<span class="fc" id="L262">                                                             estimatedTombstoneDropTime.build(),</span>
+                                                             sstableLevel,
+<span class="fc" id="L264">                                                             makeList(minValues),</span>
+<span class="fc" id="L265">                                                             makeList(maxValues),</span>
+                                                             hasLegacyCounterShards,
+                                                             repairedAt,
+                                                             totalColumnsSet,
+                                                             totalRows));
+<span class="fc" id="L270">        components.put(MetadataType.COMPACTION, new CompactionMetadata(cardinality));</span>
+<span class="fc" id="L271">        components.put(MetadataType.HEADER, header.toComponent());</span>
+<span class="fc" id="L272">        return components;</span>
+    }
+
+    private static List&lt;ByteBuffer&gt; makeList(ByteBuffer[] values)
+    {
+        // In most case, l will be the same size than values, but it's possible for it to be smaller
+<span class="fc" id="L278">        List&lt;ByteBuffer&gt; l = new ArrayList&lt;ByteBuffer&gt;(values.length);</span>
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        for (int i = 0; i &lt; values.length; i++)</span>
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">            if (values[i] == null)</span>
+<span class="nc" id="L281">                break;</span>
+            else
+<span class="fc" id="L283">                l.add(values[i]);</span>
+<span class="fc" id="L284">        return l;</span>
+    }
+
+    public static class MinMaxLongTracker
+    {
+        private final long defaultMin;
+        private final long defaultMax;
+
+<span class="fc" id="L292">        private boolean isSet = false;</span>
+        private long min;
+        private long max;
+
+        public MinMaxLongTracker()
+        {
+<span class="fc" id="L298">            this(Long.MIN_VALUE, Long.MAX_VALUE);</span>
+<span class="fc" id="L299">        }</span>
+
+        public MinMaxLongTracker(long defaultMin, long defaultMax)
+<span class="fc" id="L302">        {</span>
+<span class="fc" id="L303">            this.defaultMin = defaultMin;</span>
+<span class="fc" id="L304">            this.defaultMax = defaultMax;</span>
+<span class="fc" id="L305">        }</span>
+
+        public void update(long value)
+        {
+<span class="fc bfc" id="L309" title="All 2 branches covered.">            if (!isSet)</span>
+            {
+<span class="fc" id="L311">                min = max = value;</span>
+<span class="fc" id="L312">                isSet = true;</span>
+            }
+            else
+            {
+<span class="fc bfc" id="L316" title="All 2 branches covered.">                if (value &lt; min)</span>
+<span class="fc" id="L317">                    min = value;</span>
+<span class="fc bfc" id="L318" title="All 2 branches covered.">                if (value &gt; max)</span>
+<span class="fc" id="L319">                    max = value;</span>
+            }
+<span class="fc" id="L321">        }</span>
+
+        public long min()
+        {
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">            return isSet ? min : defaultMin;</span>
+        }
+
+        public long max()
+        {
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">            return isSet ? max : defaultMax;</span>
+        }
+    }
+
+    public static class MinMaxIntTracker
+    {
+        private final int defaultMin;
+        private final int defaultMax;
+
+<span class="fc" id="L339">        private boolean isSet = false;</span>
+        private int min;
+        private int max;
+
+        public MinMaxIntTracker()
+        {
+<span class="nc" id="L345">            this(Integer.MIN_VALUE, Integer.MAX_VALUE);</span>
+<span class="nc" id="L346">        }</span>
+
+        public MinMaxIntTracker(int defaultMin, int defaultMax)
+<span class="fc" id="L349">        {</span>
+<span class="fc" id="L350">            this.defaultMin = defaultMin;</span>
+<span class="fc" id="L351">            this.defaultMax = defaultMax;</span>
+<span class="fc" id="L352">        }</span>
+
+        public void update(int value)
+        {
+<span class="fc bfc" id="L356" title="All 2 branches covered.">            if (!isSet)</span>
+            {
+<span class="fc" id="L358">                min = max = value;</span>
+<span class="fc" id="L359">                isSet = true;</span>
+            }
+            else
+            {
+<span class="fc bfc" id="L363" title="All 2 branches covered.">                if (value &lt; min)</span>
+<span class="fc" id="L364">                    min = value;</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">                if (value &gt; max)</span>
+<span class="nc" id="L366">                    max = value;</span>
+            }
+<span class="fc" id="L368">        }</span>
+
+        public int min()
+        {
+<span class="fc bfc" id="L372" title="All 2 branches covered.">            return isSet ? min : defaultMin;</span>
+        }
+
+        public int max()
+        {
+<span class="fc bfc" id="L377" title="All 2 branches covered.">            return isSet ? max : defaultMax;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

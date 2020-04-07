@@ -1,0 +1,1624 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CFMetaData.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.config</a> &gt; <span class="el_source">CFMetaData.java</span></div><h1>CFMetaData.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.config;
+
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.DataResource;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.SuperColumnCompatibility;
+import org.apache.cassandra.cql3.statements.CFStatement;
+import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.utils.*;
+import org.github.jamm.Unmetered;
+
+/**
+ * This class can be tricky to modify. Please read http://wiki.apache.org/cassandra/ConfigurationNotes for how to do so safely.
+ */
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">@Unmetered</span>
+public final class CFMetaData
+{
+<span class="fc" id="L71">    public enum Flag</span>
+    {
+<span class="fc" id="L73">        SUPER, COUNTER, DENSE, COMPOUND</span>
+    }
+
+<span class="fc" id="L76">    private static final Pattern PATTERN_WORD_CHARS = Pattern.compile(&quot;\\w+&quot;);</span>
+
+<span class="fc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(CFMetaData.class);</span>
+
+<span class="fc" id="L80">    public static final Serializer serializer = new Serializer();</span>
+
+    //REQUIRED
+    public final UUID cfId;                           // internal id, never exposed to user
+    public final String ksName;                       // name of keyspace
+    public final String cfName;                       // name of this column family
+    public final Pair&lt;String, String&gt; ksAndCFName;
+    public final byte[] ksAndCFBytes;
+
+    private final boolean isCounter;
+    private final boolean isView;
+    private final boolean isIndex;
+
+    public volatile ClusteringComparator comparator;  // bytes, long, timeuuid, utf8, etc. This is built directly from clusteringColumns
+    public final IPartitioner partitioner;            // partitioner the table uses
+    private volatile AbstractType&lt;?&gt; keyValidator;
+
+    private final Serializers serializers;
+
+    // non-final, for now
+    private volatile ImmutableSet&lt;Flag&gt; flags;
+    private volatile boolean isDense;
+    private volatile boolean isCompound;
+    private volatile boolean isSuper;
+
+<span class="fc" id="L105">    public volatile TableParams params = TableParams.DEFAULT;</span>
+
+<span class="fc" id="L107">    private volatile Map&lt;ByteBuffer, DroppedColumn&gt; droppedColumns = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L108">    private volatile Triggers triggers = Triggers.none();</span>
+<span class="fc" id="L109">    private volatile Indexes indexes = Indexes.none();</span>
+
+    /*
+     * All CQL3 columns definition are stored in the columnMetadata map.
+     * On top of that, we keep separated collection of each kind of definition, to
+     * 1) allow easy access to each kind and 2) for the partition key and
+     * clustering key ones, those list are ordered by the &quot;component index&quot; of the
+     * elements.
+     */
+<span class="fc" id="L118">    private volatile Map&lt;ByteBuffer, ColumnDefinition&gt; columnMetadata = new HashMap&lt;&gt;();</span>
+    private volatile List&lt;ColumnDefinition&gt; partitionKeyColumns;  // Always of size keyValidator.componentsCount, null padded if necessary
+    private volatile List&lt;ColumnDefinition&gt; clusteringColumns;    // Of size comparator.componentsCount or comparator.componentsCount -1, null padded if necessary
+    private volatile PartitionColumns partitionColumns;           // Always non-PK, non-clustering columns
+
+    // For dense tables, this alias the single non-PK column the table contains (since it can only have one). We keep
+    // that as convenience to access that column more easily (but we could replace calls by partitionColumns().iterator().next()
+    // for those tables in practice).
+    private volatile ColumnDefinition compactValueColumn;
+
+    private volatile Set&lt;ColumnDefinition&gt; hiddenColumns;
+
+    public final DataResource resource;
+
+    //For hot path serialization it's often easier to store this info here
+    private volatile ColumnFilter allColumnFilter;
+
+    /**
+     * These two columns are &quot;virtual&quot; (e.g. not persisted together with schema).
+     *
+     * They are stored here to avoid re-creating during SELECT and UPDATE queries, where
+     * they are used to allow presenting supercolumn families in the CQL-compatible
+     * format. See {@link SuperColumnCompatibility} for more details.
+     **/
+    private volatile ColumnDefinition superCfKeyColumn;
+    private volatile ColumnDefinition superCfValueColumn;
+
+    /** Caches a non-compact version of the metadata for compact tables to be used with the NO_COMPACT protocol option. */
+<span class="fc" id="L146">    private volatile CFMetaData nonCompactCopy = null;</span>
+
+    public boolean isSuperColumnKeyColumn(ColumnDefinition cd)
+    {
+<span class="nc" id="L150">        return cd.name.equals(superCfKeyColumn.name);</span>
+    }
+
+    public boolean isSuperColumnValueColumn(ColumnDefinition cd)
+    {
+<span class="nc" id="L155">        return cd.name.equals(superCfValueColumn.name);</span>
+    }
+
+    public ColumnDefinition superColumnValueColumn()
+    {
+<span class="nc" id="L160">        return superCfValueColumn;</span>
+    }
+
+<span class="nc" id="L163">    public ColumnDefinition superColumnKeyColumn() { return superCfKeyColumn; }</span>
+
+    /*
+     * All of these methods will go away once CFMetaData becomes completely immutable.
+     */
+    public CFMetaData params(TableParams params)
+    {
+<span class="fc" id="L170">        this.params = params;</span>
+<span class="fc" id="L171">        return this;</span>
+    }
+
+    public CFMetaData bloomFilterFpChance(double prop)
+    {
+<span class="nc" id="L176">        params = TableParams.builder(params).bloomFilterFpChance(prop).build();</span>
+<span class="nc" id="L177">        return this;</span>
+    }
+
+    public CFMetaData caching(CachingParams prop)
+    {
+<span class="nc" id="L182">        params = TableParams.builder(params).caching(prop).build();</span>
+<span class="nc" id="L183">        return this;</span>
+    }
+
+    public CFMetaData comment(String prop)
+    {
+<span class="fc" id="L188">        params = TableParams.builder(params).comment(prop).build();</span>
+<span class="fc" id="L189">        return this;</span>
+    }
+
+    public CFMetaData compaction(CompactionParams prop)
+    {
+<span class="fc" id="L194">        params = TableParams.builder(params).compaction(prop).build();</span>
+<span class="fc" id="L195">        return this;</span>
+    }
+
+    public CFMetaData compression(CompressionParams prop)
+    {
+<span class="nc" id="L200">        params = TableParams.builder(params).compression(prop).build();</span>
+<span class="nc" id="L201">        return this;</span>
+    }
+
+    public CFMetaData dcLocalReadRepairChance(double prop)
+    {
+<span class="fc" id="L206">        params = TableParams.builder(params).dcLocalReadRepairChance(prop).build();</span>
+<span class="fc" id="L207">        return this;</span>
+    }
+
+    public CFMetaData defaultTimeToLive(int prop)
+    {
+<span class="fc" id="L212">        params = TableParams.builder(params).defaultTimeToLive(prop).build();</span>
+<span class="fc" id="L213">        return this;</span>
+    }
+
+    public CFMetaData gcGraceSeconds(int prop)
+    {
+<span class="fc" id="L218">        params = TableParams.builder(params).gcGraceSeconds(prop).build();</span>
+<span class="fc" id="L219">        return this;</span>
+    }
+
+    public CFMetaData maxIndexInterval(int prop)
+    {
+<span class="nc" id="L224">        params = TableParams.builder(params).maxIndexInterval(prop).build();</span>
+<span class="nc" id="L225">        return this;</span>
+    }
+
+    public CFMetaData memtableFlushPeriod(int prop)
+    {
+<span class="fc" id="L230">        params = TableParams.builder(params).memtableFlushPeriodInMs(prop).build();</span>
+<span class="fc" id="L231">        return this;</span>
+    }
+
+    public CFMetaData minIndexInterval(int prop)
+    {
+<span class="nc" id="L236">        params = TableParams.builder(params).minIndexInterval(prop).build();</span>
+<span class="nc" id="L237">        return this;</span>
+    }
+
+    public CFMetaData readRepairChance(double prop)
+    {
+<span class="fc" id="L242">        params = TableParams.builder(params).readRepairChance(prop).build();</span>
+<span class="fc" id="L243">        return this;</span>
+    }
+
+    public CFMetaData crcCheckChance(double prop)
+    {
+<span class="nc" id="L248">        params = TableParams.builder(params).crcCheckChance(prop).build();</span>
+<span class="nc" id="L249">        return this;</span>
+    }
+
+    public CFMetaData speculativeRetry(SpeculativeRetryParam prop)
+    {
+<span class="nc" id="L254">        params = TableParams.builder(params).speculativeRetry(prop).build();</span>
+<span class="nc" id="L255">        return this;</span>
+    }
+
+    public CFMetaData extensions(Map&lt;String, ByteBuffer&gt; extensions)
+    {
+<span class="nc" id="L260">        params = TableParams.builder(params).extensions(extensions).build();</span>
+<span class="nc" id="L261">        return this;</span>
+    }
+
+    public CFMetaData droppedColumns(Map&lt;ByteBuffer, DroppedColumn&gt; cols)
+    {
+<span class="fc" id="L266">        droppedColumns = cols;</span>
+<span class="fc" id="L267">        return this;</span>
+    }
+
+    public CFMetaData triggers(Triggers prop)
+    {
+<span class="fc" id="L272">        triggers = prop;</span>
+<span class="fc" id="L273">        return this;</span>
+    }
+
+    public CFMetaData indexes(Indexes indexes)
+    {
+<span class="fc" id="L278">        this.indexes = indexes;</span>
+<span class="fc" id="L279">        return this;</span>
+    }
+
+    private CFMetaData(String keyspace,
+                       String name,
+                       UUID cfId,
+                       boolean isSuper,
+                       boolean isCounter,
+                       boolean isDense,
+                       boolean isCompound,
+                       boolean isView,
+                       List&lt;ColumnDefinition&gt; partitionKeyColumns,
+                       List&lt;ColumnDefinition&gt; clusteringColumns,
+                       PartitionColumns partitionColumns,
+                       IPartitioner partitioner,
+                       ColumnDefinition superCfKeyColumn,
+                       ColumnDefinition superCfValueColumn)
+<span class="fc" id="L296">    {</span>
+<span class="fc" id="L297">        this.cfId = cfId;</span>
+<span class="fc" id="L298">        this.ksName = keyspace;</span>
+<span class="fc" id="L299">        this.cfName = name;</span>
+<span class="fc" id="L300">        ksAndCFName = Pair.create(keyspace, name);</span>
+<span class="fc" id="L301">        byte[] ksBytes = FBUtilities.toWriteUTFBytes(ksName);</span>
+<span class="fc" id="L302">        byte[] cfBytes = FBUtilities.toWriteUTFBytes(cfName);</span>
+<span class="fc" id="L303">        ksAndCFBytes = Arrays.copyOf(ksBytes, ksBytes.length + cfBytes.length);</span>
+<span class="fc" id="L304">        System.arraycopy(cfBytes, 0, ksAndCFBytes, ksBytes.length, cfBytes.length);</span>
+
+<span class="pc bpc" id="L306" title="5 of 6 branches missed.">        this.isDense = isSuper ? (isDense || SuperColumnCompatibility.recalculateIsDense(partitionColumns.regulars)) : isDense;</span>
+
+<span class="fc" id="L308">        this.isCompound = isCompound;</span>
+<span class="fc" id="L309">        this.isSuper = isSuper;</span>
+<span class="fc" id="L310">        this.isCounter = isCounter;</span>
+<span class="fc" id="L311">        this.isView = isView;</span>
+
+<span class="fc" id="L313">        EnumSet&lt;Flag&gt; flags = EnumSet.noneOf(Flag.class);</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">        if (isSuper)</span>
+<span class="nc" id="L315">            flags.add(Flag.SUPER);</span>
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">        if (isCounter)</span>
+<span class="nc" id="L317">            flags.add(Flag.COUNTER);</span>
+<span class="fc bfc" id="L318" title="All 2 branches covered.">        if (isDense)</span>
+<span class="fc" id="L319">            flags.add(Flag.DENSE);</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">        if (isCompound)</span>
+<span class="fc" id="L321">            flags.add(Flag.COMPOUND);</span>
+<span class="fc" id="L322">        this.flags = Sets.immutableEnumSet(flags);</span>
+
+<span class="fc" id="L324">        isIndex = cfName.contains(&quot;.&quot;);</span>
+
+<span class="pc bpc" id="L326" title="2 of 4 branches missed.">        assert partitioner != null : &quot;This assertion failure is probably due to accessing Schema.instance &quot; +</span>
+                                     &quot;from client-mode tools - See CASSANDRA-8143.&quot;;
+<span class="fc" id="L328">        this.partitioner = partitioner;</span>
+
+        // A compact table should always have a clustering
+<span class="pc bpc" id="L331" title="2 of 6 branches missed.">        assert isCQLTable() || !clusteringColumns.isEmpty() : String.format(&quot;For table %s.%s, isDense=%b, isCompound=%b, clustering=%s&quot;, ksName, cfName, isDense, isCompound, clusteringColumns);</span>
+
+        // All tables should have a partition key
+<span class="pc bpc" id="L334" title="2 of 4 branches missed.">        assert !partitionKeyColumns.isEmpty() : String.format(&quot;Have no partition keys for table %s.%s&quot;, ksName, cfName);</span>
+
+<span class="fc" id="L336">        this.partitionKeyColumns = partitionKeyColumns;</span>
+<span class="fc" id="L337">        this.clusteringColumns = clusteringColumns;</span>
+<span class="fc" id="L338">        this.partitionColumns = partitionColumns;</span>
+
+<span class="fc" id="L340">        this.superCfKeyColumn = superCfKeyColumn;</span>
+<span class="fc" id="L341">        this.superCfValueColumn = superCfValueColumn;</span>
+
+        //This needs to happen before serializers are set
+        //because they use comparator.subtypes()
+<span class="fc" id="L345">        rebuild();</span>
+
+<span class="fc" id="L347">        this.serializers = new Serializers(this);</span>
+<span class="fc" id="L348">        this.resource = DataResource.table(ksName, cfName);</span>
+<span class="fc" id="L349">    }</span>
+
+    // This rebuild informations that are intrinsically duplicate of the table definition but
+    // are kept because they are often useful in a different format.
+    private void rebuild()
+    {
+        // A non-compact copy will be created lazily
+<span class="fc" id="L356">        this.nonCompactCopy = null;</span>
+
+<span class="fc bfc" id="L358" title="All 2 branches covered.">        if (isCompactTable())</span>
+        {
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">            this.compactValueColumn = isSuper() ?</span>
+<span class="pc" id="L361">                                      SuperColumnCompatibility.getCompactValueColumn(partitionColumns) :</span>
+<span class="fc" id="L362">                                      CompactTables.getCompactValueColumn(partitionColumns);</span>
+        }
+
+<span class="fc" id="L365">        Map&lt;ByteBuffer, ColumnDefinition&gt; newColumnMetadata = Maps.newHashMapWithExpectedSize(partitionKeyColumns.size() + clusteringColumns.size() + partitionColumns.size());</span>
+
+<span class="pc bpc" id="L367" title="3 of 4 branches missed.">        if (isSuper() &amp;&amp; isDense())</span>
+        {
+<span class="nc" id="L369">            CompactTables.DefaultNames defaultNames = SuperColumnCompatibility.columnNameGenerator(partitionKeyColumns, clusteringColumns, partitionColumns);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            if (superCfKeyColumn == null)</span>
+<span class="nc" id="L371">                superCfKeyColumn = SuperColumnCompatibility.getSuperCfKeyColumn(this, clusteringColumns, defaultNames);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">            if (superCfValueColumn == null)</span>
+<span class="nc" id="L373">                superCfValueColumn = SuperColumnCompatibility.getSuperCfValueColumn(this, partitionColumns, superCfKeyColumn, defaultNames);</span>
+
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            for (ColumnDefinition def : partitionKeyColumns)</span>
+<span class="nc" id="L376">                newColumnMetadata.put(def.name.bytes, def);</span>
+<span class="nc" id="L377">            newColumnMetadata.put(clusteringColumns.get(0).name.bytes, clusteringColumns.get(0));</span>
+<span class="nc" id="L378">            newColumnMetadata.put(superCfKeyColumn.name.bytes, SuperColumnCompatibility.getSuperCfSschemaRepresentation(superCfKeyColumn));</span>
+<span class="nc" id="L379">            newColumnMetadata.put(superCfValueColumn.name.bytes, superCfValueColumn);</span>
+<span class="nc" id="L380">            newColumnMetadata.put(compactValueColumn.name.bytes, compactValueColumn);</span>
+<span class="nc" id="L381">            clusteringColumns = Arrays.asList(clusteringColumns().get(0));</span>
+<span class="nc" id="L382">            partitionColumns = PartitionColumns.of(compactValueColumn);</span>
+<span class="nc" id="L383">        }</span>
+        else
+        {
+<span class="fc bfc" id="L386" title="All 2 branches covered.">            for (ColumnDefinition def : partitionKeyColumns)</span>
+<span class="fc" id="L387">                newColumnMetadata.put(def.name.bytes, def);</span>
+<span class="fc bfc" id="L388" title="All 2 branches covered.">            for (ColumnDefinition def : clusteringColumns)</span>
+<span class="fc" id="L389">                newColumnMetadata.put(def.name.bytes, def);</span>
+<span class="fc bfc" id="L390" title="All 2 branches covered.">            for (ColumnDefinition def : partitionColumns)</span>
+<span class="fc" id="L391">                newColumnMetadata.put(def.name.bytes, def);</span>
+        }
+<span class="fc" id="L393">        this.columnMetadata = newColumnMetadata;</span>
+
+<span class="fc" id="L395">        List&lt;AbstractType&lt;?&gt;&gt; keyTypes = extractTypes(partitionKeyColumns);</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">        this.keyValidator = keyTypes.size() == 1 ? keyTypes.get(0) : CompositeType.getInstance(keyTypes);</span>
+
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">        if (isSuper())</span>
+<span class="nc" id="L399">            this.comparator = new ClusteringComparator(clusteringColumns.get(0).type);</span>
+        else
+<span class="fc" id="L401">            this.comparator = new ClusteringComparator(extractTypes(clusteringColumns));</span>
+
+        Set&lt;ColumnDefinition&gt; hiddenColumns;
+<span class="fc bfc" id="L404" title="All 6 branches covered.">        if (isCompactTable() &amp;&amp; isDense &amp;&amp; CompactTables.hasEmptyCompactValue(this))</span>
+        {
+<span class="fc" id="L406">            hiddenColumns = Collections.singleton(compactValueColumn);</span>
+        }
+<span class="pc bpc" id="L408" title="1 of 6 branches missed.">        else if (isCompactTable() &amp;&amp; !isDense &amp;&amp; !isSuper)</span>
+        {
+<span class="fc" id="L410">            hiddenColumns = Sets.newHashSetWithExpectedSize(clusteringColumns.size() + 1);</span>
+<span class="fc" id="L411">            hiddenColumns.add(compactValueColumn);</span>
+<span class="fc" id="L412">            hiddenColumns.addAll(clusteringColumns);</span>
+
+        }
+        else
+        {
+<span class="fc" id="L417">            hiddenColumns = Collections.emptySet();</span>
+        }
+<span class="fc" id="L419">        this.hiddenColumns = hiddenColumns;</span>
+
+<span class="fc" id="L421">        this.allColumnFilter = ColumnFilter.all(this);</span>
+<span class="fc" id="L422">    }</span>
+
+    public Indexes getIndexes()
+    {
+<span class="fc" id="L426">        return indexes;</span>
+    }
+
+    public ColumnFilter getAllColumnFilter()
+    {
+<span class="nc" id="L431">        return allColumnFilter;</span>
+    }
+
+    public static CFMetaData create(String ksName,
+                                    String name,
+                                    UUID cfId,
+                                    boolean isDense,
+                                    boolean isCompound,
+                                    boolean isSuper,
+                                    boolean isCounter,
+                                    boolean isView,
+                                    List&lt;ColumnDefinition&gt; columns,
+                                    IPartitioner partitioner)
+    {
+<span class="fc" id="L445">        List&lt;ColumnDefinition&gt; partitions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L446">        List&lt;ColumnDefinition&gt; clusterings = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L447">        PartitionColumns.Builder builder = PartitionColumns.builder();</span>
+
+<span class="fc bfc" id="L449" title="All 2 branches covered.">        for (ColumnDefinition column : columns)</span>
+        {
+<span class="fc bfc" id="L451" title="All 3 branches covered.">            switch (column.kind)</span>
+            {
+                case PARTITION_KEY:
+<span class="fc" id="L454">                    partitions.add(column);</span>
+<span class="fc" id="L455">                    break;</span>
+                case CLUSTERING:
+<span class="fc" id="L457">                    clusterings.add(column);</span>
+<span class="fc" id="L458">                    break;</span>
+                default:
+<span class="fc" id="L460">                    builder.add(column);</span>
+                    break;
+            }
+<span class="fc" id="L463">        }</span>
+
+<span class="fc" id="L465">        Collections.sort(partitions);</span>
+<span class="fc" id="L466">        Collections.sort(clusterings);</span>
+
+<span class="fc" id="L468">        return new CFMetaData(ksName,</span>
+                              name,
+                              cfId,
+                              isSuper,
+                              isCounter,
+                              isDense,
+                              isCompound,
+                              isView,
+                              partitions,
+                              clusterings,
+<span class="fc" id="L478">                              builder.build(),</span>
+                              partitioner,
+                              null,
+                              null);
+    }
+
+    public static List&lt;AbstractType&lt;?&gt;&gt; extractTypes(Iterable&lt;ColumnDefinition&gt; clusteringColumns)
+    {
+<span class="fc" id="L486">        List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L487" title="All 2 branches covered.">        for (ColumnDefinition def : clusteringColumns)</span>
+<span class="fc" id="L488">            types.add(def.type);</span>
+<span class="fc" id="L489">        return types;</span>
+    }
+
+    public Set&lt;Flag&gt; flags()
+    {
+<span class="fc" id="L494">        return flags;</span>
+    }
+
+    /**
+     * There is a couple of places in the code where we need a CFMetaData object and don't have one readily available
+     * and know that only the keyspace and name matter. This creates such &quot;fake&quot; metadata. Use only if you know what
+     * you're doing.
+     */
+    public static CFMetaData createFake(String keyspace, String name)
+    {
+<span class="fc" id="L504">        return CFMetaData.Builder.create(keyspace, name).addPartitionKey(&quot;key&quot;, BytesType.instance).build();</span>
+    }
+
+    public Triggers getTriggers()
+    {
+<span class="fc" id="L509">        return triggers;</span>
+    }
+
+    // Compiles a system metadata
+    public static CFMetaData compile(String cql, String keyspace)
+    {
+<span class="fc" id="L515">        CFStatement parsed = (CFStatement)QueryProcessor.parseStatement(cql);</span>
+<span class="fc" id="L516">        parsed.prepareKeyspace(keyspace);</span>
+<span class="fc" id="L517">        CreateTableStatement statement = (CreateTableStatement) ((CreateTableStatement.RawStatement) parsed).prepare(Types.none()).statement;</span>
+
+<span class="fc" id="L519">        return statement.metadataBuilder()</span>
+<span class="fc" id="L520">                        .withId(generateLegacyCfId(keyspace, statement.columnFamily()))</span>
+<span class="fc" id="L521">                        .build()</span>
+<span class="fc" id="L522">                        .params(statement.params())</span>
+<span class="fc" id="L523">                        .readRepairChance(0.0)</span>
+<span class="fc" id="L524">                        .dcLocalReadRepairChance(0.0)</span>
+<span class="fc" id="L525">                        .gcGraceSeconds(0)</span>
+<span class="fc" id="L526">                        .memtableFlushPeriod((int) TimeUnit.HOURS.toMillis(1));</span>
+    }
+
+    /**
+     * Generates deterministic UUID from keyspace/columnfamily name pair.
+     * This is used to generate the same UUID for {@code C* version &lt; 2.1}
+     *
+     * Since 2.1, this is only used for system columnfamilies and tests.
+     */
+    public static UUID generateLegacyCfId(String ksName, String cfName)
+    {
+<span class="fc" id="L537">        return UUID.nameUUIDFromBytes(ArrayUtils.addAll(ksName.getBytes(), cfName.getBytes()));</span>
+    }
+
+    public CFMetaData reloadIndexMetadataProperties(CFMetaData parent)
+    {
+<span class="nc" id="L542">        TableParams.Builder indexParams = TableParams.builder(parent.params);</span>
+
+        // Depends on parent's cache setting, turn on its index CF's cache.
+        // Row caching is never enabled; see CASSANDRA-5732
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        if (parent.params.caching.cacheKeys())</span>
+<span class="nc" id="L547">            indexParams.caching(CachingParams.CACHE_KEYS);</span>
+        else
+<span class="nc" id="L549">            indexParams.caching(CachingParams.CACHE_NOTHING);</span>
+
+<span class="nc" id="L551">        indexParams.readRepairChance(0.0)</span>
+<span class="nc" id="L552">                   .dcLocalReadRepairChance(0.0)</span>
+<span class="nc" id="L553">                   .gcGraceSeconds(0);</span>
+
+<span class="nc" id="L555">        return params(indexParams.build());</span>
+    }
+
+    /**
+     * Returns a cached non-compact version of this table. Cached version has to be invalidated
+     * every time the table is rebuilt.
+     */
+    public CFMetaData asNonCompact()
+    {
+<span class="nc bnc" id="L564" title="All 4 branches missed.">        assert isCompactTable() : &quot;Can't get non-compact version of a CQL table&quot;;</span>
+
+        // Note that this is racy, but re-computing the non-compact copy a few times on first uses isn't a big deal so
+        // we don't bother.
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        if (nonCompactCopy == null)</span>
+        {
+<span class="nc" id="L570">            nonCompactCopy = copyOpts(new CFMetaData(ksName,</span>
+                                                     cfName,
+                                                     cfId,
+                                                     false,
+                                                     isCounter,
+                                                     false,
+                                                     true,
+                                                     isView,
+<span class="nc" id="L578">                                                     copy(partitionKeyColumns),</span>
+<span class="nc" id="L579">                                                     copy(clusteringColumns),</span>
+<span class="nc" id="L580">                                                     copy(partitionColumns),</span>
+                                                     partitioner,
+                                                     superCfKeyColumn,
+                                                     superCfValueColumn),
+                                      this);
+        }
+
+<span class="nc" id="L587">        return nonCompactCopy;</span>
+    }
+
+    public CFMetaData copy()
+    {
+<span class="nc" id="L592">        return copy(cfId);</span>
+    }
+
+    /**
+     * Clones the CFMetaData, but sets a different cfId
+     *
+     * @param newCfId the cfId for the cloned CFMetaData
+     * @return the cloned CFMetaData instance with the new cfId
+     */
+    public CFMetaData copy(UUID newCfId)
+    {
+<span class="nc" id="L603">        return copyOpts(new CFMetaData(ksName,</span>
+                                       cfName,
+                                       newCfId,
+<span class="nc" id="L606">                                       isSuper(),</span>
+<span class="nc" id="L607">                                       isCounter(),</span>
+<span class="nc" id="L608">                                       isDense(),</span>
+<span class="nc" id="L609">                                       isCompound(),</span>
+<span class="nc" id="L610">                                       isView(),</span>
+<span class="nc" id="L611">                                       copy(partitionKeyColumns),</span>
+<span class="nc" id="L612">                                       copy(clusteringColumns),</span>
+<span class="nc" id="L613">                                       copy(partitionColumns),</span>
+                                       partitioner,
+                                       superCfKeyColumn,
+                                       superCfValueColumn),
+                        this);
+    }
+
+    public CFMetaData copy(IPartitioner partitioner)
+    {
+<span class="fc" id="L622">        return copyOpts(new CFMetaData(ksName,</span>
+                                       cfName,
+                                       cfId,
+                                       isSuper,
+                                       isCounter,
+                                       isDense,
+                                       isCompound,
+                                       isView,
+<span class="fc" id="L630">                                       copy(partitionKeyColumns),</span>
+<span class="fc" id="L631">                                       copy(clusteringColumns),</span>
+<span class="fc" id="L632">                                       copy(partitionColumns),</span>
+                                       partitioner,
+                                       superCfKeyColumn,
+                                       superCfValueColumn),
+                        this);
+    }
+
+    private static List&lt;ColumnDefinition&gt; copy(List&lt;ColumnDefinition&gt; l)
+    {
+<span class="fc" id="L641">        List&lt;ColumnDefinition&gt; copied = new ArrayList&lt;&gt;(l.size());</span>
+<span class="fc bfc" id="L642" title="All 2 branches covered.">        for (ColumnDefinition cd : l)</span>
+<span class="fc" id="L643">            copied.add(cd.copy());</span>
+<span class="fc" id="L644">        return copied;</span>
+    }
+
+    private static PartitionColumns copy(PartitionColumns columns)
+    {
+<span class="fc" id="L649">        PartitionColumns.Builder newColumns = PartitionColumns.builder();</span>
+<span class="fc bfc" id="L650" title="All 2 branches covered.">        for (ColumnDefinition cd : columns)</span>
+<span class="fc" id="L651">            newColumns.add(cd.copy());</span>
+<span class="fc" id="L652">        return newColumns.build();</span>
+    }
+
+    @VisibleForTesting
+    public static CFMetaData copyOpts(CFMetaData newCFMD, CFMetaData oldCFMD)
+    {
+<span class="fc" id="L658">        return newCFMD.params(oldCFMD.params)</span>
+<span class="fc" id="L659">                      .droppedColumns(new HashMap&lt;&gt;(oldCFMD.droppedColumns))</span>
+<span class="fc" id="L660">                      .triggers(oldCFMD.triggers)</span>
+<span class="fc" id="L661">                      .indexes(oldCFMD.indexes);</span>
+    }
+
+    /**
+     * generate a column family name for an index corresponding to the given column.
+     * This is NOT the same as the index's name! This is only used in sstable filenames and is not exposed to users.
+     *
+     * @param info A definition of the column with index
+     *
+     * @return name of the index ColumnFamily
+     */
+    public String indexColumnFamilyName(IndexMetadata info)
+    {
+        // TODO simplify this when info.index_name is guaranteed to be set
+<span class="nc" id="L675">        return cfName + Directories.SECONDARY_INDEX_NAME_SEPARATOR + info.name;</span>
+    }
+
+    /**
+     * true if this CFS contains secondary index data.
+     */
+    public boolean isIndex()
+    {
+<span class="fc" id="L683">        return isIndex;</span>
+    }
+
+    public DecoratedKey decorateKey(ByteBuffer key)
+    {
+<span class="fc" id="L688">        return partitioner.decorateKey(key);</span>
+    }
+
+    public Map&lt;ByteBuffer, ColumnDefinition&gt; getColumnMetadata()
+    {
+<span class="nc" id="L693">        return columnMetadata;</span>
+    }
+
+    /**
+     *
+     * @return The name of the parent cf if this is a seconday index
+     */
+    public String getParentColumnFamilyName()
+    {
+<span class="nc bnc" id="L702" title="All 2 branches missed.">        return isIndex ? cfName.substring(0, cfName.indexOf('.')) : null;</span>
+    }
+
+    public ReadRepairDecision newReadRepairDecision()
+    {
+<span class="fc" id="L707">        double chance = ThreadLocalRandom.current().nextDouble();</span>
+<span class="pc bpc" id="L708" title="1 of 2 branches missed.">        if (params.readRepairChance &gt; chance)</span>
+<span class="nc" id="L709">            return ReadRepairDecision.GLOBAL;</span>
+
+<span class="pc bpc" id="L711" title="1 of 2 branches missed.">        if (params.dcLocalReadRepairChance &gt; chance)</span>
+<span class="nc" id="L712">            return ReadRepairDecision.DC_LOCAL;</span>
+
+<span class="fc" id="L714">        return ReadRepairDecision.NONE;</span>
+    }
+
+    public AbstractType&lt;?&gt; getColumnDefinitionNameComparator(ColumnDefinition.Kind kind)
+    {
+<span class="nc bnc" id="L719" title="All 8 branches missed.">        return (isSuper() &amp;&amp; kind == ColumnDefinition.Kind.REGULAR) || (isStaticCompactTable() &amp;&amp; kind == ColumnDefinition.Kind.STATIC)</span>
+<span class="nc" id="L720">             ? thriftColumnNameType()</span>
+             : UTF8Type.instance;
+    }
+
+    public AbstractType&lt;?&gt; getKeyValidator()
+    {
+<span class="fc" id="L726">        return keyValidator;</span>
+    }
+
+    public Collection&lt;ColumnDefinition&gt; allColumns()
+    {
+<span class="fc" id="L731">        return columnMetadata.values();</span>
+    }
+
+    private Iterator&lt;ColumnDefinition&gt; nonPkColumnIterator()
+    {
+<span class="pc bpc" id="L736" title="5 of 6 branches missed.">        final boolean noNonPkColumns = isCompactTable() &amp;&amp; CompactTables.hasEmptyCompactValue(this) &amp;&amp; !isSuper();</span>
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">        if (noNonPkColumns)</span>
+        {
+<span class="nc" id="L739">            return Collections.&lt;ColumnDefinition&gt;emptyIterator();</span>
+        }
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">        else if (isStaticCompactTable())</span>
+        {
+<span class="nc" id="L743">            return partitionColumns.statics.selectOrderIterator();</span>
+        }
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">        else if (isSuper())</span>
+        {
+<span class="nc bnc" id="L747" title="All 2 branches missed.">            if (isDense)</span>
+<span class="nc" id="L748">                return Iterators.forArray(superCfKeyColumn, superCfValueColumn);</span>
+            else
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                return Iterators.filter(partitionColumns.iterator(), (c) -&gt; !c.type.isCollection());</span>
+        }
+        else
+<span class="fc" id="L753">            return partitionColumns().selectOrderIterator();</span>
+    }
+
+    // An iterator over all column definitions but that respect the order of a SELECT *.
+    // This also hides the clustering/regular columns for a non-CQL3 non-dense table for backward compatibility
+    // sake (those are accessible through thrift but not through CQL currently) and exposes the key and value
+    // columns for supercolumn family.
+    public Iterator&lt;ColumnDefinition&gt; allColumnsInSelectOrder()
+    {
+<span class="fc" id="L762">        return new AbstractIterator&lt;ColumnDefinition&gt;()</span>
+<span class="fc" id="L763">        {</span>
+<span class="fc" id="L764">            private final Iterator&lt;ColumnDefinition&gt; partitionKeyIter = partitionKeyColumns.iterator();</span>
+<span class="pc bpc" id="L765" title="1 of 2 branches missed.">            private final Iterator&lt;ColumnDefinition&gt; clusteringIter = isStaticCompactTable() ? Collections.&lt;ColumnDefinition&gt;emptyIterator() : clusteringColumns.iterator();</span>
+<span class="fc" id="L766">            private final Iterator&lt;ColumnDefinition&gt; otherColumns = nonPkColumnIterator();</span>
+
+            protected ColumnDefinition computeNext()
+            {
+<span class="fc bfc" id="L770" title="All 2 branches covered.">                if (partitionKeyIter.hasNext())</span>
+<span class="fc" id="L771">                    return partitionKeyIter.next();</span>
+
+<span class="fc bfc" id="L773" title="All 2 branches covered.">                if (clusteringIter.hasNext())</span>
+<span class="fc" id="L774">                    return clusteringIter.next();</span>
+
+<span class="fc bfc" id="L776" title="All 2 branches covered.">                return otherColumns.hasNext() ? otherColumns.next() : endOfData();</span>
+            }
+        };
+    }
+
+    public Iterable&lt;ColumnDefinition&gt; primaryKeyColumns()
+    {
+<span class="nc" id="L783">        return Iterables.concat(partitionKeyColumns, clusteringColumns);</span>
+    }
+
+    public List&lt;ColumnDefinition&gt; partitionKeyColumns()
+    {
+<span class="fc" id="L788">        return partitionKeyColumns;</span>
+    }
+
+    public List&lt;ColumnDefinition&gt; clusteringColumns()
+    {
+<span class="fc" id="L793">        return clusteringColumns;</span>
+    }
+
+    public PartitionColumns partitionColumns()
+    {
+<span class="fc" id="L798">        return partitionColumns;</span>
+    }
+
+    public ColumnDefinition compactValueColumn()
+    {
+<span class="fc" id="L803">        return compactValueColumn;</span>
+    }
+
+    public ClusteringComparator getKeyValidatorAsClusteringComparator()
+    {
+<span class="fc" id="L808">        boolean isCompound = keyValidator instanceof CompositeType;</span>
+<span class="fc bfc" id="L809" title="All 2 branches covered.">        List&lt;AbstractType&lt;?&gt;&gt; types = isCompound</span>
+                                    ? ((CompositeType) keyValidator).types
+<span class="fc" id="L811">                                    : Collections.&lt;AbstractType&lt;?&gt;&gt;singletonList(keyValidator);</span>
+<span class="fc" id="L812">        return new ClusteringComparator(types);</span>
+    }
+
+    public static ByteBuffer serializePartitionKey(ClusteringPrefix keyAsClustering)
+    {
+        // TODO: we should stop using Clustering for partition keys. Maybe we can add
+        // a few methods to DecoratedKey so we don't have to (note that while using a Clustering
+        // allows to use buildBound(), it's actually used for partition keys only when every restriction
+        // is an equal, so we could easily create a specific method for keys for that.
+<span class="fc bfc" id="L821" title="All 2 branches covered.">        if (keyAsClustering.size() == 1)</span>
+<span class="fc" id="L822">            return keyAsClustering.get(0);</span>
+
+<span class="fc" id="L824">        ByteBuffer[] values = new ByteBuffer[keyAsClustering.size()];</span>
+<span class="fc bfc" id="L825" title="All 2 branches covered.">        for (int i = 0; i &lt; keyAsClustering.size(); i++)</span>
+<span class="fc" id="L826">            values[i] = keyAsClustering.get(i);</span>
+<span class="fc" id="L827">        return CompositeType.build(values);</span>
+    }
+
+    public Map&lt;ByteBuffer, DroppedColumn&gt; getDroppedColumns()
+    {
+<span class="fc" id="L832">        return droppedColumns;</span>
+    }
+
+    public ColumnDefinition getDroppedColumnDefinition(ByteBuffer name)
+    {
+<span class="nc" id="L837">        return getDroppedColumnDefinition(name, false);</span>
+    }
+
+    /**
+     * Returns a &quot;fake&quot; ColumnDefinition corresponding to the dropped column {@code name}
+     * of {@code null} if there is no such dropped column.
+     *
+     * @param name - the column name
+     * @param isStatic - whether the column was a static column, if known
+     */
+    public ColumnDefinition getDroppedColumnDefinition(ByteBuffer name, boolean isStatic)
+    {
+<span class="nc" id="L849">        DroppedColumn dropped = droppedColumns.get(name);</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">        if (dropped == null)</span>
+<span class="nc" id="L851">            return null;</span>
+
+        // We need the type for deserialization purpose. If we don't have the type however,
+        // it means that it's a dropped column from before 3.0, and in that case using
+        // BytesType is fine for what we'll be using it for, even if that's a hack.
+<span class="nc bnc" id="L856" title="All 2 branches missed.">        AbstractType&lt;?&gt; type = dropped.type == null ? BytesType.instance : dropped.type;</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">        return isStatic</span>
+<span class="nc" id="L858">               ? ColumnDefinition.staticDef(this, name, type)</span>
+<span class="nc" id="L859">               : ColumnDefinition.regularDef(this, name, type);</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="pc bpc" id="L865" title="1 of 2 branches missed.">        if (this == o)</span>
+<span class="nc" id="L866">            return true;</span>
+
+<span class="pc bpc" id="L868" title="1 of 2 branches missed.">        if (!(o instanceof CFMetaData))</span>
+<span class="fc" id="L869">            return false;</span>
+
+<span class="nc" id="L871">        CFMetaData other = (CFMetaData) o;</span>
+
+<span class="nc bnc" id="L873" title="All 2 branches missed.">        return Objects.equal(cfId, other.cfId)</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">            &amp;&amp; Objects.equal(flags, other.flags)</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">            &amp;&amp; Objects.equal(ksName, other.ksName)</span>
+<span class="nc bnc" id="L876" title="All 2 branches missed.">            &amp;&amp; Objects.equal(cfName, other.cfName)</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">            &amp;&amp; Objects.equal(params, other.params)</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">            &amp;&amp; Objects.equal(comparator, other.comparator)</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">            &amp;&amp; Objects.equal(keyValidator, other.keyValidator)</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">            &amp;&amp; Objects.equal(columnMetadata, other.columnMetadata)</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">            &amp;&amp; Objects.equal(droppedColumns, other.droppedColumns)</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">            &amp;&amp; Objects.equal(triggers, other.triggers)</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">            &amp;&amp; Objects.equal(indexes, other.indexes);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="fc" id="L889">        return new HashCodeBuilder(29, 1597)</span>
+<span class="fc" id="L890">            .append(cfId)</span>
+<span class="fc" id="L891">            .append(ksName)</span>
+<span class="fc" id="L892">            .append(cfName)</span>
+<span class="fc" id="L893">            .append(flags)</span>
+<span class="fc" id="L894">            .append(comparator)</span>
+<span class="fc" id="L895">            .append(params)</span>
+<span class="fc" id="L896">            .append(keyValidator)</span>
+<span class="fc" id="L897">            .append(columnMetadata)</span>
+<span class="fc" id="L898">            .append(droppedColumns)</span>
+<span class="fc" id="L899">            .append(triggers)</span>
+<span class="fc" id="L900">            .append(indexes)</span>
+<span class="fc" id="L901">            .toHashCode();</span>
+    }
+
+    /**
+     * Updates CFMetaData in-place to match cfm
+     *
+     * @return true if any change was made which impacts queries/updates on the table,
+     *         e.g. any columns or indexes were added, removed, or altered; otherwise, false is returned.
+     *         Used to determine whether prepared statements against this table need to be re-prepared.
+     * @throws ConfigurationException if ks/cf names or cf ids didn't match
+     */
+    @VisibleForTesting
+    public boolean apply(CFMetaData cfm) throws ConfigurationException
+    {
+<span class="nc" id="L915">        logger.debug(&quot;applying {} to {}&quot;, cfm, this);</span>
+
+<span class="nc" id="L917">        validateCompatibility(cfm);</span>
+
+<span class="nc" id="L919">        partitionKeyColumns = cfm.partitionKeyColumns;</span>
+<span class="nc" id="L920">        clusteringColumns = cfm.clusteringColumns;</span>
+
+<span class="nc bnc" id="L922" title="All 2 branches missed.">        boolean changeAffectsStatements = !partitionColumns.equals(cfm.partitionColumns);</span>
+<span class="nc" id="L923">        partitionColumns = cfm.partitionColumns;</span>
+<span class="nc" id="L924">        superCfKeyColumn = cfm.superCfKeyColumn;</span>
+<span class="nc" id="L925">        superCfValueColumn = cfm.superCfValueColumn;</span>
+
+<span class="nc" id="L927">        isDense = cfm.isDense;</span>
+<span class="nc" id="L928">        isCompound = cfm.isCompound;</span>
+<span class="nc" id="L929">        isSuper = cfm.isSuper;</span>
+
+<span class="nc" id="L931">        flags = cfm.flags;</span>
+
+<span class="nc" id="L933">        rebuild();</span>
+
+        // compaction thresholds are checked by ThriftValidation. We shouldn't be doing
+        // validation on the apply path; it's too late for that.
+
+<span class="nc" id="L938">        params = cfm.params;</span>
+
+<span class="nc bnc" id="L940" title="All 2 branches missed.">        if (!cfm.droppedColumns.isEmpty())</span>
+<span class="nc" id="L941">            droppedColumns = cfm.droppedColumns;</span>
+
+<span class="nc" id="L943">        triggers = cfm.triggers;</span>
+
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        changeAffectsStatements |= !indexes.equals(cfm.indexes);</span>
+<span class="nc" id="L946">        indexes = cfm.indexes;</span>
+
+<span class="nc" id="L948">        logger.debug(&quot;application result is {}&quot;, this);</span>
+
+<span class="nc" id="L950">        return changeAffectsStatements;</span>
+    }
+
+    public void validateCompatibility(CFMetaData cfm) throws ConfigurationException
+    {
+        // validate
+<span class="nc bnc" id="L956" title="All 2 branches missed.">        if (!cfm.ksName.equals(ksName))</span>
+<span class="nc" id="L957">            throw new ConfigurationException(String.format(&quot;Keyspace mismatch (found %s; expected %s)&quot;,</span>
+                                                           cfm.ksName, ksName));
+<span class="nc bnc" id="L959" title="All 2 branches missed.">        if (!cfm.cfName.equals(cfName))</span>
+<span class="nc" id="L960">            throw new ConfigurationException(String.format(&quot;Column family mismatch (found %s; expected %s)&quot;,</span>
+                                                           cfm.cfName, cfName));
+<span class="nc bnc" id="L962" title="All 2 branches missed.">        if (!cfm.cfId.equals(cfId))</span>
+<span class="nc" id="L963">            throw new ConfigurationException(String.format(&quot;Column family ID mismatch (found %s; expected %s)&quot;,</span>
+                                                           cfm.cfId, cfId));
+<span class="nc" id="L965">    }</span>
+
+
+    public static Class&lt;? extends AbstractCompactionStrategy&gt; createCompactionStrategy(String className) throws ConfigurationException
+    {
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        className = className.contains(&quot;.&quot;) ? className : &quot;org.apache.cassandra.db.compaction.&quot; + className;</span>
+<span class="nc" id="L971">        Class&lt;AbstractCompactionStrategy&gt; strategyClass = FBUtilities.classForName(className, &quot;compaction strategy&quot;);</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">        if (!AbstractCompactionStrategy.class.isAssignableFrom(strategyClass))</span>
+<span class="nc" id="L973">            throw new ConfigurationException(String.format(&quot;Specified compaction strategy class (%s) is not derived from AbstractCompactionStrategy&quot;, className));</span>
+
+<span class="nc" id="L975">        return strategyClass;</span>
+    }
+
+    public static AbstractCompactionStrategy createCompactionStrategyInstance(ColumnFamilyStore cfs,
+                                                                              CompactionParams compactionParams)
+    {
+        try
+        {
+<span class="fc" id="L983">            Constructor&lt;? extends AbstractCompactionStrategy&gt; constructor =</span>
+<span class="fc" id="L984">                compactionParams.klass().getConstructor(ColumnFamilyStore.class, Map.class);</span>
+<span class="fc" id="L985">            return constructor.newInstance(cfs, compactionParams.options());</span>
+        }
+<span class="nc" id="L987">        catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | InstantiationException e)</span>
+        {
+<span class="nc" id="L989">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /**
+     * Returns the ColumnDefinition for {@code name}.
+     */
+    public ColumnDefinition getColumnDefinition(ColumnIdentifier name)
+    {
+<span class="fc" id="L998">        return getColumnDefinition(name.bytes);</span>
+    }
+
+    // In general it is preferable to work with ColumnIdentifier to make it
+    // clear that we are talking about a CQL column, not a cell name, but there
+    // is a few cases where all we have is a ByteBuffer (when dealing with IndexExpression
+    // for instance) so...
+    public ColumnDefinition getColumnDefinition(ByteBuffer name)
+    {
+<span class="fc" id="L1007">        return columnMetadata.get(name);</span>
+    }
+
+    // Returns only columns that are supposed to be visible through CQL layer
+    public ColumnDefinition getColumnDefinitionForCQL(ColumnIdentifier name)
+    {
+<span class="nc" id="L1013">        return getColumnDefinitionForCQL(name.bytes);</span>
+    }
+
+    public ColumnDefinition getColumnDefinitionForCQL(ByteBuffer name)
+    {
+<span class="fc" id="L1018">        ColumnDefinition cd = getColumnDefinition(name);</span>
+<span class="pc bpc" id="L1019" title="1 of 2 branches missed.">        return hiddenColumns.contains(cd) ? null : cd;</span>
+    }
+
+    public static boolean isNameValid(String name)
+    {
+<span class="nc bnc" id="L1024" title="All 4 branches missed.">        return name != null &amp;&amp; !name.isEmpty()</span>
+<span class="nc bnc" id="L1025" title="All 4 branches missed.">               &amp;&amp; name.length() &lt;= SchemaConstants.NAME_LENGTH &amp;&amp; PATTERN_WORD_CHARS.matcher(name).matches();</span>
+    }
+
+    public CFMetaData validate() throws ConfigurationException
+    {
+<span class="nc" id="L1030">        rebuild();</span>
+
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">        if (!isNameValid(ksName))</span>
+<span class="nc" id="L1033">            throw new ConfigurationException(String.format(&quot;Keyspace name must not be empty, more than %s characters long, or contain non-alphanumeric-underscore characters (got \&quot;%s\&quot;)&quot;, SchemaConstants.NAME_LENGTH, ksName));</span>
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">        if (!isNameValid(cfName))</span>
+<span class="nc" id="L1035">            throw new ConfigurationException(String.format(&quot;ColumnFamily name must not be empty, more than %s characters long, or contain non-alphanumeric-underscore characters (got \&quot;%s\&quot;)&quot;, SchemaConstants.NAME_LENGTH, cfName));</span>
+
+<span class="nc" id="L1037">        params.validate();</span>
+
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">        for (int i = 0; i &lt; comparator.size(); i++)</span>
+        {
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">            if (comparator.subtype(i) instanceof CounterColumnType)</span>
+<span class="nc" id="L1042">                throw new ConfigurationException(&quot;CounterColumnType is not a valid comparator&quot;);</span>
+        }
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">        if (keyValidator instanceof CounterColumnType)</span>
+<span class="nc" id="L1045">            throw new ConfigurationException(&quot;CounterColumnType is not a valid key validator&quot;);</span>
+
+        // Mixing counter with non counter columns is not supported (#2614)
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">        if (isCounter())</span>
+        {
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">            for (ColumnDefinition def : partitionColumns())</span>
+<span class="nc bnc" id="L1051" title="All 6 branches missed.">                if (!(def.type instanceof CounterColumnType) &amp;&amp; (!isSuper() || isSuperColumnValueColumn(def)))</span>
+<span class="nc" id="L1052">                    throw new ConfigurationException(&quot;Cannot add a non counter column (&quot; + def + &quot;) in a counter column family&quot;);</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">            for (ColumnDefinition def : allColumns())</span>
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">                if (def.type instanceof CounterColumnType)</span>
+<span class="nc" id="L1058">                    throw new ConfigurationException(&quot;Cannot add a counter column (&quot; + def.name + &quot;) in a non counter column family&quot;);</span>
+        }
+
+<span class="nc bnc" id="L1061" title="All 4 branches missed.">        if (!indexes.isEmpty() &amp;&amp; isSuper())</span>
+<span class="nc" id="L1062">            throw new ConfigurationException(&quot;Secondary indexes are not supported on super column families&quot;);</span>
+
+        // initialize a set of names NOT in the CF under consideration
+<span class="nc" id="L1065">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);</span>
+
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">        Set&lt;String&gt; indexNames = ksm == null ? new HashSet&lt;&gt;() : ksm.existingIndexNames(cfName);</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">        for (IndexMetadata index : indexes)</span>
+        {
+            // check index names against this CF _and_ globally
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">            if (indexNames.contains(index.name))</span>
+<span class="nc" id="L1072">                throw new ConfigurationException(&quot;Duplicate index name &quot; + index.name);</span>
+<span class="nc" id="L1073">            indexNames.add(index.name);</span>
+
+<span class="nc" id="L1075">            index.validate(this);</span>
+<span class="nc" id="L1076">        }</span>
+
+<span class="nc" id="L1078">        return this;</span>
+    }
+
+    // The comparator to validate the definition name with thrift.
+    public AbstractType&lt;?&gt; thriftColumnNameType()
+    {
+<span class="pc bpc" id="L1084" title="1 of 2 branches missed.">        if (isSuper())</span>
+        {
+<span class="nc" id="L1086">            ColumnDefinition def = compactValueColumn();</span>
+<span class="nc bnc" id="L1087" title="All 6 branches missed.">            assert def != null &amp;&amp; def.type instanceof MapType;</span>
+<span class="nc" id="L1088">            return ((MapType)def.type).nameComparator();</span>
+        }
+
+<span class="pc bpc" id="L1091" title="2 of 4 branches missed.">        assert isStaticCompactTable();</span>
+<span class="fc" id="L1092">        return clusteringColumns.get(0).type;</span>
+    }
+
+    public CFMetaData addColumnDefinition(ColumnDefinition def) throws ConfigurationException
+    {
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">        if (columnMetadata.containsKey(def.name.bytes))</span>
+<span class="nc" id="L1098">            throw new ConfigurationException(String.format(&quot;Cannot add column %s, a column with the same name already exists&quot;, def.name));</span>
+
+<span class="nc" id="L1100">        return addOrReplaceColumnDefinition(def);</span>
+    }
+
+    // This method doesn't check if a def of the same name already exist and should only be used when we
+    // know this cannot happen.
+    public CFMetaData addOrReplaceColumnDefinition(ColumnDefinition def)
+    {
+        // Adds the definition and rebuild what is necessary. We could call rebuild() but it's not too hard to
+        // only rebuild the necessary bits.
+<span class="nc bnc" id="L1109" title="All 4 branches missed.">        switch (def.kind)</span>
+        {
+            case PARTITION_KEY:
+<span class="nc" id="L1112">                partitionKeyColumns.set(def.position(), def);</span>
+<span class="nc" id="L1113">                break;</span>
+            case CLUSTERING:
+<span class="nc" id="L1115">                clusteringColumns.set(def.position(), def);</span>
+<span class="nc" id="L1116">                break;</span>
+            case REGULAR:
+            case STATIC:
+<span class="nc" id="L1119">                PartitionColumns.Builder builder = PartitionColumns.builder();</span>
+<span class="nc bnc" id="L1120" title="All 2 branches missed.">                for (ColumnDefinition column : partitionColumns)</span>
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">                    if (!column.name.equals(def.name))</span>
+<span class="nc" id="L1122">                        builder.add(column);</span>
+<span class="nc" id="L1123">                builder.add(def);</span>
+<span class="nc" id="L1124">                partitionColumns = builder.build();</span>
+                // If dense, we must have modified the compact value since that's the only one we can have.
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">                if (isDense())</span>
+<span class="nc" id="L1127">                    this.compactValueColumn = def;</span>
+                break;
+        }
+<span class="nc" id="L1130">        this.columnMetadata.put(def.name.bytes, def);</span>
+<span class="nc" id="L1131">        return this;</span>
+    }
+
+    public boolean removeColumnDefinition(ColumnDefinition def)
+    {
+<span class="nc bnc" id="L1136" title="All 4 branches missed.">        assert !def.isPartitionKey();</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">        boolean removed = columnMetadata.remove(def.name.bytes) != null;</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">        if (removed)</span>
+<span class="nc" id="L1139">            partitionColumns = partitionColumns.without(def);</span>
+<span class="nc" id="L1140">        return removed;</span>
+    }
+
+    /**
+     * Adds the column definition as a dropped column, recording the drop with the provided timestamp.
+     */
+    public void recordColumnDrop(ColumnDefinition def, long timeMicros)
+    {
+<span class="nc" id="L1148">        recordColumnDrop(def, timeMicros, true);</span>
+<span class="nc" id="L1149">    }</span>
+
+    @VisibleForTesting
+    public void recordColumnDrop(ColumnDefinition def, long timeMicros, boolean preserveKind)
+    {
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">        droppedColumns.put(def.name.bytes, new DroppedColumn(def.name.toString(), preserveKind ? def.kind : null, def.type, timeMicros));</span>
+<span class="nc" id="L1155">    }</span>
+
+    public void renameColumn(ColumnIdentifier from, ColumnIdentifier to) throws InvalidRequestException
+    {
+<span class="nc" id="L1159">        ColumnDefinition def = getColumnDefinitionForCQL(from);</span>
+
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">        if (def == null)</span>
+<span class="nc" id="L1162">            throw new InvalidRequestException(String.format(&quot;Cannot rename unknown column %s in keyspace %s&quot;, from, cfName));</span>
+
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">        if (getColumnDefinition(to) != null)</span>
+<span class="nc" id="L1165">            throw new InvalidRequestException(String.format(&quot;Cannot rename column %s to %s in keyspace %s; another column of that name already exist&quot;, from, to, cfName));</span>
+
+<span class="nc bnc" id="L1167" title="All 4 branches missed.">        if (def.isPartOfCellName(isCQLTable(), isSuper()) &amp;&amp; !isDense())</span>
+        {
+<span class="nc" id="L1169">            throw new InvalidRequestException(String.format(&quot;Cannot rename non PRIMARY KEY part %s&quot;, from));</span>
+        }
+
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">        if (!getIndexes().isEmpty())</span>
+        {
+<span class="nc" id="L1174">            ColumnFamilyStore store = Keyspace.openAndGetStore(this);</span>
+<span class="nc" id="L1175">            Set&lt;IndexMetadata&gt; dependentIndexes = store.indexManager.getDependentIndexes(def);</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">            if (!dependentIndexes.isEmpty())</span>
+<span class="nc" id="L1177">                throw new InvalidRequestException(String.format(&quot;Cannot rename column %s because it has &quot; +</span>
+                                                                &quot;dependent secondary indexes (%s)&quot;,
+                                                                from,
+<span class="nc" id="L1180">                                                                dependentIndexes.stream()</span>
+<span class="nc" id="L1181">                                                                                .map(i -&gt; i.name)</span>
+<span class="nc" id="L1182">                                                                                .collect(Collectors.joining(&quot;,&quot;))));</span>
+        }
+
+<span class="nc bnc" id="L1185" title="All 4 branches missed.">        if (isSuper() &amp;&amp; isDense())</span>
+        {
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">            if (isSuperColumnKeyColumn(def))</span>
+            {
+<span class="nc" id="L1189">                columnMetadata.remove(superCfKeyColumn.name.bytes);</span>
+<span class="nc" id="L1190">                superCfKeyColumn = superCfKeyColumn.withNewName(to);</span>
+<span class="nc" id="L1191">                columnMetadata.put(superCfKeyColumn.name.bytes, SuperColumnCompatibility.getSuperCfSschemaRepresentation(superCfKeyColumn));</span>
+            }
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">            else if (isSuperColumnValueColumn(def))</span>
+            {
+<span class="nc" id="L1195">                columnMetadata.remove(superCfValueColumn.name.bytes);</span>
+<span class="nc" id="L1196">                superCfValueColumn = superCfValueColumn.withNewName(to);</span>
+<span class="nc" id="L1197">                columnMetadata.put(superCfValueColumn.name.bytes, superCfValueColumn);</span>
+            }
+            else
+<span class="nc" id="L1200">                addOrReplaceColumnDefinition(def.withNewName(to));</span>
+        }
+        else
+        {
+<span class="nc" id="L1204">            addOrReplaceColumnDefinition(def.withNewName(to));</span>
+        }
+
+
+        // removeColumnDefinition doesn't work for partition key (expectedly) but renaming one is fine so we still
+        // want to update columnMetadata.
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">        if (def.isPartitionKey())</span>
+<span class="nc" id="L1211">            columnMetadata.remove(def.name.bytes);</span>
+        else
+<span class="nc" id="L1213">            removeColumnDefinition(def);</span>
+<span class="nc" id="L1214">    }</span>
+
+    public boolean isCQLTable()
+    {
+<span class="pc bpc" id="L1218" title="1 of 6 branches missed.">        return !isSuper() &amp;&amp; !isDense() &amp;&amp; isCompound();</span>
+    }
+
+    public boolean isCompactTable()
+    {
+<span class="fc bfc" id="L1223" title="All 2 branches covered.">        return !isCQLTable();</span>
+    }
+
+    public boolean isStaticCompactTable()
+    {
+<span class="pc bpc" id="L1228" title="1 of 6 branches missed.">        return !isSuper() &amp;&amp; !isDense() &amp;&amp; !isCompound();</span>
+    }
+
+    /**
+     * Returns whether this CFMetaData can be returned to thrift.
+     */
+    public boolean isThriftCompatible()
+    {
+<span class="nc" id="L1236">        return isCompactTable();</span>
+    }
+
+    public boolean hasStaticColumns()
+    {
+<span class="pc bpc" id="L1241" title="1 of 2 branches missed.">        return !partitionColumns.statics.isEmpty();</span>
+    }
+
+    public boolean hasCollectionColumns()
+    {
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">        for (ColumnDefinition def : partitionColumns())</span>
+<span class="nc bnc" id="L1247" title="All 4 branches missed.">            if (def.type instanceof CollectionType &amp;&amp; def.type.isMultiCell())</span>
+<span class="nc" id="L1248">                return true;</span>
+<span class="nc" id="L1249">        return false;</span>
+    }
+
+    public boolean hasComplexColumns()
+    {
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">        for (ColumnDefinition def : partitionColumns())</span>
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">            if (def.isComplex())</span>
+<span class="nc" id="L1256">                return true;</span>
+<span class="nc" id="L1257">        return false;</span>
+    }
+
+    public boolean hasDroppedCollectionColumns()
+    {
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">        for (DroppedColumn def : getDroppedColumns().values())</span>
+<span class="nc bnc" id="L1263" title="All 4 branches missed.">            if (def.type instanceof CollectionType &amp;&amp; def.type.isMultiCell())</span>
+<span class="nc" id="L1264">                return true;</span>
+<span class="nc" id="L1265">        return false;</span>
+    }
+
+    public boolean isSuper()
+    {
+<span class="fc" id="L1270">        return isSuper;</span>
+    }
+
+    public boolean isCounter()
+    {
+<span class="fc" id="L1275">        return isCounter;</span>
+    }
+
+    // We call dense a CF for which each component of the comparator is a clustering column, i.e. no
+    // component is used to store a regular column names. In other words, non-composite static &quot;thrift&quot;
+    // and CQL3 CF are *not* dense.
+    public boolean isDense()
+    {
+<span class="fc" id="L1283">        return isDense;</span>
+    }
+
+    public boolean isCompound()
+    {
+<span class="fc" id="L1288">        return isCompound;</span>
+    }
+
+    public boolean isView()
+    {
+<span class="fc" id="L1293">        return isView;</span>
+    }
+
+    /**
+     * A table with strict liveness filters/ignores rows without PK liveness info,
+     * effectively tying the row liveness to its primary key liveness.
+     *
+     * Currently this is only used by views with normal base column as PK column
+     * so updates to other columns do not make the row live when the base column
+     * is not live. See CASSANDRA-11500.
+     */
+    public boolean enforceStrictLiveness()
+    {
+<span class="pc bpc" id="L1306" title="3 of 4 branches missed.">        return isView &amp;&amp; Keyspace.open(ksName).viewManager.getByName(cfName).enforceStrictLiveness();</span>
+    }
+
+    public Serializers serializers()
+    {
+<span class="fc" id="L1311">        return serializers;</span>
+    }
+
+    public AbstractType&lt;?&gt; makeLegacyDefaultValidator()
+    {
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        if (isCounter())</span>
+<span class="nc" id="L1317">            return CounterColumnType.instance;</span>
+<span class="nc bnc" id="L1318" title="All 2 branches missed.">        else if (isCompactTable())</span>
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">            return isSuper() ? ((MapType)compactValueColumn().type).valueComparator() : compactValueColumn().type;</span>
+        else
+<span class="nc" id="L1321">            return BytesType.instance;</span>
+    }
+
+    public static Set&lt;Flag&gt; flagsFromStrings(Set&lt;String&gt; strings)
+    {
+<span class="fc" id="L1326">        return strings.stream()</span>
+<span class="fc" id="L1327">                      .map(String::toUpperCase)</span>
+<span class="fc" id="L1328">                      .map(Flag::valueOf)</span>
+<span class="fc" id="L1329">                      .collect(Collectors.toSet());</span>
+    }
+
+    public static Set&lt;String&gt; flagsToStrings(Set&lt;Flag&gt; flags)
+    {
+<span class="fc" id="L1334">        return flags.stream()</span>
+<span class="fc" id="L1335">                    .map(Flag::toString)</span>
+<span class="fc" id="L1336">                    .map(String::toLowerCase)</span>
+<span class="fc" id="L1337">                    .collect(Collectors.toSet());</span>
+    }
+
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L1344">        return new ToStringBuilder(this)</span>
+<span class="fc" id="L1345">            .append(&quot;cfId&quot;, cfId)</span>
+<span class="fc" id="L1346">            .append(&quot;ksName&quot;, ksName)</span>
+<span class="fc" id="L1347">            .append(&quot;cfName&quot;, cfName)</span>
+<span class="fc" id="L1348">            .append(&quot;flags&quot;, flags)</span>
+<span class="fc" id="L1349">            .append(&quot;params&quot;, params)</span>
+<span class="fc" id="L1350">            .append(&quot;comparator&quot;, comparator)</span>
+<span class="fc" id="L1351">            .append(&quot;partitionColumns&quot;, partitionColumns)</span>
+<span class="fc" id="L1352">            .append(&quot;partitionKeyColumns&quot;, partitionKeyColumns)</span>
+<span class="fc" id="L1353">            .append(&quot;clusteringColumns&quot;, clusteringColumns)</span>
+<span class="fc" id="L1354">            .append(&quot;keyValidator&quot;, keyValidator)</span>
+<span class="fc" id="L1355">            .append(&quot;columnMetadata&quot;, columnMetadata.values())</span>
+<span class="fc" id="L1356">            .append(&quot;droppedColumns&quot;, droppedColumns)</span>
+<span class="fc" id="L1357">            .append(&quot;triggers&quot;, triggers)</span>
+<span class="fc" id="L1358">            .append(&quot;indexes&quot;, indexes)</span>
+<span class="fc" id="L1359">            .toString();</span>
+    }
+
+    public static class Builder
+    {
+        private final String keyspace;
+        private final String table;
+        private final boolean isDense;
+        private final boolean isCompound;
+        private final boolean isSuper;
+        private final boolean isCounter;
+        private final boolean isView;
+        private Optional&lt;IPartitioner&gt; partitioner;
+
+        private UUID tableId;
+
+<span class="fc" id="L1375">        private final List&lt;Pair&lt;ColumnIdentifier, AbstractType&gt;&gt; partitionKeys = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1376">        private final List&lt;Pair&lt;ColumnIdentifier, AbstractType&gt;&gt; clusteringColumns = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1377">        private final List&lt;Pair&lt;ColumnIdentifier, AbstractType&gt;&gt; staticColumns = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1378">        private final List&lt;Pair&lt;ColumnIdentifier, AbstractType&gt;&gt; regularColumns = new ArrayList&lt;&gt;();</span>
+
+        private Builder(String keyspace, String table, boolean isDense, boolean isCompound, boolean isSuper, boolean isCounter, boolean isView)
+<span class="fc" id="L1381">        {</span>
+<span class="fc" id="L1382">            this.keyspace = keyspace;</span>
+<span class="fc" id="L1383">            this.table = table;</span>
+<span class="fc" id="L1384">            this.isDense = isDense;</span>
+<span class="fc" id="L1385">            this.isCompound = isCompound;</span>
+<span class="fc" id="L1386">            this.isSuper = isSuper;</span>
+<span class="fc" id="L1387">            this.isCounter = isCounter;</span>
+<span class="fc" id="L1388">            this.isView = isView;</span>
+<span class="fc" id="L1389">            this.partitioner = Optional.empty();</span>
+<span class="fc" id="L1390">        }</span>
+
+        public static Builder create(String keyspace, String table)
+        {
+<span class="fc" id="L1394">            return create(keyspace, table, false, true, false);</span>
+        }
+
+        public static Builder create(String keyspace, String table, boolean isDense, boolean isCompound, boolean isCounter)
+        {
+<span class="fc" id="L1399">            return create(keyspace, table, isDense, isCompound, false, isCounter);</span>
+        }
+
+        public static Builder create(String keyspace, String table, boolean isDense, boolean isCompound, boolean isSuper, boolean isCounter)
+        {
+<span class="fc" id="L1404">            return new Builder(keyspace, table, isDense, isCompound, isSuper, isCounter, false);</span>
+        }
+
+        public static Builder createView(String keyspace, String table)
+        {
+<span class="nc" id="L1409">            return new Builder(keyspace, table, false, true, false, false, true);</span>
+        }
+
+        public static Builder createDense(String keyspace, String table, boolean isCompound, boolean isCounter)
+        {
+<span class="nc" id="L1414">            return create(keyspace, table, true, isCompound, isCounter);</span>
+        }
+
+        public static Builder createSuper(String keyspace, String table, boolean isCounter)
+        {
+<span class="nc" id="L1419">            return create(keyspace, table, true, true, true, isCounter);</span>
+        }
+
+        public Builder withPartitioner(IPartitioner partitioner)
+        {
+<span class="nc" id="L1424">            this.partitioner = Optional.ofNullable(partitioner);</span>
+<span class="nc" id="L1425">            return this;</span>
+        }
+
+        public Builder withId(UUID tableId)
+        {
+<span class="fc" id="L1430">            this.tableId = tableId;</span>
+<span class="fc" id="L1431">            return this;</span>
+        }
+
+        public Builder addPartitionKey(String name, AbstractType type)
+        {
+<span class="fc" id="L1436">            return addPartitionKey(ColumnIdentifier.getInterned(name, false), type);</span>
+        }
+
+        public Builder addPartitionKey(ColumnIdentifier name, AbstractType type)
+        {
+<span class="fc" id="L1441">            this.partitionKeys.add(Pair.create(name, type));</span>
+<span class="fc" id="L1442">            return this;</span>
+        }
+
+        public Builder addClusteringColumn(String name, AbstractType type)
+        {
+<span class="fc" id="L1447">            return addClusteringColumn(ColumnIdentifier.getInterned(name, false), type);</span>
+        }
+
+        public Builder addClusteringColumn(ColumnIdentifier name, AbstractType type)
+        {
+<span class="fc" id="L1452">            this.clusteringColumns.add(Pair.create(name, type));</span>
+<span class="fc" id="L1453">            return this;</span>
+        }
+
+        public Builder addRegularColumn(String name, AbstractType type)
+        {
+<span class="fc" id="L1458">            return addRegularColumn(ColumnIdentifier.getInterned(name, false), type);</span>
+        }
+
+        public Builder addRegularColumn(ColumnIdentifier name, AbstractType type)
+        {
+<span class="fc" id="L1463">            this.regularColumns.add(Pair.create(name, type));</span>
+<span class="fc" id="L1464">            return this;</span>
+        }
+
+        public boolean hasRegulars()
+        {
+<span class="fc bfc" id="L1469" title="All 2 branches covered.">            return !this.regularColumns.isEmpty();</span>
+        }
+
+        public Builder addStaticColumn(String name, AbstractType type)
+        {
+<span class="nc" id="L1474">            return addStaticColumn(ColumnIdentifier.getInterned(name, false), type);</span>
+        }
+
+        public Builder addStaticColumn(ColumnIdentifier name, AbstractType type)
+        {
+<span class="fc" id="L1479">            this.staticColumns.add(Pair.create(name, type));</span>
+<span class="fc" id="L1480">            return this;</span>
+        }
+
+        public Set&lt;String&gt; usedColumnNames()
+        {
+<span class="fc" id="L1485">            Set&lt;String&gt; usedNames = Sets.newHashSetWithExpectedSize(partitionKeys.size() + clusteringColumns.size() + staticColumns.size() + regularColumns.size());</span>
+<span class="fc bfc" id="L1486" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : partitionKeys)</span>
+<span class="fc" id="L1487">                usedNames.add(p.left.toString());</span>
+<span class="fc bfc" id="L1488" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : clusteringColumns)</span>
+<span class="fc" id="L1489">                usedNames.add(p.left.toString());</span>
+<span class="fc bfc" id="L1490" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : staticColumns)</span>
+<span class="fc" id="L1491">                usedNames.add(p.left.toString());</span>
+<span class="fc bfc" id="L1492" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : regularColumns)</span>
+<span class="fc" id="L1493">                usedNames.add(p.left.toString());</span>
+<span class="fc" id="L1494">            return usedNames;</span>
+        }
+
+        public CFMetaData build()
+        {
+<span class="fc bfc" id="L1499" title="All 2 branches covered.">            if (tableId == null)</span>
+<span class="fc" id="L1500">                tableId = UUIDGen.getTimeUUID();</span>
+
+<span class="fc" id="L1502">            List&lt;ColumnDefinition&gt; partitions = new ArrayList&lt;&gt;(partitionKeys.size());</span>
+<span class="fc" id="L1503">            List&lt;ColumnDefinition&gt; clusterings = new ArrayList&lt;&gt;(clusteringColumns.size());</span>
+<span class="fc" id="L1504">            PartitionColumns.Builder builder = PartitionColumns.builder();</span>
+
+<span class="fc bfc" id="L1506" title="All 2 branches covered.">            for (int i = 0; i &lt; partitionKeys.size(); i++)</span>
+            {
+<span class="fc" id="L1508">                Pair&lt;ColumnIdentifier, AbstractType&gt; p = partitionKeys.get(i);</span>
+<span class="fc" id="L1509">                partitions.add(new ColumnDefinition(keyspace, table, p.left, p.right, i, ColumnDefinition.Kind.PARTITION_KEY));</span>
+            }
+
+<span class="fc bfc" id="L1512" title="All 2 branches covered.">            for (int i = 0; i &lt; clusteringColumns.size(); i++)</span>
+            {
+<span class="fc" id="L1514">                Pair&lt;ColumnIdentifier, AbstractType&gt; p = clusteringColumns.get(i);</span>
+<span class="fc" id="L1515">                clusterings.add(new ColumnDefinition(keyspace, table, p.left, p.right, i, ColumnDefinition.Kind.CLUSTERING));</span>
+            }
+
+<span class="fc bfc" id="L1518" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : regularColumns)</span>
+<span class="fc" id="L1519">                builder.add(new ColumnDefinition(keyspace, table, p.left, p.right, ColumnDefinition.NO_POSITION, ColumnDefinition.Kind.REGULAR));</span>
+
+<span class="fc bfc" id="L1521" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, AbstractType&gt; p : staticColumns)</span>
+<span class="fc" id="L1522">                builder.add(new ColumnDefinition(keyspace, table, p.left, p.right, ColumnDefinition.NO_POSITION, ColumnDefinition.Kind.STATIC));</span>
+
+<span class="fc" id="L1524">            return new CFMetaData(keyspace,</span>
+                                  table,
+                                  tableId,
+                                  isSuper,
+                                  isCounter,
+                                  isDense,
+                                  isCompound,
+                                  isView,
+                                  partitions,
+                                  clusterings,
+<span class="fc" id="L1534">                                  builder.build(),</span>
+<span class="fc" id="L1535">                                  partitioner.orElseGet(DatabaseDescriptor::getPartitioner),</span>
+                                  null,
+                                  null);
+        }
+    }
+
+<span class="fc" id="L1541">    public static class Serializer</span>
+    {
+        public void serialize(CFMetaData metadata, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L1545">            UUIDSerializer.serializer.serialize(metadata.cfId, out, version);</span>
+<span class="fc" id="L1546">        }</span>
+
+        public CFMetaData deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L1550">            UUID cfId = UUIDSerializer.serializer.deserialize(in, version);</span>
+<span class="fc" id="L1551">            CFMetaData metadata = Schema.instance.getCFMetaData(cfId);</span>
+<span class="pc bpc" id="L1552" title="1 of 2 branches missed.">            if (metadata == null)</span>
+            {
+<span class="nc" id="L1554">                String message = String.format(&quot;Couldn't find table for cfId %s. If a table was just &quot; +</span>
+                        &quot;created, this is likely due to the schema not being fully propagated.  Please wait for schema &quot; +
+                        &quot;agreement on table creation.&quot;, cfId);
+<span class="nc" id="L1557">                throw new UnknownColumnFamilyException(message, cfId);</span>
+            }
+
+<span class="fc" id="L1560">            return metadata;</span>
+        }
+
+        public long serializedSize(CFMetaData metadata, int version)
+        {
+<span class="fc" id="L1565">            return UUIDSerializer.serializer.serializedSize(metadata.cfId, version);</span>
+        }
+    }
+
+    public static class DroppedColumn
+    {
+        // we only allow dropping REGULAR columns, from CQL-native tables, so the names are always of UTF8Type
+        public final String name;
+        public final AbstractType&lt;?&gt; type;
+
+        // drop timestamp, in microseconds, yet with millisecond granularity
+        public final long droppedTime;
+
+        @Nullable
+        public final ColumnDefinition.Kind kind;
+
+        public DroppedColumn(String name, ColumnDefinition.Kind kind, AbstractType&lt;?&gt; type, long droppedTime)
+<span class="nc" id="L1582">        {</span>
+<span class="nc" id="L1583">            this.name = name;</span>
+<span class="nc" id="L1584">            this.kind = kind;</span>
+<span class="nc" id="L1585">            this.type = type;</span>
+<span class="nc" id="L1586">            this.droppedTime = droppedTime;</span>
+<span class="nc" id="L1587">        }</span>
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">            if (this == o)</span>
+<span class="nc" id="L1593">                return true;</span>
+
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">            if (!(o instanceof DroppedColumn))</span>
+<span class="nc" id="L1596">                return false;</span>
+
+<span class="nc" id="L1598">            DroppedColumn dc = (DroppedColumn) o;</span>
+
+<span class="nc bnc" id="L1600" title="All 4 branches missed.">            return name.equals(dc.name)</span>
+                &amp;&amp; kind == dc.kind
+<span class="nc bnc" id="L1602" title="All 4 branches missed.">                &amp;&amp; type.equals(dc.type)</span>
+                &amp;&amp; droppedTime == dc.droppedTime;
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L1609">            return Objects.hashCode(name, kind, type, droppedTime);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1615">            return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L1616">                              .add(&quot;name&quot;, name)</span>
+<span class="nc" id="L1617">                              .add(&quot;kind&quot;, kind)</span>
+<span class="nc" id="L1618">                              .add(&quot;type&quot;, type)</span>
+<span class="nc" id="L1619">                              .add(&quot;droppedTime&quot;, droppedTime)</span>
+<span class="nc" id="L1620">                              .toString();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

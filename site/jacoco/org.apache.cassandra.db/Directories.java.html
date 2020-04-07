@@ -1,0 +1,1070 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Directories.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">Directories.java</span></div><h1>Directories.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOError;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BiFunction;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.FSDiskFullWriteError;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.utils.DirectorySizeCalculator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Encapsulate handling of paths to the data files.
+ *
+ * &lt;pre&gt; {@code
+ *   /&lt;path_to_data_dir&gt;/ks/&lt;cf dir&gt;/ks-cf1-jb-1-Data.db
+ *                         /&lt;cf dir&gt;/la-2-Data.db
+ *                         /&lt;cf dir&gt;/.&lt;index name&gt;/ks-cf1.idx-jb-1-Data.db
+ *                         /&lt;cf dir&gt;/.&lt;index name&gt;/la-1-Data.db
+ *                         ...
+ * } &lt;/pre&gt;
+ *
+ * Until v2.0, {@code &lt;cf dir&gt;} is just column family name.
+ * Since v2.1, {@code &lt;cf dir&gt;} has column family ID(cfId) added to its end.
+ *
+ * SSTables from secondary indexes were put in the same directory as their parent.
+ * Since v2.2, they have their own directory under the parent directory whose name is index name.
+ * Upon startup, those secondary index files are moved to new directory when upgrading.
+ *
+ * For backward compatibility, Directories can use directory without cfId if exists.
+ *
+ * In addition, more that one 'root' data directory can be specified so that
+ * {@code &lt;path_to_data_dir&gt;} potentially represents multiple locations.
+ * Note that in the case of multiple locations, the manifest for the leveled
+ * compaction is only in one of the location.
+ *
+ * Snapshots (resp. backups) are always created along the sstables there are
+ * snapshotted (resp. backuped) but inside a subdirectory named 'snapshots'
+ * (resp. backups) (and snapshots are further inside a subdirectory of the name
+ * of the snapshot). For secondary indexes, snapshots (backups) are not created in
+ * their own directory, but are in their parent's snapshot (backup) directory.
+ *
+ * This class abstracts all those details from the rest of the code.
+ */
+public class Directories
+{
+<span class="fc" id="L87">    private static final Logger logger = LoggerFactory.getLogger(Directories.class);</span>
+
+    public static final String BACKUPS_SUBDIR = &quot;backups&quot;;
+    public static final String SNAPSHOT_SUBDIR = &quot;snapshots&quot;;
+    public static final String TMP_SUBDIR = &quot;tmp&quot;;
+    public static final String SECONDARY_INDEX_NAME_SEPARATOR = &quot;.&quot;;
+
+    public static final DataDirectory[] dataDirectories;
+
+    static
+    {
+<span class="fc" id="L98">        String[] locations = DatabaseDescriptor.getAllDataFileLocations();</span>
+<span class="fc" id="L99">        dataDirectories = new DataDirectory[locations.length];</span>
+<span class="fc bfc" id="L100" title="All 2 branches covered.">        for (int i = 0; i &lt; locations.length; ++i)</span>
+<span class="fc" id="L101">            dataDirectories[i] = new DataDirectory(new File(locations[i]));</span>
+<span class="fc" id="L102">    }</span>
+
+    /**
+     * Checks whether Cassandra has RWX permissions to the specified directory.  Logs an error with
+     * the details if it does not.
+     *
+     * @param dir File object of the directory.
+     * @param dataDir String representation of the directory's location
+     * @return status representing Cassandra's RWX permissions to the supplied folder location.
+     */
+    public static boolean verifyFullPermissions(File dir, String dataDir)
+    {
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        if (!dir.isDirectory())</span>
+        {
+<span class="nc" id="L116">            logger.error(&quot;Not a directory {}&quot;, dataDir);</span>
+<span class="nc" id="L117">            return false;</span>
+        }
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">        else if (!FileAction.hasPrivilege(dir, FileAction.X))</span>
+        {
+<span class="nc" id="L121">            logger.error(&quot;Doesn't have execute permissions for {} directory&quot;, dataDir);</span>
+<span class="nc" id="L122">            return false;</span>
+        }
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">        else if (!FileAction.hasPrivilege(dir, FileAction.R))</span>
+        {
+<span class="nc" id="L126">            logger.error(&quot;Doesn't have read permissions for {} directory&quot;, dataDir);</span>
+<span class="nc" id="L127">            return false;</span>
+        }
+<span class="pc bpc" id="L129" title="2 of 4 branches missed.">        else if (dir.exists() &amp;&amp; !FileAction.hasPrivilege(dir, FileAction.W))</span>
+        {
+<span class="nc" id="L131">            logger.error(&quot;Doesn't have write permissions for {} directory&quot;, dataDir);</span>
+<span class="nc" id="L132">            return false;</span>
+        }
+
+<span class="fc" id="L135">        return true;</span>
+    }
+
+<span class="fc" id="L138">    public enum FileAction</span>
+    {
+<span class="fc" id="L140">        X, W, XW, R, XR, RW, XRW;</span>
+
+        FileAction()
+        {
+        }
+
+        public static boolean hasPrivilege(File file, FileAction action)
+        {
+<span class="fc" id="L148">            boolean privilege = false;</span>
+
+<span class="pc bpc" id="L150" title="5 of 8 branches missed.">            switch (action)</span>
+            {
+                case X:
+<span class="fc" id="L153">                    privilege = file.canExecute();</span>
+<span class="fc" id="L154">                    break;</span>
+                case W:
+<span class="fc" id="L156">                    privilege = file.canWrite();</span>
+<span class="fc" id="L157">                    break;</span>
+                case XW:
+<span class="nc bnc" id="L159" title="All 4 branches missed.">                    privilege = file.canExecute() &amp;&amp; file.canWrite();</span>
+<span class="nc" id="L160">                    break;</span>
+                case R:
+<span class="fc" id="L162">                    privilege = file.canRead();</span>
+<span class="fc" id="L163">                    break;</span>
+                case XR:
+<span class="nc bnc" id="L165" title="All 4 branches missed.">                    privilege = file.canExecute() &amp;&amp; file.canRead();</span>
+<span class="nc" id="L166">                    break;</span>
+                case RW:
+<span class="nc bnc" id="L168" title="All 4 branches missed.">                    privilege = file.canRead() &amp;&amp; file.canWrite();</span>
+<span class="nc" id="L169">                    break;</span>
+                case XRW:
+<span class="nc bnc" id="L171" title="All 6 branches missed.">                    privilege = file.canExecute() &amp;&amp; file.canRead() &amp;&amp; file.canWrite();</span>
+                    break;
+            }
+<span class="fc" id="L174">            return privilege;</span>
+        }
+    }
+
+    private final CFMetaData metadata;
+    private final DataDirectory[] paths;
+    private final File[] dataPaths;
+    private final ImmutableMap&lt;Path, DataDirectory&gt; canonicalPathToDD;
+
+    public Directories(final CFMetaData metadata)
+    {
+<span class="nc" id="L185">        this(metadata, dataDirectories);</span>
+<span class="nc" id="L186">    }</span>
+
+    public Directories(final CFMetaData metadata, Collection&lt;DataDirectory&gt; paths)
+    {
+<span class="nc" id="L190">        this(metadata, paths.toArray(new DataDirectory[paths.size()]));</span>
+<span class="nc" id="L191">    }</span>
+
+    /**
+     * Create Directories of given ColumnFamily.
+     * SSTable directories are created under data_directories defined in cassandra.yaml if not exist at this time.
+     *
+     * @param metadata metadata of ColumnFamily
+     */
+    public Directories(final CFMetaData metadata, DataDirectory[] paths)
+<span class="fc" id="L200">    {</span>
+<span class="fc" id="L201">        this.metadata = metadata;</span>
+<span class="fc" id="L202">        this.paths = paths;</span>
+
+<span class="fc" id="L204">        ImmutableMap.Builder&lt;Path, DataDirectory&gt; canonicalPathsBuilder = ImmutableMap.builder();</span>
+
+<span class="fc" id="L206">        String cfId = ByteBufferUtil.bytesToHex(ByteBufferUtil.bytes(metadata.cfId));</span>
+<span class="fc" id="L207">        int idx = metadata.cfName.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        String cfName = idx &gt;= 0 ? metadata.cfName.substring(0, idx) : metadata.cfName;</span>
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">        String indexNameWithDot = idx &gt;= 0 ? metadata.cfName.substring(idx) : null;</span>
+
+<span class="fc" id="L211">        this.dataPaths = new File[paths.length];</span>
+        // If upgraded from version less than 2.1, use existing directories
+<span class="fc" id="L213">        String oldSSTableRelativePath = join(metadata.ksName, cfName);</span>
+<span class="fc bfc" id="L214" title="All 2 branches covered.">        for (int i = 0; i &lt; paths.length; ++i)</span>
+        {
+            // check if old SSTable directory exists
+<span class="fc" id="L217">            File dataPath = new File(paths[i].location, oldSSTableRelativePath);</span>
+<span class="fc" id="L218">            dataPaths[i] = dataPath;</span>
+<span class="fc" id="L219">            canonicalPathsBuilder.put(Paths.get(FileUtils.getCanonicalPath(dataPath)), paths[i]);</span>
+        }
+<span class="fc" id="L221">        boolean olderDirectoryExists = Iterables.any(Arrays.asList(dataPaths), File::exists);</span>
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">        if (!olderDirectoryExists)</span>
+        {
+<span class="fc" id="L224">            canonicalPathsBuilder = ImmutableMap.builder();</span>
+            // use 2.1+ style
+<span class="fc" id="L226">            String newSSTableRelativePath = join(metadata.ksName, cfName + '-' + cfId);</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            for (int i = 0; i &lt; paths.length; ++i)</span>
+            {
+<span class="fc" id="L229">                File dataPath = new File(paths[i].location, newSSTableRelativePath);;</span>
+<span class="fc" id="L230">                dataPaths[i] = dataPath;</span>
+<span class="fc" id="L231">                canonicalPathsBuilder.put(Paths.get(FileUtils.getCanonicalPath(dataPath)), paths[i]);</span>
+            }
+        }
+        // if index, then move to its own directory
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">        if (indexNameWithDot != null)</span>
+        {
+<span class="nc" id="L237">            canonicalPathsBuilder = ImmutableMap.builder();</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            for (int i = 0; i &lt; paths.length; ++i)</span>
+            {
+<span class="nc" id="L240">                File dataPath = new File(dataPaths[i], indexNameWithDot);</span>
+<span class="nc" id="L241">                dataPaths[i] = dataPath;</span>
+<span class="nc" id="L242">                canonicalPathsBuilder.put(Paths.get(FileUtils.getCanonicalPath(dataPath)), paths[i]);</span>
+            }
+        }
+
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        for (File dir : dataPaths)</span>
+        {
+            try
+            {
+<span class="fc" id="L250">                FileUtils.createDirectory(dir);</span>
+            }
+<span class="nc" id="L252">            catch (FSError e)</span>
+            {
+                // don't just let the default exception handler do this, we need the create loop to continue
+<span class="nc" id="L255">                logger.error(&quot;Failed to create {} directory&quot;, dir);</span>
+<span class="nc" id="L256">                FileUtils.handleFSError(e);</span>
+<span class="fc" id="L257">            }</span>
+        }
+
+        // if index, move existing older versioned SSTable files to new directory
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">        if (indexNameWithDot != null)</span>
+        {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            for (File dataPath : dataPaths)</span>
+            {
+<span class="nc" id="L265">                File[] indexFiles = dataPath.getParentFile().listFiles(new FileFilter()</span>
+<span class="nc" id="L266">                {</span>
+                    @Override
+                    public boolean accept(File file)
+                    {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                        if (file.isDirectory())</span>
+<span class="nc" id="L271">                            return false;</span>
+
+<span class="nc" id="L273">                        Pair&lt;Descriptor, Component&gt; pair = SSTable.tryComponentFromFilename(file.getParentFile(),</span>
+<span class="nc" id="L274">                                                                                            file.getName());</span>
+<span class="nc bnc" id="L275" title="All 6 branches missed.">                        return pair != null &amp;&amp; pair.left.ksname.equals(metadata.ksName) &amp;&amp; pair.left.cfname.equals(metadata.cfName);</span>
+
+                    }
+                });
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                for (File indexFile : indexFiles)</span>
+                {
+<span class="nc" id="L281">                    File destFile = new File(dataPath, indexFile.getName());</span>
+<span class="nc" id="L282">                    logger.trace(&quot;Moving index file {} to {}&quot;, indexFile, destFile);</span>
+<span class="nc" id="L283">                    FileUtils.renameWithConfirm(indexFile, destFile);</span>
+                }
+            }
+        }
+<span class="fc" id="L287">        canonicalPathToDD = canonicalPathsBuilder.build();</span>
+<span class="fc" id="L288">    }</span>
+
+    /**
+     * Returns SSTable location which is inside given data directory.
+     *
+     * @param dataDirectory
+     * @return SSTable location
+     */
+    public File getLocationForDisk(DataDirectory dataDirectory)
+    {
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">        if (dataDirectory != null)</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">            for (File dir : dataPaths)</span>
+            {
+                // Note that we must compare absolute paths (not canonical) here since keyspace directories might be symlinks
+<span class="fc" id="L302">                Path dirPath = Paths.get(dir.getAbsolutePath());</span>
+<span class="fc" id="L303">                Path locationPath = Paths.get(dataDirectory.location.getAbsolutePath());</span>
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">                if (dirPath.startsWith(locationPath))</span>
+<span class="fc" id="L305">                    return dir;</span>
+            }
+<span class="nc" id="L307">        return null;</span>
+    }
+
+    public DataDirectory getDataDirectoryForFile(Descriptor descriptor)
+    {
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">        if (descriptor != null)</span>
+<span class="fc" id="L313">            return canonicalPathToDD.get(descriptor.directory.toPath());</span>
+<span class="nc" id="L314">        return null;</span>
+    }
+
+    public Descriptor find(String filename)
+    {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        for (File dir : dataPaths)</span>
+        {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (new File(dir, filename).exists())</span>
+<span class="nc" id="L322">                return Descriptor.fromFilename(dir, filename).left;</span>
+        }
+<span class="nc" id="L324">        return null;</span>
+    }
+
+    /**
+     * Basically the same as calling {@link #getWriteableLocationAsFile(long)} with an unknown size ({@code -1L}),
+     * which may return any non-blacklisted directory - even a data directory that has no usable space.
+     * Do not use this method in production code.
+     *
+     * @throws FSWriteError if all directories are blacklisted.
+     */
+    public File getDirectoryForNewSSTables()
+    {
+<span class="nc" id="L336">        return getWriteableLocationAsFile(-1L);</span>
+    }
+
+    /**
+     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space.
+     *
+     * @throws FSWriteError if all directories are blacklisted.
+     */
+    public File getWriteableLocationAsFile(long writeSize)
+    {
+<span class="fc" id="L346">        File location = getLocationForDisk(getWriteableLocation(writeSize));</span>
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">        if (location == null)</span>
+<span class="nc" id="L348">            throw new FSWriteError(new IOException(&quot;No configured data directory contains enough space to write &quot; + writeSize + &quot; bytes&quot;), &quot;&quot;);</span>
+<span class="fc" id="L349">        return location;</span>
+    }
+
+    /**
+     * Returns a temporary subdirectory on non-blacklisted data directory
+     * that _currently_ has {@code writeSize} bytes as usable space.
+     * This method does not create the temporary directory.
+     *
+     * @throws IOError if all directories are blacklisted.
+     */
+    public File getTemporaryWriteableDirectoryAsFile(long writeSize)
+    {
+<span class="nc" id="L361">        File location = getLocationForDisk(getWriteableLocation(writeSize));</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (location == null)</span>
+<span class="nc" id="L363">            return null;</span>
+<span class="nc" id="L364">        return new File(location, TMP_SUBDIR);</span>
+    }
+
+    public void removeTemporaryDirectories()
+    {
+<span class="fc bfc" id="L369" title="All 2 branches covered.">        for (File dataDir : dataPaths)</span>
+        {
+<span class="fc" id="L371">            File tmpDir = new File(dataDir, TMP_SUBDIR);</span>
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">            if (tmpDir.exists())</span>
+            {
+<span class="nc" id="L374">                logger.debug(&quot;Removing temporary directory {}&quot;, tmpDir);</span>
+<span class="nc" id="L375">                FileUtils.deleteRecursive(tmpDir);</span>
+            }
+        }
+<span class="fc" id="L378">    }</span>
+
+    /**
+     * Returns a non-blacklisted data directory that _currently_ has {@code writeSize} bytes as usable space, null if
+     * there is not enough space left in all directories.
+     *
+     * @throws FSWriteError if all directories are blacklisted.
+     */
+    public DataDirectory getWriteableLocation(long writeSize)
+    {
+<span class="fc" id="L388">        List&lt;DataDirectoryCandidate&gt; candidates = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L390">        long totalAvailable = 0L;</span>
+
+        // pick directories with enough space and so that resulting sstable dirs aren't blacklisted for writes.
+<span class="fc" id="L393">        boolean tooBig = false;</span>
+<span class="fc bfc" id="L394" title="All 2 branches covered.">        for (DataDirectory dataDir : paths)</span>
+        {
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">            if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))</span>
+            {
+<span class="nc" id="L398">                logger.trace(&quot;removing blacklisted candidate {}&quot;, dataDir.location);</span>
+<span class="nc" id="L399">                continue;</span>
+            }
+<span class="fc" id="L401">            DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);</span>
+            // exclude directory if its total writeSize does not fit to data directory
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">            if (candidate.availableSpace &lt; writeSize)</span>
+            {
+<span class="nc" id="L405">                logger.trace(&quot;removing candidate {}, usable={}, requested={}&quot;, candidate.dataDirectory.location, candidate.availableSpace, writeSize);</span>
+<span class="nc" id="L406">                tooBig = true;</span>
+<span class="nc" id="L407">                continue;</span>
+            }
+<span class="fc" id="L409">            candidates.add(candidate);</span>
+<span class="fc" id="L410">            totalAvailable += candidate.availableSpace;</span>
+        }
+
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">        if (candidates.isEmpty())</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (tooBig)</span>
+<span class="nc" id="L415">                throw new FSDiskFullWriteError(new IOException(&quot;Insufficient disk space to write &quot; + writeSize + &quot; bytes&quot;), &quot;&quot;);</span>
+            else
+<span class="nc" id="L417">                throw new FSWriteError(new IOException(&quot;All configured data directories have been blacklisted as unwritable for erroring out&quot;), &quot;&quot;);</span>
+
+        // shortcut for single data directory systems
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">        if (candidates.size() == 1)</span>
+<span class="fc" id="L421">            return candidates.get(0).dataDirectory;</span>
+
+<span class="nc" id="L423">        sortWriteableCandidates(candidates, totalAvailable);</span>
+
+<span class="nc" id="L425">        return pickWriteableDirectory(candidates);</span>
+    }
+
+    // separated for unit testing
+    static DataDirectory pickWriteableDirectory(List&lt;DataDirectoryCandidate&gt; candidates)
+    {
+        // weighted random
+<span class="nc" id="L432">        double rnd = ThreadLocalRandom.current().nextDouble();</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        for (DataDirectoryCandidate candidate : candidates)</span>
+        {
+<span class="nc" id="L435">            rnd -= candidate.perc;</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (rnd &lt;= 0)</span>
+<span class="nc" id="L437">                return candidate.dataDirectory;</span>
+<span class="nc" id="L438">        }</span>
+
+        // last resort
+<span class="nc" id="L441">        return candidates.get(0).dataDirectory;</span>
+    }
+
+    // separated for unit testing
+    static void sortWriteableCandidates(List&lt;DataDirectoryCandidate&gt; candidates, long totalAvailable)
+    {
+        // calculate free-space-percentage
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        for (DataDirectoryCandidate candidate : candidates)</span>
+<span class="nc" id="L449">            candidate.calcFreePerc(totalAvailable);</span>
+
+        // sort directories by perc
+<span class="nc" id="L452">        Collections.sort(candidates);</span>
+<span class="nc" id="L453">    }</span>
+
+    public boolean hasAvailableDiskSpace(long estimatedSSTables, long expectedTotalWriteSize)
+    {
+<span class="fc" id="L457">        long writeSize = expectedTotalWriteSize / estimatedSSTables;</span>
+<span class="fc" id="L458">        long totalAvailable = 0L;</span>
+
+<span class="fc bfc" id="L460" title="All 2 branches covered.">        for (DataDirectory dataDir : paths)</span>
+        {
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">            if (BlacklistedDirectories.isUnwritable(getLocationForDisk(dataDir)))</span>
+<span class="nc" id="L463">                continue;</span>
+<span class="fc" id="L464">            DataDirectoryCandidate candidate = new DataDirectoryCandidate(dataDir);</span>
+            // exclude directory if its total writeSize does not fit to data directory
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">            if (candidate.availableSpace &lt; writeSize)</span>
+<span class="nc" id="L467">                continue;</span>
+<span class="fc" id="L468">            totalAvailable += candidate.availableSpace;</span>
+        }
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">        return totalAvailable &gt; expectedTotalWriteSize;</span>
+    }
+
+    public DataDirectory[] getWriteableLocations()
+    {
+<span class="fc" id="L475">        List&lt;DataDirectory&gt; nonBlacklistedDirs = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L476" title="All 2 branches covered.">        for (DataDirectory dir : paths)</span>
+        {
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">            if (!BlacklistedDirectories.isUnwritable(dir.location))</span>
+<span class="fc" id="L479">                nonBlacklistedDirs.add(dir);</span>
+        }
+
+<span class="fc" id="L482">        Collections.sort(nonBlacklistedDirs, new Comparator&lt;DataDirectory&gt;()</span>
+<span class="fc" id="L483">        {</span>
+            @Override
+            public int compare(DataDirectory o1, DataDirectory o2)
+            {
+<span class="nc" id="L487">                return o1.location.compareTo(o2.location);</span>
+            }
+        });
+<span class="fc" id="L490">        return nonBlacklistedDirs.toArray(new DataDirectory[nonBlacklistedDirs.size()]);</span>
+    }
+
+    public static File getSnapshotDirectory(Descriptor desc, String snapshotName)
+    {
+<span class="nc" id="L495">        return getSnapshotDirectory(desc.directory, snapshotName);</span>
+    }
+
+    /**
+     * Returns directory to write snapshot. If directory does not exist, then one is created.
+     *
+     * If given {@code location} indicates secondary index, this will return
+     * {@code &lt;cf dir&gt;/snapshots/&lt;snapshot name&gt;/.&lt;index name&gt;}.
+     * Otherwise, this will return {@code &lt;cf dir&gt;/snapshots/&lt;snapshot name&gt;}.
+     *
+     * @param location base directory
+     * @param snapshotName snapshot name
+     * @return directory to write snapshot
+     */
+    public static File getSnapshotDirectory(File location, String snapshotName)
+    {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (location.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))</span>
+        {
+<span class="nc" id="L513">            return getOrCreate(location.getParentFile(), SNAPSHOT_SUBDIR, snapshotName, location.getName());</span>
+        }
+        else
+        {
+<span class="nc" id="L517">            return getOrCreate(location, SNAPSHOT_SUBDIR, snapshotName);</span>
+        }
+    }
+
+    public File getSnapshotManifestFile(String snapshotName)
+    {
+<span class="nc" id="L523">        File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);</span>
+<span class="nc" id="L524">        return new File(snapshotDir, &quot;manifest.json&quot;);</span>
+    }
+
+    public File getSnapshotSchemaFile(String snapshotName)
+    {
+<span class="nc" id="L529">        File snapshotDir = getSnapshotDirectory(getDirectoryForNewSSTables(), snapshotName);</span>
+<span class="nc" id="L530">        return new File(snapshotDir, &quot;schema.cql&quot;);</span>
+    }
+
+    public File getNewEphemeralSnapshotMarkerFile(String snapshotName)
+    {
+<span class="nc" id="L535">        File snapshotDir = new File(getWriteableLocationAsFile(1L), join(SNAPSHOT_SUBDIR, snapshotName));</span>
+<span class="nc" id="L536">        return getEphemeralSnapshotMarkerFile(snapshotDir);</span>
+    }
+
+    private static File getEphemeralSnapshotMarkerFile(File snapshotDirectory)
+    {
+<span class="nc" id="L541">        return new File(snapshotDirectory, &quot;ephemeral.snapshot&quot;);</span>
+    }
+
+    public static File getBackupsDirectory(Descriptor desc)
+    {
+<span class="nc" id="L546">        return getBackupsDirectory(desc.directory);</span>
+    }
+
+    public static File getBackupsDirectory(File location)
+    {
+<span class="pc bpc" id="L551" title="1 of 2 branches missed.">        if (location.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))</span>
+        {
+<span class="nc" id="L553">            return getOrCreate(location.getParentFile(), BACKUPS_SUBDIR, location.getName());</span>
+        }
+        else
+        {
+<span class="fc" id="L557">            return getOrCreate(location, BACKUPS_SUBDIR);</span>
+        }
+    }
+
+    public static class DataDirectory
+    {
+        public final File location;
+
+        public DataDirectory(File location)
+<span class="fc" id="L566">        {</span>
+<span class="fc" id="L567">            this.location = location;</span>
+<span class="fc" id="L568">        }</span>
+
+        public long getAvailableSpace()
+        {
+<span class="fc" id="L572">            long availableSpace = FileUtils.getUsableSpace(location) - DatabaseDescriptor.getMinFreeSpacePerDriveInBytes();</span>
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">            return availableSpace &gt; 0 ? availableSpace : 0;</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L580" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L582">            DataDirectory that = (DataDirectory) o;</span>
+
+<span class="nc" id="L584">            return location.equals(that.location);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L590">            return location.hashCode();</span>
+        }
+
+        public String toString()
+        {
+<span class="fc" id="L595">            return &quot;DataDirectory{&quot; +</span>
+                   &quot;location=&quot; + location +
+                   '}';
+        }
+    }
+
+    static final class DataDirectoryCandidate implements Comparable&lt;DataDirectoryCandidate&gt;
+    {
+        final DataDirectory dataDirectory;
+        final long availableSpace;
+        double perc;
+
+        public DataDirectoryCandidate(DataDirectory dataDirectory)
+<span class="fc" id="L608">        {</span>
+<span class="fc" id="L609">            this.dataDirectory = dataDirectory;</span>
+<span class="fc" id="L610">            this.availableSpace = dataDirectory.getAvailableSpace();</span>
+<span class="fc" id="L611">        }</span>
+
+        void calcFreePerc(long totalAvailableSpace)
+        {
+<span class="nc" id="L615">            double w = availableSpace;</span>
+<span class="nc" id="L616">            w /= totalAvailableSpace;</span>
+<span class="nc" id="L617">            perc = w;</span>
+<span class="nc" id="L618">        }</span>
+
+        public int compareTo(DataDirectoryCandidate o)
+        {
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            if (this == o)</span>
+<span class="nc" id="L623">                return 0;</span>
+
+<span class="nc" id="L625">            int r = Double.compare(perc, o.perc);</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">            if (r != 0)</span>
+<span class="nc" id="L627">                return -r;</span>
+            // last resort
+<span class="nc" id="L629">            return System.identityHashCode(this) - System.identityHashCode(o);</span>
+        }
+    }
+
+    /** The type of files that can be listed by SSTableLister, we never return txn logs,
+     * use LifecycleTransaction.getFiles() if you need txn logs. */
+<span class="fc" id="L635">    public enum FileType</span>
+    {
+        /** A permanent sstable file that is safe to use. */
+<span class="fc" id="L638">        FINAL,</span>
+
+        /** A temporary sstable file that will soon be deleted. */
+<span class="fc" id="L641">        TEMPORARY,</span>
+
+        /** A transaction log file (contains information on final and temporary files). */
+<span class="fc" id="L644">        TXN_LOG;</span>
+    }
+
+    /**
+     * How to handle a failure to read a txn log file. Note that we will try a few
+     * times before giving up.
+     **/
+<span class="fc" id="L651">    public enum OnTxnErr</span>
+    {
+        /** Throw the exception */
+<span class="fc" id="L654">        THROW,</span>
+
+        /** Ignore the problematic parts of the txn log file */
+<span class="fc" id="L657">        IGNORE</span>
+    }
+
+    public SSTableLister sstableLister(OnTxnErr onTxnErr)
+    {
+<span class="fc" id="L662">        return new SSTableLister(onTxnErr);</span>
+    }
+
+    public class SSTableLister
+    {
+        private final OnTxnErr onTxnErr;
+        private boolean skipTemporary;
+        private boolean includeBackups;
+        private boolean onlyBackups;
+        private int nbFiles;
+<span class="fc" id="L672">        private final Map&lt;Descriptor, Set&lt;Component&gt;&gt; components = new HashMap&lt;&gt;();</span>
+        private boolean filtered;
+        private String snapshotName;
+
+        private SSTableLister(OnTxnErr onTxnErr)
+<span class="fc" id="L677">        {</span>
+<span class="fc" id="L678">            this.onTxnErr = onTxnErr;</span>
+<span class="fc" id="L679">        }</span>
+
+        public SSTableLister skipTemporary(boolean b)
+        {
+<span class="pc bpc" id="L683" title="1 of 2 branches missed.">            if (filtered)</span>
+<span class="nc" id="L684">                throw new IllegalStateException(&quot;list() has already been called&quot;);</span>
+<span class="fc" id="L685">            skipTemporary = b;</span>
+<span class="fc" id="L686">            return this;</span>
+        }
+
+        public SSTableLister includeBackups(boolean b)
+        {
+<span class="pc bpc" id="L691" title="1 of 2 branches missed.">            if (filtered)</span>
+<span class="nc" id="L692">                throw new IllegalStateException(&quot;list() has already been called&quot;);</span>
+<span class="fc" id="L693">            includeBackups = b;</span>
+<span class="fc" id="L694">            return this;</span>
+        }
+
+        public SSTableLister onlyBackups(boolean b)
+        {
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            if (filtered)</span>
+<span class="nc" id="L700">                throw new IllegalStateException(&quot;list() has already been called&quot;);</span>
+<span class="nc" id="L701">            onlyBackups = b;</span>
+<span class="nc" id="L702">            includeBackups = b;</span>
+<span class="nc" id="L703">            return this;</span>
+        }
+
+        public SSTableLister snapshots(String sn)
+        {
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            if (filtered)</span>
+<span class="nc" id="L709">                throw new IllegalStateException(&quot;list() has already been called&quot;);</span>
+<span class="nc" id="L710">            snapshotName = sn;</span>
+<span class="nc" id="L711">            return this;</span>
+        }
+
+        public Map&lt;Descriptor, Set&lt;Component&gt;&gt; list()
+        {
+<span class="fc" id="L716">            filter();</span>
+<span class="fc" id="L717">            return ImmutableMap.copyOf(components);</span>
+        }
+
+        public List&lt;File&gt; listFiles()
+        {
+<span class="nc" id="L722">            filter();</span>
+<span class="nc" id="L723">            List&lt;File&gt; l = new ArrayList&lt;&gt;(nbFiles);</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            for (Map.Entry&lt;Descriptor, Set&lt;Component&gt;&gt; entry : components.entrySet())</span>
+            {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                for (Component c : entry.getValue())</span>
+                {
+<span class="nc" id="L728">                    l.add(new File(entry.getKey().filenameFor(c)));</span>
+<span class="nc" id="L729">                }</span>
+<span class="nc" id="L730">            }</span>
+<span class="nc" id="L731">            return l;</span>
+        }
+
+        private void filter()
+        {
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">            if (filtered)</span>
+<span class="nc" id="L737">                return;</span>
+
+<span class="fc bfc" id="L739" title="All 2 branches covered.">            for (File location : dataPaths)</span>
+            {
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">                if (BlacklistedDirectories.isUnreadable(location))</span>
+<span class="nc" id="L742">                    continue;</span>
+
+<span class="pc bpc" id="L744" title="1 of 2 branches missed.">                if (snapshotName != null)</span>
+                {
+<span class="nc" id="L746">                    LifecycleTransaction.getFiles(getSnapshotDirectory(location, snapshotName).toPath(), getFilter(), onTxnErr);</span>
+<span class="nc" id="L747">                    continue;</span>
+                }
+
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">                if (!onlyBackups)</span>
+<span class="fc" id="L751">                    LifecycleTransaction.getFiles(location.toPath(), getFilter(), onTxnErr);</span>
+
+<span class="fc bfc" id="L753" title="All 2 branches covered.">                if (includeBackups)</span>
+<span class="fc" id="L754">                    LifecycleTransaction.getFiles(getBackupsDirectory(location).toPath(), getFilter(), onTxnErr);</span>
+            }
+
+<span class="fc" id="L757">            filtered = true;</span>
+<span class="fc" id="L758">        }</span>
+
+        private BiFunction&lt;File, FileType, Boolean&gt; getFilter()
+        {
+            // This function always return false since it adds to the components map
+<span class="fc" id="L763">            return (file, type) -&gt;</span>
+            {
+<span class="nc bnc" id="L765" title="All 4 branches missed.">                switch (type)</span>
+                {
+                    case TXN_LOG:
+<span class="nc" id="L768">                        return false;</span>
+                    case TEMPORARY:
+<span class="nc bnc" id="L770" title="All 2 branches missed.">                        if (skipTemporary)</span>
+<span class="nc" id="L771">                            return false;</span>
+
+                    case FINAL:
+<span class="nc" id="L774">                        Pair&lt;Descriptor, Component&gt; pair = SSTable.tryComponentFromFilename(file.getParentFile(), file.getName());</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">                        if (pair == null)</span>
+<span class="nc" id="L776">                            return false;</span>
+
+                        // we are only interested in the SSTable files that belong to the specific ColumnFamily
+<span class="nc bnc" id="L779" title="All 4 branches missed.">                        if (!pair.left.ksname.equals(metadata.ksName) || !pair.left.cfname.equals(metadata.cfName))</span>
+<span class="nc" id="L780">                            return false;</span>
+
+<span class="nc" id="L782">                        Set&lt;Component&gt; previous = components.get(pair.left);</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">                        if (previous == null)</span>
+                        {
+<span class="nc" id="L785">                            previous = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L786">                            components.put(pair.left, previous);</span>
+                        }
+<span class="nc bnc" id="L788" title="All 2 branches missed.">                        else if (pair.right.type == Component.Type.DIGEST)</span>
+                        {
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                            if (pair.right != pair.left.digestComponent)</span>
+                            {
+                                // Need to update the DIGEST component as it might be set to another
+                                // digest type as a guess. This may happen if the first component is
+                                // not the DIGEST (but the Data component for example), so the digest
+                                // type is _guessed_ from the Version.
+                                // Although the Version explicitly defines the digest type, it doesn't
+                                // seem to be true under all circumstances. Generated sstables from a
+                                // post 2.1.8 snapshot produced Digest.sha1 files although Version
+                                // defines Adler32.
+                                // TL;DR this piece of code updates the digest component to be &quot;correct&quot;.
+<span class="nc" id="L801">                                components.remove(pair.left);</span>
+<span class="nc" id="L802">                                Descriptor updated = pair.left.withDigestComponent(pair.right);</span>
+<span class="nc" id="L803">                                components.put(updated, previous);</span>
+                            }
+                        }
+<span class="nc" id="L806">                        previous.add(pair.right);</span>
+<span class="nc" id="L807">                        nbFiles++;</span>
+<span class="nc" id="L808">                        return false;</span>
+
+                    default:
+<span class="nc" id="L811">                        throw new AssertionError();</span>
+                }
+            };
+        }
+    }
+
+    /**
+     *
+     * @return  Return a map of all snapshots to space being used
+     * The pair for a snapshot has size on disk and true size.
+     */
+    public Map&lt;String, Pair&lt;Long, Long&gt;&gt; getSnapshotDetails()
+    {
+<span class="nc" id="L824">        final Map&lt;String, Pair&lt;Long, Long&gt;&gt; snapshotSpaceMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L825" title="All 2 branches missed.">        for (File snapshot : listSnapshots())</span>
+        {
+<span class="nc" id="L827">            final long sizeOnDisk = FileUtils.folderSize(snapshot);</span>
+<span class="nc" id="L828">            final long trueSize = getTrueAllocatedSizeIn(snapshot);</span>
+<span class="nc" id="L829">            Pair&lt;Long, Long&gt; spaceUsed = snapshotSpaceMap.get(snapshot.getName());</span>
+<span class="nc bnc" id="L830" title="All 2 branches missed.">            if (spaceUsed == null)</span>
+<span class="nc" id="L831">                spaceUsed =  Pair.create(sizeOnDisk,trueSize);</span>
+            else
+<span class="nc" id="L833">                spaceUsed = Pair.create(spaceUsed.left + sizeOnDisk, spaceUsed.right + trueSize);</span>
+<span class="nc" id="L834">            snapshotSpaceMap.put(snapshot.getName(), spaceUsed);</span>
+<span class="nc" id="L835">        }</span>
+<span class="nc" id="L836">        return snapshotSpaceMap;</span>
+    }
+
+    public List&lt;String&gt; listEphemeralSnapshots()
+    {
+<span class="fc" id="L841">        final List&lt;String&gt; ephemeralSnapshots = new LinkedList&lt;&gt;();</span>
+<span class="pc bpc" id="L842" title="1 of 2 branches missed.">        for (File snapshot : listSnapshots())</span>
+        {
+<span class="nc bnc" id="L844" title="All 2 branches missed.">            if (getEphemeralSnapshotMarkerFile(snapshot).exists())</span>
+<span class="nc" id="L845">                ephemeralSnapshots.add(snapshot.getName());</span>
+<span class="nc" id="L846">        }</span>
+<span class="fc" id="L847">        return ephemeralSnapshots;</span>
+    }
+
+    private List&lt;File&gt; listSnapshots()
+    {
+<span class="fc" id="L852">        final List&lt;File&gt; snapshots = new LinkedList&lt;&gt;();</span>
+<span class="fc bfc" id="L853" title="All 2 branches covered.">        for (final File dir : dataPaths)</span>
+        {
+<span class="pc bpc" id="L855" title="1 of 2 branches missed.">            File snapshotDir = dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR) ?</span>
+<span class="pc" id="L856">                                       new File(dir.getParent(), SNAPSHOT_SUBDIR) :</span>
+                                       new File(dir, SNAPSHOT_SUBDIR);
+<span class="pc bpc" id="L858" title="3 of 4 branches missed.">            if (snapshotDir.exists() &amp;&amp; snapshotDir.isDirectory())</span>
+            {
+<span class="nc" id="L860">                final File[] snapshotDirs  = snapshotDir.listFiles();</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">                if (snapshotDirs != null)</span>
+                {
+<span class="nc bnc" id="L863" title="All 2 branches missed.">                    for (final File snapshot : snapshotDirs)</span>
+                    {
+<span class="nc bnc" id="L865" title="All 2 branches missed.">                        if (snapshot.isDirectory())</span>
+<span class="nc" id="L866">                            snapshots.add(snapshot);</span>
+                    }
+                }
+            }
+        }
+
+<span class="fc" id="L872">        return snapshots;</span>
+    }
+
+    public boolean snapshotExists(String snapshotName)
+    {
+<span class="nc bnc" id="L877" title="All 2 branches missed.">        for (File dir : dataPaths)</span>
+        {
+            File snapshotDir;
+<span class="nc bnc" id="L880" title="All 2 branches missed.">            if (dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR))</span>
+            {
+<span class="nc" id="L882">                snapshotDir = new File(dir.getParentFile(), join(SNAPSHOT_SUBDIR, snapshotName, dir.getName()));</span>
+            }
+            else
+            {
+<span class="nc" id="L886">                snapshotDir = new File(dir, join(SNAPSHOT_SUBDIR, snapshotName));</span>
+            }
+<span class="nc bnc" id="L888" title="All 2 branches missed.">            if (snapshotDir.exists())</span>
+<span class="nc" id="L889">                return true;</span>
+        }
+<span class="nc" id="L891">        return false;</span>
+    }
+
+    public static void clearSnapshot(String snapshotName, List&lt;File&gt; snapshotDirectories)
+    {
+        // If snapshotName is empty or null, we will delete the entire snapshot directory
+<span class="nc bnc" id="L897" title="All 2 branches missed.">        String tag = snapshotName == null ? &quot;&quot; : snapshotName;</span>
+<span class="nc bnc" id="L898" title="All 2 branches missed.">        for (File dir : snapshotDirectories)</span>
+        {
+<span class="nc" id="L900">            File snapshotDir = new File(dir, join(SNAPSHOT_SUBDIR, tag));</span>
+<span class="nc bnc" id="L901" title="All 2 branches missed.">            if (snapshotDir.exists())</span>
+            {
+<span class="nc" id="L903">                logger.trace(&quot;Removing snapshot directory {}&quot;, snapshotDir);</span>
+                try
+                {
+<span class="nc" id="L906">                    FileUtils.deleteRecursive(snapshotDir);</span>
+                }
+<span class="nc" id="L908">                catch (FSWriteError e)</span>
+                {
+<span class="nc bnc" id="L910" title="All 2 branches missed.">                    if (FBUtilities.isWindows)</span>
+<span class="nc" id="L911">                        SnapshotDeletingTask.addFailedSnapshot(snapshotDir);</span>
+                    else
+<span class="nc" id="L913">                        throw e;</span>
+<span class="nc" id="L914">                }</span>
+            }
+<span class="nc" id="L916">        }</span>
+<span class="nc" id="L917">    }</span>
+
+    // The snapshot must exist
+    public long snapshotCreationTime(String snapshotName)
+    {
+<span class="nc bnc" id="L922" title="All 2 branches missed.">        for (File dir : dataPaths)</span>
+        {
+<span class="nc" id="L924">            File snapshotDir = getSnapshotDirectory(dir, snapshotName);</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">            if (snapshotDir.exists())</span>
+<span class="nc" id="L926">                return snapshotDir.lastModified();</span>
+        }
+<span class="nc" id="L928">        throw new RuntimeException(&quot;Snapshot &quot; + snapshotName + &quot; doesn't exist&quot;);</span>
+    }
+
+    /**
+     * @return total snapshot size in byte for all snapshots.
+     */
+    public long trueSnapshotsSize()
+    {
+<span class="nc" id="L936">        long result = 0L;</span>
+<span class="nc bnc" id="L937" title="All 2 branches missed.">        for (File dir : dataPaths)</span>
+        {
+<span class="nc bnc" id="L939" title="All 2 branches missed.">            File snapshotDir = dir.getName().startsWith(SECONDARY_INDEX_NAME_SEPARATOR) ?</span>
+<span class="nc" id="L940">                                       new File(dir.getParent(), SNAPSHOT_SUBDIR) :</span>
+                                       new File(dir, SNAPSHOT_SUBDIR);
+<span class="nc" id="L942">            result += getTrueAllocatedSizeIn(snapshotDir);</span>
+        }
+<span class="nc" id="L944">        return result;</span>
+    }
+
+    /**
+     * @return Raw size on disk for all directories
+     */
+    public long getRawDiretoriesSize()
+    {
+<span class="nc" id="L952">        long totalAllocatedSize = 0L;</span>
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        for (File path : dataPaths)</span>
+<span class="nc" id="L955">            totalAllocatedSize += FileUtils.folderSize(path);</span>
+
+<span class="nc" id="L957">        return totalAllocatedSize;</span>
+    }
+
+    public long getTrueAllocatedSizeIn(File input)
+    {
+<span class="nc bnc" id="L962" title="All 2 branches missed.">        if (!input.isDirectory())</span>
+<span class="nc" id="L963">            return 0;</span>
+
+<span class="nc" id="L965">        SSTableSizeSummer visitor = new SSTableSizeSummer(input, sstableLister(Directories.OnTxnErr.THROW).listFiles());</span>
+        try
+        {
+<span class="nc" id="L968">            Files.walkFileTree(input.toPath(), visitor);</span>
+        }
+<span class="nc" id="L970">        catch (IOException e)</span>
+        {
+<span class="nc" id="L972">            logger.error(&quot;Could not calculate the size of {}. {}&quot;, input, e);</span>
+<span class="nc" id="L973">        }</span>
+
+<span class="nc" id="L975">        return visitor.getAllocatedSize();</span>
+    }
+
+    public static List&lt;File&gt; getKSChildDirectories(String ksName)
+    {
+<span class="fc" id="L980">        return getKSChildDirectories(ksName, dataDirectories);</span>
+
+    }
+
+    // Recursively finds all the sub directories in the KS directory.
+    public static List&lt;File&gt; getKSChildDirectories(String ksName, DataDirectory[] directories)
+    {
+<span class="fc" id="L987">        List&lt;File&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L988" title="All 2 branches covered.">        for (DataDirectory dataDirectory : directories)</span>
+        {
+<span class="fc" id="L990">            File ksDir = new File(dataDirectory.location, ksName);</span>
+<span class="fc" id="L991">            File[] cfDirs = ksDir.listFiles();</span>
+<span class="pc bpc" id="L992" title="1 of 2 branches missed.">            if (cfDirs == null)</span>
+<span class="nc" id="L993">                continue;</span>
+<span class="fc bfc" id="L994" title="All 2 branches covered.">            for (File cfDir : cfDirs)</span>
+            {
+<span class="pc bpc" id="L996" title="1 of 2 branches missed.">                if (cfDir.isDirectory())</span>
+<span class="fc" id="L997">                    result.add(cfDir);</span>
+            }
+        }
+<span class="fc" id="L1000">        return result;</span>
+    }
+
+    public List&lt;File&gt; getCFDirectories()
+    {
+<span class="fc" id="L1005">        List&lt;File&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1006" title="All 2 branches covered.">        for (File dataDirectory : dataPaths)</span>
+        {
+<span class="pc bpc" id="L1008" title="1 of 2 branches missed.">            if (dataDirectory.isDirectory())</span>
+<span class="fc" id="L1009">                result.add(dataDirectory);</span>
+        }
+<span class="fc" id="L1011">        return result;</span>
+    }
+
+    private static File getOrCreate(File base, String... subdirs)
+    {
+<span class="pc bpc" id="L1016" title="2 of 4 branches missed.">        File dir = subdirs == null || subdirs.length == 0 ? base : new File(base, join(subdirs));</span>
+<span class="pc bpc" id="L1017" title="1 of 2 branches missed.">        if (dir.exists())</span>
+        {
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">            if (!dir.isDirectory())</span>
+<span class="nc" id="L1020">                throw new AssertionError(String.format(&quot;Invalid directory path %s: path exists but is not a directory&quot;, dir));</span>
+        }
+<span class="pc bpc" id="L1022" title="5 of 6 branches missed.">        else if (!dir.mkdirs() &amp;&amp; !(dir.exists() &amp;&amp; dir.isDirectory()))</span>
+        {
+<span class="nc" id="L1024">            throw new FSWriteError(new IOException(&quot;Unable to create directory &quot; + dir), dir);</span>
+        }
+<span class="fc" id="L1026">        return dir;</span>
+    }
+
+    private static String join(String... s)
+    {
+<span class="fc" id="L1031">        return StringUtils.join(s, File.separator);</span>
+    }
+
+    @VisibleForTesting
+    static void overrideDataDirectoriesForTest(String loc)
+    {
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">        for (int i = 0; i &lt; dataDirectories.length; ++i)</span>
+<span class="nc" id="L1038">            dataDirectories[i] = new DataDirectory(new File(loc));</span>
+<span class="nc" id="L1039">    }</span>
+
+    @VisibleForTesting
+    static void resetDataDirectoriesAfterTest()
+    {
+<span class="nc" id="L1044">        String[] locations = DatabaseDescriptor.getAllDataFileLocations();</span>
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">        for (int i = 0; i &lt; locations.length; ++i)</span>
+<span class="nc" id="L1046">            dataDirectories[i] = new DataDirectory(new File(locations[i]));</span>
+<span class="nc" id="L1047">    }</span>
+
+    private class SSTableSizeSummer extends DirectorySizeCalculator
+    {
+        private final HashSet&lt;File&gt; toSkip;
+        SSTableSizeSummer(File path, List&lt;File&gt; files)
+<span class="nc" id="L1053">        {</span>
+<span class="nc" id="L1054">            super(path);</span>
+<span class="nc" id="L1055">            toSkip = new HashSet&lt;&gt;(files);</span>
+<span class="nc" id="L1056">        }</span>
+
+        @Override
+        public boolean isAcceptable(Path path)
+        {
+<span class="nc" id="L1061">            File file = path.toFile();</span>
+<span class="nc" id="L1062">            Pair&lt;Descriptor, Component&gt; pair = SSTable.tryComponentFromFilename(path.getParent().toFile(), file.getName());</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">            return pair != null</span>
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">                    &amp;&amp; pair.left.ksname.equals(metadata.ksName)</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">                    &amp;&amp; pair.left.cfname.equals(metadata.cfName)</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">                    &amp;&amp; !toSkip.contains(file);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

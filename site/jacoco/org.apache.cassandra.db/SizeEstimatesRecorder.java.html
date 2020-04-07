@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SizeEstimatesRecorder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">SizeEstimatesRecorder.java</span></div><h1>SizeEstimatesRecorder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.service.MigrationListener;
+import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+/**
+ * A very simplistic/crude partition count/size estimator.
+ *
+ * Exposing per-primary-range estimated partitions count and size in CQL form,
+ * as a direct CQL alternative to Thrift's describe_splits_ex().
+ *
+ * Estimates (per primary range) are calculated and dumped into a system table (system.size_estimates) every 5 minutes.
+ *
+ * See CASSANDRA-7688.
+ */
+public class SizeEstimatesRecorder extends MigrationListener implements Runnable
+{
+<span class="fc" id="L52">    private static final Logger logger = LoggerFactory.getLogger(SizeEstimatesRecorder.class);</span>
+
+<span class="fc" id="L54">    public static final SizeEstimatesRecorder instance = new SizeEstimatesRecorder();</span>
+
+    private SizeEstimatesRecorder()
+<span class="fc" id="L57">    {</span>
+<span class="fc" id="L58">        MigrationManager.instance.register(this);</span>
+<span class="fc" id="L59">    }</span>
+
+    public void run()
+    {
+<span class="fc" id="L63">        TokenMetadata metadata = StorageService.instance.getTokenMetadata().cloneOnlyTokenMap();</span>
+<span class="pc bpc" id="L64" title="1 of 2 branches missed.">        if (!metadata.isMember(FBUtilities.getBroadcastAddress()))</span>
+        {
+<span class="nc" id="L66">            logger.debug(&quot;Node is not part of the ring; not recording size estimates&quot;);</span>
+<span class="nc" id="L67">            return;</span>
+        }
+
+<span class="fc" id="L70">        logger.trace(&quot;Recording size estimates&quot;);</span>
+
+<span class="fc bfc" id="L72" title="All 2 branches covered.">        for (Keyspace keyspace : Keyspace.nonLocalStrategy())</span>
+        {
+<span class="fc" id="L74">            Collection&lt;Range&lt;Token&gt;&gt; localRanges = StorageService.instance.getPrimaryRangesForEndpoint(keyspace.getName(),</span>
+<span class="fc" id="L75">                    FBUtilities.getBroadcastAddress());</span>
+<span class="fc bfc" id="L76" title="All 2 branches covered.">            for (ColumnFamilyStore table : keyspace.getColumnFamilyStores())</span>
+            {
+<span class="fc" id="L78">                long start = System.nanoTime();</span>
+<span class="fc" id="L79">                recordSizeEstimates(table, localRanges);</span>
+<span class="fc" id="L80">                long passed = System.nanoTime() - start;</span>
+<span class="fc" id="L81">                logger.trace(&quot;Spent {} milliseconds on estimating {}.{} size&quot;,</span>
+<span class="fc" id="L82">                             TimeUnit.NANOSECONDS.toMillis(passed),</span>
+                             table.metadata.ksName,
+                             table.metadata.cfName);
+<span class="fc" id="L85">            }</span>
+<span class="fc" id="L86">        }</span>
+<span class="fc" id="L87">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private void recordSizeEstimates(ColumnFamilyStore table, Collection&lt;Range&lt;Token&gt;&gt; localRanges)
+    {
+        // for each local primary range, estimate (crudely) mean partition size and partitions count.
+<span class="fc" id="L93">        Map&lt;Range&lt;Token&gt;, Pair&lt;Long, Long&gt;&gt; estimates = new HashMap&lt;&gt;(localRanges.size());</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">        for (Range&lt;Token&gt; localRange : localRanges)</span>
+        {
+<span class="fc bfc" id="L96" title="All 2 branches covered.">            for (Range&lt;Token&gt; unwrappedRange : localRange.unwrap())</span>
+            {
+                // filter sstables that have partitions in this range.
+<span class="fc" id="L99">                Refs&lt;SSTableReader&gt; refs = null;</span>
+                long partitionsCount, meanPartitionSize;
+
+                try
+                {
+<span class="fc bfc" id="L104" title="All 2 branches covered.">                    while (refs == null)</span>
+                    {
+<span class="fc" id="L106">                        Iterable&lt;SSTableReader&gt; sstables = table.getTracker().getView().select(SSTableSet.CANONICAL);</span>
+<span class="fc" id="L107">                        SSTableIntervalTree tree = SSTableIntervalTree.build(sstables);</span>
+<span class="fc" id="L108">                        Range&lt;PartitionPosition&gt; r = Range.makeRowRange(unwrappedRange);</span>
+<span class="fc" id="L109">                        Iterable&lt;SSTableReader&gt; canonicalSSTables = View.sstablesInBounds(r.left, r.right, tree);</span>
+<span class="fc" id="L110">                        refs = Refs.tryRef(canonicalSSTables);</span>
+<span class="fc" id="L111">                    }</span>
+
+                    // calculate the estimates.
+<span class="fc" id="L114">                    partitionsCount = estimatePartitionsCount(refs, unwrappedRange);</span>
+<span class="fc" id="L115">                    meanPartitionSize = estimateMeanPartitionSize(refs);</span>
+                }
+                finally
+                {
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">                    if (refs != null)</span>
+<span class="fc" id="L120">                        refs.release();</span>
+                }
+
+<span class="fc" id="L123">                estimates.put(unwrappedRange, Pair.create(partitionsCount, meanPartitionSize));</span>
+<span class="fc" id="L124">            }</span>
+<span class="fc" id="L125">        }</span>
+
+        // atomically update the estimates.
+<span class="fc" id="L128">        SystemKeyspace.updateSizeEstimates(table.metadata.ksName, table.metadata.cfName, estimates);</span>
+<span class="fc" id="L129">    }</span>
+
+    private long estimatePartitionsCount(Collection&lt;SSTableReader&gt; sstables, Range&lt;Token&gt; range)
+    {
+<span class="fc" id="L133">        long count = 0;</span>
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L135">            count += sstable.estimatedKeysForRanges(Collections.singleton(range));</span>
+<span class="fc" id="L136">        return count;</span>
+    }
+
+    private long estimateMeanPartitionSize(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L141">        long sum = 0, count = 0;</span>
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc" id="L144">            long n = sstable.getEstimatedPartitionSize().count();</span>
+<span class="nc" id="L145">            sum += sstable.getEstimatedPartitionSize().mean() * n;</span>
+<span class="nc" id="L146">            count += n;</span>
+<span class="nc" id="L147">        }</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">        return count &gt; 0 ? sum / count : 0;</span>
+    }
+
+    @Override
+    public void onDropColumnFamily(String keyspace, String table)
+    {
+<span class="nc" id="L154">        SystemKeyspace.clearSizeEstimates(keyspace, table);</span>
+<span class="nc" id="L155">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

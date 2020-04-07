@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogAwareFileLister.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.lifecycle</a> &gt; <span class="el_source">LogAwareFileLister.java</span></div><h1>LogAwareFileLister.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.db.lifecycle;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.Directories;
+
+import static org.apache.cassandra.db.Directories.*;
+
+/**
+ * A class for listing files in a folder.
+ */
+final class LogAwareFileLister
+{
+<span class="fc" id="L47">    private static final Logger logger = LoggerFactory.getLogger(LogAwareFileLister.class);</span>
+
+    // The folder to scan
+    private final Path folder;
+
+    // The filter determines which files the client wants returned
+    private final BiFunction&lt;File, FileType, Boolean&gt; filter; //file, file type
+
+    // The behavior when we fail to list files
+    private final OnTxnErr onTxnErr;
+
+    // The unfiltered result
+<span class="fc" id="L59">    NavigableMap&lt;File, Directories.FileType&gt; files = new TreeMap&lt;&gt;();</span>
+
+    @VisibleForTesting
+    LogAwareFileLister(Path folder, BiFunction&lt;File, FileType, Boolean&gt; filter, OnTxnErr onTxnErr)
+<span class="fc" id="L63">    {</span>
+<span class="fc" id="L64">        this.folder = folder;</span>
+<span class="fc" id="L65">        this.filter = filter;</span>
+<span class="fc" id="L66">        this.onTxnErr = onTxnErr;</span>
+<span class="fc" id="L67">    }</span>
+
+    public List&lt;File&gt; list()
+    {
+        try
+        {
+<span class="fc" id="L73">            return innerList();</span>
+        }
+<span class="nc" id="L75">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L77">            throw new RuntimeException(String.format(&quot;Failed to list files in %s&quot;, folder), t);</span>
+        }
+    }
+
+    List&lt;File&gt; innerList() throws Throwable
+    {
+<span class="fc" id="L83">        list(Files.newDirectoryStream(folder))</span>
+<span class="fc" id="L84">        .stream()</span>
+<span class="pc bnc" id="L85" title="All 2 branches missed.">        .filter((f) -&gt; !LogFile.isLogFile(f))</span>
+<span class="pc" id="L86">        .forEach((f) -&gt; files.put(f, FileType.FINAL));</span>
+
+        // Since many file systems are not atomic, we cannot be sure we have listed a consistent disk state
+        // (Linux would permit this, but for simplicity we keep our behaviour the same across platforms)
+        // so we must be careful to list txn log files AFTER every other file since these files are deleted last,
+        // after all other files are removed
+<span class="fc" id="L92">        list(Files.newDirectoryStream(folder, '*' + LogFile.EXT))</span>
+<span class="fc" id="L93">        .stream()</span>
+<span class="fc" id="L94">        .filter(LogFile::isLogFile)</span>
+<span class="fc" id="L95">        .forEach(this::classifyFiles);</span>
+
+        // Finally we apply the user filter before returning our result
+<span class="fc" id="L98">        return files.entrySet().stream()</span>
+<span class="pc" id="L99">                    .filter((e) -&gt; filter.apply(e.getKey(), e.getValue()))</span>
+<span class="fc" id="L100">                    .map(Map.Entry::getKey)</span>
+<span class="fc" id="L101">                    .collect(Collectors.toList());</span>
+    }
+
+    static List&lt;File&gt; list(DirectoryStream&lt;Path&gt; stream) throws IOException
+    {
+        try
+        {
+<span class="fc" id="L108">            return StreamSupport.stream(stream.spliterator(), false)</span>
+<span class="fc" id="L109">                                .map(Path::toFile)</span>
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">                                .filter((f) -&gt; !f.isDirectory())</span>
+<span class="fc" id="L111">                                .collect(Collectors.toList());</span>
+        }
+        finally
+        {
+<span class="fc" id="L115">            stream.close();</span>
+        }
+    }
+
+    /**
+     * We read txn log files, if we fail we throw only if the user has specified
+     * OnTxnErr.THROW, else we log an error and apply the txn log anyway
+     */
+    void classifyFiles(File txnFile)
+    {
+<span class="nc" id="L125">        try (LogFile txn = LogFile.make(txnFile))</span>
+        {
+<span class="nc" id="L127">            readTxnLog(txn);</span>
+<span class="nc" id="L128">            classifyFiles(txn);</span>
+<span class="nc" id="L129">            files.put(txnFile, FileType.TXN_LOG);</span>
+        }
+<span class="nc" id="L131">    }</span>
+
+    void readTxnLog(LogFile txn)
+    {
+<span class="nc bnc" id="L135" title="All 4 branches missed.">        if (!txn.verify() &amp;&amp; onTxnErr == OnTxnErr.THROW)</span>
+<span class="nc" id="L136">            throw new LogTransaction.CorruptTransactionLogException(&quot;Some records failed verification. See earlier in log for details.&quot;, txn);</span>
+<span class="nc" id="L137">    }</span>
+
+    void classifyFiles(LogFile txnFile)
+    {
+<span class="nc" id="L141">        Map&lt;LogRecord, Set&lt;File&gt;&gt; oldFiles = txnFile.getFilesOfType(folder, files.navigableKeySet(), LogRecord.Type.REMOVE);</span>
+<span class="nc" id="L142">        Map&lt;LogRecord, Set&lt;File&gt;&gt; newFiles = txnFile.getFilesOfType(folder, files.navigableKeySet(), LogRecord.Type.ADD);</span>
+
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (txnFile.completed())</span>
+        { // last record present, filter regardless of disk status
+<span class="nc" id="L146">            setTemporary(txnFile, oldFiles.values(), newFiles.values());</span>
+<span class="nc" id="L147">            return;</span>
+        }
+
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (allFilesPresent(oldFiles))</span>
+        {  // all old files present, transaction is in progress, this will filter as aborted
+<span class="nc" id="L152">            setTemporary(txnFile, oldFiles.values(), newFiles.values());</span>
+<span class="nc" id="L153">            return;</span>
+        }
+
+        // some old files are missing, we expect the txn file to either also be missing or completed, so check
+        // disk state again to resolve any previous races on non-atomic directory listing platforms
+
+        // if txn file also gone, then do nothing (all temporary should be gone, we could remove them if any)
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (!txnFile.exists())</span>
+<span class="nc" id="L161">            return;</span>
+
+        // otherwise read the file again to see if it is completed now
+<span class="nc" id="L164">        readTxnLog(txnFile);</span>
+
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (txnFile.completed())</span>
+        { // if after re-reading the txn is completed then filter accordingly
+<span class="nc" id="L168">            setTemporary(txnFile, oldFiles.values(), newFiles.values());</span>
+<span class="nc" id="L169">            return;</span>
+        }
+
+<span class="nc" id="L172">        logger.error(&quot;Failed to classify files in {}\n&quot; +</span>
+                     &quot;Some old files are missing but the txn log is still there and not completed\n&quot; +
+                     &quot;Files in folder:\n{}\nTxn: {}&quot;,
+                     folder,
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                     files.isEmpty()</span>
+                        ? &quot;\t-&quot;
+<span class="nc" id="L178">                        : String.join(&quot;\n&quot;, files.keySet().stream().map(f -&gt; String.format(&quot;\t%s&quot;, f)).collect(Collectors.toList())),</span>
+<span class="nc" id="L179">                     txnFile.toString(true));</span>
+
+        // some old files are missing and yet the txn is still there and not completed
+        // something must be wrong (see comment at the top of LogTransaction requiring txn to be
+        // completed before obsoleting or aborting sstables)
+<span class="nc" id="L184">        throw new RuntimeException(String.format(&quot;Failed to list directory files in %s, inconsistent disk state for transaction %s&quot;,</span>
+                                                 folder,
+                                                 txnFile));
+    }
+
+    /** See if all files are present */
+    private static boolean allFilesPresent(Map&lt;LogRecord, Set&lt;File&gt;&gt; oldFiles)
+    {
+<span class="nc" id="L192">        return !oldFiles.entrySet().stream()</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                        .filter((e) -&gt; e.getKey().numFiles &gt; e.getValue().size())</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                        .findFirst().isPresent();</span>
+    }
+
+    private void setTemporary(LogFile txnFile, Collection&lt;Set&lt;File&gt;&gt; oldFiles, Collection&lt;Set&lt;File&gt;&gt; newFiles)
+    {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        Collection&lt;Set&lt;File&gt;&gt; temporary = txnFile.committed() ? oldFiles : newFiles;</span>
+<span class="nc" id="L200">        temporary.stream()</span>
+<span class="nc" id="L201">                 .flatMap(Set::stream)</span>
+<span class="nc" id="L202">                 .forEach((f) -&gt; this.files.put(f, FileType.TEMPORARY));</span>
+<span class="nc" id="L203">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

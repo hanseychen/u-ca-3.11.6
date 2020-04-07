@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MemtableAllocator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.memory</a> &gt; <span class="el_source">MemtableAllocator.java</span></div><h1>MemtableAllocator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.utils.memory;
+
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.WaitQueue;
+
+public abstract class MemtableAllocator
+{
+    private final SubAllocator onHeap;
+    private final SubAllocator offHeap;
+<span class="fc" id="L32">    volatile LifeCycle state = LifeCycle.LIVE;</span>
+
+<span class="pc bpc" id="L34" title="1 of 2 branches missed.">    enum LifeCycle</span>
+    {
+<span class="fc" id="L36">        LIVE, DISCARDING, DISCARDED;</span>
+        LifeCycle transition(LifeCycle targetState)
+        {
+<span class="pc bpc" id="L39" title="1 of 3 branches missed.">            switch (targetState)</span>
+            {
+                case DISCARDING:
+<span class="pc bpc" id="L42" title="2 of 4 branches missed.">                    assert this == LifeCycle.LIVE;</span>
+<span class="fc" id="L43">                    return LifeCycle.DISCARDING;</span>
+
+                case DISCARDED:
+<span class="pc bpc" id="L46" title="2 of 4 branches missed.">                    assert this == LifeCycle.DISCARDING;</span>
+<span class="fc" id="L47">                    return LifeCycle.DISCARDED;</span>
+
+                default:
+<span class="nc" id="L50">                    throw new IllegalStateException();</span>
+            }
+        }
+    }
+
+    MemtableAllocator(SubAllocator onHeap, SubAllocator offHeap)
+<span class="fc" id="L56">    {</span>
+<span class="fc" id="L57">        this.onHeap = onHeap;</span>
+<span class="fc" id="L58">        this.offHeap = offHeap;</span>
+<span class="fc" id="L59">    }</span>
+
+    public abstract Row.Builder rowBuilder(OpOrder.Group opGroup);
+    public abstract DecoratedKey clone(DecoratedKey key, OpOrder.Group opGroup);
+    public abstract EnsureOnHeap ensureOnHeap();
+
+    public SubAllocator onHeap()
+    {
+<span class="fc" id="L67">        return onHeap;</span>
+    }
+
+    public SubAllocator offHeap()
+    {
+<span class="fc" id="L72">        return offHeap;</span>
+    }
+
+    /**
+     * Mark this allocator reclaiming; this will permit any outstanding allocations to temporarily
+     * overshoot the maximum memory limit so that flushing can begin immediately
+     */
+    public void setDiscarding()
+    {
+<span class="fc" id="L81">        state = state.transition(LifeCycle.DISCARDING);</span>
+        // mark the memory owned by this allocator as reclaiming
+<span class="fc" id="L83">        onHeap.markAllReclaiming();</span>
+<span class="fc" id="L84">        offHeap.markAllReclaiming();</span>
+<span class="fc" id="L85">    }</span>
+
+    /**
+     * Indicate the memory and resources owned by this allocator are no longer referenced,
+     * and can be reclaimed/reused.
+     */
+    public void setDiscarded()
+    {
+<span class="fc" id="L93">        state = state.transition(LifeCycle.DISCARDED);</span>
+        // release any memory owned by this allocator; automatically signals waiters
+<span class="fc" id="L95">        onHeap.releaseAll();</span>
+<span class="fc" id="L96">        offHeap.releaseAll();</span>
+<span class="fc" id="L97">    }</span>
+
+    public boolean isLive()
+    {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        return state == LifeCycle.LIVE;</span>
+    }
+
+    /** Mark the BB as unused, permitting it to be reclaimed */
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">    public static final class SubAllocator</span>
+    {
+        // the tracker we are owning memory from
+        private final MemtablePool.SubPool parent;
+
+        // the amount of memory/resource owned by this object
+        private volatile long owns;
+        // the amount of memory we are reporting to collect; this may be inaccurate, but is close
+        // and is used only to ensure that once we have reclaimed we mark the tracker with the same amount
+        private volatile long reclaiming;
+
+        SubAllocator(MemtablePool.SubPool parent)
+<span class="fc" id="L117">        {</span>
+<span class="fc" id="L118">            this.parent = parent;</span>
+<span class="fc" id="L119">        }</span>
+
+        // should only be called once we know we will never allocate to the object again.
+        // currently no corroboration/enforcement of this is performed.
+        void releaseAll()
+        {
+<span class="fc" id="L125">            parent.released(ownsUpdater.getAndSet(this, 0));</span>
+<span class="fc" id="L126">            parent.reclaimed(reclaimingUpdater.getAndSet(this, 0));</span>
+<span class="fc" id="L127">        }</span>
+
+        // like allocate, but permits allocations to be negative
+        public void adjust(long size, OpOrder.Group opGroup)
+        {
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            if (size &lt;= 0)</span>
+<span class="fc" id="L133">                released(-size);</span>
+            else
+<span class="fc" id="L135">                allocate(size, opGroup);</span>
+<span class="fc" id="L136">        }</span>
+
+        // allocate memory in the tracker, and mark ourselves as owning it
+        public void allocate(long size, OpOrder.Group opGroup)
+        {
+<span class="pc bpc" id="L141" title="2 of 4 branches missed.">            assert size &gt;= 0;</span>
+
+            while (true)
+            {
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">                if (parent.tryAllocate(size))</span>
+                {
+<span class="fc" id="L147">                    acquired(size);</span>
+<span class="fc" id="L148">                    return;</span>
+                }
+<span class="nc" id="L150">                WaitQueue.Signal signal = opGroup.isBlockingSignal(parent.hasRoom().register(parent.blockedTimerContext()));</span>
+<span class="nc" id="L151">                boolean allocated = parent.tryAllocate(size);</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">                if (allocated || opGroup.isBlocking())</span>
+                {
+<span class="nc" id="L154">                    signal.cancel();</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                    if (allocated) // if we allocated, take ownership</span>
+<span class="nc" id="L156">                        acquired(size);</span>
+                    else // otherwise we're blocking so we're permitted to overshoot our constraints, to just allocate without blocking
+<span class="nc" id="L158">                        allocated(size);</span>
+<span class="nc" id="L159">                    return;</span>
+                }
+                else
+<span class="nc" id="L162">                    signal.awaitUninterruptibly();</span>
+<span class="nc" id="L163">            }</span>
+        }
+
+        // retroactively mark an amount allocated and acquired in the tracker, and owned by us
+        private void allocated(long size)
+        {
+<span class="nc" id="L169">            parent.allocated(size);</span>
+<span class="nc" id="L170">            ownsUpdater.addAndGet(this, size);</span>
+<span class="nc" id="L171">        }</span>
+
+        // retroactively mark an amount acquired in the tracker, and owned by us
+        private void acquired(long size)
+        {
+<span class="fc" id="L176">            parent.acquired(size);</span>
+<span class="fc" id="L177">            ownsUpdater.addAndGet(this, size);</span>
+<span class="fc" id="L178">        }</span>
+
+        void released(long size)
+        {
+<span class="fc" id="L182">            parent.released(size);</span>
+<span class="fc" id="L183">            ownsUpdater.addAndGet(this, -size);</span>
+<span class="fc" id="L184">        }</span>
+
+        // mark everything we currently own as reclaiming, both here and in our parent
+        void markAllReclaiming()
+        {
+            while (true)
+            {
+<span class="fc" id="L191">                long cur = owns;</span>
+<span class="fc" id="L192">                long prev = reclaiming;</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">                if (!reclaimingUpdater.compareAndSet(this, prev, cur))</span>
+<span class="nc" id="L194">                    continue;</span>
+
+<span class="fc" id="L196">                parent.reclaiming(cur - prev);</span>
+<span class="fc" id="L197">                return;</span>
+            }
+        }
+
+        public long owns()
+        {
+<span class="fc" id="L203">            return owns;</span>
+        }
+
+        public float ownershipRatio()
+        {
+<span class="fc" id="L208">            float r = owns / (float) parent.limit;</span>
+<span class="fc bfc" id="L209" title="All 2 branches covered.">            if (Float.isNaN(r))</span>
+<span class="fc" id="L210">                return 0;</span>
+<span class="fc" id="L211">            return r;</span>
+        }
+
+<span class="fc" id="L214">        private static final AtomicLongFieldUpdater&lt;SubAllocator&gt; ownsUpdater = AtomicLongFieldUpdater.newUpdater(SubAllocator.class, &quot;owns&quot;);</span>
+<span class="fc" id="L215">        private static final AtomicLongFieldUpdater&lt;SubAllocator&gt; reclaimingUpdater = AtomicLongFieldUpdater.newUpdater(SubAllocator.class, &quot;reclaiming&quot;);</span>
+    }
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

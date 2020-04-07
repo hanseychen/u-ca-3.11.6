@@ -1,0 +1,339 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsReader.java</span></div><h1>HintsReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.EOFException;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+
+import javax.annotation.Nullable;
+
+import com.google.common.primitives.Ints;
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.NativeLibrary;
+
+/**
+ * A paged non-compressed hints reader that provides two iterators:
+ * - a 'raw' ByteBuffer iterator that doesn't deserialize the hints, but returns the pre-encoded hints verbatim
+ * - a decoded iterator, that deserializes the underlying bytes into {@link Hint} instances.
+ *
+ * The former is an optimisation for when the messaging version of the file matches the messaging version of the destination
+ * node. Extra decoding and reencoding is a waste of effort in this scenario, so we avoid it.
+ *
+ * The latter is required for dispatch of hints to nodes that have a different messaging version, and in general is just an
+ * easy way to enable backward and future compatibilty.
+ */
+class HintsReader implements AutoCloseable, Iterable&lt;HintsReader.Page&gt;
+{
+<span class="nc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(HintsReader.class);</span>
+
+    // don't read more than 512 KB of hints at a time.
+    private static final int PAGE_SIZE = 512 &lt;&lt; 10;
+
+    private final HintsDescriptor descriptor;
+    private final File file;
+    private final ChecksummedDataInput input;
+
+    // we pass the RateLimiter into HintsReader itself because it's cheaper to calculate the size before the hint is deserialized
+    @Nullable
+    private final RateLimiter rateLimiter;
+
+    protected HintsReader(HintsDescriptor descriptor, File file, ChecksummedDataInput reader, RateLimiter rateLimiter)
+<span class="nc" id="L68">    {</span>
+<span class="nc" id="L69">        this.descriptor = descriptor;</span>
+<span class="nc" id="L70">        this.file = file;</span>
+<span class="nc" id="L71">        this.input = reader;</span>
+<span class="nc" id="L72">        this.rateLimiter = rateLimiter;</span>
+<span class="nc" id="L73">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // HintsReader owns input
+    static HintsReader open(File file, RateLimiter rateLimiter)
+    {
+<span class="nc" id="L78">        ChecksummedDataInput reader = ChecksummedDataInput.open(file);</span>
+        try
+        {
+<span class="nc" id="L81">            HintsDescriptor descriptor = HintsDescriptor.deserialize(reader);</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">            if (descriptor.isCompressed())</span>
+            {
+                // since the hints descriptor is always uncompressed, it needs to be read with the normal ChecksummedDataInput.
+                // The compressed input is instantiated with the uncompressed input's position
+<span class="nc" id="L86">                reader = CompressedChecksummedDataInput.upgradeInput(reader, descriptor.createCompressor());</span>
+            }
+<span class="nc bnc" id="L88" title="All 2 branches missed.">            else if (descriptor.isEncrypted())</span>
+<span class="nc" id="L89">                reader = EncryptedChecksummedDataInput.upgradeInput(reader, descriptor.getCipher(), descriptor.createCompressor());</span>
+<span class="nc" id="L90">            return new HintsReader(descriptor, file, reader, rateLimiter);</span>
+        }
+<span class="nc" id="L92">        catch (IOException e)</span>
+        {
+<span class="nc" id="L94">            reader.close();</span>
+<span class="nc" id="L95">            throw new FSReadError(e, file);</span>
+        }
+    }
+
+    static HintsReader open(File file)
+    {
+<span class="nc" id="L101">        return open(file, null);</span>
+    }
+
+    public void close()
+    {
+<span class="nc" id="L106">        input.close();</span>
+<span class="nc" id="L107">    }</span>
+
+    public HintsDescriptor descriptor()
+    {
+<span class="nc" id="L111">        return descriptor;</span>
+    }
+
+    void seek(InputPosition newPosition)
+    {
+<span class="nc" id="L116">        input.seek(newPosition);</span>
+<span class="nc" id="L117">    }</span>
+
+    public Iterator&lt;Page&gt; iterator()
+    {
+<span class="nc" id="L121">        return new PagesIterator();</span>
+    }
+
+    public ChecksummedDataInput getInput()
+    {
+<span class="nc" id="L126">        return input;</span>
+    }
+
+    final class Page
+    {
+        public final InputPosition position;
+
+        private Page(InputPosition inputPosition)
+<span class="nc" id="L134">        {</span>
+<span class="nc" id="L135">            this.position = inputPosition;</span>
+<span class="nc" id="L136">        }</span>
+
+        Iterator&lt;Hint&gt; hintsIterator()
+        {
+<span class="nc" id="L140">            return new HintsIterator(position);</span>
+        }
+
+        Iterator&lt;ByteBuffer&gt; buffersIterator()
+        {
+<span class="nc" id="L145">            return new BuffersIterator(position);</span>
+        }
+    }
+
+<span class="nc" id="L149">    final class PagesIterator extends AbstractIterator&lt;Page&gt;</span>
+    {
+        @SuppressWarnings(&quot;resource&quot;)
+        protected Page computeNext()
+        {
+<span class="nc" id="L154">            input.tryUncacheRead();</span>
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (input.isEOF())</span>
+<span class="nc" id="L157">                return endOfData();</span>
+
+<span class="nc" id="L159">            return new Page(input.getSeekPosition());</span>
+        }
+    }
+
+    /**
+     * A decoding iterator that deserializes the hints as it goes.
+     */
+    final class HintsIterator extends AbstractIterator&lt;Hint&gt;
+    {
+        private final InputPosition offset;
+
+        HintsIterator(InputPosition offset)
+<span class="nc" id="L171">        {</span>
+<span class="nc" id="L172">            super();</span>
+<span class="nc" id="L173">            this.offset = offset;</span>
+<span class="nc" id="L174">        }</span>
+
+        protected Hint computeNext()
+        {
+            Hint hint;
+
+            do
+            {
+<span class="nc" id="L182">                InputPosition position = input.getSeekPosition();</span>
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                if (input.isEOF())</span>
+<span class="nc" id="L185">                    return endOfData(); // reached EOF</span>
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">                if (position.subtract(offset) &gt;= PAGE_SIZE)</span>
+<span class="nc" id="L188">                    return endOfData(); // read page size or more bytes</span>
+
+                try
+                {
+<span class="nc" id="L192">                    hint = computeNextInternal();</span>
+                }
+<span class="nc" id="L194">                catch (EOFException e)</span>
+                {
+<span class="nc" id="L196">                    logger.warn(&quot;Unexpected EOF replaying hints ({}), likely due to unflushed hint file on shutdown; continuing&quot;, descriptor.fileName(), e);</span>
+<span class="nc" id="L197">                    return endOfData();</span>
+                }
+<span class="nc" id="L199">                catch (IOException e)</span>
+                {
+<span class="nc" id="L201">                    throw new FSReadError(e, file);</span>
+<span class="nc" id="L202">                }</span>
+            }
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            while (hint == null);</span>
+
+<span class="nc" id="L206">            return hint;</span>
+        }
+
+        private Hint computeNextInternal() throws IOException
+        {
+<span class="nc" id="L211">            input.resetCrc();</span>
+<span class="nc" id="L212">            input.resetLimit();</span>
+
+<span class="nc" id="L214">            int size = input.readInt();</span>
+
+            // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+<span class="nc bnc" id="L217" title="All 2 branches missed.">            if (!input.checkCrc())</span>
+<span class="nc" id="L218">                throw new IOException(&quot;Digest mismatch exception&quot;);</span>
+
+<span class="nc" id="L220">            return readHint(size);</span>
+        }
+
+        private Hint readHint(int size) throws IOException
+        {
+<span class="nc bnc" id="L225" title="All 2 branches missed.">            if (rateLimiter != null)</span>
+<span class="nc" id="L226">                rateLimiter.acquire(size);</span>
+<span class="nc" id="L227">            input.limit(size);</span>
+
+            Hint hint;
+            try
+            {
+<span class="nc" id="L232">                hint = Hint.serializer.deserialize(input, descriptor.messagingVersion());</span>
+<span class="nc" id="L233">                input.checkLimit(0);</span>
+            }
+<span class="nc" id="L235">            catch (UnknownColumnFamilyException e)</span>
+            {
+<span class="nc" id="L237">                logger.warn(&quot;Failed to read a hint for {}: {} - table with id {} is unknown in file {}&quot;,</span>
+<span class="nc" id="L238">                            StorageService.instance.getEndpointForHostId(descriptor.hostId),</span>
+<span class="nc" id="L239">                            descriptor.hostId,</span>
+                            e.cfId,
+<span class="nc" id="L241">                            descriptor.fileName());</span>
+<span class="nc" id="L242">                input.skipBytes(Ints.checkedCast(size - input.bytesPastLimit()));</span>
+
+<span class="nc" id="L244">                hint = null; // set the return value to null and let following code to update/check the CRC</span>
+<span class="nc" id="L245">            }</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (input.checkCrc())</span>
+<span class="nc" id="L248">                return hint;</span>
+
+            // log a warning and skip the corrupted entry
+<span class="nc" id="L251">            logger.warn(&quot;Failed to read a hint for {}: {} - digest mismatch for hint at position {} in file {}&quot;,</span>
+<span class="nc" id="L252">                        StorageService.instance.getEndpointForHostId(descriptor.hostId),</span>
+<span class="nc" id="L253">                        descriptor.hostId,</span>
+<span class="nc" id="L254">                        input.getPosition() - size - 4,</span>
+<span class="nc" id="L255">                        descriptor.fileName());</span>
+<span class="nc" id="L256">            return null;</span>
+        }
+    }
+
+    /**
+     * A verbatim iterator that simply returns the underlying ByteBuffers.
+     */
+    final class BuffersIterator extends AbstractIterator&lt;ByteBuffer&gt;
+    {
+        private final InputPosition offset;
+
+        BuffersIterator(InputPosition offset)
+<span class="nc" id="L268">        {</span>
+<span class="nc" id="L269">            super();</span>
+<span class="nc" id="L270">            this.offset = offset;</span>
+<span class="nc" id="L271">        }</span>
+
+        protected ByteBuffer computeNext()
+        {
+            ByteBuffer buffer;
+
+            do
+            {
+<span class="nc" id="L279">                InputPosition position = input.getSeekPosition();</span>
+
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                if (input.isEOF())</span>
+<span class="nc" id="L282">                    return endOfData(); // reached EOF</span>
+
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (position.subtract(offset) &gt;= PAGE_SIZE)</span>
+<span class="nc" id="L285">                    return endOfData(); // read page size or more bytes</span>
+
+                try
+                {
+<span class="nc" id="L289">                    buffer = computeNextInternal();</span>
+                }
+<span class="nc" id="L291">                catch (EOFException e)</span>
+                {
+<span class="nc" id="L293">                    logger.warn(&quot;Unexpected EOF replaying hints ({}), likely due to unflushed hint file on shutdown; continuing&quot;, descriptor.fileName(), e);</span>
+<span class="nc" id="L294">                    return endOfData();</span>
+                }
+<span class="nc" id="L296">                catch (IOException e)</span>
+                {
+<span class="nc" id="L298">                    throw new FSReadError(e, file);</span>
+<span class="nc" id="L299">                }</span>
+            }
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            while (buffer == null);</span>
+
+<span class="nc" id="L303">            return buffer;</span>
+        }
+
+        private ByteBuffer computeNextInternal() throws IOException
+        {
+<span class="nc" id="L308">            input.resetCrc();</span>
+<span class="nc" id="L309">            input.resetLimit();</span>
+
+<span class="nc" id="L311">            int size = input.readInt();</span>
+
+            // if we cannot corroborate the size via crc, then we cannot safely skip this hint
+<span class="nc bnc" id="L314" title="All 2 branches missed.">            if (!input.checkCrc())</span>
+<span class="nc" id="L315">                throw new IOException(&quot;Digest mismatch exception&quot;);</span>
+
+<span class="nc" id="L317">            return readBuffer(size);</span>
+        }
+
+        private ByteBuffer readBuffer(int size) throws IOException
+        {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (rateLimiter != null)</span>
+<span class="nc" id="L323">                rateLimiter.acquire(size);</span>
+<span class="nc" id="L324">            input.limit(size);</span>
+
+<span class="nc" id="L326">            ByteBuffer buffer = ByteBufferUtil.read(input, size);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (input.checkCrc())</span>
+<span class="nc" id="L328">                return buffer;</span>
+
+            // log a warning and skip the corrupted entry
+<span class="nc" id="L331">            logger.warn(&quot;Failed to read a hint for {} - digest mismatch for hint at position {} in file {}&quot;,</span>
+<span class="nc" id="L332">                        descriptor.hostId,</span>
+<span class="nc" id="L333">                        input.getPosition() - size - 4,</span>
+<span class="nc" id="L334">                        descriptor.fileName());</span>
+<span class="nc" id="L335">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

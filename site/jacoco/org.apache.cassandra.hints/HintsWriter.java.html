@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsWriter.java</span></div><h1>HintsWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputBufferFixed;
+import org.apache.cassandra.utils.NativeLibrary;
+import org.apache.cassandra.utils.SyncUtil;
+import org.apache.cassandra.utils.Throwables;
+
+import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+import static org.apache.cassandra.utils.Throwables.perform;
+
+class HintsWriter implements AutoCloseable
+{
+    static final int PAGE_SIZE = 4096;
+
+    private final File directory;
+    private final HintsDescriptor descriptor;
+    private final File file;
+    protected final FileChannel channel;
+    private final int fd;
+    protected final CRC32 globalCRC;
+
+<span class="nc" id="L55">    private volatile long lastSyncPosition = 0L;</span>
+
+    protected HintsWriter(File directory, HintsDescriptor descriptor, File file, FileChannel channel, int fd, CRC32 globalCRC)
+<span class="nc" id="L58">    {</span>
+<span class="nc" id="L59">        this.directory = directory;</span>
+<span class="nc" id="L60">        this.descriptor = descriptor;</span>
+<span class="nc" id="L61">        this.file = file;</span>
+<span class="nc" id="L62">        this.channel = channel;</span>
+<span class="nc" id="L63">        this.fd = fd;</span>
+<span class="nc" id="L64">        this.globalCRC = globalCRC;</span>
+<span class="nc" id="L65">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // HintsWriter owns channel
+    static HintsWriter create(File directory, HintsDescriptor descriptor) throws IOException
+    {
+<span class="nc" id="L70">        File file = new File(directory, descriptor.fileName());</span>
+
+<span class="nc" id="L72">        FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);</span>
+<span class="nc" id="L73">        int fd = NativeLibrary.getfd(channel);</span>
+
+<span class="nc" id="L75">        CRC32 crc = new CRC32();</span>
+
+<span class="nc" id="L77">        try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())</span>
+        {
+            // write the descriptor
+<span class="nc" id="L80">            descriptor.serialize(dob);</span>
+<span class="nc" id="L81">            ByteBuffer descriptorBytes = dob.buffer();</span>
+<span class="nc" id="L82">            updateChecksum(crc, descriptorBytes);</span>
+<span class="nc" id="L83">            channel.write(descriptorBytes);</span>
+        }
+<span class="nc" id="L85">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L87">            channel.close();</span>
+<span class="nc" id="L88">            throw e;</span>
+<span class="nc" id="L89">        }</span>
+
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        if (descriptor.isEncrypted())</span>
+<span class="nc" id="L92">            return new EncryptedHintsWriter(directory, descriptor, file, channel, fd, crc);</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        if (descriptor.isCompressed())</span>
+<span class="nc" id="L94">            return new CompressedHintsWriter(directory, descriptor, file, channel, fd, crc);</span>
+<span class="nc" id="L95">        return new HintsWriter(directory, descriptor, file, channel, fd, crc);</span>
+    }
+
+    HintsDescriptor descriptor()
+    {
+<span class="nc" id="L100">        return descriptor;</span>
+    }
+
+    private void writeChecksum()
+    {
+<span class="nc" id="L105">        File checksumFile = new File(directory, descriptor.checksumFileName());</span>
+<span class="nc" id="L106">        try (OutputStream out = Files.newOutputStream(checksumFile.toPath()))</span>
+        {
+<span class="nc" id="L108">            out.write(Integer.toHexString((int) globalCRC.getValue()).getBytes(StandardCharsets.UTF_8));</span>
+        }
+<span class="nc" id="L110">        catch (IOException e)</span>
+        {
+<span class="nc" id="L112">            throw new FSWriteError(e, checksumFile);</span>
+<span class="nc" id="L113">        }</span>
+<span class="nc" id="L114">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L118">        perform(file, Throwables.FileOpType.WRITE, this::doFsync, channel::close);</span>
+
+<span class="nc" id="L120">        writeChecksum();</span>
+<span class="nc" id="L121">    }</span>
+
+    public void fsync()
+    {
+<span class="nc" id="L125">        perform(file, Throwables.FileOpType.WRITE, this::doFsync);</span>
+<span class="nc" id="L126">    }</span>
+
+    private void doFsync() throws IOException
+    {
+<span class="nc" id="L130">        SyncUtil.force(channel, true);</span>
+<span class="nc" id="L131">        lastSyncPosition = channel.position();</span>
+<span class="nc" id="L132">    }</span>
+
+    Session newSession(ByteBuffer buffer)
+    {
+        try
+        {
+<span class="nc" id="L138">            return new Session(buffer, channel.size());</span>
+        }
+<span class="nc" id="L140">        catch (IOException e)</span>
+        {
+<span class="nc" id="L142">            throw new FSWriteError(e, file);</span>
+        }
+    }
+
+    /**
+     * Writes byte buffer into the file channel. Buffer should be flipped before calling this
+     */
+    protected void writeBuffer(ByteBuffer bb) throws IOException
+    {
+<span class="nc" id="L151">        updateChecksum(globalCRC, bb);</span>
+<span class="nc" id="L152">        channel.write(bb);</span>
+<span class="nc" id="L153">    }</span>
+
+    /**
+     * The primary goal of the Session class is to be able to share the same buffers among potentially dozens or hundreds
+     * of hints writers, and ensure that their contents are always written to the underlying channels in the end.
+     */
+    final class Session implements AutoCloseable
+    {
+        private final ByteBuffer buffer;
+
+        private final long initialSize;
+        private long bytesWritten;
+
+        Session(ByteBuffer buffer, long initialSize)
+<span class="nc" id="L167">        {</span>
+<span class="nc" id="L168">            buffer.clear();</span>
+<span class="nc" id="L169">            bytesWritten = 0L;</span>
+
+<span class="nc" id="L171">            this.buffer = buffer;</span>
+<span class="nc" id="L172">            this.initialSize = initialSize;</span>
+<span class="nc" id="L173">        }</span>
+
+        @VisibleForTesting
+        long getBytesWritten()
+        {
+<span class="nc" id="L178">            return bytesWritten;</span>
+        }
+
+        long position()
+        {
+<span class="nc" id="L183">            return initialSize + bytesWritten;</span>
+        }
+
+        /**
+         * Appends the serialized hint (with CRC included) to this session's aggregation buffer,
+         * writes to the underlying channel when the buffer is overflown.
+         *
+         * @param hint the serialized hint (with CRC included)
+         * @throws IOException
+         */
+        void append(ByteBuffer hint) throws IOException
+        {
+<span class="nc" id="L195">            bytesWritten += hint.remaining();</span>
+
+            // if the hint to write won't fit in the aggregation buffer, flush it
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            if (hint.remaining() &gt; buffer.remaining())</span>
+            {
+<span class="nc" id="L200">                buffer.flip();</span>
+<span class="nc" id="L201">                writeBuffer(buffer);</span>
+<span class="nc" id="L202">                buffer.clear();</span>
+            }
+
+            // if the hint fits in the aggregation buffer, then update the aggregation buffer,
+            // otherwise write the hint buffer to the channel
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (hint.remaining() &lt;= buffer.remaining())</span>
+            {
+<span class="nc" id="L209">                buffer.put(hint);</span>
+            }
+            else
+            {
+<span class="nc" id="L213">                writeBuffer(hint);</span>
+            }
+<span class="nc" id="L215">        }</span>
+
+        /**
+         * Serializes and appends the hint (with CRC included) to this session's aggregation buffer,
+         * writes to the underlying channel when the buffer is overflown.
+         *
+         * Used mainly by tests and {@link LegacyHintsMigrator}
+         *
+         * @param hint the unserialized hint
+         * @throws IOException
+         */
+        void append(Hint hint) throws IOException
+        {
+<span class="nc" id="L228">            int hintSize = (int) Hint.serializer.serializedSize(hint, descriptor.messagingVersion());</span>
+<span class="nc" id="L229">            int totalSize = hintSize + HintsBuffer.ENTRY_OVERHEAD_SIZE;</span>
+
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (totalSize &gt; buffer.remaining())</span>
+<span class="nc" id="L232">                flushBuffer();</span>
+
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            ByteBuffer hintBuffer = totalSize &lt;= buffer.remaining()</span>
+                                  ? buffer
+<span class="nc" id="L236">                                  : ByteBuffer.allocate(totalSize);</span>
+
+<span class="nc" id="L238">            CRC32 crc = new CRC32();</span>
+<span class="nc" id="L239">            try (DataOutputBufferFixed out = new DataOutputBufferFixed(hintBuffer))</span>
+            {
+<span class="nc" id="L241">                out.writeInt(hintSize);</span>
+<span class="nc" id="L242">                updateChecksumInt(crc, hintSize);</span>
+<span class="nc" id="L243">                out.writeInt((int) crc.getValue());</span>
+
+<span class="nc" id="L245">                Hint.serializer.serialize(hint, out, descriptor.messagingVersion());</span>
+<span class="nc" id="L246">                updateChecksum(crc, hintBuffer, hintBuffer.position() - hintSize, hintSize);</span>
+<span class="nc" id="L247">                out.writeInt((int) crc.getValue());</span>
+            }
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (hintBuffer == buffer)</span>
+<span class="nc" id="L251">                bytesWritten += totalSize;</span>
+            else
+<span class="nc" id="L253">                append((ByteBuffer) hintBuffer.flip());</span>
+<span class="nc" id="L254">        }</span>
+
+        /**
+         * Closes the session - flushes the aggregation buffer (if not empty), does page aligning, and potentially fsyncs.
+         * @throws IOException
+         */
+        public void close() throws IOException
+        {
+<span class="nc" id="L262">            flushBuffer();</span>
+<span class="nc" id="L263">            maybeFsync();</span>
+<span class="nc" id="L264">            maybeSkipCache();</span>
+<span class="nc" id="L265">        }</span>
+
+        private void flushBuffer() throws IOException
+        {
+<span class="nc" id="L269">            buffer.flip();</span>
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (buffer.remaining() &gt; 0)</span>
+            {
+<span class="nc" id="L273">                writeBuffer(buffer);</span>
+            }
+
+<span class="nc" id="L276">            buffer.clear();</span>
+<span class="nc" id="L277">        }</span>
+
+        private void maybeFsync()
+        {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            if (position() &gt;= lastSyncPosition + DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024L)</span>
+<span class="nc" id="L282">                fsync();</span>
+<span class="nc" id="L283">        }</span>
+
+        private void maybeSkipCache()
+        {
+<span class="nc" id="L287">            long position = position();</span>
+
+            // don't skip page cache for tiny files, on the assumption that if they are tiny, the target node is probably
+            // alive, and if so, the file will be closed and dispatched shortly (within a minute), and the file will be dropped.
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (position &gt;= DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024L)</span>
+<span class="nc" id="L292">                NativeLibrary.trySkipCache(fd, 0, position - (position % PAGE_SIZE), file.getPath());</span>
+<span class="nc" id="L293">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

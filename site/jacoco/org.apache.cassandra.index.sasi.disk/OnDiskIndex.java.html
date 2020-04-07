@@ -1,0 +1,814 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OnDiskIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.disk</a> &gt; <span class="el_source">OnDiskIndex.java</span></div><h1>OnDiskIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.disk;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.index.sasi.Term;
+import org.apache.cassandra.index.sasi.plan.Expression;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.utils.MappedBuffer;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+import org.apache.cassandra.index.sasi.utils.AbstractIterator;
+import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.ChannelProxy;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+
+import static org.apache.cassandra.index.sasi.disk.OnDiskBlock.SearchResult;
+
+<span class="nc bnc" id="L47" title="All 2 branches missed.">public class OnDiskIndex implements Iterable&lt;OnDiskIndex.DataTerm&gt;, Closeable</span>
+{
+<span class="nc" id="L49">    public enum IteratorOrder</span>
+    {
+<span class="nc" id="L51">        DESC(1), ASC(-1);</span>
+
+        public final int step;
+
+        IteratorOrder(int step)
+<span class="nc" id="L56">        {</span>
+<span class="nc" id="L57">            this.step = step;</span>
+<span class="nc" id="L58">        }</span>
+
+        public int startAt(OnDiskBlock&lt;DataTerm&gt; block, Expression e)
+        {
+<span class="nc bnc" id="L62" title="All 3 branches missed.">            switch (this)</span>
+            {
+                case DESC:
+<span class="nc bnc" id="L65" title="All 2 branches missed.">                    return e.lower == null</span>
+                            ? 0
+<span class="nc" id="L67">                            : startAt(block.search(e.validator, e.lower.value), e.lower.inclusive);</span>
+
+                case ASC:
+<span class="nc bnc" id="L70" title="All 2 branches missed.">                    return e.upper == null</span>
+<span class="nc" id="L71">                            ? block.termCount() - 1</span>
+<span class="nc" id="L72">                            : startAt(block.search(e.validator, e.upper.value), e.upper.inclusive);</span>
+
+                default:
+<span class="nc" id="L75">                    throw new IllegalArgumentException(&quot;Unknown order: &quot; + this);</span>
+            }
+        }
+
+        public int startAt(SearchResult&lt;DataTerm&gt; found, boolean inclusive)
+        {
+<span class="nc bnc" id="L81" title="All 3 branches missed.">            switch (this)</span>
+            {
+                case DESC:
+<span class="nc bnc" id="L84" title="All 2 branches missed.">                    if (found.cmp &lt; 0)</span>
+<span class="nc" id="L85">                        return found.index + 1;</span>
+
+<span class="nc bnc" id="L87" title="All 4 branches missed.">                    return inclusive || found.cmp != 0 ? found.index : found.index + 1;</span>
+
+                case ASC:
+<span class="nc bnc" id="L90" title="All 2 branches missed.">                    if (found.cmp &lt; 0) // search term was bigger then whole data set</span>
+<span class="nc" id="L91">                        return found.index;</span>
+<span class="nc bnc" id="L92" title="All 6 branches missed.">                    return inclusive &amp;&amp; (found.cmp == 0 || found.cmp &lt; 0) ? found.index : found.index - 1;</span>
+
+                default:
+<span class="nc" id="L95">                    throw new IllegalArgumentException(&quot;Unknown order: &quot; + this);</span>
+            }
+        }
+    }
+
+    public final Descriptor descriptor;
+    protected final OnDiskIndexBuilder.Mode mode;
+    protected final OnDiskIndexBuilder.TermSize termSize;
+
+    protected final AbstractType&lt;?&gt; comparator;
+    protected final MappedBuffer indexFile;
+    protected final long indexSize;
+    protected final boolean hasMarkedPartials;
+
+    protected final Function&lt;Long, DecoratedKey&gt; keyFetcher;
+
+    protected final String indexPath;
+
+    protected final PointerLevel[] levels;
+    protected final DataLevel dataLevel;
+
+    protected final ByteBuffer minTerm, maxTerm, minKey, maxKey;
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public OnDiskIndex(File index, AbstractType&lt;?&gt; cmp, Function&lt;Long, DecoratedKey&gt; keyReader)
+<span class="nc" id="L120">    {</span>
+<span class="nc" id="L121">        keyFetcher = keyReader;</span>
+
+<span class="nc" id="L123">        comparator = cmp;</span>
+<span class="nc" id="L124">        indexPath = index.getAbsolutePath();</span>
+
+<span class="nc" id="L126">        RandomAccessFile backingFile = null;</span>
+        try
+        {
+<span class="nc" id="L129">            backingFile = new RandomAccessFile(index, &quot;r&quot;);</span>
+
+<span class="nc" id="L131">            descriptor = new Descriptor(backingFile.readUTF());</span>
+
+<span class="nc" id="L133">            termSize = OnDiskIndexBuilder.TermSize.of(backingFile.readShort());</span>
+
+<span class="nc" id="L135">            minTerm = ByteBufferUtil.readWithShortLength(backingFile);</span>
+<span class="nc" id="L136">            maxTerm = ByteBufferUtil.readWithShortLength(backingFile);</span>
+
+<span class="nc" id="L138">            minKey = ByteBufferUtil.readWithShortLength(backingFile);</span>
+<span class="nc" id="L139">            maxKey = ByteBufferUtil.readWithShortLength(backingFile);</span>
+
+<span class="nc" id="L141">            mode = OnDiskIndexBuilder.Mode.mode(backingFile.readUTF());</span>
+<span class="nc" id="L142">            hasMarkedPartials = backingFile.readBoolean();</span>
+
+<span class="nc" id="L144">            indexSize = backingFile.length();</span>
+<span class="nc" id="L145">            indexFile = new MappedBuffer(new ChannelProxy(indexPath, backingFile.getChannel()));</span>
+
+            // start of the levels
+<span class="nc" id="L148">            indexFile.position(indexFile.getLong(indexSize - 8));</span>
+
+<span class="nc" id="L150">            int numLevels = indexFile.getInt();</span>
+<span class="nc" id="L151">            levels = new PointerLevel[numLevels];</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">            for (int i = 0; i &lt; levels.length; i++)</span>
+            {
+<span class="nc" id="L154">                int blockCount = indexFile.getInt();</span>
+<span class="nc" id="L155">                levels[i] = new PointerLevel(indexFile.position(), blockCount);</span>
+<span class="nc" id="L156">                indexFile.position(indexFile.position() + blockCount * 8);</span>
+            }
+
+<span class="nc" id="L159">            int blockCount = indexFile.getInt();</span>
+<span class="nc" id="L160">            dataLevel = new DataLevel(indexFile.position(), blockCount);</span>
+        }
+<span class="nc" id="L162">        catch (IOException e)</span>
+        {
+<span class="nc" id="L164">            throw new FSReadError(e, index);</span>
+        }
+        finally
+        {
+<span class="nc" id="L168">            FileUtils.closeQuietly(backingFile);</span>
+        }
+<span class="nc" id="L170">    }</span>
+
+    public boolean hasMarkedPartials()
+    {
+<span class="nc" id="L174">        return hasMarkedPartials;</span>
+    }
+
+    public OnDiskIndexBuilder.Mode mode()
+    {
+<span class="nc" id="L179">        return mode;</span>
+    }
+
+    public ByteBuffer minTerm()
+    {
+<span class="nc" id="L184">        return minTerm;</span>
+    }
+
+    public ByteBuffer maxTerm()
+    {
+<span class="nc" id="L189">        return maxTerm;</span>
+    }
+
+    public ByteBuffer minKey()
+    {
+<span class="nc" id="L194">        return minKey;</span>
+    }
+
+    public ByteBuffer maxKey()
+    {
+<span class="nc" id="L199">        return maxKey;</span>
+    }
+
+    public DataTerm min()
+    {
+<span class="nc" id="L204">        return dataLevel.getBlock(0).getTerm(0);</span>
+    }
+
+    public DataTerm max()
+    {
+<span class="nc" id="L209">        DataBlock block = dataLevel.getBlock(dataLevel.blockCount - 1);</span>
+<span class="nc" id="L210">        return block.getTerm(block.termCount() - 1);</span>
+    }
+
+    /**
+     * Search for rows which match all of the terms inside the given expression in the index file.
+     *
+     * @param exp The expression to use for the query.
+     *
+     * @return Iterator which contains rows for all of the terms from the given range.
+     */
+    public RangeIterator&lt;Long, Token&gt; search(Expression exp)
+    {
+<span class="nc bnc" id="L222" title="All 4 branches missed.">        assert mode.supports(exp.getOp());</span>
+
+<span class="nc bnc" id="L224" title="All 6 branches missed.">        if (exp.getOp() == Expression.Op.PREFIX &amp;&amp; mode == OnDiskIndexBuilder.Mode.CONTAINS &amp;&amp; !hasMarkedPartials)</span>
+<span class="nc" id="L225">            throw new UnsupportedOperationException(&quot;prefix queries in CONTAINS mode are not supported by this index&quot;);</span>
+
+        // optimization in case single term is requested from index
+        // we don't really need to build additional union iterator
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (exp.getOp() == Op.EQ)</span>
+        {
+<span class="nc" id="L231">            DataTerm term = getTerm(exp.lower.value);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            return term == null ? null : term.getTokens();</span>
+        }
+
+        // convert single NOT_EQ to range with exclusion
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        final Expression expression = (exp.getOp() != Op.NOT_EQ)</span>
+                                        ? exp
+<span class="nc" id="L238">                                        : new Expression(exp).setOp(Op.RANGE)</span>
+<span class="nc" id="L239">                                                .setLower(new Expression.Bound(minTerm, true))</span>
+<span class="nc" id="L240">                                                .setUpper(new Expression.Bound(maxTerm, true))</span>
+<span class="nc" id="L241">                                                .addExclusion(exp.lower.value);</span>
+
+<span class="nc" id="L243">        List&lt;ByteBuffer&gt; exclusions = new ArrayList&lt;&gt;(expression.exclusions.size());</span>
+
+<span class="nc" id="L245">        Iterables.addAll(exclusions, expression.exclusions.stream().filter(exclusion -&gt; {</span>
+            // accept only exclusions which are in the bounds of lower/upper
+<span class="nc bnc" id="L247" title="All 6 branches missed.">            return !(expression.lower != null &amp;&amp; comparator.compare(exclusion, expression.lower.value) &lt; 0)</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                &amp;&amp; !(expression.upper != null &amp;&amp; comparator.compare(exclusion, expression.upper.value) &gt; 0);</span>
+<span class="nc" id="L249">        }).collect(Collectors.toList()));</span>
+
+<span class="nc" id="L251">        Collections.sort(exclusions, comparator);</span>
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (exclusions.size() == 0)</span>
+<span class="nc" id="L254">            return searchRange(expression);</span>
+
+<span class="nc" id="L256">        List&lt;Expression&gt; ranges = new ArrayList&lt;&gt;(exclusions.size());</span>
+
+        // calculate range splits based on the sorted exclusions
+<span class="nc" id="L259">        Iterator&lt;ByteBuffer&gt; exclusionsIterator = exclusions.iterator();</span>
+
+<span class="nc" id="L261">        Expression.Bound min = expression.lower, max = null;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        while (exclusionsIterator.hasNext())</span>
+        {
+<span class="nc" id="L264">            max = new Expression.Bound(exclusionsIterator.next(), false);</span>
+<span class="nc" id="L265">            ranges.add(new Expression(expression).setOp(Op.RANGE).setLower(min).setUpper(max));</span>
+<span class="nc" id="L266">            min = max;</span>
+        }
+
+<span class="nc bnc" id="L269" title="All 4 branches missed.">        assert max != null;</span>
+<span class="nc" id="L270">        ranges.add(new Expression(expression).setOp(Op.RANGE).setLower(max).setUpper(expression.upper));</span>
+
+<span class="nc" id="L272">        RangeUnionIterator.Builder&lt;Long, Token&gt; builder = RangeUnionIterator.builder();</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        for (Expression e : ranges)</span>
+        {
+            @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L276">            RangeIterator&lt;Long, Token&gt; range = searchRange(e);</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (range != null)</span>
+<span class="nc" id="L278">                builder.add(range);</span>
+<span class="nc" id="L279">        }</span>
+
+<span class="nc" id="L281">        return builder.build();</span>
+    }
+
+    private RangeIterator&lt;Long, Token&gt; searchRange(Expression range)
+    {
+<span class="nc" id="L286">        Expression.Bound lower = range.lower;</span>
+<span class="nc" id="L287">        Expression.Bound upper = range.upper;</span>
+
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        int lowerBlock = lower == null ? 0 : getDataBlock(lower.value);</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">        int upperBlock = upper == null</span>
+                ? dataLevel.blockCount - 1
+                // optimization so we don't have to fetch upperBlock when query has lower == upper
+<span class="nc bnc" id="L293" title="All 2 branches missed.">                : (lower != null &amp;&amp; comparator.compare(lower.value, upper.value) == 0) ? lowerBlock : getDataBlock(upper.value);</span>
+
+<span class="nc bnc" id="L295" title="All 6 branches missed.">        return (mode != OnDiskIndexBuilder.Mode.SPARSE || lowerBlock == upperBlock || upperBlock - lowerBlock &lt;= 1)</span>
+<span class="nc" id="L296">                ? searchPoint(lowerBlock, range)</span>
+<span class="nc" id="L297">                : searchRange(lowerBlock, lower, upperBlock, upper);</span>
+    }
+
+    private RangeIterator&lt;Long, Token&gt; searchRange(int lowerBlock, Expression.Bound lower, int upperBlock, Expression.Bound upper)
+    {
+        // if lower is at the beginning of the block that means we can just do a single iterator per block
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        SearchResult&lt;DataTerm&gt; lowerPosition = (lower == null) ? null : searchIndex(lower.value, lowerBlock);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        SearchResult&lt;DataTerm&gt; upperPosition = (upper == null) ? null : searchIndex(upper.value, upperBlock);</span>
+
+<span class="nc" id="L306">        RangeUnionIterator.Builder&lt;Long, Token&gt; builder = RangeUnionIterator.builder();</span>
+
+        // optimistically assume that first and last blocks are full block reads, saves at least 3 'else' conditions
+<span class="nc" id="L309">        int firstFullBlockIdx = lowerBlock, lastFullBlockIdx = upperBlock;</span>
+
+        // 'lower' doesn't cover the whole block so we need to do a partial iteration
+        // Two reasons why that can happen:
+        //   - 'lower' is not the first element of the block
+        //   - 'lower' is first element but it's not inclusive in the query
+<span class="nc bnc" id="L315" title="All 6 branches missed.">        if (lowerPosition != null &amp;&amp; (lowerPosition.index &gt; 0 || !lower.inclusive))</span>
+        {
+<span class="nc" id="L317">            DataBlock block = dataLevel.getBlock(lowerBlock);</span>
+<span class="nc bnc" id="L318" title="All 4 branches missed.">            int start = (lower.inclusive || lowerPosition.cmp != 0) ? lowerPosition.index : lowerPosition.index + 1;</span>
+
+<span class="nc" id="L320">            builder.add(block.getRange(start, block.termCount()));</span>
+<span class="nc" id="L321">            firstFullBlockIdx = lowerBlock + 1;</span>
+        }
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (upperPosition != null)</span>
+        {
+<span class="nc" id="L326">            DataBlock block = dataLevel.getBlock(upperBlock);</span>
+<span class="nc" id="L327">            int lastIndex = block.termCount() - 1;</span>
+
+            // The save as with 'lower' but here we need to check if the upper is the last element of the block,
+            // which means that we only have to get individual results if:
+            //  - if it *is not* the last element, or
+            //  - it *is* but shouldn't be included (dictated by upperInclusive)
+<span class="nc bnc" id="L333" title="All 4 branches missed.">            if (upperPosition.index != lastIndex || !upper.inclusive)</span>
+            {
+<span class="nc bnc" id="L335" title="All 6 branches missed.">                int end = (upperPosition.cmp &lt; 0 || (upperPosition.cmp == 0 &amp;&amp; upper.inclusive))</span>
+                                ? upperPosition.index + 1 : upperPosition.index;
+
+<span class="nc" id="L338">                builder.add(block.getRange(0, end));</span>
+<span class="nc" id="L339">                lastFullBlockIdx = upperBlock - 1;</span>
+            }
+        }
+
+<span class="nc" id="L343">        int totalSuperBlocks = (lastFullBlockIdx - firstFullBlockIdx) / OnDiskIndexBuilder.SUPER_BLOCK_SIZE;</span>
+
+        // if there are no super-blocks, we can simply read all of the block iterators in sequence
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (totalSuperBlocks == 0)</span>
+        {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            for (int i = firstFullBlockIdx; i &lt;= lastFullBlockIdx; i++)</span>
+<span class="nc" id="L349">                builder.add(dataLevel.getBlock(i).getBlockIndex().iterator(keyFetcher));</span>
+
+<span class="nc" id="L351">            return builder.build();</span>
+        }
+
+        // first get all of the blocks which are aligned before the first super-block in the sequence,
+        // e.g. if the block range was (1, 9) and super-block-size = 4, we need to read 1, 2, 3, 4 - 7 is covered by
+        // super-block, 8, 9 is a remainder.
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        int superBlockAlignedStart = firstFullBlockIdx == 0 ? 0 : (int) FBUtilities.align(firstFullBlockIdx, OnDiskIndexBuilder.SUPER_BLOCK_SIZE);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        for (int blockIdx = firstFullBlockIdx; blockIdx &lt; Math.min(superBlockAlignedStart, lastFullBlockIdx); blockIdx++)</span>
+<span class="nc" id="L360">            builder.add(getBlockIterator(blockIdx));</span>
+
+        // now read all of the super-blocks matched by the request, from the previous comment
+        // it's a block with index 1 (which covers everything from 4 to 7)
+
+<span class="nc" id="L365">        int superBlockIdx = superBlockAlignedStart / OnDiskIndexBuilder.SUPER_BLOCK_SIZE;</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (int offset = 0; offset &lt; totalSuperBlocks - 1; offset++)</span>
+<span class="nc" id="L367">            builder.add(dataLevel.getSuperBlock(superBlockIdx++).iterator());</span>
+
+        // now it's time for a remainder read, again from the previous example it's 8, 9 because
+        // we have over-shot previous block but didn't request enough to cover next super-block.
+
+<span class="nc" id="L372">        int lastCoveredBlock = superBlockIdx * OnDiskIndexBuilder.SUPER_BLOCK_SIZE;</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        for (int offset = 0; offset &lt;= (lastFullBlockIdx - lastCoveredBlock); offset++)</span>
+<span class="nc" id="L374">            builder.add(getBlockIterator(lastCoveredBlock + offset));</span>
+
+<span class="nc" id="L376">        return builder.build();</span>
+    }
+
+    private RangeIterator&lt;Long, Token&gt; searchPoint(int lowerBlock, Expression expression)
+    {
+<span class="nc" id="L381">        Iterator&lt;DataTerm&gt; terms = new TermIterator(lowerBlock, expression, IteratorOrder.DESC);</span>
+<span class="nc" id="L382">        RangeUnionIterator.Builder&lt;Long, Token&gt; builder = RangeUnionIterator.builder();</span>
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        while (terms.hasNext())</span>
+        {
+            try
+            {
+<span class="nc" id="L388">                builder.add(terms.next().getTokens());</span>
+            }
+            finally
+            {
+<span class="nc" id="L392">                expression.checkpoint();</span>
+<span class="nc" id="L393">            }</span>
+        }
+
+<span class="nc" id="L396">        return builder.build();</span>
+    }
+
+    private RangeIterator&lt;Long, Token&gt; getBlockIterator(int blockIdx)
+    {
+<span class="nc" id="L401">        DataBlock block = dataLevel.getBlock(blockIdx);</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        return (block.hasCombinedIndex)</span>
+<span class="nc" id="L403">                ? block.getBlockIndex().iterator(keyFetcher)</span>
+<span class="nc" id="L404">                : block.getRange(0, block.termCount());</span>
+    }
+
+    public Iterator&lt;DataTerm&gt; iteratorAt(ByteBuffer query, IteratorOrder order, boolean inclusive)
+    {
+<span class="nc" id="L409">        Expression e = new Expression(&quot;&quot;, comparator);</span>
+<span class="nc" id="L410">        Expression.Bound bound = new Expression.Bound(query, inclusive);</span>
+
+<span class="nc bnc" id="L412" title="All 3 branches missed.">        switch (order)</span>
+        {
+            case DESC:
+<span class="nc" id="L415">                e.setLower(bound);</span>
+<span class="nc" id="L416">                break;</span>
+
+            case ASC:
+<span class="nc" id="L419">                e.setUpper(bound);</span>
+<span class="nc" id="L420">                break;</span>
+
+            default:
+<span class="nc" id="L423">                throw new IllegalArgumentException(&quot;Unknown order: &quot; + order);</span>
+        }
+
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        return new TermIterator(levels.length == 0 ? 0 : getBlockIdx(findPointer(query), query), e, order);</span>
+    }
+
+    private int getDataBlock(ByteBuffer query)
+    {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        return levels.length == 0 ? 0 : getBlockIdx(findPointer(query), query);</span>
+    }
+
+    public Iterator&lt;DataTerm&gt; iterator()
+    {
+<span class="nc" id="L436">        return new TermIterator(0, new Expression(&quot;&quot;, comparator), IteratorOrder.DESC);</span>
+    }
+
+    public void close() throws IOException
+    {
+<span class="nc" id="L441">        FileUtils.closeQuietly(indexFile);</span>
+<span class="nc" id="L442">    }</span>
+
+    private PointerTerm findPointer(ByteBuffer query)
+    {
+<span class="nc" id="L446">        PointerTerm ptr = null;</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        for (PointerLevel level : levels)</span>
+        {
+<span class="nc bnc" id="L449" title="All 2 branches missed.">            if ((ptr = level.getPointer(ptr, query)) == null)</span>
+<span class="nc" id="L450">                return null;</span>
+        }
+
+<span class="nc" id="L453">        return ptr;</span>
+    }
+
+    private DataTerm getTerm(ByteBuffer query)
+    {
+<span class="nc" id="L458">        SearchResult&lt;DataTerm&gt; term = searchIndex(query, getDataBlock(query));</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        return term.cmp == 0 ? term.result : null;</span>
+    }
+
+    private SearchResult&lt;DataTerm&gt; searchIndex(ByteBuffer query, int blockIdx)
+    {
+<span class="nc" id="L464">        return dataLevel.getBlock(blockIdx).search(comparator, query);</span>
+    }
+
+    private int getBlockIdx(PointerTerm ptr, ByteBuffer query)
+    {
+<span class="nc" id="L469">        int blockIdx = 0;</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        if (ptr != null)</span>
+        {
+<span class="nc" id="L472">            int cmp = ptr.compareTo(comparator, query);</span>
+<span class="nc bnc" id="L473" title="All 4 branches missed.">            blockIdx = (cmp == 0 || cmp &gt; 0) ? ptr.getBlock() : ptr.getBlock() + 1;</span>
+        }
+
+<span class="nc" id="L476">        return blockIdx;</span>
+    }
+
+    protected class PointerLevel extends Level&lt;PointerBlock&gt;
+    {
+        public PointerLevel(long offset, int count)
+<span class="nc" id="L482">        {</span>
+<span class="nc" id="L483">            super(offset, count);</span>
+<span class="nc" id="L484">        }</span>
+
+        public PointerTerm getPointer(PointerTerm parent, ByteBuffer query)
+        {
+<span class="nc" id="L488">            return getBlock(getBlockIdx(parent, query)).search(comparator, query).result;</span>
+        }
+
+        protected PointerBlock cast(MappedBuffer block)
+        {
+<span class="nc" id="L493">            return new PointerBlock(block);</span>
+        }
+    }
+
+<span class="nc bnc" id="L497" title="All 2 branches missed.">    protected class DataLevel extends Level&lt;DataBlock&gt;</span>
+    {
+        protected final int superBlockCnt;
+        protected final long superBlocksOffset;
+
+        public DataLevel(long offset, int count)
+<span class="nc" id="L503">        {</span>
+<span class="nc" id="L504">            super(offset, count);</span>
+<span class="nc" id="L505">            long baseOffset = blockOffsets + blockCount * 8;</span>
+<span class="nc" id="L506">            superBlockCnt = indexFile.getInt(baseOffset);</span>
+<span class="nc" id="L507">            superBlocksOffset = baseOffset + 4;</span>
+<span class="nc" id="L508">        }</span>
+
+        protected DataBlock cast(MappedBuffer block)
+        {
+<span class="nc" id="L512">            return new DataBlock(block);</span>
+        }
+
+        public OnDiskSuperBlock getSuperBlock(int idx)
+        {
+<span class="nc bnc" id="L517" title="All 4 branches missed.">            assert idx &lt; superBlockCnt : String.format(&quot;requested index %d is greater than super block count %d&quot;, idx, superBlockCnt);</span>
+<span class="nc" id="L518">            long blockOffset = indexFile.getLong(superBlocksOffset + idx * 8);</span>
+<span class="nc" id="L519">            return new OnDiskSuperBlock(indexFile.duplicate().position(blockOffset));</span>
+        }
+    }
+
+    protected class OnDiskSuperBlock
+    {
+        private final TokenTree tokenTree;
+
+        public OnDiskSuperBlock(MappedBuffer buffer)
+<span class="nc" id="L528">        {</span>
+<span class="nc" id="L529">            tokenTree = new TokenTree(descriptor, buffer);</span>
+<span class="nc" id="L530">        }</span>
+
+        public RangeIterator&lt;Long, Token&gt; iterator()
+        {
+<span class="nc" id="L534">            return tokenTree.iterator(keyFetcher);</span>
+        }
+    }
+
+<span class="nc bnc" id="L538" title="All 2 branches missed.">    protected abstract class Level&lt;T extends OnDiskBlock&gt;</span>
+    {
+        protected final long blockOffsets;
+        protected final int blockCount;
+
+        public Level(long offsets, int count)
+<span class="nc" id="L544">        {</span>
+<span class="nc" id="L545">            this.blockOffsets = offsets;</span>
+<span class="nc" id="L546">            this.blockCount = count;</span>
+<span class="nc" id="L547">        }</span>
+
+        public T getBlock(int idx) throws FSReadError
+        {
+<span class="nc bnc" id="L551" title="All 6 branches missed.">            assert idx &gt;= 0 &amp;&amp; idx &lt; blockCount;</span>
+
+            // calculate block offset and move there
+            // (long is intentional, we'll just need mmap implementation which supports long positions)
+<span class="nc" id="L555">            long blockOffset = indexFile.getLong(blockOffsets + idx * 8);</span>
+<span class="nc" id="L556">            return cast(indexFile.duplicate().position(blockOffset));</span>
+        }
+
+        protected abstract T cast(MappedBuffer block);
+    }
+
+    protected class DataBlock extends OnDiskBlock&lt;DataTerm&gt;
+    {
+        public DataBlock(MappedBuffer data)
+<span class="nc" id="L565">        {</span>
+<span class="nc" id="L566">            super(descriptor, data, BlockType.DATA);</span>
+<span class="nc" id="L567">        }</span>
+
+        protected DataTerm cast(MappedBuffer data)
+        {
+<span class="nc" id="L571">            return new DataTerm(data, termSize, getBlockIndex());</span>
+        }
+
+        public RangeIterator&lt;Long, Token&gt; getRange(int start, int end)
+        {
+<span class="nc" id="L576">            RangeUnionIterator.Builder&lt;Long, Token&gt; builder = RangeUnionIterator.builder();</span>
+<span class="nc" id="L577">            NavigableMap&lt;Long, Token&gt; sparse = new TreeMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            for (int i = start; i &lt; end; i++)</span>
+            {
+<span class="nc" id="L581">                DataTerm term = getTerm(i);</span>
+
+<span class="nc bnc" id="L583" title="All 2 branches missed.">                if (term.isSparse())</span>
+                {
+<span class="nc" id="L585">                    NavigableMap&lt;Long, Token&gt; tokens = term.getSparseTokens();</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">                    for (Map.Entry&lt;Long, Token&gt; t : tokens.entrySet())</span>
+                    {
+<span class="nc" id="L588">                        Token token = sparse.get(t.getKey());</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                        if (token == null)</span>
+<span class="nc" id="L590">                            sparse.put(t.getKey(), t.getValue());</span>
+                        else
+<span class="nc" id="L592">                            token.merge(t.getValue());</span>
+<span class="nc" id="L593">                    }</span>
+<span class="nc" id="L594">                }</span>
+                else
+                {
+<span class="nc" id="L597">                    builder.add(term.getTokens());</span>
+                }
+            }
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">            PrefetchedTokensIterator prefetched = sparse.isEmpty() ? null : new PrefetchedTokensIterator(sparse);</span>
+
+<span class="nc bnc" id="L603" title="All 2 branches missed.">            if (builder.rangeCount() == 0)</span>
+<span class="nc" id="L604">                return prefetched;</span>
+
+<span class="nc" id="L606">            builder.add(prefetched);</span>
+<span class="nc" id="L607">            return builder.build();</span>
+        }
+    }
+
+    protected class PointerBlock extends OnDiskBlock&lt;PointerTerm&gt;
+    {
+        public PointerBlock(MappedBuffer block)
+<span class="nc" id="L614">        {</span>
+<span class="nc" id="L615">            super(descriptor, block, BlockType.POINTER);</span>
+<span class="nc" id="L616">        }</span>
+
+        protected PointerTerm cast(MappedBuffer data)
+        {
+<span class="nc" id="L620">            return new PointerTerm(data, termSize, hasMarkedPartials);</span>
+        }
+    }
+
+<span class="nc bnc" id="L624" title="All 2 branches missed.">    public class DataTerm extends Term implements Comparable&lt;DataTerm&gt;</span>
+    {
+        private final TokenTree perBlockIndex;
+
+        protected DataTerm(MappedBuffer content, OnDiskIndexBuilder.TermSize size, TokenTree perBlockIndex)
+<span class="nc" id="L629">        {</span>
+<span class="nc" id="L630">            super(content, size, hasMarkedPartials);</span>
+<span class="nc" id="L631">            this.perBlockIndex = perBlockIndex;</span>
+<span class="nc" id="L632">        }</span>
+
+        public RangeIterator&lt;Long, Token&gt; getTokens()
+        {
+<span class="nc" id="L636">            final long blockEnd = FBUtilities.align(content.position(), OnDiskIndexBuilder.BLOCK_SIZE);</span>
+
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if (isSparse())</span>
+<span class="nc" id="L639">                return new PrefetchedTokensIterator(getSparseTokens());</span>
+
+<span class="nc" id="L641">            long offset = blockEnd + 4 + content.getInt(getDataOffset() + 1);</span>
+<span class="nc" id="L642">            return new TokenTree(descriptor, indexFile.duplicate().position(offset)).iterator(keyFetcher);</span>
+        }
+
+        public boolean isSparse()
+        {
+<span class="nc bnc" id="L647" title="All 2 branches missed.">            return content.get(getDataOffset()) &gt; 0;</span>
+        }
+
+        public NavigableMap&lt;Long, Token&gt; getSparseTokens()
+        {
+<span class="nc" id="L652">            long ptrOffset = getDataOffset();</span>
+
+<span class="nc" id="L654">            byte size = content.get(ptrOffset);</span>
+
+<span class="nc bnc" id="L656" title="All 4 branches missed.">            assert size &gt; 0;</span>
+
+<span class="nc" id="L658">            NavigableMap&lt;Long, Token&gt; individualTokens = new TreeMap&lt;&gt;();</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L661">                Token token = perBlockIndex.get(content.getLong(ptrOffset + 1 + (8 * i)), keyFetcher);</span>
+
+<span class="nc bnc" id="L663" title="All 4 branches missed.">                assert token != null;</span>
+<span class="nc" id="L664">                individualTokens.put(token.get(), token);</span>
+            }
+
+<span class="nc" id="L667">            return individualTokens;</span>
+        }
+
+        public int compareTo(DataTerm other)
+        {
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            return other == null ? 1 : compareTo(comparator, other.getTerm());</span>
+        }
+    }
+
+    protected static class PointerTerm extends Term
+    {
+        public PointerTerm(MappedBuffer content, OnDiskIndexBuilder.TermSize size, boolean hasMarkedPartials)
+        {
+<span class="nc" id="L680">            super(content, size, hasMarkedPartials);</span>
+<span class="nc" id="L681">        }</span>
+
+        public int getBlock()
+        {
+<span class="nc" id="L685">            return content.getInt(getDataOffset());</span>
+        }
+    }
+
+    private static class PrefetchedTokensIterator extends RangeIterator&lt;Long, Token&gt;
+    {
+        private final NavigableMap&lt;Long, Token&gt; tokens;
+        private PeekingIterator&lt;Token&gt; currentIterator;
+
+        public PrefetchedTokensIterator(NavigableMap&lt;Long, Token&gt; tokens)
+        {
+<span class="nc" id="L696">            super(tokens.firstKey(), tokens.lastKey(), tokens.size());</span>
+<span class="nc" id="L697">            this.tokens = tokens;</span>
+<span class="nc" id="L698">            this.currentIterator = Iterators.peekingIterator(tokens.values().iterator());</span>
+<span class="nc" id="L699">        }</span>
+
+        protected Token computeNext()
+        {
+<span class="nc bnc" id="L703" title="All 4 branches missed.">            return currentIterator != null &amp;&amp; currentIterator.hasNext()</span>
+<span class="nc" id="L704">                    ? currentIterator.next()</span>
+<span class="nc" id="L705">                    : endOfData();</span>
+        }
+
+        protected void performSkipTo(Long nextToken)
+        {
+<span class="nc" id="L710">            currentIterator = Iterators.peekingIterator(tokens.tailMap(nextToken, true).values().iterator());</span>
+<span class="nc" id="L711">        }</span>
+
+        public void close() throws IOException
+        {
+<span class="nc" id="L715">            endOfData();</span>
+<span class="nc" id="L716">        }</span>
+    }
+
+    public AbstractType&lt;?&gt; getComparator()
+    {
+<span class="nc" id="L721">        return comparator;</span>
+    }
+
+    public String getIndexPath()
+    {
+<span class="nc" id="L726">        return indexPath;</span>
+    }
+
+    private class TermIterator extends AbstractIterator&lt;DataTerm&gt;
+    {
+        private final Expression e;
+        private final IteratorOrder order;
+
+        protected OnDiskBlock&lt;DataTerm&gt; currentBlock;
+        protected int blockIndex, offset;
+
+<span class="nc" id="L737">        private boolean checkLower = true, checkUpper = true;</span>
+
+        public TermIterator(int startBlock, Expression expression, IteratorOrder order)
+<span class="nc" id="L740">        {</span>
+<span class="nc" id="L741">            this.e = expression;</span>
+<span class="nc" id="L742">            this.order = order;</span>
+<span class="nc" id="L743">            this.blockIndex = startBlock;</span>
+
+<span class="nc" id="L745">            nextBlock();</span>
+<span class="nc" id="L746">        }</span>
+
+        protected DataTerm computeNext()
+        {
+            for (;;)
+            {
+<span class="nc bnc" id="L752" title="All 2 branches missed.">                if (currentBlock == null)</span>
+<span class="nc" id="L753">                    return endOfData();</span>
+
+<span class="nc bnc" id="L755" title="All 4 branches missed.">                if (offset &gt;= 0 &amp;&amp; offset &lt; currentBlock.termCount())</span>
+                {
+<span class="nc" id="L757">                    DataTerm currentTerm = currentBlock.getTerm(nextOffset());</span>
+
+                    // we need to step over all of the partial terms, in PREFIX mode,
+                    // encountered by the query until upper-bound tells us to stop
+<span class="nc bnc" id="L761" title="All 4 branches missed.">                    if (e.getOp() == Op.PREFIX &amp;&amp; currentTerm.isPartial())</span>
+<span class="nc" id="L762">                        continue;</span>
+
+                    // haven't reached the start of the query range yet, let's
+                    // keep skip the current term until lower bound is satisfied
+<span class="nc bnc" id="L766" title="All 4 branches missed.">                    if (checkLower &amp;&amp; !e.isLowerSatisfiedBy(currentTerm))</span>
+<span class="nc" id="L767">                        continue;</span>
+
+                    // flip the flag right on the first bounds match
+                    // to avoid expensive comparisons
+<span class="nc" id="L771">                    checkLower = false;</span>
+
+<span class="nc bnc" id="L773" title="All 4 branches missed.">                    if (checkUpper &amp;&amp; !e.isUpperSatisfiedBy(currentTerm))</span>
+<span class="nc" id="L774">                        return endOfData();</span>
+
+<span class="nc" id="L776">                    return currentTerm;</span>
+                }
+
+<span class="nc" id="L779">                nextBlock();</span>
+            }
+        }
+
+        protected void nextBlock()
+        {
+<span class="nc" id="L785">            currentBlock = null;</span>
+
+<span class="nc bnc" id="L787" title="All 4 branches missed.">            if (blockIndex &lt; 0 || blockIndex &gt;= dataLevel.blockCount)</span>
+<span class="nc" id="L788">                return;</span>
+
+<span class="nc" id="L790">            currentBlock = dataLevel.getBlock(nextBlockIndex());</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">            offset = checkLower ? order.startAt(currentBlock, e) : currentBlock.minOffset(order);</span>
+
+            // let's check the last term of the new block right away
+            // if expression's upper bound is satisfied by it such means that we can avoid
+            // doing any expensive upper bound checks for that block.
+<span class="nc bnc" id="L796" title="All 4 branches missed.">            checkUpper = e.hasUpper() &amp;&amp; !e.isUpperSatisfiedBy(currentBlock.getTerm(currentBlock.maxOffset(order)));</span>
+<span class="nc" id="L797">        }</span>
+
+        protected int nextBlockIndex()
+        {
+<span class="nc" id="L801">            int current = blockIndex;</span>
+<span class="nc" id="L802">            blockIndex += order.step;</span>
+<span class="nc" id="L803">            return current;</span>
+        }
+
+        protected int nextOffset()
+        {
+<span class="nc" id="L808">            int current = offset;</span>
+<span class="nc" id="L809">            offset += order.step;</span>
+<span class="nc" id="L810">            return current;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MultiPartitionPager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.pager</a> &gt; <span class="el_source">MultiPartitionPager.java</span></div><h1>MultiPartitionPager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service.pager;
+
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.AbstractIterator;
+
+import java.util.Arrays;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.service.ClientState;
+
+/**
+ * Pager over a list of ReadCommand.
+ *
+ * Note that this is not easy to make efficient. Indeed, we need to page the first command fully before
+ * returning results from the next one, but if the result returned by each command is small (compared to pageSize),
+ * paging the commands one at a time under-performs compared to parallelizing. On the other, if we parallelize
+ * and each command raised pageSize results, we'll end up with commands.size() * pageSize results in memory, which
+ * defeats the purpose of paging.
+ *
+ * For now, we keep it simple (somewhat) and just do one command at a time. Provided that we make sure to not
+ * create a pager unless we need to, this is probably fine. Though if we later want to get fancy, we could use the
+ * cfs meanPartitionSize to decide if parallelizing some of the command might be worth it while being confident we don't
+ * blow out memory.
+ */
+public class MultiPartitionPager implements QueryPager
+{
+    private final SinglePartitionPager[] pagers;
+    private final DataLimits limit;
+
+    private final int nowInSec;
+
+    private int remaining;
+    private int current;
+
+    public MultiPartitionPager(SinglePartitionReadCommand.Group group, PagingState state, ProtocolVersion protocolVersion)
+<span class="nc" id="L58">    {</span>
+<span class="nc" id="L59">        this.limit = group.limits();</span>
+<span class="nc" id="L60">        this.nowInSec = group.nowInSec();</span>
+
+<span class="nc" id="L62">        int i = 0;</span>
+        // If it's not the beginning (state != null), we need to find where we were and skip previous commands
+        // since they are done.
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        if (state != null)</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">            for (; i &lt; group.commands.size(); i++)</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">                if (group.commands.get(i).partitionKey().getKey().equals(state.partitionKey))</span>
+<span class="nc" id="L68">                    break;</span>
+
+<span class="nc bnc" id="L70" title="All 2 branches missed.">        if (i &gt;= group.commands.size())</span>
+        {
+<span class="nc" id="L72">            pagers = null;</span>
+<span class="nc" id="L73">            return;</span>
+        }
+
+<span class="nc" id="L76">        pagers = new SinglePartitionPager[group.commands.size() - i];</span>
+        // 'i' is on the first non exhausted pager for the previous page (or the first one)
+<span class="nc" id="L78">        SinglePartitionReadCommand command = group.commands.get(i);</span>
+<span class="nc" id="L79">        pagers[0] = command.getPager(state, protocolVersion);</span>
+
+        // Following ones haven't been started yet
+<span class="nc bnc" id="L82" title="All 2 branches missed.">        for (int j = i + 1; j &lt; group.commands.size(); j++)</span>
+<span class="nc" id="L83">            pagers[j - i] = group.commands.get(j).getPager(null, protocolVersion);</span>
+
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        remaining = state == null ? limit.count() : state.remaining;</span>
+<span class="nc" id="L86">    }</span>
+
+    private MultiPartitionPager(SinglePartitionPager[] pagers,
+                                DataLimits limit,
+                                int nowInSec,
+                                int remaining,
+                                int current)
+<span class="nc" id="L93">    {</span>
+<span class="nc" id="L94">        this.pagers = pagers;</span>
+<span class="nc" id="L95">        this.limit = limit;</span>
+<span class="nc" id="L96">        this.nowInSec = nowInSec;</span>
+<span class="nc" id="L97">        this.remaining = remaining;</span>
+<span class="nc" id="L98">        this.current = current;</span>
+<span class="nc" id="L99">    }</span>
+
+    public QueryPager withUpdatedLimit(DataLimits newLimits)
+    {
+<span class="nc" id="L103">        SinglePartitionPager[] newPagers = Arrays.copyOf(pagers, pagers.length);</span>
+<span class="nc" id="L104">        newPagers[current] = newPagers[current].withUpdatedLimit(newLimits);</span>
+
+<span class="nc" id="L106">        return new MultiPartitionPager(newPagers,</span>
+                                       newLimits,
+                                       nowInSec,
+                                       remaining,
+                                       current);
+    }
+
+    public PagingState state()
+    {
+        // Sets current to the first non-exhausted pager
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (isExhausted())</span>
+<span class="nc" id="L117">            return null;</span>
+
+<span class="nc" id="L119">        PagingState state = pagers[current].state();</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        return new PagingState(pagers[current].key(), state == null ? null : state.rowMark, remaining, pagers[current].remainingInPartition());</span>
+    }
+
+    public boolean isExhausted()
+    {
+<span class="nc bnc" id="L125" title="All 4 branches missed.">        if (remaining &lt;= 0 || pagers == null)</span>
+<span class="nc" id="L126">            return true;</span>
+
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        while (current &lt; pagers.length)</span>
+        {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (!pagers[current].isExhausted())</span>
+<span class="nc" id="L131">                return false;</span>
+
+<span class="nc" id="L133">            current++;</span>
+        }
+<span class="nc" id="L135">        return true;</span>
+    }
+
+    public ReadExecutionController executionController()
+    {
+        // Note that for all pagers, the only difference is the partition key to which it applies, so in practice we
+        // can use any of the sub-pager ReadOrderGroup group to protect the whole pager
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        for (int i = current; i &lt; pagers.length; i++)</span>
+        {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            if (pagers[i] != null)</span>
+<span class="nc" id="L145">                return pagers[i].executionController();</span>
+        }
+<span class="nc" id="L147">        throw new AssertionError(&quot;Shouldn't be called on an exhausted pager&quot;);</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;) // iter closed via countingIter
+    public PartitionIterator fetchPage(int pageSize, ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L153">        int toQuery = Math.min(remaining, pageSize);</span>
+<span class="nc" id="L154">        return new PagersIterator(toQuery, consistency, clientState, null, queryStartNanoTime);</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;) // iter closed via countingIter
+    public PartitionIterator fetchPageInternal(int pageSize, ReadExecutionController executionController) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L160">        int toQuery = Math.min(remaining, pageSize);</span>
+<span class="nc" id="L161">        return new PagersIterator(toQuery, null, null, executionController, System.nanoTime());</span>
+    }
+
+    private class PagersIterator extends AbstractIterator&lt;RowIterator&gt; implements PartitionIterator
+    {
+        private final int pageSize;
+        private PartitionIterator result;
+        private boolean closed;
+        private final long queryStartNanoTime;
+
+        // For &quot;normal&quot; queries
+        private final ConsistencyLevel consistency;
+        private final ClientState clientState;
+
+        // For internal queries
+        private final ReadExecutionController executionController;
+
+        private int pagerMaxRemaining;
+        private int counted;
+
+        public PagersIterator(int pageSize, ConsistencyLevel consistency, ClientState clientState, ReadExecutionController executionController, long queryStartNanoTime)
+<span class="nc" id="L182">        {</span>
+<span class="nc" id="L183">            this.pageSize = pageSize;</span>
+<span class="nc" id="L184">            this.consistency = consistency;</span>
+<span class="nc" id="L185">            this.clientState = clientState;</span>
+<span class="nc" id="L186">            this.executionController = executionController;</span>
+<span class="nc" id="L187">            this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="nc" id="L188">        }</span>
+
+        protected RowIterator computeNext()
+        {
+<span class="nc bnc" id="L192" title="All 4 branches missed.">            while (result == null || !result.hasNext())</span>
+            {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                if (result != null)</span>
+                {
+<span class="nc" id="L196">                    result.close();</span>
+<span class="nc" id="L197">                    counted += pagerMaxRemaining - pagers[current].maxRemaining();</span>
+                }
+
+                // We are done if we have reached the page size or in the case of GROUP BY if the current pager
+                // is not exhausted.
+<span class="nc bnc" id="L202" title="All 4 branches missed.">                boolean isDone = counted &gt;= pageSize</span>
+<span class="nc bnc" id="L203" title="All 4 branches missed.">                        || (result != null &amp;&amp; limit.isGroupByLimit() &amp;&amp; !pagers[current].isExhausted());</span>
+
+                // isExhausted() will sets us on the first non-exhausted pager
+<span class="nc bnc" id="L206" title="All 4 branches missed.">                if (isDone || isExhausted())</span>
+                {
+<span class="nc" id="L208">                    closed = true;</span>
+<span class="nc" id="L209">                    return endOfData();</span>
+                }
+
+<span class="nc" id="L212">                pagerMaxRemaining = pagers[current].maxRemaining();</span>
+<span class="nc" id="L213">                int toQuery = pageSize - counted;</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                result = consistency == null</span>
+<span class="nc" id="L215">                       ? pagers[current].fetchPageInternal(toQuery, executionController)</span>
+<span class="nc" id="L216">                       : pagers[current].fetchPage(toQuery, consistency, clientState, queryStartNanoTime);</span>
+<span class="nc" id="L217">            }</span>
+<span class="nc" id="L218">            return result.next();</span>
+        }
+
+        public void close()
+        {
+<span class="nc" id="L223">            remaining -= counted;</span>
+<span class="nc bnc" id="L224" title="All 4 branches missed.">            if (result != null &amp;&amp; !closed)</span>
+<span class="nc" id="L225">                result.close();</span>
+<span class="nc" id="L226">        }</span>
+    }
+
+    public int maxRemaining()
+    {
+<span class="nc" id="L231">        return remaining;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

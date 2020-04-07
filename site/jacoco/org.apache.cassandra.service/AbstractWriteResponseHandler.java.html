@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractWriteResponseHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">AbstractWriteResponseHandler.java</span></div><h1>AbstractWriteResponseHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.net.InetAddress;
+import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+
+import com.google.common.collect.Iterables;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.utils.concurrent.SimpleCondition;
+
+public abstract class AbstractWriteResponseHandler&lt;T&gt; implements IAsyncCallbackWithFailure&lt;T&gt;
+{
+<span class="fc" id="L43">    protected static final Logger logger = LoggerFactory.getLogger( AbstractWriteResponseHandler.class );</span>
+
+<span class="fc" id="L45">    private final SimpleCondition condition = new SimpleCondition();</span>
+    protected final Keyspace keyspace;
+    protected final Collection&lt;InetAddress&gt; naturalEndpoints;
+    public final ConsistencyLevel consistencyLevel;
+    protected final Runnable callback;
+    protected final Collection&lt;InetAddress&gt; pendingEndpoints;
+    protected final WriteType writeType;
+<span class="fc" id="L52">    private static final AtomicIntegerFieldUpdater&lt;AbstractWriteResponseHandler&gt; failuresUpdater</span>
+<span class="fc" id="L53">        = AtomicIntegerFieldUpdater.newUpdater(AbstractWriteResponseHandler.class, &quot;failures&quot;);</span>
+<span class="fc" id="L54">    private volatile int failures = 0;</span>
+    private final Map&lt;InetAddress, RequestFailureReason&gt; failureReasonByEndpoint;
+    private final long queryStartNanoTime;
+<span class="fc" id="L57">    private volatile boolean supportsBackPressure = true;</span>
+
+    /**
+     * @param callback A callback to be called when the write is successful.
+     * @param queryStartNanoTime
+     */
+    protected AbstractWriteResponseHandler(Keyspace keyspace,
+                                           Collection&lt;InetAddress&gt; naturalEndpoints,
+                                           Collection&lt;InetAddress&gt; pendingEndpoints,
+                                           ConsistencyLevel consistencyLevel,
+                                           Runnable callback,
+                                           WriteType writeType,
+                                           long queryStartNanoTime)
+<span class="fc" id="L70">    {</span>
+<span class="fc" id="L71">        this.keyspace = keyspace;</span>
+<span class="fc" id="L72">        this.pendingEndpoints = pendingEndpoints;</span>
+<span class="fc" id="L73">        this.consistencyLevel = consistencyLevel;</span>
+<span class="fc" id="L74">        this.naturalEndpoints = naturalEndpoints;</span>
+<span class="fc" id="L75">        this.callback = callback;</span>
+<span class="fc" id="L76">        this.writeType = writeType;</span>
+<span class="fc" id="L77">        this.failureReasonByEndpoint = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L78">        this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L79">    }</span>
+
+    public void get() throws WriteTimeoutException, WriteFailureException
+    {
+<span class="fc" id="L83">        long timeout = currentTimeout();</span>
+
+        boolean success;
+        try
+        {
+<span class="fc" id="L88">            success = condition.await(timeout, TimeUnit.NANOSECONDS);</span>
+        }
+<span class="nc" id="L90">        catch (InterruptedException ex)</span>
+        {
+<span class="nc" id="L92">            throw new AssertionError(ex);</span>
+<span class="fc" id="L93">        }</span>
+
+<span class="pc bpc" id="L95" title="1 of 2 branches missed.">        if (!success)</span>
+        {
+<span class="nc" id="L97">            int blockedFor = totalBlockFor();</span>
+<span class="nc" id="L98">            int acks = ackCount();</span>
+            // It's pretty unlikely, but we can race between exiting await above and here, so
+            // that we could now have enough acks. In that case, we &quot;lie&quot; on the acks count to
+            // avoid sending confusing info to the user (see CASSANDRA-6491).
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            if (acks &gt;= blockedFor)</span>
+<span class="nc" id="L103">                acks = blockedFor - 1;</span>
+<span class="nc" id="L104">            throw new WriteTimeoutException(writeType, consistencyLevel, acks, blockedFor);</span>
+        }
+
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if (totalBlockFor() + failures &gt; totalEndpoints())</span>
+        {
+<span class="nc" id="L109">            throw new WriteFailureException(consistencyLevel, ackCount(), totalBlockFor(), writeType, failureReasonByEndpoint);</span>
+        }
+<span class="fc" id="L111">    }</span>
+
+    public final long currentTimeout()
+    {
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">        long requestTimeout = writeType == WriteType.COUNTER</span>
+<span class="nc" id="L116">                              ? DatabaseDescriptor.getCounterWriteRpcTimeout()</span>
+<span class="fc" id="L117">                              : DatabaseDescriptor.getWriteRpcTimeout();</span>
+<span class="fc" id="L118">        return TimeUnit.MILLISECONDS.toNanos(requestTimeout) - (System.nanoTime() - queryStartNanoTime);</span>
+    }
+
+    /**
+     * @return the minimum number of endpoints that must reply.
+     */
+    protected int totalBlockFor()
+    {
+        // During bootstrap, we have to include the pending endpoints or we may fail the consistency level
+        // guarantees (see #833)
+<span class="fc" id="L128">        return consistencyLevel.blockFor(keyspace) + pendingEndpoints.size();</span>
+    }
+
+    /**
+     * @return the total number of endpoints the request has been sent to.
+     */
+    protected int totalEndpoints()
+    {
+<span class="fc" id="L136">        return naturalEndpoints.size() + pendingEndpoints.size();</span>
+    }
+
+    /**
+     * @return true if the message counts towards the totalBlockFor() threshold
+     */
+    protected boolean waitingFor(InetAddress from)
+    {
+<span class="nc" id="L144">        return true;</span>
+    }
+
+    /**
+     * @return number of responses received
+     */
+    protected abstract int ackCount();
+
+    /** null message means &quot;response from local write&quot; */
+    public abstract void response(MessageIn&lt;T&gt; msg);
+
+    public void assureSufficientLiveNodes() throws UnavailableException
+    {
+<span class="fc" id="L157">        consistencyLevel.assureSufficientLiveNodes(keyspace, Iterables.filter(Iterables.concat(naturalEndpoints, pendingEndpoints), isAlive));</span>
+<span class="fc" id="L158">    }</span>
+
+    protected void signal()
+    {
+<span class="fc" id="L162">        condition.signalAll();</span>
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">        if (callback != null)</span>
+<span class="nc" id="L164">            callback.run();</span>
+<span class="fc" id="L165">    }</span>
+
+    @Override
+    public void onFailure(InetAddress from, RequestFailureReason failureReason)
+    {
+<span class="nc" id="L170">        logger.trace(&quot;Got failure from {}&quot;, from);</span>
+
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        int n = waitingFor(from)</span>
+<span class="nc" id="L173">              ? failuresUpdater.incrementAndGet(this)</span>
+              : failures;
+
+<span class="nc" id="L176">        failureReasonByEndpoint.put(from, failureReason);</span>
+
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (totalBlockFor() + n &gt; totalEndpoints())</span>
+<span class="nc" id="L179">            signal();</span>
+<span class="nc" id="L180">    }</span>
+
+    @Override
+    public boolean supportsBackPressure()
+    {
+<span class="nc" id="L185">        return supportsBackPressure;</span>
+    }
+
+    public void setSupportsBackPressure(boolean supportsBackPressure)
+    {
+<span class="nc" id="L190">        this.supportsBackPressure = supportsBackPressure;</span>
+<span class="nc" id="L191">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

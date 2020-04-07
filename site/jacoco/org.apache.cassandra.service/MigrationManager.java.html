@@ -1,0 +1,730 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MigrationManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">MigrationManager.java</span></div><h1>MigrationManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.*;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.ViewDefinition;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.exceptions.AlreadyExistsException;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.gms.*;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+public class MigrationManager
+{
+<span class="fc" id="L55">    private static final Logger logger = LoggerFactory.getLogger(MigrationManager.class);</span>
+
+<span class="fc" id="L57">    public static final MigrationManager instance = new MigrationManager();</span>
+
+<span class="fc" id="L59">    private static final RuntimeMXBean runtimeMXBean = ManagementFactory.getRuntimeMXBean();</span>
+
+    public static final int MIGRATION_DELAY_IN_MS = 60000;
+
+<span class="fc" id="L63">    private static final int MIGRATION_TASK_WAIT_IN_SECONDS = Integer.parseInt(System.getProperty(&quot;cassandra.migration_task_wait_in_seconds&quot;, &quot;1&quot;));</span>
+
+<span class="fc" id="L65">    private final List&lt;MigrationListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L67">    private MigrationManager() {}</span>
+
+    public void register(MigrationListener listener)
+    {
+<span class="fc" id="L71">        listeners.add(listener);</span>
+<span class="fc" id="L72">    }</span>
+
+    public void unregister(MigrationListener listener)
+    {
+<span class="nc" id="L76">        listeners.remove(listener);</span>
+<span class="nc" id="L77">    }</span>
+
+    public static void scheduleSchemaPull(InetAddress endpoint, EndpointState state)
+    {
+<span class="fc" id="L81">        UUID schemaVersion = state.getSchemaVersion();</span>
+<span class="pc bpc" id="L82" title="2 of 4 branches missed.">        if (!endpoint.equals(FBUtilities.getBroadcastAddress()) &amp;&amp; schemaVersion != null)</span>
+<span class="fc" id="L83">            maybeScheduleSchemaPull(schemaVersion, endpoint, state.getApplicationState(ApplicationState.RELEASE_VERSION).value);</span>
+<span class="fc" id="L84">    }</span>
+
+    /**
+     * If versions differ this node sends request with local migration list to the endpoint
+     * and expecting to receive a list of migrations to apply locally.
+     */
+    private static void maybeScheduleSchemaPull(final UUID theirVersion, final InetAddress endpoint, String  releaseVersion)
+    {
+<span class="fc" id="L92">        String ourMajorVersion = FBUtilities.getReleaseVersionMajor();</span>
+<span class="pc bpc" id="L93" title="1 of 2 branches missed.">        if (!releaseVersion.startsWith(ourMajorVersion))</span>
+        {
+<span class="nc" id="L95">            logger.debug(&quot;Not pulling schema because release version in Gossip is not major version {}, it is {}&quot;, ourMajorVersion, releaseVersion);</span>
+<span class="nc" id="L96">            return;</span>
+        }
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">        if (Schema.instance.getVersion() == null)</span>
+        {
+<span class="nc" id="L100">            logger.debug(&quot;Not pulling schema from {}, because local schama version is not known yet&quot;,</span>
+                         endpoint);
+<span class="nc" id="L102">            return;</span>
+        }
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        if (Schema.instance.isSameVersion(theirVersion))</span>
+        {
+<span class="fc" id="L106">            logger.debug(&quot;Not pulling schema from {}, because schema versions match: &quot; +</span>
+                         &quot;local/real={}, local/compatible={}, remote={}&quot;,
+                         endpoint,
+<span class="fc" id="L109">                         Schema.schemaVersionToString(Schema.instance.getRealVersion()),</span>
+<span class="fc" id="L110">                         Schema.schemaVersionToString(Schema.instance.getAltVersion()),</span>
+<span class="fc" id="L111">                         Schema.schemaVersionToString(theirVersion));</span>
+<span class="fc" id="L112">            return;</span>
+        }
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (!shouldPullSchemaFrom(endpoint))</span>
+        {
+<span class="nc" id="L116">            logger.debug(&quot;Not pulling schema because versions match or shouldPullSchemaFrom returned false&quot;);</span>
+<span class="nc" id="L117">            return;</span>
+        }
+
+<span class="nc bnc" id="L120" title="All 4 branches missed.">        if (Schema.instance.isEmpty() || runtimeMXBean.getUptime() &lt; MIGRATION_DELAY_IN_MS)</span>
+        {
+            // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
+<span class="nc" id="L123">            logger.debug(&quot;Immediately submitting migration task for {}, &quot; +</span>
+                         &quot;schema versions: local/real={}, local/compatible={}, remote={}&quot;,
+                         endpoint,
+<span class="nc" id="L126">                         Schema.schemaVersionToString(Schema.instance.getRealVersion()),</span>
+<span class="nc" id="L127">                         Schema.schemaVersionToString(Schema.instance.getAltVersion()),</span>
+<span class="nc" id="L128">                         Schema.schemaVersionToString(theirVersion));</span>
+<span class="nc" id="L129">            submitMigrationTask(endpoint);</span>
+        }
+        else
+        {
+            // Include a delay to make sure we have a chance to apply any changes being
+            // pushed out simultaneously. See CASSANDRA-5025
+<span class="nc" id="L135">            Runnable runnable = () -&gt;</span>
+            {
+                // grab the latest version of the schema since it may have changed again since the initial scheduling
+<span class="nc" id="L138">                UUID epSchemaVersion = Gossiper.instance.getSchemaVersion(endpoint);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">                if (epSchemaVersion == null)</span>
+                {
+<span class="nc" id="L141">                    logger.debug(&quot;epState vanished for {}, not submitting migration task&quot;, endpoint);</span>
+<span class="nc" id="L142">                    return;</span>
+                }
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                if (Schema.instance.isSameVersion(epSchemaVersion))</span>
+                {
+<span class="nc" id="L146">                    logger.debug(&quot;Not submitting migration task for {} because our versions match ({})&quot;, endpoint, epSchemaVersion);</span>
+<span class="nc" id="L147">                    return;</span>
+                }
+<span class="nc" id="L149">                logger.debug(&quot;submitting migration task for {}, schema version mismatch: local/real={}, local/compatible={}, remote={}&quot;,</span>
+                             endpoint,
+<span class="nc" id="L151">                             Schema.schemaVersionToString(Schema.instance.getRealVersion()),</span>
+<span class="nc" id="L152">                             Schema.schemaVersionToString(Schema.instance.getAltVersion()),</span>
+<span class="nc" id="L153">                             Schema.schemaVersionToString(epSchemaVersion));</span>
+<span class="nc" id="L154">                submitMigrationTask(endpoint);</span>
+<span class="nc" id="L155">            };</span>
+<span class="nc" id="L156">            ScheduledExecutors.nonPeriodicTasks.schedule(runnable, MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);</span>
+        }
+<span class="nc" id="L158">    }</span>
+
+    private static Future&lt;?&gt; submitMigrationTask(InetAddress endpoint)
+    {
+        /*
+         * Do not de-ref the future because that causes distributed deadlock (CASSANDRA-3832) because we are
+         * running in the gossip stage.
+         */
+<span class="nc" id="L166">        return StageManager.getStage(Stage.MIGRATION).submit(new MigrationTask(endpoint));</span>
+    }
+
+    public static boolean shouldPullSchemaFrom(InetAddress endpoint)
+    {
+        /*
+         * Don't request schema from nodes with a differnt or unknonw major version (may have incompatible schema)
+         * Don't request schema from fat clients
+         */
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        return MessagingService.instance().knowsVersion(endpoint)</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                &amp;&amp; is30Compatible(MessagingService.instance().getRawVersion(endpoint))</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                &amp;&amp; !Gossiper.instance.isGossipOnlyMember(endpoint);</span>
+    }
+
+    // Since 3.0.14 protocol contains only a CASSANDRA-13004 bugfix, it is safe to accept schema changes
+    // from both 3.0 and 3.0.14.
+    private static boolean is30Compatible(int version)
+    {
+<span class="nc bnc" id="L184" title="All 4 branches missed.">        return version == MessagingService.current_version || version == MessagingService.VERSION_3014;</span>
+    }
+
+    public static boolean isReadyForBootstrap()
+    {
+<span class="nc" id="L189">        return MigrationTask.getInflightTasks().isEmpty();</span>
+    }
+
+    public static void waitUntilReadyForBootstrap()
+    {
+        CountDownLatch completionLatch;
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        while ((completionLatch = MigrationTask.getInflightTasks().poll()) != null)</span>
+        {
+            try
+            {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                if (!completionLatch.await(MIGRATION_TASK_WAIT_IN_SECONDS, TimeUnit.SECONDS))</span>
+<span class="nc" id="L200">                    logger.error(&quot;Migration task failed to complete&quot;);</span>
+            }
+<span class="nc" id="L202">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L204">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L205">                logger.error(&quot;Migration task was interrupted&quot;);</span>
+<span class="nc" id="L206">            }</span>
+        }
+<span class="nc" id="L208">    }</span>
+
+    public void notifyCreateKeyspace(KeyspaceMetadata ksm)
+    {
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        for (MigrationListener listener : listeners)</span>
+<span class="fc" id="L213">            listener.onCreateKeyspace(ksm.name);</span>
+<span class="fc" id="L214">    }</span>
+
+    public void notifyCreateColumnFamily(CFMetaData cfm)
+    {
+<span class="fc bfc" id="L218" title="All 2 branches covered.">        for (MigrationListener listener : listeners)</span>
+<span class="fc" id="L219">            listener.onCreateColumnFamily(cfm.ksName, cfm.cfName);</span>
+<span class="fc" id="L220">    }</span>
+
+    public void notifyCreateView(ViewDefinition view)
+    {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L225">            listener.onCreateView(view.ksName, view.viewName);</span>
+<span class="nc" id="L226">    }</span>
+
+    public void notifyCreateUserType(UserType ut)
+    {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L231">            listener.onCreateUserType(ut.keyspace, ut.getNameAsString());</span>
+<span class="nc" id="L232">    }</span>
+
+    public void notifyCreateFunction(UDFunction udf)
+    {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L237">            listener.onCreateFunction(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L238">    }</span>
+
+    public void notifyCreateAggregate(UDAggregate udf)
+    {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L243">            listener.onCreateAggregate(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L244">    }</span>
+
+    public void notifyUpdateKeyspace(KeyspaceMetadata ksm)
+    {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L249">            listener.onUpdateKeyspace(ksm.name);</span>
+<span class="nc" id="L250">    }</span>
+
+    public void notifyUpdateColumnFamily(CFMetaData cfm, boolean columnsDidChange)
+    {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L255">            listener.onUpdateColumnFamily(cfm.ksName, cfm.cfName, columnsDidChange);</span>
+<span class="nc" id="L256">    }</span>
+
+    public void notifyUpdateView(ViewDefinition view, boolean columnsDidChange)
+    {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L261">            listener.onUpdateView(view.ksName, view.viewName, columnsDidChange);</span>
+<span class="nc" id="L262">    }</span>
+
+    public void notifyUpdateUserType(UserType ut)
+    {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L267">            listener.onUpdateUserType(ut.keyspace, ut.getNameAsString());</span>
+
+        // FIXME: remove when we get rid of AbstractType in metadata. Doesn't really belong anywhere.
+<span class="nc" id="L270">        Schema.instance.getKSMetaData(ut.keyspace).functions.udfs().forEach(f -&gt; f.userTypeUpdated(ut.keyspace, ut.getNameAsString()));</span>
+<span class="nc" id="L271">    }</span>
+
+    public void notifyUpdateFunction(UDFunction udf)
+    {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L276">            listener.onUpdateFunction(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L277">    }</span>
+
+    public void notifyUpdateAggregate(UDAggregate udf)
+    {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L282">            listener.onUpdateAggregate(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L283">    }</span>
+
+    public void notifyDropKeyspace(KeyspaceMetadata ksm)
+    {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L288">            listener.onDropKeyspace(ksm.name);</span>
+<span class="nc" id="L289">    }</span>
+
+    public void notifyDropColumnFamily(CFMetaData cfm)
+    {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L294">            listener.onDropColumnFamily(cfm.ksName, cfm.cfName);</span>
+<span class="nc" id="L295">    }</span>
+
+    public void notifyDropView(ViewDefinition view)
+    {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L300">            listener.onDropView(view.ksName, view.viewName);</span>
+<span class="nc" id="L301">    }</span>
+
+    public void notifyDropUserType(UserType ut)
+    {
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L306">            listener.onDropUserType(ut.keyspace, ut.getNameAsString());</span>
+<span class="nc" id="L307">    }</span>
+
+    public void notifyDropFunction(UDFunction udf)
+    {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L312">            listener.onDropFunction(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L313">    }</span>
+
+    public void notifyDropAggregate(UDAggregate udf)
+    {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        for (MigrationListener listener : listeners)</span>
+<span class="nc" id="L318">            listener.onDropAggregate(udf.name().keyspace, udf.name().name, udf.argTypes());</span>
+<span class="nc" id="L319">    }</span>
+
+    public static void announceNewKeyspace(KeyspaceMetadata ksm) throws ConfigurationException
+    {
+<span class="nc" id="L323">        announceNewKeyspace(ksm, false);</span>
+<span class="nc" id="L324">    }</span>
+
+    public static void announceNewKeyspace(KeyspaceMetadata ksm, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L328">        announceNewKeyspace(ksm, FBUtilities.timestampMicros(), announceLocally);</span>
+<span class="nc" id="L329">    }</span>
+
+    public static void announceNewKeyspace(KeyspaceMetadata ksm, long timestamp, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L333">        ksm.validate();</span>
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        if (Schema.instance.getKSMetaData(ksm.name) != null)</span>
+<span class="nc" id="L336">            throw new AlreadyExistsException(ksm.name);</span>
+
+<span class="nc" id="L338">        logger.info(&quot;Create new Keyspace: {}&quot;, ksm);</span>
+<span class="nc" id="L339">        announce(SchemaKeyspace.makeCreateKeyspaceMutation(ksm, timestamp), announceLocally);</span>
+<span class="nc" id="L340">    }</span>
+
+    public static void announceNewColumnFamily(CFMetaData cfm) throws ConfigurationException
+    {
+<span class="nc" id="L344">        announceNewColumnFamily(cfm, false);</span>
+<span class="nc" id="L345">    }</span>
+
+    public static void announceNewColumnFamily(CFMetaData cfm, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L349">        announceNewColumnFamily(cfm, announceLocally, true);</span>
+<span class="nc" id="L350">    }</span>
+
+    private static void announceNewColumnFamily(CFMetaData cfm, boolean announceLocally, boolean throwOnDuplicate) throws ConfigurationException
+    {
+<span class="nc" id="L354">        announceNewColumnFamily(cfm, announceLocally, throwOnDuplicate, FBUtilities.timestampMicros());</span>
+<span class="nc" id="L355">    }</span>
+
+    private static void announceNewColumnFamily(CFMetaData cfm, boolean announceLocally, boolean throwOnDuplicate, long timestamp) throws ConfigurationException
+    {
+<span class="nc" id="L359">        cfm.validate();</span>
+
+<span class="nc" id="L361">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(cfm.ksName);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (ksm == null)</span>
+<span class="nc" id="L363">            throw new ConfigurationException(String.format(&quot;Cannot add table '%s' to non existing keyspace '%s'.&quot;, cfm.cfName, cfm.ksName));</span>
+        // If we have a table or a view which has the same name, we can't add a new one
+<span class="nc bnc" id="L365" title="All 4 branches missed.">        else if (throwOnDuplicate &amp;&amp; ksm.getTableOrViewNullable(cfm.cfName) != null)</span>
+<span class="nc" id="L366">            throw new AlreadyExistsException(cfm.ksName, cfm.cfName);</span>
+
+<span class="nc" id="L368">        logger.info(&quot;Create new table: {}&quot;, cfm);</span>
+<span class="nc" id="L369">        announce(SchemaKeyspace.makeCreateTableMutation(ksm, cfm, timestamp), announceLocally);</span>
+<span class="nc" id="L370">    }</span>
+
+    public static void announceNewView(ViewDefinition view, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L374">        view.metadata.validate();</span>
+
+<span class="nc" id="L376">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(view.ksName);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (ksm == null)</span>
+<span class="nc" id="L378">            throw new ConfigurationException(String.format(&quot;Cannot add table '%s' to non existing keyspace '%s'.&quot;, view.viewName, view.ksName));</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        else if (ksm.getTableOrViewNullable(view.viewName) != null)</span>
+<span class="nc" id="L380">            throw new AlreadyExistsException(view.ksName, view.viewName);</span>
+
+<span class="nc" id="L382">        logger.info(&quot;Create new view: {}&quot;, view);</span>
+<span class="nc" id="L383">        announce(SchemaKeyspace.makeCreateViewMutation(ksm, view, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L384">    }</span>
+
+    public static void announceNewType(UserType newType, boolean announceLocally)
+    {
+<span class="nc" id="L388">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(newType.keyspace);</span>
+<span class="nc" id="L389">        announce(SchemaKeyspace.makeCreateTypeMutation(ksm, newType, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L390">    }</span>
+
+    public static void announceNewFunction(UDFunction udf, boolean announceLocally)
+    {
+<span class="nc" id="L394">        logger.info(&quot;Create scalar function '{}'&quot;, udf.name());</span>
+<span class="nc" id="L395">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(udf.name().keyspace);</span>
+<span class="nc" id="L396">        announce(SchemaKeyspace.makeCreateFunctionMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L397">    }</span>
+
+    public static void announceNewAggregate(UDAggregate udf, boolean announceLocally)
+    {
+<span class="nc" id="L401">        logger.info(&quot;Create aggregate function '{}'&quot;, udf.name());</span>
+<span class="nc" id="L402">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(udf.name().keyspace);</span>
+<span class="nc" id="L403">        announce(SchemaKeyspace.makeCreateAggregateMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L404">    }</span>
+
+    public static void announceKeyspaceUpdate(KeyspaceMetadata ksm) throws ConfigurationException
+    {
+<span class="nc" id="L408">        announceKeyspaceUpdate(ksm, false);</span>
+<span class="nc" id="L409">    }</span>
+
+    public static void announceKeyspaceUpdate(KeyspaceMetadata ksm, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L413">        ksm.validate();</span>
+
+<span class="nc" id="L415">        KeyspaceMetadata oldKsm = Schema.instance.getKSMetaData(ksm.name);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">        if (oldKsm == null)</span>
+<span class="nc" id="L417">            throw new ConfigurationException(String.format(&quot;Cannot update non existing keyspace '%s'.&quot;, ksm.name));</span>
+
+<span class="nc" id="L419">        logger.info(&quot;Update Keyspace '{}' From {} To {}&quot;, ksm.name, oldKsm, ksm);</span>
+<span class="nc" id="L420">        announce(SchemaKeyspace.makeCreateKeyspaceMutation(ksm.name, ksm.params, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L421">    }</span>
+
+    public static void announceColumnFamilyUpdate(CFMetaData cfm) throws ConfigurationException
+    {
+<span class="nc" id="L425">        announceColumnFamilyUpdate(cfm, false);</span>
+<span class="nc" id="L426">    }</span>
+
+    public static void announceColumnFamilyUpdate(CFMetaData cfm, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L430">        announceColumnFamilyUpdate(cfm, null, announceLocally);</span>
+<span class="nc" id="L431">    }</span>
+
+    public static void announceColumnFamilyUpdate(CFMetaData cfm, Collection&lt;ViewDefinition&gt; views, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L435">        cfm.validate();</span>
+
+<span class="nc" id="L437">        CFMetaData oldCfm = Schema.instance.getCFMetaData(cfm.ksName, cfm.cfName);</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (oldCfm == null)</span>
+<span class="nc" id="L439">            throw new ConfigurationException(String.format(&quot;Cannot update non existing table '%s' in keyspace '%s'.&quot;, cfm.cfName, cfm.ksName));</span>
+<span class="nc" id="L440">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(cfm.ksName);</span>
+
+<span class="nc" id="L442">        oldCfm.validateCompatibility(cfm);</span>
+
+<span class="nc" id="L444">        long timestamp = FBUtilities.timestampMicros();</span>
+
+<span class="nc" id="L446">        logger.info(&quot;Update table '{}/{}' From {} To {}&quot;, cfm.ksName, cfm.cfName, oldCfm, cfm);</span>
+<span class="nc" id="L447">        Mutation.SimpleBuilder builder = SchemaKeyspace.makeUpdateTableMutation(ksm, oldCfm, cfm, timestamp);</span>
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (views != null)</span>
+<span class="nc" id="L450">            views.forEach(view -&gt; addViewUpdateToMutationBuilder(view, builder));</span>
+
+<span class="nc" id="L452">        announce(builder, announceLocally);</span>
+<span class="nc" id="L453">    }</span>
+
+    public static void announceViewUpdate(ViewDefinition view, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L457">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(view.ksName);</span>
+<span class="nc" id="L458">        long timestamp = FBUtilities.timestampMicros();</span>
+<span class="nc" id="L459">        Mutation.SimpleBuilder builder = SchemaKeyspace.makeCreateKeyspaceMutation(ksm.name, ksm.params, timestamp);</span>
+<span class="nc" id="L460">        addViewUpdateToMutationBuilder(view, builder);</span>
+<span class="nc" id="L461">        announce(builder, announceLocally);</span>
+<span class="nc" id="L462">    }</span>
+
+    private static void addViewUpdateToMutationBuilder(ViewDefinition view, Mutation.SimpleBuilder builder)
+    {
+<span class="nc" id="L466">        view.metadata.validate();</span>
+
+<span class="nc" id="L468">        ViewDefinition oldView = Schema.instance.getView(view.ksName, view.viewName);</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        if (oldView == null)</span>
+<span class="nc" id="L470">            throw new ConfigurationException(String.format(&quot;Cannot update non existing materialized view '%s' in keyspace '%s'.&quot;, view.viewName, view.ksName));</span>
+
+<span class="nc" id="L472">        oldView.metadata.validateCompatibility(view.metadata);</span>
+
+<span class="nc" id="L474">        logger.info(&quot;Update view '{}/{}' From {} To {}&quot;, view.ksName, view.viewName, oldView, view);</span>
+<span class="nc" id="L475">        SchemaKeyspace.makeUpdateViewMutation(builder, oldView, view);</span>
+<span class="nc" id="L476">    }</span>
+
+    public static void announceTypeUpdate(UserType updatedType, boolean announceLocally)
+    {
+<span class="nc" id="L480">        logger.info(&quot;Update type '{}.{}' to {}&quot;, updatedType.keyspace, updatedType.getNameAsString(), updatedType);</span>
+<span class="nc" id="L481">        announceNewType(updatedType, announceLocally);</span>
+<span class="nc" id="L482">    }</span>
+
+    public static void announceKeyspaceDrop(String ksName) throws ConfigurationException
+    {
+<span class="nc" id="L486">        announceKeyspaceDrop(ksName, false);</span>
+<span class="nc" id="L487">    }</span>
+
+    public static void announceKeyspaceDrop(String ksName, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L491">        KeyspaceMetadata oldKsm = Schema.instance.getKSMetaData(ksName);</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        if (oldKsm == null)</span>
+<span class="nc" id="L493">            throw new ConfigurationException(String.format(&quot;Cannot drop non existing keyspace '%s'.&quot;, ksName));</span>
+
+<span class="nc" id="L495">        logger.info(&quot;Drop Keyspace '{}'&quot;, oldKsm.name);</span>
+<span class="nc" id="L496">        announce(SchemaKeyspace.makeDropKeyspaceMutation(oldKsm, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L497">    }</span>
+
+    public static void announceColumnFamilyDrop(String ksName, String cfName) throws ConfigurationException
+    {
+<span class="nc" id="L501">        announceColumnFamilyDrop(ksName, cfName, false);</span>
+<span class="nc" id="L502">    }</span>
+
+    public static void announceColumnFamilyDrop(String ksName, String cfName, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L506">        CFMetaData oldCfm = Schema.instance.getCFMetaData(ksName, cfName);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        if (oldCfm == null)</span>
+<span class="nc" id="L508">            throw new ConfigurationException(String.format(&quot;Cannot drop non existing table '%s' in keyspace '%s'.&quot;, cfName, ksName));</span>
+<span class="nc" id="L509">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);</span>
+
+<span class="nc" id="L511">        logger.info(&quot;Drop table '{}/{}'&quot;, oldCfm.ksName, oldCfm.cfName);</span>
+<span class="nc" id="L512">        announce(SchemaKeyspace.makeDropTableMutation(ksm, oldCfm, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L513">    }</span>
+
+    public static void announceViewDrop(String ksName, String viewName, boolean announceLocally) throws ConfigurationException
+    {
+<span class="nc" id="L517">        ViewDefinition view = Schema.instance.getView(ksName, viewName);</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (view == null)</span>
+<span class="nc" id="L519">            throw new ConfigurationException(String.format(&quot;Cannot drop non existing materialized view '%s' in keyspace '%s'.&quot;, viewName, ksName));</span>
+<span class="nc" id="L520">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);</span>
+
+<span class="nc" id="L522">        logger.info(&quot;Drop table '{}/{}'&quot;, view.ksName, view.viewName);</span>
+<span class="nc" id="L523">        announce(SchemaKeyspace.makeDropViewMutation(ksm, view, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L524">    }</span>
+
+    public static void announceTypeDrop(UserType droppedType)
+    {
+<span class="nc" id="L528">        announceTypeDrop(droppedType, false);</span>
+<span class="nc" id="L529">    }</span>
+
+    public static void announceTypeDrop(UserType droppedType, boolean announceLocally)
+    {
+<span class="nc" id="L533">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(droppedType.keyspace);</span>
+<span class="nc" id="L534">        announce(SchemaKeyspace.dropTypeFromSchemaMutation(ksm, droppedType, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L535">    }</span>
+
+    public static void announceFunctionDrop(UDFunction udf, boolean announceLocally)
+    {
+<span class="nc" id="L539">        logger.info(&quot;Drop scalar function overload '{}' args '{}'&quot;, udf.name(), udf.argTypes());</span>
+<span class="nc" id="L540">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(udf.name().keyspace);</span>
+<span class="nc" id="L541">        announce(SchemaKeyspace.makeDropFunctionMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L542">    }</span>
+
+    public static void announceAggregateDrop(UDAggregate udf, boolean announceLocally)
+    {
+<span class="nc" id="L546">        logger.info(&quot;Drop aggregate function overload '{}' args '{}'&quot;, udf.name(), udf.argTypes());</span>
+<span class="nc" id="L547">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(udf.name().keyspace);</span>
+<span class="nc" id="L548">        announce(SchemaKeyspace.makeDropAggregateMutation(ksm, udf, FBUtilities.timestampMicros()), announceLocally);</span>
+<span class="nc" id="L549">    }</span>
+
+    static void announceGlobally(Mutation change)
+    {
+<span class="nc" id="L553">        announceGlobally(Collections.singletonList(change));</span>
+<span class="nc" id="L554">    }</span>
+
+    static void announceGlobally(Collection&lt;Mutation&gt; change)
+    {
+<span class="fc" id="L558">        FBUtilities.waitOnFuture(announce(change));</span>
+<span class="fc" id="L559">    }</span>
+
+    /**
+     * actively announce a new version to active hosts via rpc
+     * @param schema The schema mutation to be applied
+     */
+    private static void announce(Mutation.SimpleBuilder schema, boolean announceLocally)
+    {
+<span class="nc" id="L567">        List&lt;Mutation&gt; mutations = Collections.singletonList(schema.build());</span>
+
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (announceLocally)</span>
+<span class="nc" id="L570">            SchemaKeyspace.mergeSchema(mutations);</span>
+        else
+<span class="nc" id="L572">            FBUtilities.waitOnFuture(announce(mutations));</span>
+<span class="nc" id="L573">    }</span>
+
+    private static void pushSchemaMutation(InetAddress endpoint, Collection&lt;Mutation&gt; schema)
+    {
+<span class="nc" id="L577">        MessageOut&lt;Collection&lt;Mutation&gt;&gt; msg = new MessageOut&lt;&gt;(MessagingService.Verb.DEFINITIONS_UPDATE,</span>
+                                                                schema,
+                                                                MigrationsSerializer.instance);
+<span class="nc" id="L580">        MessagingService.instance().sendOneWay(msg, endpoint);</span>
+<span class="nc" id="L581">    }</span>
+
+    // Returns a future on the local application of the schema
+    private static Future&lt;?&gt; announce(final Collection&lt;Mutation&gt; schema)
+    {
+<span class="fc" id="L586">        Future&lt;?&gt; f = StageManager.getStage(Stage.MIGRATION).submit(new WrappedRunnable()</span>
+<span class="fc" id="L587">        {</span>
+            protected void runMayThrow() throws ConfigurationException
+            {
+<span class="fc" id="L590">                SchemaKeyspace.mergeSchemaAndAnnounceVersion(schema);</span>
+<span class="fc" id="L591">            }</span>
+        });
+
+<span class="fc bfc" id="L594" title="All 2 branches covered.">        for (InetAddress endpoint : Gossiper.instance.getLiveMembers())</span>
+        {
+            // only push schema to nodes with known and equal versions
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">            if (!endpoint.equals(FBUtilities.getBroadcastAddress()) &amp;&amp;</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">                MessagingService.instance().knowsVersion(endpoint) &amp;&amp;</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                is30Compatible(MessagingService.instance().getRawVersion(endpoint)))</span>
+<span class="nc" id="L600">                pushSchemaMutation(endpoint, schema);</span>
+<span class="fc" id="L601">        }</span>
+
+<span class="fc" id="L603">        return f;</span>
+    }
+
+    /**
+     * Announce my version passively over gossip.
+     * Used to notify nodes as they arrive in the cluster.
+     *
+     * @param version The schema version to announce
+     * @param compatible flag whether {@code version} is a 3.0 compatible version
+     */
+    public static void passiveAnnounce(UUID version, boolean compatible)
+    {
+<span class="fc" id="L615">        Gossiper.instance.addLocalApplicationState(ApplicationState.SCHEMA, StorageService.instance.valueFactory.schema(version));</span>
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        logger.debug(&quot;Gossiping my {} schema version {}&quot;,</span>
+                     compatible ? &quot;3.0 compatible&quot; : &quot;3.11&quot;,
+<span class="fc" id="L618">                     Schema.schemaVersionToString(version));</span>
+<span class="fc" id="L619">    }</span>
+
+    /**
+     * Clear all locally stored schema information and reset schema to initial state.
+     * Called by user (via JMX) who wants to get rid of schema disagreement.
+     */
+    public static void resetLocalSchema()
+    {
+<span class="nc" id="L627">        logger.info(&quot;Starting local schema reset...&quot;);</span>
+
+<span class="nc" id="L629">        logger.debug(&quot;Truncating schema tables...&quot;);</span>
+
+<span class="nc" id="L631">        SchemaKeyspace.truncate();</span>
+
+<span class="nc" id="L633">        logger.debug(&quot;Clearing local schema keyspace definitions...&quot;);</span>
+
+<span class="nc" id="L635">        Schema.instance.clear();</span>
+
+<span class="nc" id="L637">        Set&lt;InetAddress&gt; liveEndpoints = Gossiper.instance.getLiveMembers();</span>
+<span class="nc" id="L638">        liveEndpoints.remove(FBUtilities.getBroadcastAddress());</span>
+
+        // force migration if there are nodes around
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        for (InetAddress node : liveEndpoints)</span>
+        {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">            if (shouldPullSchemaFrom(node))</span>
+            {
+<span class="nc" id="L645">                logger.debug(&quot;Requesting schema from {}&quot;, node);</span>
+<span class="nc" id="L646">                FBUtilities.waitOnFuture(submitMigrationTask(node));</span>
+<span class="nc" id="L647">                break;</span>
+            }
+<span class="nc" id="L649">        }</span>
+
+<span class="nc" id="L651">        logger.info(&quot;Local schema reset is complete.&quot;);</span>
+<span class="nc" id="L652">    }</span>
+
+    /**
+     * We have a set of non-local, distributed system keyspaces, e.g. system_traces, system_auth, etc.
+     * (see {@link Schema#REPLICATED_SYSTEM_KEYSPACE_NAMES}), that need to be created on cluster initialisation,
+     * and later evolved on major upgrades (sometimes minor too). This method compares the current known definitions
+     * of the tables (if the keyspace exists) to the expected, most modern ones expected by the running version of C*;
+     * if any changes have been detected, a schema Mutation will be created which, when applied, should make
+     * cluster's view of that keyspace aligned with the expected modern definition.
+     *
+     * @param keyspace   the expected modern definition of the keyspace
+     * @param generation timestamp to use for the table changes in the schema mutation
+     *
+     * @return empty Optional if the current definition is up to date, or an Optional with the Mutation that would
+     *         bring the schema in line with the expected definition.
+     */
+    static Optional&lt;Mutation&gt; evolveSystemKeyspace(KeyspaceMetadata keyspace, long generation)
+    {
+<span class="fc" id="L670">        Mutation.SimpleBuilder builder = null;</span>
+
+<span class="fc" id="L672">        KeyspaceMetadata definedKeyspace = Schema.instance.getKSMetaData(keyspace.name);</span>
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">        Tables definedTables = null == definedKeyspace ? Tables.none() : definedKeyspace.tables;</span>
+
+<span class="fc bfc" id="L675" title="All 2 branches covered.">        for (CFMetaData table : keyspace.tables)</span>
+        {
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">            if (table.equals(definedTables.getNullable(table.cfName)))</span>
+<span class="nc" id="L678">                continue;</span>
+
+<span class="fc bfc" id="L680" title="All 2 branches covered.">            if (null == builder)</span>
+            {
+                // for the keyspace definition itself (name, replication, durability) always use generation 0;
+                // this ensures that any changes made to replication by the user will never be overwritten.
+<span class="fc" id="L684">                builder = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace.name, keyspace.params, 0);</span>
+
+                // now set the timestamp to generation, so the tables have the expected timestamp
+<span class="fc" id="L687">                builder.timestamp(generation);</span>
+            }
+
+            // for table definitions always use the provided generation; these tables, unlike their containing
+            // keyspaces, are *NOT* meant to be altered by the user; if their definitions need to change,
+            // the schema must be updated in code, and the appropriate generation must be bumped.
+<span class="fc" id="L693">            SchemaKeyspace.addTableToSchemaMutation(table, true, builder);</span>
+<span class="fc" id="L694">        }</span>
+
+<span class="pc bpc" id="L696" title="1 of 2 branches missed.">        return builder == null ? Optional.empty() : Optional.of(builder.build());</span>
+    }
+
+<span class="fc" id="L699">    public static class MigrationsSerializer implements IVersionedSerializer&lt;Collection&lt;Mutation&gt;&gt;</span>
+    {
+<span class="fc" id="L701">        public static MigrationsSerializer instance = new MigrationsSerializer();</span>
+
+        public void serialize(Collection&lt;Mutation&gt; schema, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L705">            out.writeInt(schema.size());</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            for (Mutation mutation : schema)</span>
+<span class="nc" id="L707">                Mutation.serializer.serialize(mutation, out, version);</span>
+<span class="nc" id="L708">        }</span>
+
+        public Collection&lt;Mutation&gt; deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L712">            int count = in.readInt();</span>
+<span class="nc" id="L713">            Collection&lt;Mutation&gt; schema = new ArrayList&lt;&gt;(count);</span>
+
+<span class="nc bnc" id="L715" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++)</span>
+<span class="nc" id="L716">                schema.add(Mutation.serializer.deserialize(in, version));</span>
+
+<span class="nc" id="L718">            return schema;</span>
+        }
+
+        public long serializedSize(Collection&lt;Mutation&gt; schema, int version)
+        {
+<span class="nc" id="L723">            int size = TypeSizes.sizeof(schema.size());</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            for (Mutation mutation : schema)</span>
+<span class="nc" id="L725">                size += Mutation.serializer.serializedSize(mutation, version);</span>
+<span class="nc" id="L726">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

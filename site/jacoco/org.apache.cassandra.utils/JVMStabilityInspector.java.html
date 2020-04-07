@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JVMStabilityInspector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">JVMStabilityInspector.java</span></div><h1>JVMStabilityInspector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import java.io.FileNotFoundException;
+import java.net.SocketException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.service.StorageService;
+
+/**
+ * Responsible for deciding whether to kill the JVM if it gets in an &quot;unstable&quot; state (think OOM).
+ */
+public final class JVMStabilityInspector
+{
+<span class="nc" id="L42">    private static final Logger logger = LoggerFactory.getLogger(JVMStabilityInspector.class);</span>
+<span class="nc" id="L43">    private static Killer killer = new Killer();</span>
+
+<span class="nc" id="L45">    private static Object lock = new Object();</span>
+    private static boolean printingHeapHistogram;
+
+    private JVMStabilityInspector() {}
+
+    /**
+     * Certain Throwables and Exceptions represent &quot;Die&quot; conditions for the server.
+     * This recursively checks the input Throwable's cause hierarchy until null.
+     * @param t
+     *      The Throwable to check for server-stop conditions
+     */
+    public static void inspectThrowable(Throwable t)
+    {
+<span class="nc" id="L58">        boolean isUnstable = false;</span>
+<span class="nc bnc" id="L59" title="All 2 branches missed.">        if (t instanceof OutOfMemoryError)</span>
+        {
+<span class="nc bnc" id="L61" title="All 2 branches missed.">            if (Boolean.getBoolean(&quot;cassandra.printHeapHistogramOnOutOfMemoryError&quot;))</span>
+            {
+                // We want to avoid printing multiple time the heap histogram if multiple OOM errors happen in a short
+                // time span.
+<span class="nc" id="L65">                synchronized(lock)</span>
+                {
+<span class="nc bnc" id="L67" title="All 2 branches missed.">                    if (printingHeapHistogram)</span>
+<span class="nc" id="L68">                        return;</span>
+<span class="nc" id="L69">                    printingHeapHistogram = true;</span>
+<span class="nc" id="L70">                }</span>
+<span class="nc" id="L71">                HeapUtils.logHeapHistogram();</span>
+            }
+
+<span class="nc" id="L74">            logger.error(&quot;OutOfMemory error letting the JVM handle the error:&quot;, t);</span>
+
+<span class="nc" id="L76">            StorageService.instance.removeShutdownHook();</span>
+            // We let the JVM handle the error. The startup checks should have warned the user if it did not configure
+            // the JVM behavior in case of OOM (CASSANDRA-13006).
+<span class="nc" id="L79">            throw (OutOfMemoryError) t;</span>
+        }
+
+<span class="nc bnc" id="L82" title="All 2 branches missed.">        if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.die)</span>
+<span class="nc bnc" id="L83" title="All 4 branches missed.">            if (t instanceof FSError || t instanceof CorruptSSTableException)</span>
+<span class="nc" id="L84">            isUnstable = true;</span>
+
+        // Check for file handle exhaustion
+<span class="nc bnc" id="L87" title="All 4 branches missed.">        if (t instanceof FileNotFoundException || t instanceof SocketException)</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">            if (t.getMessage().contains(&quot;Too many open files&quot;))</span>
+<span class="nc" id="L89">                isUnstable = true;</span>
+
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        if (isUnstable)</span>
+<span class="nc" id="L92">            killer.killCurrentJVM(t);</span>
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (t.getCause() != null)</span>
+<span class="nc" id="L95">            inspectThrowable(t.getCause());</span>
+<span class="nc" id="L96">    }</span>
+
+    public static void inspectCommitLogThrowable(Throwable t)
+    {
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        if (!StorageService.instance.isDaemonSetupCompleted())</span>
+        {
+<span class="nc" id="L102">            logger.error(&quot;Exiting due to error while processing commit log during initialization.&quot;, t);</span>
+<span class="nc" id="L103">            killer.killCurrentJVM(t, true);</span>
+        }
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        else if (DatabaseDescriptor.getCommitFailurePolicy() == Config.CommitFailurePolicy.die)</span>
+<span class="nc" id="L106">            killer.killCurrentJVM(t);</span>
+        else
+<span class="nc" id="L108">            inspectThrowable(t);</span>
+<span class="nc" id="L109">    }</span>
+
+    public static void killCurrentJVM(Throwable t, boolean quiet)
+    {
+<span class="nc" id="L113">        killer.killCurrentJVM(t, quiet);</span>
+<span class="nc" id="L114">    }</span>
+
+    public static void userFunctionTimeout(Throwable t)
+    {
+<span class="nc bnc" id="L118" title="All 4 branches missed.">        switch (DatabaseDescriptor.getUserFunctionTimeoutPolicy())</span>
+        {
+            case die:
+                // policy to give 250ms grace time to
+<span class="nc" id="L122">                ScheduledExecutors.nonPeriodicTasks.schedule(() -&gt; killer.killCurrentJVM(t), 250, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L123">                break;</span>
+            case die_immediate:
+<span class="nc" id="L125">                killer.killCurrentJVM(t);</span>
+<span class="nc" id="L126">                break;</span>
+            case ignore:
+<span class="nc" id="L128">                logger.error(t.getMessage());</span>
+                break;
+        }
+<span class="nc" id="L131">    }</span>
+
+    @VisibleForTesting
+    public static Killer replaceKiller(Killer newKiller)
+    {
+<span class="nc" id="L136">        Killer oldKiller = JVMStabilityInspector.killer;</span>
+<span class="nc" id="L137">        JVMStabilityInspector.killer = newKiller;</span>
+<span class="nc" id="L138">        return oldKiller;</span>
+    }
+
+    @VisibleForTesting
+<span class="nc" id="L142">    public static class Killer</span>
+    {
+<span class="nc" id="L144">        private final AtomicBoolean killing = new AtomicBoolean();</span>
+
+        /**
+        * Certain situations represent &quot;Die&quot; conditions for the server, and if so, the reason is logged and the current JVM is killed.
+        *
+        * @param t
+        *      The Throwable to log before killing the current JVM
+        */
+        protected void killCurrentJVM(Throwable t)
+        {
+<span class="nc" id="L154">            killCurrentJVM(t, false);</span>
+<span class="nc" id="L155">        }</span>
+
+        protected void killCurrentJVM(Throwable t, boolean quiet)
+        {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (!quiet)</span>
+            {
+<span class="nc" id="L161">                t.printStackTrace(System.err);</span>
+<span class="nc" id="L162">                logger.error(&quot;JVM state determined to be unstable.  Exiting forcefully due to:&quot;, t);</span>
+            }
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (killing.compareAndSet(false, true))</span>
+            {
+<span class="nc" id="L166">                StorageService.instance.removeShutdownHook();</span>
+<span class="nc" id="L167">                System.exit(100);</span>
+            }
+<span class="nc" id="L169">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

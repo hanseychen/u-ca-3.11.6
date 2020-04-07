@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>EncryptedSegment.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">EncryptedSegment.java</span></div><h1>EncryptedSegment.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Map;
+import javax.crypto.Cipher;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.compress.ICompressor;
+import org.apache.cassandra.security.EncryptionUtils;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.utils.Hex;
+
+import static org.apache.cassandra.security.EncryptionUtils.ENCRYPTED_BLOCK_HEADER_SIZE;
+
+/**
+ * Writes encrypted segments to disk. Data is compressed before encrypting to (hopefully) reduce the size of the data into
+ * the encryption algorithms.
+ *
+ * The format of the encrypted commit log is as follows:
+ * - standard commit log header (as written by {@link CommitLogDescriptor#writeHeader(ByteBuffer, CommitLogDescriptor)})
+ * - a series of 'sync segments' that are written every time the commit log is sync()'ed
+ * -- a sync section header, see {@link CommitLogSegment#writeSyncMarker(long, ByteBuffer, int, int, int)}
+ * -- total plain text length for this section
+ * -- a series of encrypted data blocks, each of which contains:
+ * --- the length of the encrypted block (cipher text)
+ * --- the length of the unencrypted data (compressed text)
+ * --- the encrypted block, which contains:
+ * ---- the length of the plain text (raw) data
+ * ---- block of compressed data
+ *
+ * Notes:
+ * - &quot;length of the unencrypted data&quot; is different from the length of resulting decrypted buffer as encryption adds padding
+ * to the output buffer, and we need to ignore that padding when processing.
+ */
+<span class="nc bnc" id="L58" title="All 2 branches missed.">public class EncryptedSegment extends FileDirectSegment</span>
+{
+<span class="nc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(EncryptedSegment.class);</span>
+
+    private static final int ENCRYPTED_SECTION_HEADER_SIZE = SYNC_MARKER_SIZE + 4;
+
+    private final EncryptionContext encryptionContext;
+    private final Cipher cipher;
+
+    public EncryptedSegment(CommitLog commitLog, AbstractCommitLogSegmentManager manager)
+    {
+<span class="nc" id="L69">        super(commitLog, manager);</span>
+<span class="nc" id="L70">        this.encryptionContext = commitLog.configuration.getEncryptionContext();</span>
+
+        try
+        {
+<span class="nc" id="L74">            cipher = encryptionContext.getEncryptor();</span>
+        }
+<span class="nc" id="L76">        catch (IOException e)</span>
+        {
+<span class="nc" id="L78">            throw new FSWriteError(e, logFile);</span>
+<span class="nc" id="L79">        }</span>
+<span class="nc" id="L80">        logger.debug(&quot;created a new encrypted commit log segment: {}&quot;, logFile);</span>
+        // Keep reusable buffers on-heap regardless of compression preference so we avoid copy off/on repeatedly during decryption
+<span class="nc" id="L82">        manager.getBufferPool().setPreferredReusableBufferType(BufferType.ON_HEAP);</span>
+<span class="nc" id="L83">    }</span>
+
+    protected Map&lt;String, String&gt; additionalHeaderParameters()
+    {
+<span class="nc" id="L87">        Map&lt;String, String&gt; map = encryptionContext.toHeaderParameters();</span>
+<span class="nc" id="L88">        map.put(EncryptionContext.ENCRYPTION_IV, Hex.bytesToHex(cipher.getIV()));</span>
+<span class="nc" id="L89">        return map;</span>
+    }
+
+    ByteBuffer createBuffer(CommitLog commitLog)
+    {
+        // Note: we want to keep the compression buffers on-heap as we need those bytes for encryption,
+        // and we want to avoid copying from off-heap (compression buffer) to on-heap encryption APIs
+<span class="nc" id="L96">        return manager.getBufferPool().createBuffer(BufferType.ON_HEAP);</span>
+    }
+
+    void write(int startMarker, int nextMarker)
+    {
+<span class="nc" id="L101">        int contentStart = startMarker + SYNC_MARKER_SIZE;</span>
+<span class="nc" id="L102">        final int length = nextMarker - contentStart;</span>
+        // The length may be 0 when the segment is being closed.
+<span class="nc bnc" id="L104" title="All 8 branches missed.">        assert length &gt; 0 || length == 0 &amp;&amp; !isStillAllocating();</span>
+
+<span class="nc" id="L106">        final ICompressor compressor = encryptionContext.getCompressor();</span>
+<span class="nc" id="L107">        final int blockSize = encryptionContext.getChunkLength();</span>
+        try
+        {
+<span class="nc" id="L110">            ByteBuffer inputBuffer = buffer.duplicate();</span>
+<span class="nc" id="L111">            inputBuffer.limit(contentStart + length).position(contentStart);</span>
+<span class="nc" id="L112">            ByteBuffer buffer = manager.getBufferPool().getThreadLocalReusableBuffer(DatabaseDescriptor.getCommitLogSegmentSize());</span>
+
+            // save space for the sync marker at the beginning of this section
+<span class="nc" id="L115">            final long syncMarkerPosition = lastWrittenPos;</span>
+<span class="nc" id="L116">            channel.position(syncMarkerPosition + ENCRYPTED_SECTION_HEADER_SIZE);</span>
+
+            // loop over the segment data in encryption buffer sized chunks
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            while (contentStart &lt; nextMarker)</span>
+            {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                int nextBlockSize = nextMarker - blockSize &gt; contentStart ? blockSize : nextMarker - contentStart;</span>
+<span class="nc" id="L122">                ByteBuffer slice = inputBuffer.duplicate();</span>
+<span class="nc" id="L123">                slice.limit(contentStart + nextBlockSize).position(contentStart);</span>
+
+<span class="nc" id="L125">                buffer = EncryptionUtils.compress(slice, buffer, true, compressor);</span>
+
+                // reuse the same buffer for the input and output of the encryption operation
+<span class="nc" id="L128">                buffer = EncryptionUtils.encryptAndWrite(buffer, channel, true, cipher);</span>
+
+<span class="nc" id="L130">                contentStart += nextBlockSize;</span>
+<span class="nc" id="L131">                manager.addSize(buffer.limit() + ENCRYPTED_BLOCK_HEADER_SIZE);</span>
+<span class="nc" id="L132">            }</span>
+
+<span class="nc" id="L134">            lastWrittenPos = channel.position();</span>
+
+            // rewind to the beginning of the section and write out the sync marker
+<span class="nc" id="L137">            buffer.position(0).limit(ENCRYPTED_SECTION_HEADER_SIZE);</span>
+<span class="nc" id="L138">            writeSyncMarker(id, buffer, 0, (int) syncMarkerPosition, (int) lastWrittenPos);</span>
+<span class="nc" id="L139">            buffer.putInt(SYNC_MARKER_SIZE, length);</span>
+<span class="nc" id="L140">            buffer.rewind();</span>
+<span class="nc" id="L141">            manager.addSize(buffer.limit());</span>
+
+<span class="nc" id="L143">            channel.position(syncMarkerPosition);</span>
+<span class="nc" id="L144">            channel.write(buffer);</span>
+        }
+<span class="nc" id="L146">        catch (Exception e)</span>
+        {
+<span class="nc" id="L148">            throw new FSWriteError(e, getPath());</span>
+<span class="nc" id="L149">        }</span>
+<span class="nc" id="L150">    }</span>
+
+    public long onDiskSize()
+    {
+<span class="nc" id="L154">        return lastWrittenPos;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

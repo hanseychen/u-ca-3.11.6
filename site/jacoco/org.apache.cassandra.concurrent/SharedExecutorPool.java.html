@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SharedExecutorPool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.concurrent</a> &gt; <span class="el_source">SharedExecutorPool.java</span></div><h1>SharedExecutorPool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.concurrent;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
+
+import static org.apache.cassandra.concurrent.SEPWorker.Work;
+
+/**
+ * A pool of worker threads that are shared between all Executors created with it. Each executor is treated as a distinct
+ * unit, with its own concurrency and task queue limits, but the threads that service the tasks on each executor are
+ * free to hop between executors at will.
+ *
+ * To keep producers from incurring unnecessary delays, once an executor is &quot;spun up&quot; (i.e. is processing tasks at a steady
+ * rate), adding tasks to the executor often involves only placing the task on the work queue and updating the
+ * task permits (which imposes our max queue length constraints). Only when it cannot be guaranteed the task will be serviced
+ * promptly, and the maximum concurrency has not been reached, does the producer have to schedule a thread itself to perform
+ * the work ('promptly' in this context means we already have a worker spinning for work, as described next).
+ *
+ * Otherwise the worker threads schedule themselves: when they are assigned a task, they will attempt to spawn
+ * a partner worker to service any other work outstanding on the queue (if any); once they have finished the task they
+ * will either take another (if any remaining) and repeat this, or they will attempt to assign themselves to another executor
+ * that does have tasks remaining. If both fail, it will enter a non-busy-spinning phase, where it will sleep for a short
+ * random interval (based upon the number of threads in this mode, so that the total amount of non-sleeping time remains
+ * approximately fixed regardless of the number of spinning threads), and upon waking will again try to assign itself to
+ * an executor with outstanding tasks to perform. As a result of always scheduling a partner before committing to performing
+ * any work, with a steady state of task arrival we should generally have either one spinning worker ready to promptly respond
+ * to incoming work, or all possible workers actively committed to tasks.
+ *
+ * In order to prevent this executor pool acting like a noisy neighbour to other processes on the system, workers also deschedule
+ * themselves when it is detected that there are too many for the current rate of operation arrival. This is decided as a function
+ * of the total time spent spinning by all workers in an interval; as more workers spin, workers are descheduled more rapidly.
+ */
+<span class="pc bpc" id="L57" title="1 of 2 branches missed.">public class SharedExecutorPool</span>
+{
+
+<span class="fc" id="L60">    public static final SharedExecutorPool SHARED = new SharedExecutorPool(&quot;SharedPool&quot;);</span>
+
+    // the name assigned to workers in the pool, and the id suffix
+    final String poolName;
+<span class="fc" id="L64">    final AtomicLong workerId = new AtomicLong();</span>
+
+    // the collection of executors serviced by this pool; periodically ordered by traffic volume
+<span class="fc" id="L67">    public final List&lt;SEPExecutor&gt; executors = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+    // the number of workers currently in a spinning state
+<span class="fc" id="L70">    final AtomicInteger spinningCount = new AtomicInteger();</span>
+    // see SEPWorker.maybeStop() - used to self coordinate stopping of threads
+<span class="fc" id="L72">    final AtomicLong stopCheck = new AtomicLong();</span>
+    // the collection of threads that are (most likely) in a spinning state - new workers are scheduled from here first
+    // TODO: consider using a queue partially-ordered by scheduled wake-up time
+    // (a full-fledged correctly ordered SkipList is overkill)
+<span class="fc" id="L76">    final ConcurrentSkipListMap&lt;Long, SEPWorker&gt; spinning = new ConcurrentSkipListMap&lt;&gt;();</span>
+    // the collection of threads that have been asked to stop/deschedule - new workers are scheduled from here last
+<span class="fc" id="L78">    final ConcurrentSkipListMap&lt;Long, SEPWorker&gt; descheduled = new ConcurrentSkipListMap&lt;&gt;();</span>
+
+<span class="fc" id="L80">    volatile boolean shuttingDown = false;</span>
+
+    public SharedExecutorPool(String poolName)
+<span class="fc" id="L83">    {</span>
+<span class="fc" id="L84">        this.poolName = poolName;</span>
+<span class="fc" id="L85">    }</span>
+
+    void schedule(Work work)
+    {
+        // we try to hand-off our work to the spinning queue before the descheduled queue, even though we expect it to be empty
+        // all we're doing here is hoping to find a worker without work to do, but it doesn't matter too much what we find;
+        // we atomically set the task so even if this were a collection of all workers it would be safe, and if they are both
+        // empty we schedule a new thread
+        Map.Entry&lt;Long, SEPWorker&gt; e;
+<span class="pc bpc" id="L94" title="1 of 4 branches missed.">        while (null != (e = spinning.pollFirstEntry()) || null != (e = descheduled.pollFirstEntry()))</span>
+<span class="pc bpc" id="L95" title="1 of 2 branches missed.">            if (e.getValue().assign(work, false))</span>
+<span class="fc" id="L96">                return;</span>
+
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">        if (!work.isStop())</span>
+<span class="fc" id="L99">            new SEPWorker(workerId.incrementAndGet(), work, this);</span>
+<span class="fc" id="L100">    }</span>
+
+    void maybeStartSpinningWorker()
+    {
+        // in general the workers manage spinningCount directly; however if it is zero, we increment it atomically
+        // ourselves to avoid starting a worker unless we have to
+<span class="fc" id="L106">        int current = spinningCount.get();</span>
+<span class="pc bpc" id="L107" title="1 of 4 branches missed.">        if (current == 0 &amp;&amp; spinningCount.compareAndSet(0, 1))</span>
+<span class="fc" id="L108">            schedule(Work.SPINNING);</span>
+<span class="fc" id="L109">    }</span>
+
+    public synchronized LocalAwareExecutorService newExecutor(int maxConcurrency, int maxQueuedTasks, String jmxPath, String name)
+    {
+<span class="fc" id="L113">        SEPExecutor executor = new SEPExecutor(this, maxConcurrency, maxQueuedTasks, jmxPath, name);</span>
+<span class="fc" id="L114">        executors.add(executor);</span>
+<span class="fc" id="L115">        return executor;</span>
+    }
+
+    public synchronized void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException
+    {
+<span class="nc" id="L120">        shuttingDown = true;</span>
+<span class="nc" id="L121">        List&lt;SEPExecutor&gt; executors = new ArrayList&lt;&gt;(this.executors);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        for (SEPExecutor executor : executors)</span>
+<span class="nc" id="L123">            executor.shutdownNow();</span>
+
+<span class="nc" id="L125">        terminateWorkers();</span>
+
+<span class="nc" id="L127">        long until = System.nanoTime() + unit.toNanos(timeout);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        for (SEPExecutor executor : executors)</span>
+<span class="nc" id="L129">            executor.shutdown.await(until - System.nanoTime(), TimeUnit.NANOSECONDS);</span>
+<span class="nc" id="L130">    }</span>
+
+    private void terminateWorkers()
+    {
+<span class="nc bnc" id="L134" title="All 4 branches missed.">        assert shuttingDown;</span>
+
+        // To terminate our workers, we only need to unpark thread to make it runnable again,
+        // so that the pool.shuttingDown boolean is checked. If work was already in the process
+        // of being scheduled, worker will terminate upon running the task.
+        Map.Entry&lt;Long, SEPWorker&gt; e;
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        while (null != (e = descheduled.pollFirstEntry()))</span>
+<span class="nc" id="L141">            e.getValue().assign(Work.SPINNING, false);</span>
+
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        while (null != (e = spinning.pollFirstEntry()))</span>
+<span class="nc" id="L144">            LockSupport.unpark(e.getValue().thread);</span>
+<span class="nc" id="L145">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

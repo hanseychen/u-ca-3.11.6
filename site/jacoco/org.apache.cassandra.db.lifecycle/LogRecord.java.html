@@ -1,0 +1,421 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogRecord.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.lifecycle</a> &gt; <span class="el_source">LogRecord.java</span></div><h1>LogRecord.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.db.lifecycle;
+
+import java.io.File;
+import java.io.FilenameFilter;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.zip.CRC32;
+
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+
+/**
+ * A decoded line in a transaction log file replica.
+ *
+ * @see LogReplica and LogFile.
+ */
+<span class="pc bpc" id="L44" title="1 of 2 branches missed.">final class LogRecord</span>
+{
+<span class="fc" id="L46">    public enum Type</span>
+    {
+<span class="fc" id="L48">        UNKNOWN, // a record that cannot be parsed</span>
+<span class="fc" id="L49">        ADD,    // new files to be retained on commit</span>
+<span class="fc" id="L50">        REMOVE, // old files to be retained on abort</span>
+<span class="fc" id="L51">        COMMIT, // commit flag</span>
+<span class="fc" id="L52">        ABORT;  // abort flag</span>
+
+        public static Type fromPrefix(String prefix)
+        {
+<span class="nc" id="L56">            return valueOf(prefix.toUpperCase());</span>
+        }
+
+        public boolean hasFile()
+        {
+<span class="fc bfc" id="L61" title="All 4 branches covered.">            return this == Type.ADD || this == Type.REMOVE;</span>
+        }
+
+        public boolean matches(LogRecord record)
+        {
+<span class="fc bfc" id="L66" title="All 2 branches covered.">            return this == record.type;</span>
+        }
+
+<span class="nc bnc" id="L69" title="All 4 branches missed.">        public boolean isFinal() { return this == Type.COMMIT || this == Type.ABORT; }</span>
+    }
+
+    /**
+     * The status of a record after it has been verified, any parsing errors
+     * are also store here.
+     */
+<span class="fc" id="L76">    public final static class Status</span>
+    {
+        // if there are any errors, they end up here
+<span class="fc" id="L79">        Optional&lt;String&gt; error = Optional.empty();</span>
+
+        // if the record was only partially matched across files this is true
+<span class="fc" id="L82">        boolean partial = false;</span>
+
+        // if the status of this record on disk is required (e.g. existing files), it is
+        // stored here for caching
+        LogRecord onDiskRecord;
+
+        void setError(String error)
+        {
+<span class="nc bnc" id="L90" title="All 2 branches missed.">            if (!this.error.isPresent())</span>
+<span class="nc" id="L91">                this.error = Optional.of(error);</span>
+<span class="nc" id="L92">        }</span>
+
+        boolean hasError()
+        {
+<span class="fc" id="L96">            return error.isPresent();</span>
+        }
+    }
+
+    // the type of record, see Type
+    public final Type type;
+    // for sstable records, the absolute path of the table desc
+    public final Optional&lt;String&gt; absolutePath;
+    // for sstable records, the last update time of all files (may not be available for NEW records)
+    public final long updateTime;
+    // for sstable records, the total number of files (may not be accurate for NEW records)
+    public final int numFiles;
+    // the raw string as written or read from a file
+    public final String raw;
+    // the checksum of this record, written at the end of the record string
+    public final long checksum;
+    // the status of this record, @see Status class
+    public final Status status;
+
+    // (add|remove|commit|abort):[*,*,*][checksum]
+<span class="fc" id="L116">    static Pattern REGEX = Pattern.compile(&quot;^(add|remove|commit|abort):\\[([^,]*),?([^,]*),?([^,]*)\\]\\[(\\d*)\\]$&quot;, Pattern.CASE_INSENSITIVE);</span>
+
+    public static LogRecord make(String line)
+    {
+        try
+        {
+<span class="nc" id="L122">            Matcher matcher = REGEX.matcher(line);</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">            if (!matcher.matches())</span>
+<span class="nc" id="L124">                return new LogRecord(Type.UNKNOWN, null, 0, 0, 0, line)</span>
+<span class="nc" id="L125">                       .setError(String.format(&quot;Failed to parse [%s]&quot;, line));</span>
+
+<span class="nc" id="L127">            Type type = Type.fromPrefix(matcher.group(1));</span>
+<span class="nc" id="L128">            return new LogRecord(type,</span>
+<span class="nc" id="L129">                                 matcher.group(2) + Component.separator, // see comment on CASSANDRA-13294 below</span>
+<span class="nc" id="L130">                                 Long.parseLong(matcher.group(3)),</span>
+<span class="nc" id="L131">                                 Integer.parseInt(matcher.group(4)),</span>
+<span class="nc" id="L132">                                 Long.parseLong(matcher.group(5)),</span>
+                                 line);
+        }
+<span class="nc" id="L135">        catch (IllegalArgumentException e)</span>
+        {
+<span class="nc" id="L137">            return new LogRecord(Type.UNKNOWN, null, 0, 0, 0, line)</span>
+<span class="nc" id="L138">                   .setError(String.format(&quot;Failed to parse line: %s&quot;, e.getMessage()));</span>
+        }
+    }
+
+    public static LogRecord makeCommit(long updateTime)
+    {
+<span class="fc" id="L144">        return new LogRecord(Type.COMMIT, updateTime);</span>
+    }
+
+    public static LogRecord makeAbort(long updateTime)
+    {
+<span class="nc" id="L149">        return new LogRecord(Type.ABORT, updateTime);</span>
+    }
+
+    public static LogRecord make(Type type, SSTable table)
+    {
+        // CASSANDRA-13294: add the sstable component separator because for legacy (2.1) files
+        // there is no separator after the generation number, and this would cause files of sstables with
+        // a higher generation number that starts with the same number, to be incorrectly classified as files
+        // of this record sstable
+<span class="fc" id="L158">        String absoluteTablePath = absolutePath(table.descriptor.baseFilename());</span>
+<span class="fc" id="L159">        return make(type, getExistingFiles(absoluteTablePath), table.getAllFilePaths().size(), absoluteTablePath);</span>
+    }
+
+    public static Map&lt;SSTable, LogRecord&gt; make(Type type, Iterable&lt;SSTableReader&gt; tables)
+    {
+        // contains a mapping from sstable absolute path (everything up until the 'Data'/'Index'/etc part of the filename) to the sstable
+<span class="fc" id="L165">        Map&lt;String, SSTable&gt; absolutePaths = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L166" title="All 2 branches covered.">        for (SSTableReader table : tables)</span>
+<span class="fc" id="L167">            absolutePaths.put(absolutePath(table.descriptor.baseFilename()), table);</span>
+
+        // maps sstable base file name to the actual files on disk
+<span class="fc" id="L170">        Map&lt;String, List&lt;File&gt;&gt; existingFiles = getExistingFiles(absolutePaths.keySet());</span>
+<span class="fc" id="L171">        Map&lt;SSTable, LogRecord&gt; records = new HashMap&lt;&gt;(existingFiles.size());</span>
+<span class="fc bfc" id="L172" title="All 2 branches covered.">        for (Map.Entry&lt;String, List&lt;File&gt;&gt; entry : existingFiles.entrySet())</span>
+        {
+<span class="fc" id="L174">            List&lt;File&gt; filesOnDisk = entry.getValue();</span>
+<span class="fc" id="L175">            String baseFileName = entry.getKey();</span>
+<span class="fc" id="L176">            SSTable sstable = absolutePaths.get(baseFileName);</span>
+<span class="fc" id="L177">            records.put(sstable, make(type, filesOnDisk, sstable.getAllFilePaths().size(), baseFileName));</span>
+<span class="fc" id="L178">        }</span>
+<span class="fc" id="L179">        return records;</span>
+    }
+
+    private static String absolutePath(String baseFilename)
+    {
+<span class="fc" id="L184">        return FileUtils.getCanonicalPath(baseFilename + Component.separator);</span>
+    }
+
+    public LogRecord withExistingFiles(List&lt;File&gt; existingFiles)
+    {
+<span class="nc" id="L189">        return make(type, existingFiles, 0, absolutePath.get());</span>
+    }
+
+    public static LogRecord make(Type type, List&lt;File&gt; files, int minFiles, String absolutePath)
+    {
+        // CASSANDRA-11889: File.lastModified() returns a positive value only if the file exists, therefore
+        // we filter by positive values to only consider the files that still exists right now, in case things
+        // changed on disk since getExistingFiles() was called
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">        List&lt;Long&gt; positiveModifiedTimes = files.stream().map(File::lastModified).filter(lm -&gt; lm &gt; 0).collect(Collectors.toList());</span>
+<span class="fc" id="L198">        long lastModified = positiveModifiedTimes.stream().reduce(0L, Long::max);</span>
+<span class="fc" id="L199">        return new LogRecord(type, absolutePath, lastModified, Math.max(minFiles, positiveModifiedTimes.size()));</span>
+    }
+
+    private LogRecord(Type type, long updateTime)
+    {
+<span class="fc" id="L204">        this(type, null, updateTime, 0, 0, null);</span>
+<span class="fc" id="L205">    }</span>
+
+    private LogRecord(Type type,
+                      String absolutePath,
+                      long updateTime,
+                      int numFiles)
+    {
+<span class="fc" id="L212">        this(type, absolutePath, updateTime, numFiles, 0, null);</span>
+<span class="fc" id="L213">    }</span>
+
+    private LogRecord(Type type,
+                      String absolutePath,
+                      long updateTime,
+                      int numFiles,
+                      long checksum,
+                      String raw)
+<span class="fc" id="L221">    {</span>
+<span class="pc bpc" id="L222" title="2 of 6 branches missed.">        assert !type.hasFile() || absolutePath != null : &quot;Expected file path for file records&quot;;</span>
+
+<span class="fc" id="L224">        this.type = type;</span>
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        this.absolutePath = type.hasFile() ? Optional.of(absolutePath) : Optional.empty();</span>
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        this.updateTime = type == Type.REMOVE ? updateTime : 0;</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">        this.numFiles = type.hasFile() ? numFiles : 0;</span>
+<span class="fc" id="L228">        this.status = new Status();</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        if (raw == null)</span>
+        {
+<span class="pc bpc" id="L231" title="2 of 4 branches missed.">            assert checksum == 0;</span>
+<span class="fc" id="L232">            this.checksum = computeChecksum();</span>
+<span class="fc" id="L233">            this.raw = format();</span>
+        }
+        else
+        {
+<span class="nc" id="L237">            this.checksum = checksum;</span>
+<span class="nc" id="L238">            this.raw = raw;</span>
+        }
+<span class="fc" id="L240">    }</span>
+
+    LogRecord setError(String error)
+    {
+<span class="nc" id="L244">        status.setError(error);</span>
+<span class="nc" id="L245">        return this;</span>
+    }
+
+    String error()
+    {
+<span class="nc" id="L250">        return status.error.orElse(&quot;&quot;);</span>
+    }
+
+    void setPartial()
+    {
+<span class="nc" id="L255">        status.partial = true;</span>
+<span class="nc" id="L256">    }</span>
+
+    boolean partial()
+    {
+<span class="nc" id="L260">        return status.partial;</span>
+    }
+
+    boolean isValid()
+    {
+<span class="pc bpc" id="L265" title="2 of 4 branches missed.">        return !status.hasError() &amp;&amp; type != Type.UNKNOWN;</span>
+    }
+
+    boolean isInvalid()
+    {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        return !isValid();</span>
+    }
+
+    boolean isInvalidOrPartial()
+    {
+<span class="nc bnc" id="L275" title="All 4 branches missed.">        return isInvalid() || partial();</span>
+    }
+
+    private String format()
+    {
+<span class="fc" id="L280">        return String.format(&quot;%s:[%s,%d,%d][%d]&quot;,</span>
+<span class="fc" id="L281">                             type.toString(),</span>
+<span class="fc" id="L282">                             absolutePath(),</span>
+<span class="fc" id="L283">                             updateTime,</span>
+<span class="fc" id="L284">                             numFiles,</span>
+<span class="fc" id="L285">                             checksum);</span>
+    }
+
+    public static List&lt;File&gt; getExistingFiles(String absoluteFilePath)
+    {
+<span class="fc" id="L290">        Path path = Paths.get(absoluteFilePath);</span>
+<span class="fc" id="L291">        File[] files = path.getParent().toFile().listFiles((dir, name) -&gt; name.startsWith(path.getFileName().toString()));</span>
+        // files may be null if the directory does not exist yet, e.g. when tracking new files
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">        return files == null ? Collections.emptyList() : Arrays.asList(files);</span>
+    }
+
+    /**
+     * absoluteFilePaths contains full file parts up to (but excluding) the component name
+     *
+     * This method finds all files on disk beginning with any of the paths in absoluteFilePaths
+     *
+     * @return a map from absoluteFilePath to actual file on disk.
+     */
+    public static Map&lt;String, List&lt;File&gt;&gt; getExistingFiles(Set&lt;String&gt; absoluteFilePaths)
+    {
+<span class="fc" id="L305">        Map&lt;String, List&lt;File&gt;&gt; fileMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L306">        Map&lt;File, TreeSet&lt;String&gt;&gt; dirToFileNamePrefix = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">        for (String absolutePath : absoluteFilePaths)</span>
+        {
+<span class="fc" id="L309">            Path fullPath = Paths.get(absolutePath);</span>
+<span class="fc" id="L310">            Path path = fullPath.getParent();</span>
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">            if (path != null)</span>
+<span class="fc" id="L312">                dirToFileNamePrefix.computeIfAbsent(path.toFile(), (k) -&gt; new TreeSet&lt;&gt;()).add(fullPath.getFileName().toString());</span>
+<span class="fc" id="L313">        }</span>
+
+<span class="fc" id="L315">        FilenameFilter ff = (dir, name) -&gt; {</span>
+<span class="fc" id="L316">            TreeSet&lt;String&gt; dirSet = dirToFileNamePrefix.get(dir);</span>
+            // if the set contains a prefix of the current file name, the file name we have here should sort directly
+            // after the prefix in the tree set, which means we can use 'floor' to get the prefix (returns the largest
+            // of the smaller strings in the set). Also note that the prefixes always end with '-' which means we won't
+            // have &quot;xy-1111-Data.db&quot;.startsWith(&quot;xy-11&quot;) below (we'd get &quot;xy-1111-Data.db&quot;.startsWith(&quot;xy-11-&quot;))
+<span class="fc" id="L321">            String baseName = dirSet.floor(name);</span>
+<span class="fc bfc" id="L322" title="All 4 branches covered.">            if (baseName != null &amp;&amp; name.startsWith(baseName))</span>
+            {
+<span class="fc" id="L324">                String absolutePath = new File(dir, baseName).getPath();</span>
+<span class="fc" id="L325">                fileMap.computeIfAbsent(absolutePath, k -&gt; new ArrayList&lt;&gt;()).add(new File(dir, name));</span>
+            }
+<span class="fc" id="L327">            return false;</span>
+        };
+
+        // populate the file map:
+<span class="fc bfc" id="L331" title="All 2 branches covered.">        for (File f : dirToFileNamePrefix.keySet())</span>
+<span class="fc" id="L332">            f.listFiles(ff);</span>
+
+<span class="fc" id="L334">        return fileMap;</span>
+    }
+
+
+    public boolean isFinal()
+    {
+<span class="nc" id="L340">        return type.isFinal();</span>
+    }
+
+    String fileName()
+    {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        return absolutePath.isPresent() ? Paths.get(absolutePath.get()).getFileName().toString() : &quot;&quot;;</span>
+    }
+
+    boolean isInFolder(Path folder)
+    {
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        return absolutePath.isPresent()</span>
+<span class="nc" id="L351">               ? FileUtils.isContained(folder.toFile(), Paths.get(absolutePath.get()).toFile())</span>
+               : false;
+    }
+
+    /**
+     * Return the absolute path, if present, except for the last character (the descriptor separator), or
+     * the empty string if the record has no path. This method is only to be used internally for writing
+     * the record to file or computing the checksum.
+     *
+     * CASSANDRA-13294: the last character of the absolute path is the descriptor separator, it is removed
+     * from the absolute path for backward compatibility, to make sure that on upgrade from 3.0.x to 3.0.y
+     * or to 3.y or to 4.0, the checksum of existing txn files still matches (in case of non clean shutdown
+     * some txn files may be present). By removing the last character here, it means that
+     * it will never be written to txn files, but it is added after reading a txn file in LogFile.make().
+     */
+    private String absolutePath()
+    {
+<span class="fc bfc" id="L368" title="All 2 branches covered.">        if (!absolutePath.isPresent())</span>
+<span class="fc" id="L369">            return &quot;&quot;;</span>
+
+<span class="fc" id="L371">        String ret = absolutePath.get();</span>
+<span class="pc bpc" id="L372" title="2 of 4 branches missed.">        assert ret.charAt(ret.length() -1) == Component.separator : &quot;Invalid absolute path, should end with '-'&quot;;</span>
+<span class="fc" id="L373">        return ret.substring(0, ret.length() - 1);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+        // see comment in equals
+<span class="fc" id="L380">        return Objects.hash(type, absolutePath, numFiles, updateTime);</span>
+    }
+
+    @Override
+    public boolean equals(Object obj)
+    {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (!(obj instanceof LogRecord))</span>
+<span class="nc" id="L387">            return false;</span>
+
+<span class="nc" id="L389">        final LogRecord other = (LogRecord)obj;</span>
+
+        // we exclude on purpose checksum, error and full file path
+        // since records must match across log file replicas on different disks
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        return type == other.type &amp;&amp;</span>
+<span class="nc bnc" id="L394" title="All 6 branches missed.">               absolutePath.equals(other.absolutePath) &amp;&amp;</span>
+               numFiles == other.numFiles &amp;&amp;
+               updateTime == other.updateTime;
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L402">        return raw;</span>
+    }
+
+    long computeChecksum()
+    {
+<span class="fc" id="L407">        CRC32 crc32 = new CRC32();</span>
+<span class="fc" id="L408">        crc32.update((absolutePath()).getBytes(FileUtils.CHARSET));</span>
+<span class="fc" id="L409">        crc32.update(type.toString().getBytes(FileUtils.CHARSET));</span>
+<span class="fc" id="L410">        FBUtilities.updateChecksumInt(crc32, (int) updateTime);</span>
+<span class="fc" id="L411">        FBUtilities.updateChecksumInt(crc32, (int) (updateTime &gt;&gt;&gt; 32));</span>
+<span class="fc" id="L412">        FBUtilities.updateChecksumInt(crc32, numFiles);</span>
+<span class="fc" id="L413">        return crc32.getValue() &amp; (Long.MAX_VALUE);</span>
+    }
+
+    LogRecord asType(Type type)
+    {
+<span class="fc" id="L418">        return new LogRecord(type, absolutePath.orElse(null), updateTime, numFiles);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

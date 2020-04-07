@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosState.java</span></div><h1>PaxosState.java</h1><pre class="source lang-java linenums">/*
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
+ */
+package org.apache.cassandra.service.paxos;
+
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.Lock;
+
+import com.google.common.base.Throwables;
+import com.google.common.util.concurrent.Striped;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.UUIDGen;
+
+<span class="nc bnc" id="L36" title="All 2 branches missed.">public class PaxosState</span>
+{
+<span class="nc" id="L38">    private static final Striped&lt;Lock&gt; LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentWriters() * 1024);</span>
+
+    private final Commit promised;
+    private final Commit accepted;
+    private final Commit mostRecentCommit;
+
+    public PaxosState(DecoratedKey key, CFMetaData metadata)
+    {
+<span class="nc" id="L46">        this(Commit.emptyCommit(key, metadata), Commit.emptyCommit(key, metadata), Commit.emptyCommit(key, metadata));</span>
+<span class="nc" id="L47">    }</span>
+
+    public PaxosState(Commit promised, Commit accepted, Commit mostRecentCommit)
+<span class="nc" id="L50">    {</span>
+<span class="nc bnc" id="L51" title="All 6 branches missed.">        assert promised.update.partitionKey().equals(accepted.update.partitionKey()) &amp;&amp; accepted.update.partitionKey().equals(mostRecentCommit.update.partitionKey());</span>
+<span class="nc bnc" id="L52" title="All 6 branches missed.">        assert promised.update.metadata() == accepted.update.metadata() &amp;&amp; accepted.update.metadata() == mostRecentCommit.update.metadata();</span>
+
+<span class="nc" id="L54">        this.promised = promised;</span>
+<span class="nc" id="L55">        this.accepted = accepted;</span>
+<span class="nc" id="L56">        this.mostRecentCommit = mostRecentCommit;</span>
+<span class="nc" id="L57">    }</span>
+
+    public static PrepareResponse prepare(Commit toPrepare)
+    {
+<span class="nc" id="L61">        long start = System.nanoTime();</span>
+        try
+        {
+<span class="nc" id="L64">            Lock lock = LOCKS.get(toPrepare.update.partitionKey());</span>
+<span class="nc" id="L65">            lock.lock();</span>
+            try
+            {
+                // When preparing, we need to use the same time as &quot;now&quot; (that's the time we use to decide if something
+                // is expired or not) accross nodes otherwise we may have a window where a Most Recent Commit shows up
+                // on some replica and not others during a new proposal (in StorageProxy.beginAndRepairPaxos()), and no
+                // amount of re-submit will fix this (because the node on which the commit has expired will have a
+                // tombstone that hides any re-submit). See CASSANDRA-12043 for details.
+<span class="nc" id="L73">                int nowInSec = UUIDGen.unixTimestampInSec(toPrepare.ballot);</span>
+<span class="nc" id="L74">                PaxosState state = SystemKeyspace.loadPaxosState(toPrepare.update.partitionKey(), toPrepare.update.metadata(), nowInSec);</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">                if (toPrepare.isAfter(state.promised))</span>
+                {
+<span class="nc" id="L77">                    Tracing.trace(&quot;Promising ballot {}&quot;, toPrepare.ballot);</span>
+<span class="nc" id="L78">                    SystemKeyspace.savePaxosPromise(toPrepare);</span>
+<span class="nc" id="L79">                    return new PrepareResponse(true, state.accepted, state.mostRecentCommit);</span>
+                }
+                else
+                {
+<span class="nc" id="L83">                    Tracing.trace(&quot;Promise rejected; {} is not sufficiently newer than {}&quot;, toPrepare, state.promised);</span>
+                    // return the currently promised ballot (not the last accepted one) so the coordinator can make sure it uses newer ballot next time (#5667)
+<span class="nc" id="L85">                    return new PrepareResponse(false, state.promised, state.mostRecentCommit);</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L90">                lock.unlock();</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L95">            Keyspace.open(toPrepare.update.metadata().ksName).getColumnFamilyStore(toPrepare.update.metadata().cfId).metric.casPrepare.addNano(System.nanoTime() - start);</span>
+        }
+
+    }
+
+    public static Boolean propose(Commit proposal)
+    {
+<span class="nc" id="L102">        long start = System.nanoTime();</span>
+        try
+        {
+<span class="nc" id="L105">            Lock lock = LOCKS.get(proposal.update.partitionKey());</span>
+<span class="nc" id="L106">            lock.lock();</span>
+            try
+            {
+<span class="nc" id="L109">                int nowInSec = UUIDGen.unixTimestampInSec(proposal.ballot);</span>
+<span class="nc" id="L110">                PaxosState state = SystemKeyspace.loadPaxosState(proposal.update.partitionKey(), proposal.update.metadata(), nowInSec);</span>
+<span class="nc bnc" id="L111" title="All 4 branches missed.">                if (proposal.hasBallot(state.promised.ballot) || proposal.isAfter(state.promised))</span>
+                {
+<span class="nc" id="L113">                    Tracing.trace(&quot;Accepting proposal {}&quot;, proposal);</span>
+<span class="nc" id="L114">                    SystemKeyspace.savePaxosProposal(proposal);</span>
+<span class="nc" id="L115">                    return true;</span>
+                }
+                else
+                {
+<span class="nc" id="L119">                    Tracing.trace(&quot;Rejecting proposal for {} because inProgress is now {}&quot;, proposal, state.promised);</span>
+<span class="nc" id="L120">                    return false;</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L125">                lock.unlock();</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L130">            Keyspace.open(proposal.update.metadata().ksName).getColumnFamilyStore(proposal.update.metadata().cfId).metric.casPropose.addNano(System.nanoTime() - start);</span>
+        }
+    }
+
+    public static void commit(Commit proposal)
+    {
+<span class="nc" id="L136">        long start = System.nanoTime();</span>
+        try
+        {
+            // There is no guarantee we will see commits in the right order, because messages
+            // can get delayed, so a proposal can be older than our current most recent ballot/commit.
+            // Committing it is however always safe due to column timestamps, so always do it. However,
+            // if our current in-progress ballot is strictly greater than the proposal one, we shouldn't
+            // erase the in-progress update.
+            // The table may have been truncated since the proposal was initiated. In that case, we
+            // don't want to perform the mutation and potentially resurrect truncated data
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if (UUIDGen.unixTimestamp(proposal.ballot) &gt;= SystemKeyspace.getTruncatedAt(proposal.update.metadata().cfId))</span>
+            {
+<span class="nc" id="L148">                Tracing.trace(&quot;Committing proposal {}&quot;, proposal);</span>
+<span class="nc" id="L149">                Mutation mutation = proposal.makeMutation();</span>
+<span class="nc" id="L150">                Keyspace.open(mutation.getKeyspaceName()).apply(mutation, true);</span>
+<span class="nc" id="L151">            }</span>
+            else
+            {
+<span class="nc" id="L154">                Tracing.trace(&quot;Not committing proposal {} as ballot timestamp predates last truncation time&quot;, proposal);</span>
+            }
+            // We don't need to lock, we're just blindly updating
+<span class="nc" id="L157">            SystemKeyspace.savePaxosCommit(proposal);</span>
+        }
+        finally
+        {
+<span class="nc" id="L161">            Keyspace.open(proposal.update.metadata().ksName).getColumnFamilyStore(proposal.update.metadata().cfId).metric.casCommit.addNano(System.nanoTime() - start);</span>
+        }
+<span class="nc" id="L163">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

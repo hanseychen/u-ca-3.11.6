@@ -1,0 +1,596 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractCompactionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">AbstractCompactionStrategy.java</span></div><h1>AbstractCompactionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.util.*;
+
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.SimpleSSTableMultiWriter;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Memtable;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+/**
+ * Pluggable compaction strategy determines how SSTables get merged.
+ *
+ * There are two main goals:
+ *  - perform background compaction constantly as needed; this typically makes a tradeoff between
+ *    i/o done by compaction, and merging done at read time.
+ *  - perform a full (maximum possible) compaction if requested by the user
+ */
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">public abstract class AbstractCompactionStrategy</span>
+{
+<span class="fc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(AbstractCompactionStrategy.class);</span>
+
+    protected static final float DEFAULT_TOMBSTONE_THRESHOLD = 0.2f;
+    // minimum interval needed to perform tombstone removal compaction in seconds, default 86400 or 1 day.
+    protected static final long DEFAULT_TOMBSTONE_COMPACTION_INTERVAL = 86400;
+    protected static final boolean DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION = false;
+    protected static final boolean DEFAULT_LOG_ALL_OPTION = false;
+
+    protected static final String TOMBSTONE_THRESHOLD_OPTION = &quot;tombstone_threshold&quot;;
+    protected static final String TOMBSTONE_COMPACTION_INTERVAL_OPTION = &quot;tombstone_compaction_interval&quot;;
+    // disable range overlap check when deciding if an SSTable is candidate for tombstone compaction (CASSANDRA-6563)
+    protected static final String UNCHECKED_TOMBSTONE_COMPACTION_OPTION = &quot;unchecked_tombstone_compaction&quot;;
+    protected static final String LOG_ALL_OPTION = &quot;log_all&quot;;
+    protected static final String COMPACTION_ENABLED = &quot;enabled&quot;;
+    public static final String ONLY_PURGE_REPAIRED_TOMBSTONES = &quot;only_purge_repaired_tombstones&quot;;
+
+    protected Map&lt;String, String&gt; options;
+
+    protected final ColumnFamilyStore cfs;
+    protected float tombstoneThreshold;
+    protected long tombstoneCompactionInterval;
+    protected boolean uncheckedTombstoneCompaction;
+<span class="fc" id="L82">    protected boolean disableTombstoneCompactions = false;</span>
+<span class="fc" id="L83">    protected boolean logAll = true;</span>
+
+    private final Directories directories;
+
+    /**
+     * pause/resume/getNextBackgroundTask must synchronize.  This guarantees that after pause completes,
+     * no new tasks will be generated; or put another way, pause can't run until in-progress tasks are
+     * done being created.
+     *
+     * This allows runWithCompactionsDisabled to be confident that after pausing, once in-progress
+     * tasks abort, it's safe to proceed with truncate/cleanup/etc.
+     *
+     * See CASSANDRA-3430
+     */
+<span class="fc" id="L97">    protected boolean isActive = false;</span>
+
+    protected AbstractCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options)
+<span class="fc" id="L100">    {</span>
+<span class="pc bpc" id="L101" title="2 of 4 branches missed.">        assert cfs != null;</span>
+<span class="fc" id="L102">        this.cfs = cfs;</span>
+<span class="fc" id="L103">        this.options = ImmutableMap.copyOf(options);</span>
+
+        /* checks must be repeated here, as user supplied strategies might not call validateOptions directly */
+
+        try
+        {
+<span class="fc" id="L109">            validateOptions(options);</span>
+<span class="fc" id="L110">            String optionValue = options.get(TOMBSTONE_THRESHOLD_OPTION);</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">            tombstoneThreshold = optionValue == null ? DEFAULT_TOMBSTONE_THRESHOLD : Float.parseFloat(optionValue);</span>
+<span class="fc" id="L112">            optionValue = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);</span>
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">            tombstoneCompactionInterval = optionValue == null ? DEFAULT_TOMBSTONE_COMPACTION_INTERVAL : Long.parseLong(optionValue);</span>
+<span class="fc" id="L114">            optionValue = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);</span>
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">            uncheckedTombstoneCompaction = optionValue == null ? DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION : Boolean.parseBoolean(optionValue);</span>
+<span class="fc" id="L116">            optionValue = options.get(LOG_ALL_OPTION);</span>
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">            logAll = optionValue == null ? DEFAULT_LOG_ALL_OPTION : Boolean.parseBoolean(optionValue);</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">            if (!shouldBeEnabled())</span>
+<span class="fc" id="L119">                this.disable();</span>
+        }
+<span class="nc" id="L121">        catch (ConfigurationException e)</span>
+        {
+<span class="nc" id="L123">            logger.warn(&quot;Error setting compaction strategy options ({}), defaults will be used&quot;, e.getMessage());</span>
+<span class="nc" id="L124">            tombstoneThreshold = DEFAULT_TOMBSTONE_THRESHOLD;</span>
+<span class="nc" id="L125">            tombstoneCompactionInterval = DEFAULT_TOMBSTONE_COMPACTION_INTERVAL;</span>
+<span class="nc" id="L126">            uncheckedTombstoneCompaction = DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION;</span>
+<span class="fc" id="L127">        }</span>
+
+<span class="fc" id="L129">        directories = cfs.getDirectories();</span>
+<span class="fc" id="L130">    }</span>
+
+    public Directories getDirectories()
+    {
+<span class="fc" id="L134">        return directories;</span>
+    }
+
+    /**
+     * For internal, temporary suspension of background compactions so that we can do exceptional
+     * things like truncate or major compaction
+     */
+    public synchronized void pause()
+    {
+<span class="nc" id="L143">        isActive = false;</span>
+<span class="nc" id="L144">    }</span>
+
+    /**
+     * For internal, temporary suspension of background compactions so that we can do exceptional
+     * things like truncate or major compaction
+     */
+    public synchronized void resume()
+    {
+<span class="nc" id="L152">        isActive = true;</span>
+<span class="nc" id="L153">    }</span>
+
+    /**
+     * Performs any extra initialization required
+     */
+    public void startup()
+    {
+<span class="fc" id="L160">        isActive = true;</span>
+<span class="fc" id="L161">    }</span>
+
+    /**
+     * Releases any resources if this strategy is shutdown (when the CFS is reloaded after a schema change).
+     */
+    public void shutdown()
+    {
+<span class="fc" id="L168">        isActive = false;</span>
+<span class="fc" id="L169">    }</span>
+
+    /**
+     * @param gcBefore throw away tombstones older than this
+     *
+     * @return the next background/minor compaction task to run; null if nothing to do.
+     *
+     * Is responsible for marking its sstables as compaction-pending.
+     */
+    public abstract AbstractCompactionTask getNextBackgroundTask(final int gcBefore);
+
+    /**
+     * @param gcBefore throw away tombstones older than this
+     *
+     * @return a compaction task that should be run to compact this columnfamilystore
+     * as much as possible.  Null if nothing to do.
+     *
+     * Is responsible for marking its sstables as compaction-pending.
+     */
+    public abstract Collection&lt;AbstractCompactionTask&gt; getMaximalTask(final int gcBefore, boolean splitOutput);
+
+    /**
+     * @param sstables SSTables to compact. Must be marked as compacting.
+     * @param gcBefore throw away tombstones older than this
+     *
+     * @return a compaction task corresponding to the requested sstables.
+     * Will not be null. (Will throw if user requests an invalid compaction.)
+     *
+     * Is responsible for marking its sstables as compaction-pending.
+     */
+    public abstract AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, final int gcBefore);
+
+    public AbstractCompactionTask getCompactionTask(LifecycleTransaction txn, final int gcBefore, long maxSSTableBytes)
+    {
+<span class="nc" id="L203">        return new CompactionTask(cfs, txn, gcBefore);</span>
+    }
+
+    /**
+     * @return the number of background tasks estimated to still be needed for this columnfamilystore
+     */
+    public abstract int getEstimatedRemainingTasks();
+
+    /**
+     * @return size in bytes of the largest sstables for this strategy
+     */
+    public abstract long getMaxSSTableBytes();
+
+    public void enable()
+    {
+<span class="fc" id="L218">    }</span>
+
+    public void disable()
+    {
+<span class="fc" id="L222">    }</span>
+
+    /**
+     * @return whether or not MeteredFlusher should be able to trigger memtable flushes for this CF.
+     */
+    public boolean isAffectedByMeteredFlusher()
+    {
+<span class="nc" id="L229">        return true;</span>
+    }
+
+    /**
+     * If not affected by MeteredFlusher (and handling flushing on its own), override to tell MF how much
+     * space to reserve for this CF, i.e., how much space to subtract from `memtable_total_space_in_mb` when deciding
+     * if other memtables should be flushed or not.
+     */
+    public long getMemtableReservedSize()
+    {
+<span class="nc" id="L239">        return 0;</span>
+    }
+
+    /**
+     * Handle a flushed memtable.
+     *
+     * @param memtable the flushed memtable
+     * @param sstables the written sstables. can be null or empty if the memtable was clean.
+     */
+    public void replaceFlushed(Memtable memtable, Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L250">        cfs.getTracker().replaceFlushed(memtable, sstables);</span>
+<span class="nc bnc" id="L251" title="All 4 branches missed.">        if (sstables != null &amp;&amp; !sstables.isEmpty())</span>
+<span class="nc" id="L252">            CompactionManager.instance.submitBackground(cfs);</span>
+<span class="nc" id="L253">    }</span>
+
+    /**
+     * Filters SSTables that are to be blacklisted from the given collection
+     *
+     * @param originalCandidates The collection to check for blacklisted SSTables
+     * @return list of the SSTables with blacklisted ones filtered out
+     */
+    public static List&lt;SSTableReader&gt; filterSuspectSSTables(Iterable&lt;SSTableReader&gt; originalCandidates)
+    {
+<span class="fc" id="L263">        List&lt;SSTableReader&gt; filtered = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">        for (SSTableReader sstable : originalCandidates)</span>
+        {
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">            if (!sstable.isMarkedSuspect())</span>
+<span class="fc" id="L267">                filtered.add(sstable);</span>
+<span class="fc" id="L268">        }</span>
+<span class="fc" id="L269">        return filtered;</span>
+    }
+
+
+    public ScannerList getScanners(Collection&lt;SSTableReader&gt; sstables, Range&lt;Token&gt; range)
+    {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        return range == null ? getScanners(sstables, (Collection&lt;Range&lt;Token&gt;&gt;)null) : getScanners(sstables, Collections.singleton(range));</span>
+    }
+    /**
+     * Returns a list of KeyScanners given sstables and a range on which to scan.
+     * The default implementation simply grab one SSTableScanner per-sstable, but overriding this method
+     * allow for a more memory efficient solution if we know the sstable don't overlap (see
+     * LeveledCompactionStrategy for instance).
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public ScannerList getScanners(Collection&lt;SSTableReader&gt; sstables, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="fc" id="L286">        ArrayList&lt;ISSTableScanner&gt; scanners = new ArrayList&lt;ISSTableScanner&gt;();</span>
+        try
+        {
+<span class="fc bfc" id="L289" title="All 2 branches covered.">            for (SSTableReader sstable : sstables)</span>
+<span class="fc" id="L290">                scanners.add(sstable.getScanner(ranges, null));</span>
+        }
+<span class="nc" id="L292">        catch (Throwable t)</span>
+        {
+            try
+            {
+<span class="nc" id="L296">                new ScannerList(scanners).close();</span>
+            }
+<span class="nc" id="L298">            catch (Throwable t2)</span>
+            {
+<span class="nc" id="L300">                t.addSuppressed(t2);</span>
+<span class="nc" id="L301">            }</span>
+<span class="nc" id="L302">            throw t;</span>
+<span class="fc" id="L303">        }</span>
+<span class="fc" id="L304">        return new ScannerList(scanners);</span>
+    }
+
+    public boolean shouldDefragment()
+    {
+<span class="fc" id="L309">        return false;</span>
+    }
+
+    public String getName()
+    {
+<span class="fc" id="L314">        return getClass().getSimpleName();</span>
+    }
+
+    public synchronized void replaceSSTables(Collection&lt;SSTableReader&gt; removed, Collection&lt;SSTableReader&gt; added)
+    {
+<span class="fc bfc" id="L319" title="All 2 branches covered.">        for (SSTableReader remove : removed)</span>
+<span class="fc" id="L320">            removeSSTable(remove);</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">        for (SSTableReader add : added)</span>
+<span class="fc" id="L322">            addSSTable(add);</span>
+<span class="fc" id="L323">    }</span>
+
+    public abstract void addSSTable(SSTableReader added);
+
+    public synchronized void addSSTables(Iterable&lt;SSTableReader&gt; added)
+    {
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">        for (SSTableReader sstable : added)</span>
+<span class="nc" id="L330">            addSSTable(sstable);</span>
+<span class="fc" id="L331">    }</span>
+
+    public abstract void removeSSTable(SSTableReader sstable);
+
+    public static class ScannerList implements AutoCloseable
+    {
+        public final List&lt;ISSTableScanner&gt; scanners;
+        public ScannerList(List&lt;ISSTableScanner&gt; scanners)
+<span class="fc" id="L339">        {</span>
+<span class="fc" id="L340">            this.scanners = scanners;</span>
+<span class="fc" id="L341">        }</span>
+
+        public long getTotalBytesScanned()
+        {
+<span class="fc" id="L345">            long bytesScanned = 0L;</span>
+<span class="fc bfc" id="L346" title="All 2 branches covered.">            for (ISSTableScanner scanner : scanners)</span>
+<span class="fc" id="L347">                bytesScanned += scanner.getBytesScanned();</span>
+
+<span class="fc" id="L349">            return bytesScanned;</span>
+        }
+
+        public long getTotalCompressedSize()
+        {
+<span class="fc" id="L354">            long compressedSize = 0;</span>
+<span class="fc bfc" id="L355" title="All 2 branches covered.">            for (ISSTableScanner scanner : scanners)</span>
+<span class="fc" id="L356">                compressedSize += scanner.getCompressedLengthInBytes();</span>
+
+<span class="fc" id="L358">            return compressedSize;</span>
+        }
+
+        public double getCompressionRatio()
+        {
+<span class="fc" id="L363">            double compressed = 0.0;</span>
+<span class="fc" id="L364">            double uncompressed = 0.0;</span>
+
+<span class="fc bfc" id="L366" title="All 2 branches covered.">            for (ISSTableScanner scanner : scanners)</span>
+            {
+<span class="fc" id="L368">                compressed += scanner.getCompressedLengthInBytes();</span>
+<span class="fc" id="L369">                uncompressed += scanner.getLengthInBytes();</span>
+<span class="fc" id="L370">            }</span>
+
+<span class="pc bpc" id="L372" title="2 of 4 branches missed.">            if (compressed == uncompressed || uncompressed == 0)</span>
+<span class="nc" id="L373">                return MetadataCollector.NO_COMPRESSION_RATIO;</span>
+
+<span class="fc" id="L375">            return compressed / uncompressed;</span>
+        }
+
+        public void close()
+        {
+<span class="fc" id="L380">            Throwable t = null;</span>
+<span class="fc bfc" id="L381" title="All 2 branches covered.">            for (ISSTableScanner scanner : scanners)</span>
+            {
+                try
+                {
+<span class="fc" id="L385">                    scanner.close();</span>
+                }
+<span class="nc" id="L387">                catch (Throwable t2)</span>
+                {
+<span class="nc" id="L389">                    JVMStabilityInspector.inspectThrowable(t2);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                    if (t == null)</span>
+<span class="nc" id="L391">                        t = t2;</span>
+                    else
+<span class="nc" id="L393">                        t.addSuppressed(t2);</span>
+<span class="fc" id="L394">                }</span>
+<span class="fc" id="L395">            }</span>
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">            if (t != null)</span>
+<span class="nc" id="L397">                throw Throwables.propagate(t);</span>
+<span class="fc" id="L398">        }</span>
+    }
+
+    public ScannerList getScanners(Collection&lt;SSTableReader&gt; toCompact)
+    {
+<span class="nc" id="L403">        return getScanners(toCompact, (Collection&lt;Range&lt;Token&gt;&gt;)null);</span>
+    }
+
+    /**
+     * Check if given sstable is worth dropping tombstones at gcBefore.
+     * Check is skipped if tombstone_compaction_interval time does not elapse since sstable creation and returns false.
+     *
+     * @param sstable SSTable to check
+     * @param gcBefore time to drop tombstones
+     * @return true if given sstable's tombstones are expected to be removed
+     */
+    protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
+    {
+<span class="pc bpc" id="L416" title="2 of 4 branches missed.">        if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES)</span>
+<span class="nc" id="L417">            return false;</span>
+        // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
+        // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
+        // elapsed since SSTable created.
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">        if (System.currentTimeMillis() &lt; sstable.getCreationTimeFor(Component.DATA) + tombstoneCompactionInterval * 1000)</span>
+<span class="fc" id="L422">           return false;</span>
+
+<span class="nc" id="L424">        double droppableRatio = sstable.getEstimatedDroppableTombstoneRatio(gcBefore);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (droppableRatio &lt;= tombstoneThreshold)</span>
+<span class="nc" id="L426">            return false;</span>
+
+        //sstable range overlap check is disabled. See CASSANDRA-6563.
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        if (uncheckedTombstoneCompaction)</span>
+<span class="nc" id="L430">            return true;</span>
+
+<span class="nc" id="L432">        Collection&lt;SSTableReader&gt; overlaps = cfs.getOverlappingLiveSSTables(Collections.singleton(sstable));</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (overlaps.isEmpty())</span>
+        {
+            // there is no overlap, tombstones are safely droppable
+<span class="nc" id="L436">            return true;</span>
+        }
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        else if (CompactionController.getFullyExpiredSSTables(cfs, Collections.singleton(sstable), overlaps, gcBefore).size() &gt; 0)</span>
+        {
+<span class="nc" id="L440">            return true;</span>
+        }
+        else
+        {
+            // what percentage of columns do we expect to compact outside of overlap?
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            if (sstable.getIndexSummarySize() &lt; 2)</span>
+            {
+                // we have too few samples to estimate correct percentage
+<span class="nc" id="L448">                return false;</span>
+            }
+            // first, calculate estimated keys that do not overlap
+<span class="nc" id="L451">            long keys = sstable.estimatedKeys();</span>
+<span class="nc" id="L452">            Set&lt;Range&lt;Token&gt;&gt; ranges = new HashSet&lt;Range&lt;Token&gt;&gt;(overlaps.size());</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">            for (SSTableReader overlap : overlaps)</span>
+<span class="nc" id="L454">                ranges.add(new Range&lt;&gt;(overlap.first.getToken(), overlap.last.getToken()));</span>
+<span class="nc" id="L455">            long remainingKeys = keys - sstable.estimatedKeysForRanges(ranges);</span>
+            // next, calculate what percentage of columns we have within those keys
+<span class="nc" id="L457">            long columns = sstable.getEstimatedColumnCount().mean() * remainingKeys;</span>
+<span class="nc" id="L458">            double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedColumnCount().count() * sstable.getEstimatedColumnCount().mean());</span>
+
+            // return if we still expect to have droppable tombstones in rest of columns
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            return remainingColumnsRatio * droppableRatio &gt; tombstoneThreshold;</span>
+        }
+    }
+
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options) throws ConfigurationException
+    {
+<span class="fc" id="L467">        String threshold = options.get(TOMBSTONE_THRESHOLD_OPTION);</span>
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">        if (threshold != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L472">                float thresholdValue = Float.parseFloat(threshold);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                if (thresholdValue &lt; 0)</span>
+                {
+<span class="nc" id="L475">                    throw new ConfigurationException(String.format(&quot;%s must be greater than 0, but was %f&quot;, TOMBSTONE_THRESHOLD_OPTION, thresholdValue));</span>
+                }
+            }
+<span class="nc" id="L478">            catch (NumberFormatException e)</span>
+            {
+<span class="nc" id="L480">                throw new ConfigurationException(String.format(&quot;%s is not a parsable int (base10) for %s&quot;, threshold, TOMBSTONE_THRESHOLD_OPTION), e);</span>
+<span class="nc" id="L481">            }</span>
+        }
+
+<span class="fc" id="L484">        String interval = options.get(TOMBSTONE_COMPACTION_INTERVAL_OPTION);</span>
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">        if (interval != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L489">                long tombstoneCompactionInterval = Long.parseLong(interval);</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">                if (tombstoneCompactionInterval &lt; 0)</span>
+                {
+<span class="nc" id="L492">                    throw new ConfigurationException(String.format(&quot;%s must be greater than 0, but was %d&quot;, TOMBSTONE_COMPACTION_INTERVAL_OPTION, tombstoneCompactionInterval));</span>
+                }
+            }
+<span class="nc" id="L495">            catch (NumberFormatException e)</span>
+            {
+<span class="nc" id="L497">                throw new ConfigurationException(String.format(&quot;%s is not a parsable int (base10) for %s&quot;, interval, TOMBSTONE_COMPACTION_INTERVAL_OPTION), e);</span>
+<span class="nc" id="L498">            }</span>
+        }
+
+<span class="fc" id="L501">        String unchecked = options.get(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);</span>
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">        if (unchecked != null)</span>
+        {
+<span class="nc bnc" id="L504" title="All 4 branches missed.">            if (!unchecked.equalsIgnoreCase(&quot;true&quot;) &amp;&amp; !unchecked.equalsIgnoreCase(&quot;false&quot;))</span>
+<span class="nc" id="L505">                throw new ConfigurationException(String.format(&quot;'%s' should be either 'true' or 'false', not '%s'&quot;, UNCHECKED_TOMBSTONE_COMPACTION_OPTION, unchecked));</span>
+        }
+
+<span class="fc" id="L508">        String logAll = options.get(LOG_ALL_OPTION);</span>
+<span class="pc bpc" id="L509" title="1 of 2 branches missed.">        if (logAll != null)</span>
+        {
+<span class="nc bnc" id="L511" title="All 4 branches missed.">            if (!logAll.equalsIgnoreCase(&quot;true&quot;) &amp;&amp; !logAll.equalsIgnoreCase(&quot;false&quot;))</span>
+            {
+<span class="nc" id="L513">                throw new ConfigurationException(String.format(&quot;'%s' should either be 'true' or 'false', not %s&quot;, LOG_ALL_OPTION, logAll));</span>
+            }
+        }
+
+<span class="fc" id="L517">        String compactionEnabled = options.get(COMPACTION_ENABLED);</span>
+<span class="fc bfc" id="L518" title="All 2 branches covered.">        if (compactionEnabled != null)</span>
+        {
+<span class="pc bpc" id="L520" title="2 of 4 branches missed.">            if (!compactionEnabled.equalsIgnoreCase(&quot;true&quot;) &amp;&amp; !compactionEnabled.equalsIgnoreCase(&quot;false&quot;))</span>
+            {
+<span class="nc" id="L522">                throw new ConfigurationException(String.format(&quot;enabled should either be 'true' or 'false', not %s&quot;, compactionEnabled));</span>
+            }
+        }
+
+<span class="fc" id="L526">        Map&lt;String, String&gt; uncheckedOptions = new HashMap&lt;String, String&gt;(options);</span>
+<span class="fc" id="L527">        uncheckedOptions.remove(TOMBSTONE_THRESHOLD_OPTION);</span>
+<span class="fc" id="L528">        uncheckedOptions.remove(TOMBSTONE_COMPACTION_INTERVAL_OPTION);</span>
+<span class="fc" id="L529">        uncheckedOptions.remove(UNCHECKED_TOMBSTONE_COMPACTION_OPTION);</span>
+<span class="fc" id="L530">        uncheckedOptions.remove(LOG_ALL_OPTION);</span>
+<span class="fc" id="L531">        uncheckedOptions.remove(COMPACTION_ENABLED);</span>
+<span class="fc" id="L532">        uncheckedOptions.remove(ONLY_PURGE_REPAIRED_TOMBSTONES);</span>
+<span class="fc" id="L533">        uncheckedOptions.remove(CompactionParams.Option.PROVIDE_OVERLAPPING_TOMBSTONES.toString());</span>
+<span class="fc" id="L534">        return uncheckedOptions;</span>
+    }
+
+    public boolean shouldBeEnabled()
+    {
+<span class="fc" id="L539">        String optionValue = options.get(COMPACTION_ENABLED);</span>
+
+<span class="pc bpc" id="L541" title="1 of 4 branches missed.">        return optionValue == null || Boolean.parseBoolean(optionValue);</span>
+    }
+
+
+    /**
+     * Method for grouping similar SSTables together, This will be used by
+     * anti-compaction to determine which SSTables should be anitcompacted
+     * as a group. If a given compaction strategy creates sstables which
+     * cannot be merged due to some constraint it must override this method.
+     */
+    public Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupSSTablesForAntiCompaction(Collection&lt;SSTableReader&gt; sstablesToGroup)
+    {
+<span class="nc" id="L553">        int groupSize = 2;</span>
+<span class="nc" id="L554">        List&lt;SSTableReader&gt; sortedSSTablesToGroup = new ArrayList&lt;&gt;(sstablesToGroup);</span>
+<span class="nc" id="L555">        Collections.sort(sortedSSTablesToGroup, SSTableReader.sstableComparator);</span>
+
+<span class="nc" id="L557">        Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupedSSTables = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L558">        Collection&lt;SSTableReader&gt; currGroup = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        for (SSTableReader sstable : sortedSSTablesToGroup)</span>
+        {
+<span class="nc" id="L562">            currGroup.add(sstable);</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            if (currGroup.size() == groupSize)</span>
+            {
+<span class="nc" id="L565">                groupedSSTables.add(currGroup);</span>
+<span class="nc" id="L566">                currGroup = new ArrayList&lt;&gt;();</span>
+            }
+<span class="nc" id="L568">        }</span>
+
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (currGroup.size() != 0)</span>
+<span class="nc" id="L571">            groupedSSTables.add(currGroup);</span>
+<span class="nc" id="L572">        return groupedSSTables;</span>
+    }
+
+    public CompactionLogger.Strategy strategyLogger()
+    {
+<span class="nc" id="L577">        return CompactionLogger.Strategy.none;</span>
+    }
+
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+                                                       long keyCount,
+                                                       long repairedAt,
+                                                       MetadataCollector meta,
+                                                       SerializationHeader header,
+                                                       Collection&lt;Index&gt; indexes,
+                                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="fc" id="L588">        return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, cfs.metadata, meta, header, indexes, lifecycleNewTracker);</span>
+    }
+
+    public boolean supportsEarlyOpen()
+    {
+<span class="fc" id="L593">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

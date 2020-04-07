@@ -1,0 +1,1583 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SystemKeyspace.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">SystemKeyspace.java</span></div><h1>SystemKeyspace.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.File;
+import java.io.IOError;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+import java.util.concurrent.Future;
+
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.SetMultimap;
+import com.google.common.collect.Sets;
+import com.google.common.io.ByteStreams;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.util.concurrent.Futures;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.functions.*;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.compaction.CompactionHistoryTabularData;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.metrics.RestorableMeter;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PaxosState;
+import org.apache.cassandra.thrift.cassandraConstants;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.*;
+
+import static java.util.Collections.emptyMap;
+import static java.util.Collections.singletonMap;
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
+import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
+import static org.apache.cassandra.io.util.FileUtils.visitDirectory;
+
+<span class="pc bpc" id="L77" title="1 of 2 branches missed.">public final class SystemKeyspace</span>
+{
+    private SystemKeyspace()
+    {
+    }
+
+<span class="fc" id="L83">    private static final Logger logger = LoggerFactory.getLogger(SystemKeyspace.class);</span>
+
+    // Used to indicate that there was a previous version written to the legacy (pre 1.2)
+    // system.Versions table, but that we cannot read it. Suffice to say, any upgrade should
+    // proceed through 1.2.x before upgrading to the current version.
+<span class="fc" id="L88">    public static final CassandraVersion UNREADABLE_VERSION = new CassandraVersion(&quot;0.0.0-unknown&quot;);</span>
+
+    // Used to indicate that no previous version information was found. When encountered, we assume that
+    // Cassandra was not previously installed and we're in the process of starting a fresh node.
+<span class="fc" id="L92">    public static final CassandraVersion NULL_VERSION = new CassandraVersion(&quot;0.0.0-absent&quot;);</span>
+
+    public static final String BATCHES = &quot;batches&quot;;
+    public static final String PAXOS = &quot;paxos&quot;;
+    public static final String BUILT_INDEXES = &quot;IndexInfo&quot;;
+    public static final String LOCAL = &quot;local&quot;;
+    public static final String PEERS = &quot;peers&quot;;
+    public static final String PEER_EVENTS = &quot;peer_events&quot;;
+    public static final String RANGE_XFERS = &quot;range_xfers&quot;;
+    public static final String COMPACTION_HISTORY = &quot;compaction_history&quot;;
+    public static final String SSTABLE_ACTIVITY = &quot;sstable_activity&quot;;
+    public static final String SIZE_ESTIMATES = &quot;size_estimates&quot;;
+    public static final String AVAILABLE_RANGES = &quot;available_ranges&quot;;
+    public static final String TRANSFERRED_RANGES = &quot;transferred_ranges&quot;;
+    public static final String VIEWS_BUILDS_IN_PROGRESS = &quot;views_builds_in_progress&quot;;
+    public static final String BUILT_VIEWS = &quot;built_views&quot;;
+    public static final String PREPARED_STATEMENTS = &quot;prepared_statements&quot;;
+
+    @Deprecated public static final String LEGACY_HINTS = &quot;hints&quot;;
+    @Deprecated public static final String LEGACY_BATCHLOG = &quot;batchlog&quot;;
+    @Deprecated public static final String LEGACY_KEYSPACES = &quot;schema_keyspaces&quot;;
+    @Deprecated public static final String LEGACY_COLUMNFAMILIES = &quot;schema_columnfamilies&quot;;
+    @Deprecated public static final String LEGACY_COLUMNS = &quot;schema_columns&quot;;
+    @Deprecated public static final String LEGACY_TRIGGERS = &quot;schema_triggers&quot;;
+    @Deprecated public static final String LEGACY_USERTYPES = &quot;schema_usertypes&quot;;
+    @Deprecated public static final String LEGACY_FUNCTIONS = &quot;schema_functions&quot;;
+    @Deprecated public static final String LEGACY_AGGREGATES = &quot;schema_aggregates&quot;;
+
+<span class="fc" id="L120">    public static final CFMetaData Batches =</span>
+<span class="fc" id="L121">        compile(BATCHES,</span>
+                &quot;batches awaiting replay&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;id timeuuid,&quot;
+                + &quot;mutations list&lt;blob&gt;,&quot;
+                + &quot;version int,&quot;
+                + &quot;PRIMARY KEY ((id)))&quot;)
+<span class="fc" id="L128">                .copy(new LocalPartitioner(TimeUUIDType.instance))</span>
+<span class="fc" id="L129">                .compaction(CompactionParams.scts(singletonMap(&quot;min_threshold&quot;, &quot;2&quot;)))</span>
+<span class="fc" id="L130">                .gcGraceSeconds(0);</span>
+
+<span class="fc" id="L132">    private static final CFMetaData Paxos =</span>
+<span class="fc" id="L133">        compile(PAXOS,</span>
+                &quot;in-progress paxos proposals&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;row_key blob,&quot;
+                + &quot;cf_id UUID,&quot;
+                + &quot;in_progress_ballot timeuuid,&quot;
+                + &quot;most_recent_commit blob,&quot;
+                + &quot;most_recent_commit_at timeuuid,&quot;
+                + &quot;most_recent_commit_version int,&quot;
+                + &quot;proposal blob,&quot;
+                + &quot;proposal_ballot timeuuid,&quot;
+                + &quot;proposal_version int,&quot;
+                + &quot;PRIMARY KEY ((row_key), cf_id))&quot;)
+<span class="fc" id="L146">                .compaction(CompactionParams.lcs(emptyMap()));</span>
+
+<span class="fc" id="L148">    private static final CFMetaData BuiltIndexes =</span>
+<span class="fc" id="L149">        compile(BUILT_INDEXES,</span>
+                &quot;built column indexes&quot;,
+                &quot;CREATE TABLE \&quot;%s\&quot; (&quot;
+                + &quot;table_name text,&quot; // table_name here is the name of the keyspace - don't be fooled
+                + &quot;index_name text,&quot;
+                + &quot;PRIMARY KEY ((table_name), index_name)) &quot;
+                + &quot;WITH COMPACT STORAGE&quot;);
+
+<span class="fc" id="L157">    private static final CFMetaData Local =</span>
+<span class="fc" id="L158">        compile(LOCAL,</span>
+                &quot;information about the local node&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;key text,&quot;
+                + &quot;bootstrapped text,&quot;
+                + &quot;broadcast_address inet,&quot;
+                + &quot;cluster_name text,&quot;
+                + &quot;cql_version text,&quot;
+                + &quot;data_center text,&quot;
+                + &quot;gossip_generation int,&quot;
+                + &quot;host_id uuid,&quot;
+                + &quot;listen_address inet,&quot;
+                + &quot;native_protocol_version text,&quot;
+                + &quot;partitioner text,&quot;
+                + &quot;rack text,&quot;
+                + &quot;release_version text,&quot;
+                + &quot;rpc_address inet,&quot;
+                + &quot;schema_version uuid,&quot;
+                + &quot;thrift_version text,&quot;
+                + &quot;tokens set&lt;varchar&gt;,&quot;
+                + &quot;truncated_at map&lt;uuid, blob&gt;,&quot;
+                + &quot;PRIMARY KEY ((key)))&quot;);
+
+<span class="fc" id="L181">    private static final CFMetaData Peers =</span>
+<span class="fc" id="L182">        compile(PEERS,</span>
+                &quot;information about known peers in the cluster&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;peer inet,&quot;
+                + &quot;data_center text,&quot;
+                + &quot;host_id uuid,&quot;
+                + &quot;preferred_ip inet,&quot;
+                + &quot;rack text,&quot;
+                + &quot;release_version text,&quot;
+                + &quot;rpc_address inet,&quot;
+                + &quot;schema_version uuid,&quot;
+                + &quot;tokens set&lt;varchar&gt;,&quot;
+                + &quot;PRIMARY KEY ((peer)))&quot;);
+
+<span class="fc" id="L196">    private static final CFMetaData PeerEvents =</span>
+<span class="fc" id="L197">        compile(PEER_EVENTS,</span>
+                &quot;events related to peers&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;peer inet,&quot;
+                + &quot;hints_dropped map&lt;uuid, int&gt;,&quot;
+                + &quot;PRIMARY KEY ((peer)))&quot;);
+
+<span class="fc" id="L204">    private static final CFMetaData RangeXfers =</span>
+<span class="fc" id="L205">        compile(RANGE_XFERS,</span>
+                &quot;ranges requested for transfer&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;token_bytes blob,&quot;
+                + &quot;requested_at timestamp,&quot;
+                + &quot;PRIMARY KEY ((token_bytes)))&quot;);
+
+<span class="fc" id="L212">    private static final CFMetaData CompactionHistory =</span>
+<span class="fc" id="L213">        compile(COMPACTION_HISTORY,</span>
+                &quot;week-long compaction history&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;id uuid,&quot;
+                + &quot;bytes_in bigint,&quot;
+                + &quot;bytes_out bigint,&quot;
+                + &quot;columnfamily_name text,&quot;
+                + &quot;compacted_at timestamp,&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;rows_merged map&lt;int, bigint&gt;,&quot;
+                + &quot;PRIMARY KEY ((id)))&quot;)
+<span class="fc" id="L224">                .defaultTimeToLive((int) TimeUnit.DAYS.toSeconds(7));</span>
+
+<span class="fc" id="L226">    private static final CFMetaData SSTableActivity =</span>
+<span class="fc" id="L227">        compile(SSTABLE_ACTIVITY,</span>
+                &quot;historic sstable read rates&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;columnfamily_name text,&quot;
+                + &quot;generation int,&quot;
+                + &quot;rate_120m double,&quot;
+                + &quot;rate_15m double,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name, columnfamily_name, generation)))&quot;);
+
+<span class="fc" id="L237">    private static final CFMetaData SizeEstimates =</span>
+<span class="fc" id="L238">        compile(SIZE_ESTIMATES,</span>
+                &quot;per-table primary range size estimates&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;table_name text,&quot;
+                + &quot;range_start text,&quot;
+                + &quot;range_end text,&quot;
+                + &quot;mean_partition_size bigint,&quot;
+                + &quot;partitions_count bigint,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), table_name, range_start, range_end))&quot;)
+<span class="fc" id="L248">                .gcGraceSeconds(0);</span>
+
+<span class="fc" id="L250">    private static final CFMetaData AvailableRanges =</span>
+<span class="fc" id="L251">        compile(AVAILABLE_RANGES,</span>
+                &quot;available keyspace/ranges during bootstrap/replace that are ready to be served&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;ranges set&lt;blob&gt;,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name)))&quot;);
+
+<span class="fc" id="L258">    private static final CFMetaData TransferredRanges =</span>
+<span class="fc" id="L259">        compile(TRANSFERRED_RANGES,</span>
+                &quot;record of transferred ranges for streaming operation&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;operation text,&quot;
+                + &quot;peer inet,&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;ranges set&lt;blob&gt;,&quot;
+                + &quot;PRIMARY KEY ((operation, keyspace_name), peer))&quot;);
+
+<span class="fc" id="L268">    private static final CFMetaData ViewsBuildsInProgress =</span>
+<span class="fc" id="L269">        compile(VIEWS_BUILDS_IN_PROGRESS,</span>
+                &quot;views builds current progress&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;view_name text,&quot;
+                + &quot;last_token varchar,&quot;
+                + &quot;generation_number int,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), view_name))&quot;);
+
+<span class="fc" id="L278">    private static final CFMetaData BuiltViews =</span>
+<span class="fc" id="L279">        compile(BUILT_VIEWS,</span>
+                &quot;built views&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;view_name text,&quot;
+                + &quot;status_replicated boolean,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), view_name))&quot;);
+
+<span class="fc" id="L287">    private static final CFMetaData PreparedStatements =</span>
+<span class="fc" id="L288">        compile(PREPARED_STATEMENTS,</span>
+                &quot;prepared statements&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;prepared_id blob,&quot;
+                + &quot;logged_keyspace text,&quot;
+                + &quot;query_string text,&quot;
+                + &quot;PRIMARY KEY ((prepared_id)))&quot;);
+
+    @Deprecated
+<span class="fc" id="L297">    public static final CFMetaData LegacyHints =</span>
+<span class="fc" id="L298">        compile(LEGACY_HINTS,</span>
+                &quot;*DEPRECATED* hints awaiting delivery&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;target_id uuid,&quot;
+                + &quot;hint_id timeuuid,&quot;
+                + &quot;message_version int,&quot;
+                + &quot;mutation blob,&quot;
+                + &quot;PRIMARY KEY ((target_id), hint_id, message_version)) &quot;
+                + &quot;WITH COMPACT STORAGE&quot;)
+<span class="fc" id="L307">                .compaction(CompactionParams.scts(singletonMap(&quot;enabled&quot;, &quot;false&quot;)))</span>
+<span class="fc" id="L308">                .gcGraceSeconds(0);</span>
+
+    @Deprecated
+<span class="fc" id="L311">    public static final CFMetaData LegacyBatchlog =</span>
+<span class="fc" id="L312">        compile(LEGACY_BATCHLOG,</span>
+                &quot;*DEPRECATED* batchlog entries&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;id uuid,&quot;
+                + &quot;data blob,&quot;
+                + &quot;version int,&quot;
+                + &quot;written_at timestamp,&quot;
+                + &quot;PRIMARY KEY ((id)))&quot;)
+<span class="fc" id="L320">                .compaction(CompactionParams.scts(singletonMap(&quot;min_threshold&quot;, &quot;2&quot;)))</span>
+<span class="fc" id="L321">                .gcGraceSeconds(0);</span>
+
+    @Deprecated
+<span class="fc" id="L324">    public static final CFMetaData LegacyKeyspaces =</span>
+<span class="fc" id="L325">        compile(LEGACY_KEYSPACES,</span>
+                &quot;*DEPRECATED* keyspace definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;durable_writes boolean,&quot;
+                + &quot;strategy_class text,&quot;
+                + &quot;strategy_options text,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name))) &quot;
+                + &quot;WITH COMPACT STORAGE&quot;);
+
+    @Deprecated
+<span class="fc" id="L336">    public static final CFMetaData LegacyColumnfamilies =</span>
+<span class="fc" id="L337">        compile(LEGACY_COLUMNFAMILIES,</span>
+                &quot;*DEPRECATED* table definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;columnfamily_name text,&quot;
+                + &quot;bloom_filter_fp_chance double,&quot;
+                + &quot;caching text,&quot;
+                + &quot;cf_id uuid,&quot; // post-2.1 UUID cfid
+                + &quot;comment text,&quot;
+                + &quot;compaction_strategy_class text,&quot;
+                + &quot;compaction_strategy_options text,&quot;
+                + &quot;comparator text,&quot;
+                + &quot;compression_parameters text,&quot;
+                + &quot;default_time_to_live int,&quot;
+                + &quot;default_validator text,&quot;
+                + &quot;dropped_columns map&lt;text, bigint&gt;,&quot;
+                + &quot;gc_grace_seconds int,&quot;
+                + &quot;is_dense boolean,&quot;
+                + &quot;key_validator text,&quot;
+                + &quot;local_read_repair_chance double,&quot;
+                + &quot;max_compaction_threshold int,&quot;
+                + &quot;max_index_interval int,&quot;
+                + &quot;memtable_flush_period_in_ms int,&quot;
+                + &quot;min_compaction_threshold int,&quot;
+                + &quot;min_index_interval int,&quot;
+                + &quot;read_repair_chance double,&quot;
+                + &quot;speculative_retry text,&quot;
+                + &quot;subcomparator text,&quot;
+                + &quot;type text,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), columnfamily_name))&quot;);
+
+    @Deprecated
+<span class="fc" id="L369">    public static final CFMetaData LegacyColumns =</span>
+<span class="fc" id="L370">        compile(LEGACY_COLUMNS,</span>
+                &quot;*DEPRECATED* column definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;columnfamily_name text,&quot;
+                + &quot;column_name text,&quot;
+                + &quot;component_index int,&quot;
+                + &quot;index_name text,&quot;
+                + &quot;index_options text,&quot;
+                + &quot;index_type text,&quot;
+                + &quot;type text,&quot;
+                + &quot;validator text,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), columnfamily_name, column_name))&quot;);
+
+    @Deprecated
+<span class="fc" id="L385">    public static final CFMetaData LegacyTriggers =</span>
+<span class="fc" id="L386">        compile(LEGACY_TRIGGERS,</span>
+                &quot;*DEPRECATED* trigger definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;columnfamily_name text,&quot;
+                + &quot;trigger_name text,&quot;
+                + &quot;trigger_options map&lt;text, text&gt;,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), columnfamily_name, trigger_name))&quot;);
+
+    @Deprecated
+<span class="fc" id="L396">    public static final CFMetaData LegacyUsertypes =</span>
+<span class="fc" id="L397">        compile(LEGACY_USERTYPES,</span>
+                &quot;*DEPRECATED* user defined type definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;type_name text,&quot;
+                + &quot;field_names list&lt;text&gt;,&quot;
+                + &quot;field_types list&lt;text&gt;,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), type_name))&quot;);
+
+    @Deprecated
+<span class="fc" id="L407">    public static final CFMetaData LegacyFunctions =</span>
+<span class="fc" id="L408">        compile(LEGACY_FUNCTIONS,</span>
+                &quot;*DEPRECATED* user defined function definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;function_name text,&quot;
+                + &quot;signature frozen&lt;list&lt;text&gt;&gt;,&quot;
+                + &quot;argument_names list&lt;text&gt;,&quot;
+                + &quot;argument_types list&lt;text&gt;,&quot;
+                + &quot;body text,&quot;
+                + &quot;language text,&quot;
+                + &quot;return_type text,&quot;
+                + &quot;called_on_null_input boolean,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), function_name, signature))&quot;);
+
+    @Deprecated
+<span class="fc" id="L423">    public static final CFMetaData LegacyAggregates =</span>
+<span class="fc" id="L424">        compile(LEGACY_AGGREGATES,</span>
+                &quot;*DEPRECATED* user defined aggregate definitions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;keyspace_name text,&quot;
+                + &quot;aggregate_name text,&quot;
+                + &quot;signature frozen&lt;list&lt;text&gt;&gt;,&quot;
+                + &quot;argument_types list&lt;text&gt;,&quot;
+                + &quot;final_func text,&quot;
+                + &quot;initcond blob,&quot;
+                + &quot;return_type text,&quot;
+                + &quot;state_func text,&quot;
+                + &quot;state_type text,&quot;
+                + &quot;PRIMARY KEY ((keyspace_name), aggregate_name, signature))&quot;);
+
+    private static CFMetaData compile(String name, String description, String schema)
+    {
+<span class="fc" id="L440">        return CFMetaData.compile(String.format(schema, name), SchemaConstants.SYSTEM_KEYSPACE_NAME)</span>
+<span class="fc" id="L441">                         .comment(description);</span>
+    }
+
+    public static KeyspaceMetadata metadata()
+    {
+<span class="fc" id="L446">        return KeyspaceMetadata.create(SchemaConstants.SYSTEM_KEYSPACE_NAME, KeyspaceParams.local(), tables(), Views.none(), Types.none(), functions());</span>
+    }
+
+    private static Tables tables()
+    {
+<span class="fc" id="L451">        return Tables.of(BuiltIndexes,</span>
+                         Batches,
+                         Paxos,
+                         Local,
+                         Peers,
+                         PeerEvents,
+                         RangeXfers,
+                         CompactionHistory,
+                         SSTableActivity,
+                         SizeEstimates,
+                         AvailableRanges,
+                         TransferredRanges,
+                         ViewsBuildsInProgress,
+                         BuiltViews,
+                         LegacyHints,
+                         LegacyBatchlog,
+                         PreparedStatements,
+                         LegacyKeyspaces,
+                         LegacyColumnfamilies,
+                         LegacyColumns,
+                         LegacyTriggers,
+                         LegacyUsertypes,
+                         LegacyFunctions,
+                         LegacyAggregates);
+    }
+
+    private static Functions functions()
+    {
+<span class="fc" id="L479">        return Functions.builder()</span>
+<span class="fc" id="L480">                        .add(UuidFcts.all())</span>
+<span class="fc" id="L481">                        .add(TimeFcts.all())</span>
+<span class="fc" id="L482">                        .add(BytesConversionFcts.all())</span>
+<span class="fc" id="L483">                        .add(AggregateFcts.all())</span>
+<span class="fc" id="L484">                        .add(CastFcts.all())</span>
+<span class="fc" id="L485">                        .build();</span>
+    }
+
+    private static volatile Map&lt;UUID, Pair&lt;CommitLogPosition, Long&gt;&gt; truncationRecords;
+
+<span class="fc" id="L490">    public enum BootstrapState</span>
+    {
+<span class="fc" id="L492">        NEEDS_BOOTSTRAP,</span>
+<span class="fc" id="L493">        COMPLETED,</span>
+<span class="fc" id="L494">        IN_PROGRESS,</span>
+<span class="fc" id="L495">        DECOMMISSIONED</span>
+    }
+
+    public static void finishStartup()
+    {
+<span class="fc" id="L500">        SchemaKeyspace.saveSystemKeyspacesSchema();</span>
+<span class="fc" id="L501">    }</span>
+
+    public static void persistLocalMetadata()
+    {
+<span class="fc" id="L505">        String req = &quot;INSERT INTO system.%s (&quot; +</span>
+                     &quot;key,&quot; +
+                     &quot;cluster_name,&quot; +
+                     &quot;release_version,&quot; +
+                     &quot;cql_version,&quot; +
+                     &quot;thrift_version,&quot; +
+                     &quot;native_protocol_version,&quot; +
+                     &quot;data_center,&quot; +
+                     &quot;rack,&quot; +
+                     &quot;partitioner,&quot; +
+                     &quot;rpc_address,&quot; +
+                     &quot;broadcast_address,&quot; +
+                     &quot;listen_address&quot; +
+                     &quot;) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)&quot;;
+<span class="fc" id="L519">        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="fc" id="L520">        executeOnceInternal(String.format(req, LOCAL),</span>
+                            LOCAL,
+<span class="fc" id="L522">                            DatabaseDescriptor.getClusterName(),</span>
+<span class="fc" id="L523">                            FBUtilities.getReleaseVersionString(),</span>
+<span class="fc" id="L524">                            QueryProcessor.CQL_VERSION.toString(),</span>
+                            cassandraConstants.VERSION,
+<span class="fc" id="L526">                            String.valueOf(ProtocolVersion.CURRENT.asInt()),</span>
+<span class="fc" id="L527">                            snitch.getDatacenter(FBUtilities.getBroadcastAddress()),</span>
+<span class="fc" id="L528">                            snitch.getRack(FBUtilities.getBroadcastAddress()),</span>
+<span class="fc" id="L529">                            DatabaseDescriptor.getPartitioner().getClass().getName(),</span>
+<span class="fc" id="L530">                            DatabaseDescriptor.getRpcAddress(),</span>
+<span class="fc" id="L531">                            FBUtilities.getBroadcastAddress(),</span>
+<span class="fc" id="L532">                            FBUtilities.getLocalAddress());</span>
+<span class="fc" id="L533">    }</span>
+
+    public static void updateCompactionHistory(String ksname,
+                                               String cfname,
+                                               long compactedAt,
+                                               long bytesIn,
+                                               long bytesOut,
+                                               Map&lt;Integer, Long&gt; rowsMerged)
+    {
+        // don't write anything when the history table itself is compacted, since that would in turn cause new compactions
+<span class="pc bpc" id="L543" title="2 of 4 branches missed.">        if (ksname.equals(&quot;system&quot;) &amp;&amp; cfname.equals(COMPACTION_HISTORY))</span>
+<span class="nc" id="L544">            return;</span>
+<span class="fc" id="L545">        String req = &quot;INSERT INTO system.%s (id, keyspace_name, columnfamily_name, compacted_at, bytes_in, bytes_out, rows_merged) VALUES (?, ?, ?, ?, ?, ?, ?)&quot;;</span>
+<span class="fc" id="L546">        executeInternal(String.format(req, COMPACTION_HISTORY),</span>
+<span class="fc" id="L547">                        UUIDGen.getTimeUUID(),</span>
+                        ksname,
+                        cfname,
+<span class="fc" id="L550">                        ByteBufferUtil.bytes(compactedAt),</span>
+<span class="fc" id="L551">                        bytesIn,</span>
+<span class="fc" id="L552">                        bytesOut,</span>
+                        rowsMerged);
+<span class="fc" id="L554">    }</span>
+
+    public static TabularData getCompactionHistory() throws OpenDataException
+    {
+<span class="nc" id="L558">        UntypedResultSet queryResultSet = executeInternal(String.format(&quot;SELECT * from system.%s&quot;, COMPACTION_HISTORY));</span>
+<span class="nc" id="L559">        return CompactionHistoryTabularData.from(queryResultSet);</span>
+    }
+
+    public static boolean isViewBuilt(String keyspaceName, String viewName)
+    {
+<span class="nc" id="L564">        String req = &quot;SELECT view_name FROM %s.\&quot;%s\&quot; WHERE keyspace_name=? AND view_name=?&quot;;</span>
+<span class="nc" id="L565">        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        return !result.isEmpty();</span>
+    }
+
+    public static boolean isViewStatusReplicated(String keyspaceName, String viewName)
+    {
+<span class="nc" id="L571">        String req = &quot;SELECT status_replicated FROM %s.\&quot;%s\&quot; WHERE keyspace_name=? AND view_name=?&quot;;</span>
+<span class="nc" id="L572">        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);</span>
+
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        if (result.isEmpty())</span>
+<span class="nc" id="L575">            return false;</span>
+<span class="nc" id="L576">        UntypedResultSet.Row row = result.one();</span>
+<span class="nc bnc" id="L577" title="All 4 branches missed.">        return row.has(&quot;status_replicated&quot;) &amp;&amp; row.getBoolean(&quot;status_replicated&quot;);</span>
+    }
+
+    public static void setViewBuilt(String keyspaceName, String viewName, boolean replicated)
+    {
+<span class="nc" id="L582">        String req = &quot;INSERT INTO %s.\&quot;%s\&quot; (keyspace_name, view_name, status_replicated) VALUES (?, ?, ?)&quot;;</span>
+<span class="nc" id="L583">        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName, replicated);</span>
+<span class="nc" id="L584">        forceBlockingFlush(BUILT_VIEWS);</span>
+<span class="nc" id="L585">    }</span>
+
+    public static void setViewRemoved(String keyspaceName, String viewName)
+    {
+<span class="nc" id="L589">        String buildReq = &quot;DELETE FROM %S.%s WHERE keyspace_name = ? AND view_name = ?&quot;;</span>
+<span class="nc" id="L590">        executeInternal(String.format(buildReq, SchemaConstants.SYSTEM_KEYSPACE_NAME, VIEWS_BUILDS_IN_PROGRESS), keyspaceName, viewName);</span>
+<span class="nc" id="L591">        forceBlockingFlush(VIEWS_BUILDS_IN_PROGRESS);</span>
+
+<span class="nc" id="L593">        String builtReq = &quot;DELETE FROM %s.\&quot;%s\&quot; WHERE keyspace_name = ? AND view_name = ?&quot;;</span>
+<span class="nc" id="L594">        executeInternal(String.format(builtReq, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_VIEWS), keyspaceName, viewName);</span>
+<span class="nc" id="L595">        forceBlockingFlush(BUILT_VIEWS);</span>
+<span class="nc" id="L596">    }</span>
+
+    public static void beginViewBuild(String ksname, String viewName, int generationNumber)
+    {
+<span class="nc" id="L600">        executeInternal(String.format(&quot;INSERT INTO system.%s (keyspace_name, view_name, generation_number) VALUES (?, ?, ?)&quot;, VIEWS_BUILDS_IN_PROGRESS),</span>
+                        ksname,
+                        viewName,
+<span class="nc" id="L603">                        generationNumber);</span>
+<span class="nc" id="L604">    }</span>
+
+    public static void finishViewBuildStatus(String ksname, String viewName)
+    {
+        // We flush the view built first, because if we fail now, we'll restart at the last place we checkpointed
+        // view build.
+        // If we flush the delete first, we'll have to restart from the beginning.
+        // Also, if writing to the built_view succeeds, but the view_builds_in_progress deletion fails, we will be able
+        // to skip the view build next boot.
+<span class="nc" id="L613">        setViewBuilt(ksname, viewName, false);</span>
+<span class="nc" id="L614">        executeInternal(String.format(&quot;DELETE FROM system.%s WHERE keyspace_name = ? AND view_name = ?&quot;, VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);</span>
+<span class="nc" id="L615">        forceBlockingFlush(VIEWS_BUILDS_IN_PROGRESS);</span>
+<span class="nc" id="L616">    }</span>
+
+    public static void setViewBuiltReplicated(String ksname, String viewName)
+    {
+<span class="nc" id="L620">        setViewBuilt(ksname, viewName, true);</span>
+<span class="nc" id="L621">    }</span>
+
+    public static void updateViewBuildStatus(String ksname, String viewName, Token token)
+    {
+<span class="nc" id="L625">        String req = &quot;INSERT INTO system.%s (keyspace_name, view_name, last_token) VALUES (?, ?, ?)&quot;;</span>
+<span class="nc" id="L626">        Token.TokenFactory factory = ViewsBuildsInProgress.partitioner.getTokenFactory();</span>
+<span class="nc" id="L627">        executeInternal(String.format(req, VIEWS_BUILDS_IN_PROGRESS), ksname, viewName, factory.toString(token));</span>
+<span class="nc" id="L628">    }</span>
+
+    public static Pair&lt;Integer, Token&gt; getViewBuildStatus(String ksname, String viewName)
+    {
+<span class="nc" id="L632">        String req = &quot;SELECT generation_number, last_token FROM system.%s WHERE keyspace_name = ? AND view_name = ?&quot;;</span>
+<span class="nc" id="L633">        UntypedResultSet queryResultSet = executeInternal(String.format(req, VIEWS_BUILDS_IN_PROGRESS), ksname, viewName);</span>
+<span class="nc bnc" id="L634" title="All 4 branches missed.">        if (queryResultSet == null || queryResultSet.isEmpty())</span>
+<span class="nc" id="L635">            return null;</span>
+
+<span class="nc" id="L637">        UntypedResultSet.Row row = queryResultSet.one();</span>
+
+<span class="nc" id="L639">        Integer generation = null;</span>
+<span class="nc" id="L640">        Token lastKey = null;</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        if (row.has(&quot;generation_number&quot;))</span>
+<span class="nc" id="L642">            generation = row.getInt(&quot;generation_number&quot;);</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        if (row.has(&quot;last_key&quot;))</span>
+        {
+<span class="nc" id="L645">            Token.TokenFactory factory = ViewsBuildsInProgress.partitioner.getTokenFactory();</span>
+<span class="nc" id="L646">            lastKey = factory.fromString(row.getString(&quot;last_key&quot;));</span>
+        }
+
+<span class="nc" id="L649">        return Pair.create(generation, lastKey);</span>
+    }
+
+    public static synchronized void saveTruncationRecord(ColumnFamilyStore cfs, long truncatedAt, CommitLogPosition position)
+    {
+<span class="nc" id="L654">        String req = &quot;UPDATE system.%s SET truncated_at = truncated_at + ? WHERE key = '%s'&quot;;</span>
+<span class="nc" id="L655">        executeInternal(String.format(req, LOCAL, LOCAL), truncationAsMapEntry(cfs, truncatedAt, position));</span>
+<span class="nc" id="L656">        truncationRecords = null;</span>
+<span class="nc" id="L657">        forceBlockingFlush(LOCAL);</span>
+<span class="nc" id="L658">    }</span>
+
+    /**
+     * This method is used to remove information about truncation time for specified column family
+     */
+    public static synchronized void removeTruncationRecord(UUID cfId)
+    {
+<span class="fc" id="L665">        String req = &quot;DELETE truncated_at[?] from system.%s WHERE key = '%s'&quot;;</span>
+<span class="fc" id="L666">        executeInternal(String.format(req, LOCAL, LOCAL), cfId);</span>
+<span class="fc" id="L667">        truncationRecords = null;</span>
+<span class="fc" id="L668">        forceBlockingFlush(LOCAL);</span>
+<span class="fc" id="L669">    }</span>
+
+    private static Map&lt;UUID, ByteBuffer&gt; truncationAsMapEntry(ColumnFamilyStore cfs, long truncatedAt, CommitLogPosition position)
+    {
+<span class="nc" id="L673">        try (DataOutputBuffer out = DataOutputBuffer.scratchBuffer.get())</span>
+        {
+<span class="nc" id="L675">            CommitLogPosition.serializer.serialize(position, out);</span>
+<span class="nc" id="L676">            out.writeLong(truncatedAt);</span>
+<span class="nc" id="L677">            return singletonMap(cfs.metadata.cfId, out.asNewBuffer());</span>
+        }
+<span class="nc" id="L679">        catch (IOException e)</span>
+        {
+<span class="nc" id="L681">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    public static CommitLogPosition getTruncatedPosition(UUID cfId)
+    {
+<span class="nc" id="L687">        Pair&lt;CommitLogPosition, Long&gt; record = getTruncationRecord(cfId);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">        return record == null ? null : record.left;</span>
+    }
+
+    public static long getTruncatedAt(UUID cfId)
+    {
+<span class="nc" id="L693">        Pair&lt;CommitLogPosition, Long&gt; record = getTruncationRecord(cfId);</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        return record == null ? Long.MIN_VALUE : record.right;</span>
+    }
+
+    private static synchronized Pair&lt;CommitLogPosition, Long&gt; getTruncationRecord(UUID cfId)
+    {
+<span class="nc bnc" id="L699" title="All 2 branches missed.">        if (truncationRecords == null)</span>
+<span class="nc" id="L700">            truncationRecords = readTruncationRecords();</span>
+<span class="nc" id="L701">        return truncationRecords.get(cfId);</span>
+    }
+
+    private static Map&lt;UUID, Pair&lt;CommitLogPosition, Long&gt;&gt; readTruncationRecords()
+    {
+<span class="nc" id="L706">        UntypedResultSet rows = executeInternal(String.format(&quot;SELECT truncated_at FROM system.%s WHERE key = '%s'&quot;, LOCAL, LOCAL));</span>
+
+<span class="nc" id="L708">        Map&lt;UUID, Pair&lt;CommitLogPosition, Long&gt;&gt; records = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L710" title="All 4 branches missed.">        if (!rows.isEmpty() &amp;&amp; rows.one().has(&quot;truncated_at&quot;))</span>
+        {
+<span class="nc" id="L712">            Map&lt;UUID, ByteBuffer&gt; map = rows.one().getMap(&quot;truncated_at&quot;, UUIDType.instance, BytesType.instance);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            for (Map.Entry&lt;UUID, ByteBuffer&gt; entry : map.entrySet())</span>
+<span class="nc" id="L714">                records.put(entry.getKey(), truncationRecordFromBlob(entry.getValue()));</span>
+        }
+
+<span class="nc" id="L717">        return records;</span>
+    }
+
+    private static Pair&lt;CommitLogPosition, Long&gt; truncationRecordFromBlob(ByteBuffer bytes)
+    {
+<span class="nc" id="L722">        try (RebufferingInputStream in = new DataInputBuffer(bytes, true))</span>
+        {
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            return Pair.create(CommitLogPosition.serializer.deserialize(in), in.available() &gt; 0 ? in.readLong() : Long.MIN_VALUE);</span>
+        }
+<span class="nc" id="L726">        catch (IOException e)</span>
+        {
+<span class="nc" id="L728">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /**
+     * Record tokens being used by another node
+     */
+    public static Future&lt;?&gt; updateTokens(final InetAddress ep, final Collection&lt;Token&gt; tokens, ExecutorService executorService)
+    {
+<span class="fc bfc" id="L737" title="All 2 branches covered.">        if (ep.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L738">            return Futures.immediateFuture(null);</span>
+
+<span class="fc" id="L740">        String req = &quot;INSERT INTO system.%s (peer, tokens) VALUES (?, ?)&quot;;</span>
+<span class="fc" id="L741">        return executorService.submit((Runnable) () -&gt; executeInternal(String.format(req, PEERS), ep, tokensAsSet(tokens)));</span>
+    }
+
+    public static void updatePreferredIP(InetAddress ep, InetAddress preferred_ip)
+    {
+<span class="nc" id="L746">        String req = &quot;INSERT INTO system.%s (peer, preferred_ip) VALUES (?, ?)&quot;;</span>
+<span class="nc" id="L747">        executeInternal(String.format(req, PEERS), ep, preferred_ip);</span>
+<span class="nc" id="L748">        forceBlockingFlush(PEERS);</span>
+<span class="nc" id="L749">    }</span>
+
+    public static Future&lt;?&gt; updatePeerInfo(final InetAddress ep, final String columnName, final Object value, ExecutorService executorService)
+    {
+<span class="fc bfc" id="L753" title="All 2 branches covered.">        if (ep.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L754">            return Futures.immediateFuture(null);</span>
+
+<span class="fc" id="L756">        String req = &quot;INSERT INTO system.%s (peer, %s) VALUES (?, ?)&quot;;</span>
+<span class="fc" id="L757">        return executorService.submit((Runnable) () -&gt; executeInternal(String.format(req, PEERS, columnName), ep, value));</span>
+    }
+
+    public static void updatePeerReleaseVersion(final InetAddress ep, final Object value, Runnable postUpdateTask, ExecutorService executorService)
+    {
+<span class="fc bfc" id="L762" title="All 2 branches covered.">        if (ep.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L763">            return;</span>
+
+<span class="fc" id="L765">        String req = &quot;INSERT INTO system.%s (peer, release_version) VALUES (?, ?)&quot;;</span>
+<span class="fc" id="L766">        executorService.execute(() -&gt; {</span>
+<span class="fc" id="L767">            executeInternal(String.format(req, PEERS), ep, value);</span>
+<span class="fc" id="L768">            postUpdateTask.run();</span>
+<span class="fc" id="L769">        });</span>
+<span class="fc" id="L770">    }</span>
+
+    public static synchronized void updateHintsDropped(InetAddress ep, UUID timePeriod, int value)
+    {
+        // with 30 day TTL
+<span class="nc" id="L775">        String req = &quot;UPDATE system.%s USING TTL 2592000 SET hints_dropped[ ? ] = ? WHERE peer = ?&quot;;</span>
+<span class="nc" id="L776">        executeInternal(String.format(req, PEER_EVENTS), timePeriod, value, ep);</span>
+<span class="nc" id="L777">    }</span>
+
+    public static synchronized void updateSchemaVersion(UUID version)
+    {
+<span class="fc" id="L781">        String req = &quot;INSERT INTO system.%s (key, schema_version) VALUES ('%s', ?)&quot;;</span>
+<span class="fc" id="L782">        executeInternal(String.format(req, LOCAL, LOCAL), version);</span>
+<span class="fc" id="L783">    }</span>
+
+    private static Set&lt;String&gt; tokensAsSet(Collection&lt;Token&gt; tokens)
+    {
+<span class="pc bpc" id="L787" title="1 of 2 branches missed.">        if (tokens.isEmpty())</span>
+<span class="nc" id="L788">            return Collections.emptySet();</span>
+<span class="fc" id="L789">        Token.TokenFactory factory = StorageService.instance.getTokenFactory();</span>
+<span class="fc" id="L790">        Set&lt;String&gt; s = new HashSet&lt;&gt;(tokens.size());</span>
+<span class="fc bfc" id="L791" title="All 2 branches covered.">        for (Token tk : tokens)</span>
+<span class="fc" id="L792">            s.add(factory.toString(tk));</span>
+<span class="fc" id="L793">        return s;</span>
+    }
+
+    private static Collection&lt;Token&gt; deserializeTokens(Collection&lt;String&gt; tokensStrings)
+    {
+<span class="fc" id="L798">        Token.TokenFactory factory = StorageService.instance.getTokenFactory();</span>
+<span class="fc" id="L799">        List&lt;Token&gt; tokens = new ArrayList&lt;&gt;(tokensStrings.size());</span>
+<span class="fc bfc" id="L800" title="All 2 branches covered.">        for (String tk : tokensStrings)</span>
+<span class="fc" id="L801">            tokens.add(factory.fromString(tk));</span>
+<span class="fc" id="L802">        return tokens;</span>
+    }
+
+    /**
+     * Remove stored tokens being used by another node
+     */
+    public static void removeEndpoint(InetAddress ep)
+    {
+<span class="nc" id="L810">        String req = &quot;DELETE FROM system.%s WHERE peer = ?&quot;;</span>
+<span class="nc" id="L811">        executeInternal(String.format(req, PEERS), ep);</span>
+<span class="nc" id="L812">        forceBlockingFlush(PEERS);</span>
+<span class="nc" id="L813">    }</span>
+
+    /**
+     * This method is used to update the System Keyspace with the new tokens for this node
+    */
+    public static synchronized void updateTokens(Collection&lt;Token&gt; tokens)
+    {
+<span class="pc bpc" id="L820" title="2 of 4 branches missed.">        assert !tokens.isEmpty() : &quot;removeEndpoint should be used instead&quot;;</span>
+<span class="fc" id="L821">        String req = &quot;INSERT INTO system.%s (key, tokens) VALUES ('%s', ?)&quot;;</span>
+<span class="fc" id="L822">        executeInternal(String.format(req, LOCAL, LOCAL), tokensAsSet(tokens));</span>
+<span class="fc" id="L823">        forceBlockingFlush(LOCAL);</span>
+<span class="fc" id="L824">    }</span>
+
+    public static void forceBlockingFlush(String cfname)
+    {
+<span class="pc bpc" id="L828" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.isUnsafeSystem())</span>
+<span class="fc" id="L829">            FBUtilities.waitOnFuture(Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(cfname).forceFlush());</span>
+<span class="fc" id="L830">    }</span>
+
+    /**
+     * Return a map of stored tokens to IP addresses
+     *
+     */
+    public static SetMultimap&lt;InetAddress, Token&gt; loadTokens()
+    {
+<span class="fc" id="L838">        SetMultimap&lt;InetAddress, Token&gt; tokenMap = HashMultimap.create();</span>
+<span class="pc bpc" id="L839" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : executeInternal(&quot;SELECT peer, tokens FROM system.&quot; + PEERS))</span>
+        {
+<span class="nc" id="L841">            InetAddress peer = row.getInetAddress(&quot;peer&quot;);</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            if (row.has(&quot;tokens&quot;))</span>
+<span class="nc" id="L843">                tokenMap.putAll(peer, deserializeTokens(row.getSet(&quot;tokens&quot;, UTF8Type.instance)));</span>
+<span class="nc" id="L844">        }</span>
+
+<span class="fc" id="L846">        return tokenMap;</span>
+    }
+
+    /**
+     * Return a map of store host_ids to IP addresses
+     *
+     */
+    public static Map&lt;InetAddress, UUID&gt; loadHostIds()
+    {
+<span class="fc" id="L855">        Map&lt;InetAddress, UUID&gt; hostIdMap = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L856" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : executeInternal(&quot;SELECT peer, host_id FROM system.&quot; + PEERS))</span>
+        {
+<span class="nc" id="L858">            InetAddress peer = row.getInetAddress(&quot;peer&quot;);</span>
+<span class="nc bnc" id="L859" title="All 2 branches missed.">            if (row.has(&quot;host_id&quot;))</span>
+            {
+<span class="nc" id="L861">                hostIdMap.put(peer, row.getUUID(&quot;host_id&quot;));</span>
+            }
+<span class="nc" id="L863">        }</span>
+<span class="fc" id="L864">        return hostIdMap;</span>
+    }
+
+    /**
+     * Return a map of IP address to C* version. If an invalid version string, or no version
+     * at all is stored for a given peer IP, then NULL_VERSION will be reported for that peer
+     */
+    public static Map&lt;InetAddress, CassandraVersion&gt; loadPeerVersions()
+    {
+<span class="fc" id="L873">        Map&lt;InetAddress, CassandraVersion&gt; releaseVersionMap = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L874" title="All 2 branches covered.">        for (UntypedResultSet.Row row : executeInternal(&quot;SELECT peer, release_version FROM system.&quot; + PEERS))</span>
+        {
+<span class="fc" id="L876">            InetAddress peer = row.getInetAddress(&quot;peer&quot;);</span>
+<span class="pc bpc" id="L877" title="1 of 2 branches missed.">            if (row.has(&quot;release_version&quot;))</span>
+            {
+                try
+                {
+<span class="fc" id="L881">                    releaseVersionMap.put(peer, new CassandraVersion(row.getString(&quot;release_version&quot;)));</span>
+                }
+<span class="nc" id="L883">                catch (IllegalArgumentException e)</span>
+                {
+<span class="nc" id="L885">                    logger.info(&quot;Invalid version string found for {}&quot;, peer);</span>
+<span class="nc" id="L886">                    releaseVersionMap.put(peer, NULL_VERSION);</span>
+<span class="pc" id="L887">                }</span>
+            }
+            else
+            {
+<span class="nc" id="L891">                logger.info(&quot;No version string found for {}&quot;, peer);</span>
+<span class="nc" id="L892">                releaseVersionMap.put(peer, NULL_VERSION);</span>
+            }
+<span class="fc" id="L894">        }</span>
+<span class="fc" id="L895">        return releaseVersionMap;</span>
+    }
+
+    /**
+     * Get preferred IP for given endpoint if it is known. Otherwise this returns given endpoint itself.
+     *
+     * @param ep endpoint address to check
+     * @return Preferred IP for given endpoint if present, otherwise returns given ep
+     */
+    public static InetAddress getPreferredIP(InetAddress ep)
+    {
+<span class="fc" id="L906">        String req = &quot;SELECT preferred_ip FROM system.%s WHERE peer=?&quot;;</span>
+<span class="fc" id="L907">        UntypedResultSet result = executeInternal(String.format(req, PEERS), ep);</span>
+<span class="pc bpc" id="L908" title="3 of 4 branches missed.">        if (!result.isEmpty() &amp;&amp; result.one().has(&quot;preferred_ip&quot;))</span>
+<span class="nc" id="L909">            return result.one().getInetAddress(&quot;preferred_ip&quot;);</span>
+<span class="fc" id="L910">        return ep;</span>
+    }
+
+    /**
+     * Return a map of IP addresses containing a map of dc and rack info
+     */
+    public static Map&lt;InetAddress, Map&lt;String,String&gt;&gt; loadDcRackInfo()
+    {
+<span class="nc" id="L918">        Map&lt;InetAddress, Map&lt;String, String&gt;&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">        for (UntypedResultSet.Row row : executeInternal(&quot;SELECT peer, data_center, rack from system.&quot; + PEERS))</span>
+        {
+<span class="nc" id="L921">            InetAddress peer = row.getInetAddress(&quot;peer&quot;);</span>
+<span class="nc bnc" id="L922" title="All 4 branches missed.">            if (row.has(&quot;data_center&quot;) &amp;&amp; row.has(&quot;rack&quot;))</span>
+            {
+<span class="nc" id="L924">                Map&lt;String, String&gt; dcRack = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L925">                dcRack.put(&quot;data_center&quot;, row.getString(&quot;data_center&quot;));</span>
+<span class="nc" id="L926">                dcRack.put(&quot;rack&quot;, row.getString(&quot;rack&quot;));</span>
+<span class="nc" id="L927">                result.put(peer, dcRack);</span>
+            }
+<span class="nc" id="L929">        }</span>
+<span class="nc" id="L930">        return result;</span>
+    }
+
+    /**
+     * Get release version for given endpoint.
+     * If release version is unknown, then this returns null.
+     *
+     * @param ep endpoint address to check
+     * @return Release version or null if version is unknown.
+     */
+    public static CassandraVersion getReleaseVersion(InetAddress ep)
+    {
+        try
+        {
+<span class="nc bnc" id="L944" title="All 2 branches missed.">            if (FBUtilities.getBroadcastAddress().equals(ep))</span>
+            {
+<span class="nc" id="L946">                return new CassandraVersion(FBUtilities.getReleaseVersionString());</span>
+            }
+<span class="nc" id="L948">            String req = &quot;SELECT release_version FROM system.%s WHERE peer=?&quot;;</span>
+<span class="nc" id="L949">            UntypedResultSet result = executeInternal(String.format(req, PEERS), ep);</span>
+<span class="nc bnc" id="L950" title="All 4 branches missed.">            if (result != null &amp;&amp; result.one().has(&quot;release_version&quot;))</span>
+            {
+<span class="nc" id="L952">                return new CassandraVersion(result.one().getString(&quot;release_version&quot;));</span>
+            }
+            // version is unknown
+<span class="nc" id="L955">            return null;</span>
+        }
+<span class="nc" id="L957">        catch (IllegalArgumentException e)</span>
+        {
+            // version string cannot be parsed
+<span class="nc" id="L960">            return null;</span>
+        }
+    }
+
+    /**
+     * One of three things will happen if you try to read the system keyspace:
+     * 1. files are present and you can read them: great
+     * 2. no files are there: great (new node is assumed)
+     * 3. files are present but you can't read them: bad
+     * @throws ConfigurationException
+     */
+    public static void checkHealth() throws ConfigurationException
+    {
+        Keyspace keyspace;
+        try
+        {
+<span class="fc" id="L976">            keyspace = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);</span>
+        }
+<span class="nc" id="L978">        catch (AssertionError err)</span>
+        {
+            // this happens when a user switches from OPP to RP.
+<span class="nc" id="L981">            ConfigurationException ex = new ConfigurationException(&quot;Could not read system keyspace!&quot;);</span>
+<span class="nc" id="L982">            ex.initCause(err);</span>
+<span class="nc" id="L983">            throw ex;</span>
+<span class="fc" id="L984">        }</span>
+<span class="fc" id="L985">        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(LOCAL);</span>
+
+<span class="fc" id="L987">        String req = &quot;SELECT cluster_name FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L988">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+<span class="pc bpc" id="L990" title="3 of 4 branches missed.">        if (result.isEmpty() || !result.one().has(&quot;cluster_name&quot;))</span>
+        {
+            // this is a brand new node
+<span class="pc bpc" id="L993" title="1 of 2 branches missed.">            if (!cfs.getLiveSSTables().isEmpty())</span>
+<span class="nc" id="L994">                throw new ConfigurationException(&quot;Found system keyspace files, but they couldn't be loaded!&quot;);</span>
+
+            // no system files.  this is a new node.
+<span class="fc" id="L997">            return;</span>
+        }
+
+<span class="nc" id="L1000">        String savedClusterName = result.one().getString(&quot;cluster_name&quot;);</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">        if (!DatabaseDescriptor.getClusterName().equals(savedClusterName))</span>
+<span class="nc" id="L1002">            throw new ConfigurationException(&quot;Saved cluster name &quot; + savedClusterName + &quot; != configured name &quot; + DatabaseDescriptor.getClusterName());</span>
+<span class="nc" id="L1003">    }</span>
+
+    public static Collection&lt;Token&gt; getSavedTokens()
+    {
+<span class="fc" id="L1007">        String req = &quot;SELECT tokens FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1008">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+<span class="pc bpc" id="L1009" title="1 of 4 branches missed.">        return result.isEmpty() || !result.one().has(&quot;tokens&quot;)</span>
+<span class="fc" id="L1010">             ? Collections.&lt;Token&gt;emptyList()</span>
+<span class="fc" id="L1011">             : deserializeTokens(result.one().getSet(&quot;tokens&quot;, UTF8Type.instance));</span>
+    }
+
+    public static int incrementAndGetGeneration()
+    {
+<span class="fc" id="L1016">        String req = &quot;SELECT gossip_generation FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1017">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+        int generation;
+<span class="pc bpc" id="L1020" title="2 of 4 branches missed.">        if (result.isEmpty() || !result.one().has(&quot;gossip_generation&quot;))</span>
+        {
+            // seconds-since-epoch isn't a foolproof new generation
+            // (where foolproof is &quot;guaranteed to be larger than the last one seen at this ip address&quot;),
+            // but it's as close as sanely possible
+<span class="fc" id="L1025">            generation = (int) (System.currentTimeMillis() / 1000);</span>
+        }
+        else
+        {
+            // Other nodes will ignore gossip messages about a node that have a lower generation than previously seen.
+<span class="nc" id="L1030">            final int storedGeneration = result.one().getInt(&quot;gossip_generation&quot;) + 1;</span>
+<span class="nc" id="L1031">            final int now = (int) (System.currentTimeMillis() / 1000);</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            if (storedGeneration &gt;= now)</span>
+            {
+<span class="nc" id="L1034">                logger.warn(&quot;Using stored Gossip Generation {} as it is greater than current system time {}.  See CASSANDRA-3654 if you experience problems&quot;,</span>
+<span class="nc" id="L1035">                            storedGeneration, now);</span>
+<span class="nc" id="L1036">                generation = storedGeneration;</span>
+            }
+            else
+            {
+<span class="nc" id="L1040">                generation = now;</span>
+            }
+        }
+
+<span class="fc" id="L1044">        req = &quot;INSERT INTO system.%s (key, gossip_generation) VALUES ('%s', ?)&quot;;</span>
+<span class="fc" id="L1045">        executeInternal(String.format(req, LOCAL, LOCAL), generation);</span>
+<span class="fc" id="L1046">        forceBlockingFlush(LOCAL);</span>
+
+<span class="fc" id="L1048">        return generation;</span>
+    }
+
+    public static BootstrapState getBootstrapState()
+    {
+<span class="fc" id="L1053">        String req = &quot;SELECT bootstrapped FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1054">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+<span class="pc bpc" id="L1056" title="1 of 4 branches missed.">        if (result.isEmpty() || !result.one().has(&quot;bootstrapped&quot;))</span>
+<span class="fc" id="L1057">            return BootstrapState.NEEDS_BOOTSTRAP;</span>
+
+<span class="fc" id="L1059">        return BootstrapState.valueOf(result.one().getString(&quot;bootstrapped&quot;));</span>
+    }
+
+    public static boolean bootstrapComplete()
+    {
+<span class="fc bfc" id="L1064" title="All 2 branches covered.">        return getBootstrapState() == BootstrapState.COMPLETED;</span>
+    }
+
+    public static boolean bootstrapInProgress()
+    {
+<span class="pc bpc" id="L1069" title="1 of 2 branches missed.">        return getBootstrapState() == BootstrapState.IN_PROGRESS;</span>
+    }
+
+    public static boolean wasDecommissioned()
+    {
+<span class="pc bpc" id="L1074" title="1 of 2 branches missed.">        return getBootstrapState() == BootstrapState.DECOMMISSIONED;</span>
+    }
+
+    public static void setBootstrapState(BootstrapState state)
+    {
+<span class="fc" id="L1079">        String req = &quot;INSERT INTO system.%s (key, bootstrapped) VALUES ('%s', ?)&quot;;</span>
+<span class="fc" id="L1080">        executeInternal(String.format(req, LOCAL, LOCAL), state.name());</span>
+<span class="fc" id="L1081">        forceBlockingFlush(LOCAL);</span>
+<span class="fc" id="L1082">    }</span>
+
+    public static boolean isIndexBuilt(String keyspaceName, String indexName)
+    {
+<span class="nc" id="L1086">        String req = &quot;SELECT index_name FROM %s.\&quot;%s\&quot; WHERE table_name=? AND index_name=?&quot;;</span>
+<span class="nc" id="L1087">        UntypedResultSet result = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">        return !result.isEmpty();</span>
+    }
+
+    public static void setIndexBuilt(String keyspaceName, String indexName)
+    {
+<span class="nc" id="L1093">        String req = &quot;INSERT INTO %s.\&quot;%s\&quot; (table_name, index_name) VALUES (?, ?)&quot;;</span>
+<span class="nc" id="L1094">        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);</span>
+<span class="nc" id="L1095">        forceBlockingFlush(BUILT_INDEXES);</span>
+<span class="nc" id="L1096">    }</span>
+
+    public static void setIndexRemoved(String keyspaceName, String indexName)
+    {
+<span class="nc" id="L1100">        String req = &quot;DELETE FROM %s.\&quot;%s\&quot; WHERE table_name = ? AND index_name = ?&quot;;</span>
+<span class="nc" id="L1101">        executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, indexName);</span>
+<span class="nc" id="L1102">        forceBlockingFlush(BUILT_INDEXES);</span>
+<span class="nc" id="L1103">    }</span>
+
+    public static List&lt;String&gt; getBuiltIndexes(String keyspaceName, Set&lt;String&gt; indexNames)
+    {
+<span class="fc" id="L1107">        List&lt;String&gt; names = new ArrayList&lt;&gt;(indexNames);</span>
+<span class="fc" id="L1108">        String req = &quot;SELECT index_name from %s.\&quot;%s\&quot; WHERE table_name=? AND index_name IN ?&quot;;</span>
+<span class="fc" id="L1109">        UntypedResultSet results = executeInternal(String.format(req, SchemaConstants.SYSTEM_KEYSPACE_NAME, BUILT_INDEXES), keyspaceName, names);</span>
+<span class="fc" id="L1110">        return StreamSupport.stream(results.spliterator(), false)</span>
+<span class="pc" id="L1111">                            .map(r -&gt; r.getString(&quot;index_name&quot;))</span>
+<span class="fc" id="L1112">                            .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * Read the host ID from the system keyspace, creating (and storing) one if
+     * none exists.
+     */
+    public static UUID getLocalHostId()
+    {
+<span class="fc" id="L1121">        String req = &quot;SELECT host_id FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1122">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+        // Look up the Host UUID (return it if found)
+<span class="pc bpc" id="L1125" title="2 of 4 branches missed.">        if (!result.isEmpty() &amp;&amp; result.one().has(&quot;host_id&quot;))</span>
+<span class="nc" id="L1126">            return result.one().getUUID(&quot;host_id&quot;);</span>
+
+        // ID not found, generate a new one, persist, and then return it.
+<span class="fc" id="L1129">        UUID hostId = UUID.randomUUID();</span>
+<span class="fc" id="L1130">        logger.warn(&quot;No host ID found, created {} (Note: This should happen exactly once per node).&quot;, hostId);</span>
+<span class="fc" id="L1131">        return setLocalHostId(hostId);</span>
+    }
+
+    /**
+     * Sets the local host ID explicitly.  Should only be called outside of SystemTable when replacing a node.
+     */
+    public static UUID setLocalHostId(UUID hostId)
+    {
+<span class="fc" id="L1139">        String req = &quot;INSERT INTO system.%s (key, host_id) VALUES ('%s', ?)&quot;;</span>
+<span class="fc" id="L1140">        executeInternal(String.format(req, LOCAL, LOCAL), hostId);</span>
+<span class="fc" id="L1141">        return hostId;</span>
+    }
+
+    /**
+     * Gets the stored rack for the local node, or null if none have been set yet.
+     */
+    public static String getRack()
+    {
+<span class="fc" id="L1149">        String req = &quot;SELECT rack FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1150">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+        // Look up the Rack (return it if found)
+<span class="pc bpc" id="L1153" title="3 of 4 branches missed.">        if (!result.isEmpty() &amp;&amp; result.one().has(&quot;rack&quot;))</span>
+<span class="nc" id="L1154">            return result.one().getString(&quot;rack&quot;);</span>
+
+<span class="fc" id="L1156">        return null;</span>
+    }
+
+    /**
+     * Gets the stored data center for the local node, or null if none have been set yet.
+     */
+    public static String getDatacenter()
+    {
+<span class="fc" id="L1164">        String req = &quot;SELECT data_center FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1165">        UntypedResultSet result = executeInternal(String.format(req, LOCAL, LOCAL));</span>
+
+        // Look up the Data center (return it if found)
+<span class="pc bpc" id="L1168" title="3 of 4 branches missed.">        if (!result.isEmpty() &amp;&amp; result.one().has(&quot;data_center&quot;))</span>
+<span class="nc" id="L1169">            return result.one().getString(&quot;data_center&quot;);</span>
+
+<span class="fc" id="L1171">        return null;</span>
+    }
+
+    public static PaxosState loadPaxosState(DecoratedKey key, CFMetaData metadata, int nowInSec)
+    {
+<span class="nc" id="L1176">        String req = &quot;SELECT * FROM system.%s WHERE row_key = ? AND cf_id = ?&quot;;</span>
+<span class="nc" id="L1177">        UntypedResultSet results = QueryProcessor.executeInternalWithNow(nowInSec, System.nanoTime(), String.format(req, PAXOS), key.getKey(), metadata.cfId);</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">        if (results.isEmpty())</span>
+<span class="nc" id="L1179">            return new PaxosState(key, metadata);</span>
+<span class="nc" id="L1180">        UntypedResultSet.Row row = results.one();</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">        Commit promised = row.has(&quot;in_progress_ballot&quot;)</span>
+<span class="nc" id="L1182">                        ? new Commit(row.getUUID(&quot;in_progress_ballot&quot;), new PartitionUpdate(metadata, key, metadata.partitionColumns(), 1))</span>
+<span class="nc" id="L1183">                        : Commit.emptyCommit(key, metadata);</span>
+        // either we have both a recently accepted ballot and update or we have neither
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">        int proposalVersion = row.has(&quot;proposal_version&quot;) ? row.getInt(&quot;proposal_version&quot;) : MessagingService.VERSION_21;</span>
+<span class="nc bnc" id="L1186" title="All 2 branches missed.">        Commit accepted = row.has(&quot;proposal&quot;)</span>
+<span class="nc" id="L1187">                        ? new Commit(row.getUUID(&quot;proposal_ballot&quot;), PartitionUpdate.fromBytes(row.getBytes(&quot;proposal&quot;), proposalVersion, key))</span>
+<span class="nc" id="L1188">                        : Commit.emptyCommit(key, metadata);</span>
+        // either most_recent_commit and most_recent_commit_at will both be set, or neither
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        int mostRecentVersion = row.has(&quot;most_recent_commit_version&quot;) ? row.getInt(&quot;most_recent_commit_version&quot;) : MessagingService.VERSION_21;</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">        Commit mostRecent = row.has(&quot;most_recent_commit&quot;)</span>
+<span class="nc" id="L1192">                          ? new Commit(row.getUUID(&quot;most_recent_commit_at&quot;), PartitionUpdate.fromBytes(row.getBytes(&quot;most_recent_commit&quot;), mostRecentVersion, key))</span>
+<span class="nc" id="L1193">                          : Commit.emptyCommit(key, metadata);</span>
+<span class="nc" id="L1194">        return new PaxosState(promised, accepted, mostRecent);</span>
+    }
+
+    public static void savePaxosPromise(Commit promise)
+    {
+<span class="nc" id="L1199">        String req = &quot;UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET in_progress_ballot = ? WHERE row_key = ? AND cf_id = ?&quot;;</span>
+<span class="nc" id="L1200">        executeInternal(String.format(req, PAXOS),</span>
+<span class="nc" id="L1201">                        UUIDGen.microsTimestamp(promise.ballot),</span>
+<span class="nc" id="L1202">                        paxosTtlSec(promise.update.metadata()),</span>
+                        promise.ballot,
+<span class="nc" id="L1204">                        promise.update.partitionKey().getKey(),</span>
+<span class="nc" id="L1205">                        promise.update.metadata().cfId);</span>
+<span class="nc" id="L1206">    }</span>
+
+    public static void savePaxosProposal(Commit proposal)
+    {
+<span class="nc" id="L1210">        executeInternal(String.format(&quot;UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = ?, proposal = ?, proposal_version = ? WHERE row_key = ? AND cf_id = ?&quot;, PAXOS),</span>
+<span class="nc" id="L1211">                        UUIDGen.microsTimestamp(proposal.ballot),</span>
+<span class="nc" id="L1212">                        paxosTtlSec(proposal.update.metadata()),</span>
+                        proposal.ballot,
+<span class="nc" id="L1214">                        PartitionUpdate.toBytes(proposal.update, MessagingService.current_version),</span>
+<span class="nc" id="L1215">                        MessagingService.current_version,</span>
+<span class="nc" id="L1216">                        proposal.update.partitionKey().getKey(),</span>
+<span class="nc" id="L1217">                        proposal.update.metadata().cfId);</span>
+<span class="nc" id="L1218">    }</span>
+
+    public static int paxosTtlSec(CFMetaData metadata)
+    {
+        // keep paxos state around for at least 3h
+<span class="nc" id="L1223">        return Math.max(3 * 3600, metadata.params.gcGraceSeconds);</span>
+    }
+
+    public static void savePaxosCommit(Commit commit)
+    {
+        // We always erase the last proposal (with the commit timestamp to no erase more recent proposal in case the commit is old)
+        // even though that's really just an optimization  since SP.beginAndRepairPaxos will exclude accepted proposal older than the mrc.
+<span class="nc" id="L1230">        String cql = &quot;UPDATE system.%s USING TIMESTAMP ? AND TTL ? SET proposal_ballot = null, proposal = null, most_recent_commit_at = ?, most_recent_commit = ?, most_recent_commit_version = ? WHERE row_key = ? AND cf_id = ?&quot;;</span>
+<span class="nc" id="L1231">        executeInternal(String.format(cql, PAXOS),</span>
+<span class="nc" id="L1232">                        UUIDGen.microsTimestamp(commit.ballot),</span>
+<span class="nc" id="L1233">                        paxosTtlSec(commit.update.metadata()),</span>
+                        commit.ballot,
+<span class="nc" id="L1235">                        PartitionUpdate.toBytes(commit.update, MessagingService.current_version),</span>
+<span class="nc" id="L1236">                        MessagingService.current_version,</span>
+<span class="nc" id="L1237">                        commit.update.partitionKey().getKey(),</span>
+<span class="nc" id="L1238">                        commit.update.metadata().cfId);</span>
+<span class="nc" id="L1239">    }</span>
+
+    /**
+     * Returns a RestorableMeter tracking the average read rate of a particular SSTable, restoring the last-seen rate
+     * from values in system.sstable_activity if present.
+     * @param keyspace the keyspace the sstable belongs to
+     * @param table the table the sstable belongs to
+     * @param generation the generation number for the sstable
+     */
+    public static RestorableMeter getSSTableReadMeter(String keyspace, String table, int generation)
+    {
+<span class="nc" id="L1250">        String cql = &quot;SELECT * FROM system.%s WHERE keyspace_name=? and columnfamily_name=? and generation=?&quot;;</span>
+<span class="nc" id="L1251">        UntypedResultSet results = executeInternal(String.format(cql, SSTABLE_ACTIVITY), keyspace, table, generation);</span>
+
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">        if (results.isEmpty())</span>
+<span class="nc" id="L1254">            return new RestorableMeter();</span>
+
+<span class="nc" id="L1256">        UntypedResultSet.Row row = results.one();</span>
+<span class="nc" id="L1257">        double m15rate = row.getDouble(&quot;rate_15m&quot;);</span>
+<span class="nc" id="L1258">        double m120rate = row.getDouble(&quot;rate_120m&quot;);</span>
+<span class="nc" id="L1259">        return new RestorableMeter(m15rate, m120rate);</span>
+    }
+
+    /**
+     * Writes the current read rates for a given SSTable to system.sstable_activity
+     */
+    public static void persistSSTableReadMeter(String keyspace, String table, int generation, RestorableMeter meter)
+    {
+        // Store values with a one-day TTL to handle corner cases where cleanup might not occur
+<span class="nc" id="L1268">        String cql = &quot;INSERT INTO system.%s (keyspace_name, columnfamily_name, generation, rate_15m, rate_120m) VALUES (?, ?, ?, ?, ?) USING TTL 864000&quot;;</span>
+<span class="nc" id="L1269">        executeInternal(String.format(cql, SSTABLE_ACTIVITY),</span>
+                        keyspace,
+                        table,
+<span class="nc" id="L1272">                        generation,</span>
+<span class="nc" id="L1273">                        meter.fifteenMinuteRate(),</span>
+<span class="nc" id="L1274">                        meter.twoHourRate());</span>
+<span class="nc" id="L1275">    }</span>
+
+    /**
+     * Clears persisted read rates from system.sstable_activity for SSTables that have been deleted.
+     */
+    public static void clearSSTableReadMeter(String keyspace, String table, int generation)
+    {
+<span class="fc" id="L1282">        String cql = &quot;DELETE FROM system.%s WHERE keyspace_name=? AND columnfamily_name=? and generation=?&quot;;</span>
+<span class="fc" id="L1283">        executeInternal(String.format(cql, SSTABLE_ACTIVITY), keyspace, table, generation);</span>
+<span class="fc" id="L1284">    }</span>
+
+    /**
+     * Writes the current partition count and size estimates into SIZE_ESTIMATES_CF
+     */
+    public static void updateSizeEstimates(String keyspace, String table, Map&lt;Range&lt;Token&gt;, Pair&lt;Long, Long&gt;&gt; estimates)
+    {
+<span class="fc" id="L1291">        long timestamp = FBUtilities.timestampMicros();</span>
+<span class="fc" id="L1292">        PartitionUpdate update = new PartitionUpdate(SizeEstimates, UTF8Type.instance.decompose(keyspace), SizeEstimates.partitionColumns(), estimates.size());</span>
+<span class="fc" id="L1293">        Mutation mutation = new Mutation(update);</span>
+
+        // delete all previous values with a single range tombstone.
+<span class="fc" id="L1296">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="fc" id="L1297">        update.add(new RangeTombstone(Slice.make(SizeEstimates.comparator, table), new DeletionTime(timestamp - 1, nowInSec)));</span>
+
+        // add a CQL row for each primary token range.
+<span class="fc bfc" id="L1300" title="All 2 branches covered.">        for (Map.Entry&lt;Range&lt;Token&gt;, Pair&lt;Long, Long&gt;&gt; entry : estimates.entrySet())</span>
+        {
+<span class="fc" id="L1302">            Range&lt;Token&gt; range = entry.getKey();</span>
+<span class="fc" id="L1303">            Pair&lt;Long, Long&gt; values = entry.getValue();</span>
+<span class="fc" id="L1304">            update.add(Rows.simpleBuilder(SizeEstimates, table, range.left.toString(), range.right.toString())</span>
+<span class="fc" id="L1305">                           .timestamp(timestamp)</span>
+<span class="fc" id="L1306">                           .add(&quot;partitions_count&quot;, values.left)</span>
+<span class="fc" id="L1307">                           .add(&quot;mean_partition_size&quot;, values.right)</span>
+<span class="fc" id="L1308">                           .build());</span>
+<span class="fc" id="L1309">        }</span>
+
+<span class="fc" id="L1311">        mutation.apply();</span>
+<span class="fc" id="L1312">    }</span>
+
+    /**
+     * Clears size estimates for a table (on table drop)
+     */
+    public static void clearSizeEstimates(String keyspace, String table)
+    {
+<span class="nc" id="L1319">        String cql = String.format(&quot;DELETE FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, SIZE_ESTIMATES);</span>
+<span class="nc" id="L1320">        executeInternal(cql, keyspace, table);</span>
+<span class="nc" id="L1321">    }</span>
+
+    /**
+     * Clears size estimates for a keyspace (used to manually clean when we miss a keyspace drop)
+     */
+    public static void clearSizeEstimates(String keyspace)
+    {
+<span class="nc" id="L1328">        String cql = String.format(&quot;DELETE FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, SIZE_ESTIMATES);</span>
+<span class="nc" id="L1329">        executeInternal(cql, keyspace);</span>
+<span class="nc" id="L1330">    }</span>
+
+    /**
+     * @return A multimap from keyspace to table for all tables with entries in size estimates
+     */
+
+    public static synchronized SetMultimap&lt;String, String&gt; getTablesWithSizeEstimates()
+    {
+<span class="fc" id="L1338">        SetMultimap&lt;String, String&gt; keyspaceTableMap = HashMultimap.create();</span>
+<span class="fc" id="L1339">        String cql = String.format(&quot;SELECT keyspace_name, table_name FROM %s.%s&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, SIZE_ESTIMATES);</span>
+<span class="fc" id="L1340">        UntypedResultSet rs = executeInternal(cql);</span>
+<span class="pc bpc" id="L1341" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : rs)</span>
+        {
+<span class="nc" id="L1343">            keyspaceTableMap.put(row.getString(&quot;keyspace_name&quot;), row.getString(&quot;table_name&quot;));</span>
+<span class="nc" id="L1344">        }</span>
+
+<span class="fc" id="L1346">        return keyspaceTableMap;</span>
+    }
+
+    public static synchronized void updateAvailableRanges(String keyspace, Collection&lt;Range&lt;Token&gt;&gt; completedRanges)
+    {
+<span class="nc" id="L1351">        String cql = &quot;UPDATE system.%s SET ranges = ranges + ? WHERE keyspace_name = ?&quot;;</span>
+<span class="nc" id="L1352">        Set&lt;ByteBuffer&gt; rangesToUpdate = new HashSet&lt;&gt;(completedRanges.size());</span>
+<span class="nc bnc" id="L1353" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : completedRanges)</span>
+        {
+<span class="nc" id="L1355">            rangesToUpdate.add(rangeToBytes(range));</span>
+<span class="nc" id="L1356">        }</span>
+<span class="nc" id="L1357">        executeInternal(String.format(cql, AVAILABLE_RANGES), rangesToUpdate, keyspace);</span>
+<span class="nc" id="L1358">    }</span>
+
+    public static synchronized Set&lt;Range&lt;Token&gt;&gt; getAvailableRanges(String keyspace, IPartitioner partitioner)
+    {
+<span class="nc" id="L1362">        Set&lt;Range&lt;Token&gt;&gt; result = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1363">        String query = &quot;SELECT * FROM system.%s WHERE keyspace_name=?&quot;;</span>
+<span class="nc" id="L1364">        UntypedResultSet rs = executeInternal(String.format(query, AVAILABLE_RANGES), keyspace);</span>
+<span class="nc bnc" id="L1365" title="All 2 branches missed.">        for (UntypedResultSet.Row row : rs)</span>
+        {
+<span class="nc" id="L1367">            Set&lt;ByteBuffer&gt; rawRanges = row.getSet(&quot;ranges&quot;, BytesType.instance);</span>
+<span class="nc bnc" id="L1368" title="All 2 branches missed.">            for (ByteBuffer rawRange : rawRanges)</span>
+            {
+<span class="nc" id="L1370">                result.add(byteBufferToRange(rawRange, partitioner));</span>
+<span class="nc" id="L1371">            }</span>
+<span class="nc" id="L1372">        }</span>
+<span class="nc" id="L1373">        return ImmutableSet.copyOf(result);</span>
+    }
+
+    public static void resetAvailableRanges()
+    {
+<span class="nc" id="L1378">        ColumnFamilyStore availableRanges = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(AVAILABLE_RANGES);</span>
+<span class="nc" id="L1379">        availableRanges.truncateBlocking();</span>
+<span class="nc" id="L1380">    }</span>
+
+    public static synchronized void updateTransferredRanges(String description,
+                                                         InetAddress peer,
+                                                         String keyspace,
+                                                         Collection&lt;Range&lt;Token&gt;&gt; streamedRanges)
+    {
+<span class="nc" id="L1387">        String cql = &quot;UPDATE system.%s SET ranges = ranges + ? WHERE operation = ? AND peer = ? AND keyspace_name = ?&quot;;</span>
+<span class="nc" id="L1388">        Set&lt;ByteBuffer&gt; rangesToUpdate = new HashSet&lt;&gt;(streamedRanges.size());</span>
+<span class="nc bnc" id="L1389" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : streamedRanges)</span>
+        {
+<span class="nc" id="L1391">            rangesToUpdate.add(rangeToBytes(range));</span>
+<span class="nc" id="L1392">        }</span>
+<span class="nc" id="L1393">        executeInternal(String.format(cql, TRANSFERRED_RANGES), rangesToUpdate, description, peer, keyspace);</span>
+<span class="nc" id="L1394">    }</span>
+
+    public static synchronized Map&lt;InetAddress, Set&lt;Range&lt;Token&gt;&gt;&gt; getTransferredRanges(String description, String keyspace, IPartitioner partitioner)
+    {
+<span class="nc" id="L1398">        Map&lt;InetAddress, Set&lt;Range&lt;Token&gt;&gt;&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1399">        String query = &quot;SELECT * FROM system.%s WHERE operation = ? AND keyspace_name = ?&quot;;</span>
+<span class="nc" id="L1400">        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES), description, keyspace);</span>
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">        for (UntypedResultSet.Row row : rs)</span>
+        {
+<span class="nc" id="L1403">            InetAddress peer = row.getInetAddress(&quot;peer&quot;);</span>
+<span class="nc" id="L1404">            Set&lt;ByteBuffer&gt; rawRanges = row.getSet(&quot;ranges&quot;, BytesType.instance);</span>
+<span class="nc" id="L1405">            Set&lt;Range&lt;Token&gt;&gt; ranges = Sets.newHashSetWithExpectedSize(rawRanges.size());</span>
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">            for (ByteBuffer rawRange : rawRanges)</span>
+            {
+<span class="nc" id="L1408">                ranges.add(byteBufferToRange(rawRange, partitioner));</span>
+<span class="nc" id="L1409">            }</span>
+<span class="nc" id="L1410">            result.put(peer, ranges);</span>
+<span class="nc" id="L1411">        }</span>
+<span class="nc" id="L1412">        return ImmutableMap.copyOf(result);</span>
+    }
+
+    /**
+     * Compare the release version in the system.local table with the one included in the distro.
+     * If they don't match, snapshot all tables in the system keyspace. This is intended to be
+     * called at startup to create a backup of the system tables during an upgrade
+     *
+     * @throws IOException
+     */
+    public static boolean snapshotOnVersionChange() throws IOException
+    {
+<span class="fc" id="L1424">        String previous = getPreviousVersionString();</span>
+<span class="fc" id="L1425">        String next = FBUtilities.getReleaseVersionString();</span>
+
+<span class="fc" id="L1427">        FBUtilities.setPreviousReleaseVersionString(previous);</span>
+
+        // if we're restarting after an upgrade, snapshot the system keyspace
+<span class="pc bpc" id="L1430" title="3 of 4 branches missed.">        if (!previous.equals(NULL_VERSION.toString()) &amp;&amp; !previous.equals(next))</span>
+
+        {
+<span class="nc" id="L1433">            logger.info(&quot;Detected version upgrade from {} to {}, snapshotting system keyspace&quot;, previous, next);</span>
+<span class="nc" id="L1434">            String snapshotName = Keyspace.getTimestampedSnapshotName(String.format(&quot;upgrade-%s-%s&quot;,</span>
+                                                                                    previous,
+                                                                                    next));
+<span class="nc" id="L1437">            Keyspace systemKs = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);</span>
+<span class="nc" id="L1438">            systemKs.snapshot(snapshotName, null);</span>
+<span class="nc" id="L1439">            return true;</span>
+        }
+
+<span class="fc" id="L1442">        return false;</span>
+    }
+
+    /**
+     * Try to determine what the previous version, if any, was installed on this node.
+     * Primary source of truth is the release version in system.local. If the previous
+     * version cannot be determined by looking there then either:
+     * * the node never had a C* install before
+     * * the was a very old version (pre 1.2) installed, which did not include system.local
+     *
+     * @return either a version read from the system.local table or one of two special values
+     * indicating either no previous version (SystemUpgrade.NULL_VERSION) or an unreadable,
+     * legacy version (SystemUpgrade.UNREADABLE_VERSION).
+     */
+    private static String getPreviousVersionString()
+    {
+<span class="fc" id="L1458">        String req = &quot;SELECT release_version FROM system.%s WHERE key='%s'&quot;;</span>
+<span class="fc" id="L1459">        UntypedResultSet result = executeInternal(String.format(req, SystemKeyspace.LOCAL, SystemKeyspace.LOCAL));</span>
+<span class="pc bpc" id="L1460" title="3 of 4 branches missed.">        if (result.isEmpty() || !result.one().has(&quot;release_version&quot;))</span>
+        {
+            // it isn't inconceivable that one might try to upgrade a node straight from &lt;= 1.1 to whatever
+            // the current version is. If we couldn't read a previous version from system.local we check for
+            // the existence of the legacy system.Versions table. We don't actually attempt to read a version
+            // from there, but it informs us that this isn't a completely new node.
+<span class="fc bfc" id="L1466" title="All 2 branches covered.">            for (File dataDirectory : Directories.getKSChildDirectories(SchemaConstants.SYSTEM_KEYSPACE_NAME))</span>
+            {
+<span class="pc bpc" id="L1468" title="3 of 4 branches missed.">                if (dataDirectory.getName().equals(&quot;Versions&quot;) &amp;&amp; dataDirectory.listFiles().length &gt; 0)</span>
+                {
+<span class="nc" id="L1470">                    logger.trace(&quot;Found unreadable versions info in pre 1.2 system.Versions table&quot;);</span>
+<span class="nc" id="L1471">                    return UNREADABLE_VERSION.toString();</span>
+                }
+<span class="fc" id="L1473">            }</span>
+
+            // no previous version information found, we can assume that this is a new node
+<span class="fc" id="L1476">            return NULL_VERSION.toString();</span>
+        }
+        // report back whatever we found in the system table
+<span class="nc" id="L1479">        return result.one().getString(&quot;release_version&quot;);</span>
+    }
+
+    /**
+     * Check data directories for old files that can be removed when migrating from 2.1 or 2.2 to 3.0,
+     * these checks can be removed in 4.0, see CASSANDRA-7066
+     */
+    public static void migrateDataDirs()
+    {
+<span class="nc" id="L1488">        Iterable&lt;String&gt; dirs = Arrays.asList(DatabaseDescriptor.getAllDataFileLocations());</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">        for (String dataDir : dirs)</span>
+        {
+<span class="nc" id="L1491">            logger.debug(&quot;Checking {} for legacy files&quot;, dataDir);</span>
+<span class="nc" id="L1492">            File dir = new File(dataDir);</span>
+<span class="nc bnc" id="L1493" title="All 4 branches missed.">            assert dir.exists() : dir + &quot; should have been created by startup checks&quot;;</span>
+
+<span class="nc" id="L1495">            visitDirectory(dir.toPath(),</span>
+                           File::isDirectory,
+                           ksdir -&gt;
+                           {
+<span class="nc" id="L1499">                               logger.trace(&quot;Checking {} for legacy files&quot;, ksdir);</span>
+<span class="nc" id="L1500">                               visitDirectory(ksdir.toPath(),</span>
+                                              File::isDirectory,
+                                              cfdir -&gt;
+                                              {
+<span class="nc" id="L1504">                                                  logger.trace(&quot;Checking {} for legacy files&quot;, cfdir);</span>
+
+<span class="nc bnc" id="L1506" title="All 2 branches missed.">                                                  if (Descriptor.isLegacyFile(cfdir))</span>
+                                                  {
+<span class="nc" id="L1508">                                                      FileUtils.deleteRecursive(cfdir);</span>
+                                                  }
+                                                  else
+                                                  {
+<span class="nc" id="L1512">                                                      visitDirectory(cfdir.toPath(),</span>
+                                                                     Descriptor::isLegacyFile,
+<span class="nc" id="L1514">                                                                     FileUtils::delete);</span>
+                                                  }
+<span class="nc" id="L1516">                                              });</span>
+<span class="nc" id="L1517">                           });</span>
+<span class="nc" id="L1518">        }</span>
+<span class="nc" id="L1519">    }</span>
+
+    private static ByteBuffer rangeToBytes(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L1523">        try (DataOutputBuffer out = new DataOutputBuffer())</span>
+        {
+<span class="nc" id="L1525">            Range.tokenSerializer.serialize(range, out, MessagingService.VERSION_22);</span>
+<span class="nc" id="L1526">            return out.buffer();</span>
+        }
+<span class="nc" id="L1528">        catch (IOException e)</span>
+        {
+<span class="nc" id="L1530">            throw new IOError(e);</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static Range&lt;Token&gt; byteBufferToRange(ByteBuffer rawRange, IPartitioner partitioner)
+    {
+        try
+        {
+<span class="nc" id="L1539">            return (Range&lt;Token&gt;) Range.tokenSerializer.deserialize(ByteStreams.newDataInput(ByteBufferUtil.getArray(rawRange)),</span>
+                                                                    partitioner,
+                                                                    MessagingService.VERSION_22);
+        }
+<span class="nc" id="L1543">        catch (IOException e)</span>
+        {
+<span class="nc" id="L1545">            throw new IOError(e);</span>
+        }
+    }
+
+    public static void writePreparedStatement(String loggedKeyspace, MD5Digest key, String cql)
+    {
+<span class="nc" id="L1551">        executeInternal(String.format(&quot;INSERT INTO %s.%s&quot;</span>
+                                      + &quot; (logged_keyspace, prepared_id, query_string) VALUES (?, ?, ?)&quot;,
+                                      SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS),
+<span class="nc" id="L1554">                        loggedKeyspace, key.byteBuffer(), cql);</span>
+<span class="nc" id="L1555">        logger.debug(&quot;stored prepared statement for logged keyspace '{}': '{}'&quot;, loggedKeyspace, cql);</span>
+<span class="nc" id="L1556">    }</span>
+
+    public static void removePreparedStatement(MD5Digest key)
+    {
+<span class="nc" id="L1560">        executeInternal(String.format(&quot;DELETE FROM %s.%s&quot;</span>
+                                      + &quot; WHERE prepared_id = ?&quot;,
+                                      SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS),
+<span class="nc" id="L1563">                        key.byteBuffer());</span>
+<span class="nc" id="L1564">    }</span>
+
+    public static void resetPreparedStatements()
+    {
+<span class="nc" id="L1568">        ColumnFamilyStore availableRanges = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(PREPARED_STATEMENTS);</span>
+<span class="nc" id="L1569">        availableRanges.truncateBlocking();</span>
+<span class="nc" id="L1570">    }</span>
+
+    public static List&lt;Pair&lt;String, String&gt;&gt; loadPreparedStatements()
+    {
+<span class="fc" id="L1574">        String query = String.format(&quot;SELECT logged_keyspace, query_string FROM %s.%s&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS);</span>
+<span class="fc" id="L1575">        UntypedResultSet resultSet = executeOnceInternal(query);</span>
+<span class="fc" id="L1576">        List&lt;Pair&lt;String, String&gt;&gt; r = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L1577" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : resultSet)</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">            r.add(Pair.create(row.has(&quot;logged_keyspace&quot;) ? row.getString(&quot;logged_keyspace&quot;) : null,</span>
+<span class="nc" id="L1579">                              row.getString(&quot;query_string&quot;)));</span>
+<span class="fc" id="L1580">        return r;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

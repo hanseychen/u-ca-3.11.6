@@ -1,0 +1,560 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionIterator.java</span></div><h1>CompactionIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.util.*;
+import java.util.function.Predicate;
+
+import com.google.common.collect.Ordering;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.PurgeFunction;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.index.transactions.CompactionTransaction;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.metrics.CompactionMetrics;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+
+/**
+ * Merge multiple iterators over the content of sstable into a &quot;compacted&quot; iterator.
+ * &lt;p&gt;
+ * On top of the actual merging the source iterators, this class:
+ * &lt;ul&gt;
+ *   &lt;li&gt;purge gc-able tombstones if possible (see PurgeIterator below).&lt;/li&gt;
+ *   &lt;li&gt;update 2ndary indexes if necessary (as we don't read-before-write on index updates, index entries are
+ *       not deleted on deletion of the base table data, which is ok because we'll fix index inconsistency
+ *       on reads. This however mean that potentially obsolete index entries could be kept a long time for
+ *       data that is not read often, so compaction &quot;pro-actively&quot; fix such index entries. This is mainly
+ *       an optimization).&lt;/li&gt;
+ *   &lt;li&gt;invalidate cached partitions that are empty post-compaction. This avoids keeping partitions with
+ *       only purgable tombstones in the row cache.&lt;/li&gt;
+ *   &lt;li&gt;keep tracks of the compaction progress.&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+<span class="pc bpc" id="L54" title="1 of 2 branches missed.">public class CompactionIterator extends CompactionInfo.Holder implements UnfilteredPartitionIterator</span>
+{
+    private static final long UNFILTERED_TO_UPDATE_PROGRESS = 100;
+
+    private final OperationType type;
+    private final CompactionController controller;
+    private final List&lt;ISSTableScanner&gt; scanners;
+    private final int nowInSec;
+    private final UUID compactionId;
+
+    private final long totalBytes;
+    private long bytesRead;
+    private long totalSourceCQLRows;
+
+    /*
+     * counters for merged rows.
+     * array index represents (number of merged rows - 1), so index 0 is counter for no merge (1 row),
+     * index 1 is counter for 2 rows merged, and so on.
+     */
+    private final long[] mergeCounters;
+
+    private final UnfilteredPartitionIterator compacted;
+    private final CompactionMetrics metrics;
+
+    public CompactionIterator(OperationType type, List&lt;ISSTableScanner&gt; scanners, CompactionController controller, int nowInSec, UUID compactionId)
+    {
+<span class="fc" id="L80">        this(type, scanners, controller, nowInSec, compactionId, null);</span>
+<span class="fc" id="L81">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // We make sure to close mergedIterator in close() and CompactionIterator is itself an AutoCloseable
+    public CompactionIterator(OperationType type, List&lt;ISSTableScanner&gt; scanners, CompactionController controller, int nowInSec, UUID compactionId, CompactionMetrics metrics)
+<span class="fc" id="L85">    {</span>
+<span class="fc" id="L86">        this.controller = controller;</span>
+<span class="fc" id="L87">        this.type = type;</span>
+<span class="fc" id="L88">        this.scanners = scanners;</span>
+<span class="fc" id="L89">        this.nowInSec = nowInSec;</span>
+<span class="fc" id="L90">        this.compactionId = compactionId;</span>
+<span class="fc" id="L91">        this.bytesRead = 0;</span>
+
+<span class="fc" id="L93">        long bytes = 0;</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">        for (ISSTableScanner scanner : scanners)</span>
+<span class="fc" id="L95">            bytes += scanner.getLengthInBytes();</span>
+<span class="fc" id="L96">        this.totalBytes = bytes;</span>
+<span class="fc" id="L97">        this.mergeCounters = new long[scanners.size()];</span>
+<span class="fc" id="L98">        this.metrics = metrics;</span>
+
+<span class="pc bpc" id="L100" title="1 of 2 branches missed.">        if (metrics != null)</span>
+<span class="nc" id="L101">            metrics.beginCompaction(this);</span>
+
+<span class="pc bpc" id="L103" title="1 of 2 branches missed.">        UnfilteredPartitionIterator merged = scanners.isEmpty()</span>
+<span class="pc" id="L104">                                             ? EmptyIterators.unfilteredPartition(controller.cfs.metadata, false)</span>
+<span class="fc" id="L105">                                             : UnfilteredPartitionIterators.merge(scanners, nowInSec, listener());</span>
+<span class="fc" id="L106">        boolean isForThrift = merged.isForThrift(); // to stop capture of iterator in Purger, which is confusing for debug</span>
+<span class="fc" id="L107">        merged = Transformation.apply(merged, new GarbageSkipper(controller, nowInSec));</span>
+<span class="fc" id="L108">        this.compacted = Transformation.apply(merged, new Purger(isForThrift, controller, nowInSec));</span>
+<span class="fc" id="L109">    }</span>
+
+    public boolean isForThrift()
+    {
+<span class="nc" id="L113">        return false;</span>
+    }
+
+    public CFMetaData metadata()
+    {
+<span class="nc" id="L118">        return controller.cfs.metadata;</span>
+    }
+
+    public CompactionInfo getCompactionInfo()
+    {
+<span class="fc" id="L123">        return new CompactionInfo(controller.cfs.metadata,</span>
+                                  type,
+                                  bytesRead,
+                                  totalBytes,
+                                  compactionId);
+    }
+
+    public boolean isGlobal()
+    {
+<span class="fc" id="L132">        return false;</span>
+    }
+
+    private void updateCounterFor(int rows)
+    {
+<span class="pc bpc" id="L137" title="3 of 6 branches missed.">        assert rows &gt; 0 &amp;&amp; rows - 1 &lt; mergeCounters.length;</span>
+<span class="fc" id="L138">        mergeCounters[rows - 1] += 1;</span>
+<span class="fc" id="L139">    }</span>
+
+    public long[] getMergedRowCounts()
+    {
+<span class="fc" id="L143">        return mergeCounters;</span>
+    }
+
+    public long getTotalSourceCQLRows()
+    {
+<span class="fc" id="L148">        return totalSourceCQLRows;</span>
+    }
+
+    private UnfilteredPartitionIterators.MergeListener listener()
+    {
+<span class="fc" id="L153">        return new UnfilteredPartitionIterators.MergeListener()</span>
+<span class="pc bpc" id="L154" title="1 of 2 branches missed.">        {</span>
+            public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List&lt;UnfilteredRowIterator&gt; versions)
+            {
+<span class="fc" id="L157">                int merged = 0;</span>
+<span class="fc bfc" id="L158" title="All 2 branches covered.">                for (UnfilteredRowIterator iter : versions)</span>
+                {
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">                    if (iter != null)</span>
+<span class="fc" id="L161">                        merged++;</span>
+<span class="fc" id="L162">                }</span>
+
+<span class="pc bpc" id="L164" title="2 of 4 branches missed.">                assert merged &gt; 0;</span>
+
+<span class="fc" id="L166">                CompactionIterator.this.updateCounterFor(merged);</span>
+
+<span class="pc bpc" id="L168" title="2 of 4 branches missed.">                if (type != OperationType.COMPACTION || !controller.cfs.indexManager.hasIndexes())</span>
+<span class="fc" id="L169">                    return null;</span>
+
+<span class="nc" id="L171">                Columns statics = Columns.NONE;</span>
+<span class="nc" id="L172">                Columns regulars = Columns.NONE;</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                for (UnfilteredRowIterator iter : versions)</span>
+                {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                    if (iter != null)</span>
+                    {
+<span class="nc" id="L177">                        statics = statics.mergeTo(iter.columns().statics);</span>
+<span class="nc" id="L178">                        regulars = regulars.mergeTo(iter.columns().regulars);</span>
+                    }
+<span class="nc" id="L180">                }</span>
+<span class="nc" id="L181">                final PartitionColumns partitionColumns = new PartitionColumns(statics, regulars);</span>
+
+                // If we have a 2ndary index, we must update it with deleted/shadowed cells.
+                // we can reuse a single CleanupTransaction for the duration of a partition.
+                // Currently, it doesn't do any batching of row updates, so every merge event
+                // for a single partition results in a fresh cycle of:
+                // * Get new Indexer instances
+                // * Indexer::start
+                // * Indexer::onRowMerge (for every row being merged by the compaction)
+                // * Indexer::commit
+                // A new OpOrder.Group is opened in an ARM block wrapping the commits
+                // TODO: this should probably be done asynchronously and batched.
+<span class="nc" id="L193">                final CompactionTransaction indexTransaction =</span>
+<span class="nc" id="L194">                    controller.cfs.indexManager.newCompactionTransaction(partitionKey,</span>
+                                                                         partitionColumns,
+<span class="nc" id="L196">                                                                         versions.size(),</span>
+<span class="nc" id="L197">                                                                         nowInSec);</span>
+
+<span class="nc" id="L199">                return new UnfilteredRowIterators.MergeListener()</span>
+<span class="nc" id="L200">                {</span>
+                    public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+                    {
+<span class="nc" id="L203">                    }</span>
+
+                    public void onMergedRows(Row merged, Row[] versions)
+                    {
+<span class="nc" id="L207">                        indexTransaction.start();</span>
+<span class="nc" id="L208">                        indexTransaction.onRowMerge(merged, versions);</span>
+<span class="nc" id="L209">                        indexTransaction.commit();</span>
+<span class="nc" id="L210">                    }</span>
+
+                    public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker mergedMarker, RangeTombstoneMarker[] versions)
+                    {
+<span class="nc" id="L214">                    }</span>
+
+                    public void close()
+                    {
+<span class="nc" id="L218">                    }</span>
+                };
+            }
+
+            public void close()
+            {
+<span class="fc" id="L224">            }</span>
+        };
+    }
+
+    private void updateBytesRead()
+    {
+<span class="nc" id="L230">        long n = 0;</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        for (ISSTableScanner scanner : scanners)</span>
+<span class="nc" id="L232">            n += scanner.getCurrentPosition();</span>
+<span class="nc" id="L233">        bytesRead = n;</span>
+<span class="nc" id="L234">    }</span>
+
+    public boolean hasNext()
+    {
+<span class="fc" id="L238">        return compacted.hasNext();</span>
+    }
+
+    public UnfilteredRowIterator next()
+    {
+<span class="fc" id="L243">        return compacted.next();</span>
+    }
+
+    public void remove()
+    {
+<span class="nc" id="L248">        throw new UnsupportedOperationException();</span>
+    }
+
+    public void close()
+    {
+        try
+        {
+<span class="fc" id="L255">            compacted.close();</span>
+        }
+        finally
+        {
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">            if (metrics != null)</span>
+<span class="nc" id="L260">                metrics.finishCompaction(this);</span>
+        }
+<span class="fc" id="L262">    }</span>
+
+    public String toString()
+    {
+<span class="nc" id="L266">        return this.getCompactionInfo().toString();</span>
+    }
+
+    private class Purger extends PurgeFunction
+    {
+        private final CompactionController controller;
+
+        private DecoratedKey currentKey;
+        private Predicate&lt;Long&gt; purgeEvaluator;
+
+        private long compactedUnfiltered;
+
+        private Purger(boolean isForThrift, CompactionController controller, int nowInSec)
+<span class="fc" id="L279">        {</span>
+<span class="fc" id="L280">            super(isForThrift,</span>
+                  nowInSec,
+                  controller.gcBefore,
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">                  controller.compactingRepaired() ? Integer.MAX_VALUE : Integer.MIN_VALUE,</span>
+<span class="fc" id="L284">                  controller.cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones(),</span>
+<span class="fc" id="L285">                  controller.cfs.metadata.enforceStrictLiveness());</span>
+<span class="fc" id="L286">            this.controller = controller;</span>
+<span class="fc" id="L287">        }</span>
+
+        @Override
+        protected void onEmptyPartitionPostPurge(DecoratedKey key)
+        {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (type == OperationType.COMPACTION)</span>
+<span class="nc" id="L293">                controller.cfs.invalidateCachedPartition(key);</span>
+<span class="nc" id="L294">        }</span>
+
+        @Override
+        protected void onNewPartition(DecoratedKey key)
+        {
+<span class="fc" id="L299">            currentKey = key;</span>
+<span class="fc" id="L300">            purgeEvaluator = null;</span>
+<span class="fc" id="L301">        }</span>
+
+        @Override
+        protected void updateProgress()
+        {
+<span class="fc" id="L306">            totalSourceCQLRows++;</span>
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">            if ((++compactedUnfiltered) % UNFILTERED_TO_UPDATE_PROGRESS == 0)</span>
+<span class="nc" id="L308">                updateBytesRead();</span>
+<span class="fc" id="L309">        }</span>
+
+        /*
+         * Evaluates whether a tombstone with the given deletion timestamp can be purged. This is the minimum
+         * timestamp for any sstable containing `currentKey` outside of the set of sstables involved in this compaction.
+         * This is computed lazily on demand as we only need this if there is tombstones and this a bit expensive
+         * (see #8914).
+         */
+        protected Predicate&lt;Long&gt; getPurgeEvaluator()
+        {
+<span class="fc bfc" id="L319" title="All 2 branches covered.">            if (purgeEvaluator == null)</span>
+            {
+<span class="fc" id="L321">                purgeEvaluator = controller.getPurgeEvaluator(currentKey);</span>
+            }
+<span class="fc" id="L323">            return purgeEvaluator;</span>
+        }
+    }
+
+    /**
+     * Unfiltered row iterator that removes deleted data as provided by a &quot;tombstone source&quot; for the partition.
+     * The result produced by this iterator is such that when merged with tombSource it produces the same output
+     * as the merge of dataSource and tombSource.
+     */
+<span class="nc bnc" id="L332" title="All 2 branches missed.">    private static class GarbageSkippingUnfilteredRowIterator extends WrappingUnfilteredRowIterator</span>
+    {
+        final UnfilteredRowIterator tombSource;
+        final DeletionTime partitionLevelDeletion;
+        final Row staticRow;
+        final ColumnFilter cf;
+        final int nowInSec;
+        final CFMetaData metadata;
+        final boolean cellLevelGC;
+
+<span class="nc" id="L342">        DeletionTime tombOpenDeletionTime = DeletionTime.LIVE;</span>
+<span class="nc" id="L343">        DeletionTime dataOpenDeletionTime = DeletionTime.LIVE;</span>
+<span class="nc" id="L344">        DeletionTime openDeletionTime = DeletionTime.LIVE;</span>
+        DeletionTime partitionDeletionTime;
+        DeletionTime activeDeletionTime;
+<span class="nc" id="L347">        Unfiltered tombNext = null;</span>
+<span class="nc" id="L348">        Unfiltered dataNext = null;</span>
+<span class="nc" id="L349">        Unfiltered next = null;</span>
+
+        /**
+         * Construct an iterator that filters out data shadowed by the provided &quot;tombstone source&quot;.
+         *
+         * @param dataSource The input row. The result is a filtered version of this.
+         * @param tombSource Tombstone source, i.e. iterator used to identify deleted data in the input row.
+         * @param nowInSec Current time, used in choosing the winner when cell expiration is involved.
+         * @param cellLevelGC If false, the iterator will only look at row-level deletion times and tombstones.
+         *                    If true, deleted or overwritten cells within a surviving row will also be removed.
+         */
+        protected GarbageSkippingUnfilteredRowIterator(UnfilteredRowIterator dataSource, UnfilteredRowIterator tombSource, int nowInSec, boolean cellLevelGC)
+        {
+<span class="nc" id="L362">            super(dataSource);</span>
+<span class="nc" id="L363">            this.tombSource = tombSource;</span>
+<span class="nc" id="L364">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L365">            this.cellLevelGC = cellLevelGC;</span>
+<span class="nc" id="L366">            metadata = dataSource.metadata();</span>
+<span class="nc" id="L367">            cf = ColumnFilter.all(metadata);</span>
+
+<span class="nc" id="L369">            activeDeletionTime = partitionDeletionTime = tombSource.partitionLevelDeletion();</span>
+
+            // Only preserve partition level deletion if not shadowed. (Note: Shadowing deletion must not be copied.)
+<span class="nc bnc" id="L372" title="All 2 branches missed.">            this.partitionLevelDeletion = dataSource.partitionLevelDeletion().supersedes(tombSource.partitionLevelDeletion()) ?</span>
+<span class="nc" id="L373">                    dataSource.partitionLevelDeletion() :</span>
+                    DeletionTime.LIVE;
+
+<span class="nc" id="L376">            Row dataStaticRow = garbageFilterRow(dataSource.staticRow(), tombSource.staticRow());</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            this.staticRow = dataStaticRow != null ? dataStaticRow : Rows.EMPTY_STATIC_ROW;</span>
+
+<span class="nc" id="L379">            tombNext = advance(tombSource);</span>
+<span class="nc" id="L380">            dataNext = advance(dataSource);</span>
+<span class="nc" id="L381">        }</span>
+
+        private static Unfiltered advance(UnfilteredRowIterator source)
+        {
+<span class="nc bnc" id="L385" title="All 2 branches missed.">            return source.hasNext() ? source.next() : null;</span>
+        }
+
+        @Override
+        public DeletionTime partitionLevelDeletion()
+        {
+<span class="nc" id="L391">            return partitionLevelDeletion;</span>
+        }
+
+        public void close()
+        {
+<span class="nc" id="L396">            super.close();</span>
+<span class="nc" id="L397">            tombSource.close();</span>
+<span class="nc" id="L398">        }</span>
+
+        @Override
+        public Row staticRow()
+        {
+<span class="nc" id="L403">            return staticRow;</span>
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            // Produce the next element. This may consume multiple elements from both inputs until we find something
+            // from dataSource that is still live. We track the currently open deletion in both sources, as well as the
+            // one we have last issued to the output. The tombOpenDeletionTime is used to filter out content; the others
+            // to decide whether or not a tombstone is superseded, and to be able to surface (the rest of) a deletion
+            // range from the input when a suppressing deletion ends.
+<span class="nc bnc" id="L414" title="All 4 branches missed.">            while (next == null &amp;&amp; dataNext != null)</span>
+            {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                int cmp = tombNext == null ? -1 : metadata.comparator.compare(dataNext, tombNext);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                if (cmp &lt; 0)</span>
+                {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                    if (dataNext.isRow())</span>
+<span class="nc" id="L420">                        next = ((Row) dataNext).filter(cf, activeDeletionTime, false, metadata);</span>
+                    else
+<span class="nc" id="L422">                        next = processDataMarker();</span>
+                }
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                else if (cmp == 0)</span>
+                {
+<span class="nc bnc" id="L426" title="All 2 branches missed.">                    if (dataNext.isRow())</span>
+                    {
+<span class="nc" id="L428">                        next = garbageFilterRow((Row) dataNext, (Row) tombNext);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L432">                        tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);</span>
+<span class="nc" id="L433">                        activeDeletionTime = Ordering.natural().max(partitionDeletionTime,</span>
+                                                                    tombOpenDeletionTime);
+<span class="nc" id="L435">                        next = processDataMarker();</span>
+                    }
+                }
+                else // (cmp &gt; 0)
+                {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                    if (tombNext.isRangeTombstoneMarker())</span>
+                    {
+<span class="nc" id="L442">                        tombOpenDeletionTime = updateOpenDeletionTime(tombOpenDeletionTime, tombNext);</span>
+<span class="nc" id="L443">                        activeDeletionTime = Ordering.natural().max(partitionDeletionTime,</span>
+                                                                    tombOpenDeletionTime);
+<span class="nc" id="L445">                        boolean supersededBefore = openDeletionTime.isLive();</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                        boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);</span>
+                        // If a range open was not issued because it was superseded and the deletion isn't superseded any more, we need to open it now.
+<span class="nc bnc" id="L448" title="All 4 branches missed.">                        if (supersededBefore &amp;&amp; !supersededAfter)</span>
+<span class="nc" id="L449">                            next = new RangeTombstoneBoundMarker(((RangeTombstoneMarker) tombNext).closeBound(false).invert(), dataOpenDeletionTime);</span>
+                        // If the deletion begins to be superseded, we don't close the range yet. This can save us a close/open pair if it ends after the superseding range.
+                    }
+                }
+
+<span class="nc bnc" id="L454" title="All 2 branches missed.">                if (next instanceof RangeTombstoneMarker)</span>
+<span class="nc" id="L455">                    openDeletionTime = updateOpenDeletionTime(openDeletionTime, next);</span>
+
+<span class="nc bnc" id="L457" title="All 2 branches missed.">                if (cmp &lt;= 0)</span>
+<span class="nc" id="L458">                    dataNext = advance(wrapped);</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">                if (cmp &gt;= 0)</span>
+<span class="nc" id="L460">                    tombNext = advance(tombSource);</span>
+<span class="nc" id="L461">            }</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            return next != null;</span>
+        }
+
+        protected Row garbageFilterRow(Row dataRow, Row tombRow)
+        {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (cellLevelGC)</span>
+            {
+<span class="nc" id="L469">                return Rows.removeShadowedCells(dataRow, tombRow, activeDeletionTime, nowInSec);</span>
+            }
+            else
+            {
+<span class="nc" id="L473">                DeletionTime deletion = Ordering.natural().max(tombRow.deletion().time(),</span>
+                                                               activeDeletionTime);
+<span class="nc" id="L475">                return dataRow.filter(cf, deletion, false, metadata);</span>
+            }
+        }
+
+        /**
+         * Decide how to act on a tombstone marker from the input iterator. We can decide what to issue depending on
+         * whether or not the ranges before and after the marker are superseded/live -- if none are, we can reuse the
+         * marker; if both are, the marker can be ignored; otherwise we issue a corresponding start/end marker.
+         */
+        private RangeTombstoneMarker processDataMarker()
+        {
+<span class="nc" id="L486">            dataOpenDeletionTime = updateOpenDeletionTime(dataOpenDeletionTime, dataNext);</span>
+<span class="nc" id="L487">            boolean supersededBefore = openDeletionTime.isLive();</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            boolean supersededAfter = !dataOpenDeletionTime.supersedes(activeDeletionTime);</span>
+<span class="nc" id="L489">            RangeTombstoneMarker marker = (RangeTombstoneMarker) dataNext;</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (!supersededBefore)</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                if (!supersededAfter)</span>
+<span class="nc" id="L492">                    return marker;</span>
+                else
+<span class="nc" id="L494">                    return new RangeTombstoneBoundMarker(marker.closeBound(false), marker.closeDeletionTime(false));</span>
+            else
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                if (!supersededAfter)</span>
+<span class="nc" id="L497">                    return new RangeTombstoneBoundMarker(marker.openBound(false), marker.openDeletionTime(false));</span>
+                else
+<span class="nc" id="L499">                    return null;</span>
+        }
+
+        @Override
+        public Unfiltered next()
+        {
+<span class="nc bnc" id="L505" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L506">                throw new IllegalStateException();</span>
+
+<span class="nc" id="L508">            Unfiltered v = next;</span>
+<span class="nc" id="L509">            next = null;</span>
+<span class="nc" id="L510">            return v;</span>
+        }
+
+        private DeletionTime updateOpenDeletionTime(DeletionTime openDeletionTime, Unfiltered next)
+        {
+<span class="nc" id="L515">            RangeTombstoneMarker marker = (RangeTombstoneMarker) next;</span>
+<span class="nc bnc" id="L516" title="All 6 branches missed.">            assert openDeletionTime.isLive() == !marker.isClose(false);</span>
+<span class="nc bnc" id="L517" title="All 6 branches missed.">            assert openDeletionTime.isLive() || openDeletionTime.equals(marker.closeDeletionTime(false));</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">            return marker.isOpen(false) ? marker.openDeletionTime(false) : DeletionTime.LIVE;</span>
+        }
+    }
+
+    /**
+     * Partition transformation applying GarbageSkippingUnfilteredRowIterator, obtaining tombstone sources for each
+     * partition using the controller's shadowSources method.
+     */
+    private static class GarbageSkipper extends Transformation&lt;UnfilteredRowIterator&gt;
+    {
+        final int nowInSec;
+        final CompactionController controller;
+        final boolean cellLevelGC;
+
+        private GarbageSkipper(CompactionController controller, int nowInSec)
+<span class="fc" id="L533">        {</span>
+<span class="fc" id="L534">            this.controller = controller;</span>
+<span class="fc" id="L535">            this.nowInSec = nowInSec;</span>
+<span class="pc bpc" id="L536" title="1 of 2 branches missed.">            cellLevelGC = controller.tombstoneOption == TombstoneOption.CELL;</span>
+<span class="fc" id="L537">        }</span>
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+<span class="pc bpc" id="L542" title="1 of 2 branches missed.">            Iterable&lt;UnfilteredRowIterator&gt; sources = controller.shadowSources(partition.partitionKey(), !cellLevelGC);</span>
+<span class="pc bpc" id="L543" title="1 of 2 branches missed.">            if (sources == null)</span>
+<span class="fc" id="L544">                return partition;</span>
+<span class="nc" id="L545">            List&lt;UnfilteredRowIterator&gt; iters = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            for (UnfilteredRowIterator iter : sources)</span>
+            {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                if (!iter.isEmpty())</span>
+<span class="nc" id="L549">                    iters.add(iter);</span>
+                else
+<span class="nc" id="L551">                    iter.close();</span>
+<span class="nc" id="L552">            }</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            if (iters.isEmpty())</span>
+<span class="nc" id="L554">                return partition;</span>
+
+<span class="nc" id="L556">            return new GarbageSkippingUnfilteredRowIterator(partition, UnfilteredRowIterators.merge(iters, nowInSec), nowInSec, cellLevelGC);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,346 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CounterMutation.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">CounterMutation.java</span></div><h1>CounterMutation.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+
+import com.google.common.base.Function;
+import com.google.common.base.Objects;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+import com.google.common.util.concurrent.Striped;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
+public class CounterMutation implements IMutation
+{
+<span class="fc" id="L50">    public static final CounterMutationSerializer serializer = new CounterMutationSerializer();</span>
+
+<span class="fc" id="L52">    private static final Striped&lt;Lock&gt; LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentCounterWriters() * 1024);</span>
+
+    private final Mutation mutation;
+    private final ConsistencyLevel consistency;
+
+    public CounterMutation(Mutation mutation, ConsistencyLevel consistency)
+<span class="nc" id="L58">    {</span>
+<span class="nc" id="L59">        this.mutation = mutation;</span>
+<span class="nc" id="L60">        this.consistency = consistency;</span>
+<span class="nc" id="L61">    }</span>
+
+    public String getKeyspaceName()
+    {
+<span class="nc" id="L65">        return mutation.getKeyspaceName();</span>
+    }
+
+    public Collection&lt;UUID&gt; getColumnFamilyIds()
+    {
+<span class="nc" id="L70">        return mutation.getColumnFamilyIds();</span>
+    }
+
+    public Collection&lt;PartitionUpdate&gt; getPartitionUpdates()
+    {
+<span class="nc" id="L75">        return mutation.getPartitionUpdates();</span>
+    }
+
+    public Mutation getMutation()
+    {
+<span class="nc" id="L80">        return mutation;</span>
+    }
+
+    public DecoratedKey key()
+    {
+<span class="nc" id="L85">        return mutation.key();</span>
+    }
+
+    public ConsistencyLevel consistency()
+    {
+<span class="nc" id="L90">        return consistency;</span>
+    }
+
+    public MessageOut&lt;CounterMutation&gt; makeMutationMessage()
+    {
+<span class="nc" id="L95">        return new MessageOut&lt;&gt;(MessagingService.Verb.COUNTER_MUTATION, this, serializer);</span>
+    }
+
+    /**
+     * Applies the counter mutation, returns the result Mutation (for replication to other nodes).
+     *
+     * 1. Grabs the striped cell-level locks in the proper order
+     * 2. Gets the current values of the counters-to-be-modified from the counter cache
+     * 3. Reads the rest of the current values (cache misses) from the CF
+     * 4. Writes the updated counter values
+     * 5. Updates the counter cache
+     * 6. Releases the lock(s)
+     *
+     * See CASSANDRA-4775 and CASSANDRA-6504 for further details.
+     *
+     * @return the applied resulting Mutation
+     */
+    public Mutation applyCounterMutation() throws WriteTimeoutException
+    {
+<span class="nc" id="L114">        Mutation result = new Mutation(getKeyspaceName(), key());</span>
+<span class="nc" id="L115">        Keyspace keyspace = Keyspace.open(getKeyspaceName());</span>
+
+<span class="nc" id="L117">        List&lt;Lock&gt; locks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L118">        Tracing.trace(&quot;Acquiring counter locks&quot;);</span>
+        try
+        {
+<span class="nc" id="L121">            grabCounterLocks(keyspace, locks);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            for (PartitionUpdate upd : getPartitionUpdates())</span>
+<span class="nc" id="L123">                result.add(processModifications(upd));</span>
+<span class="nc" id="L124">            result.apply();</span>
+<span class="nc" id="L125">            return result;</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            for (Lock lock : locks)</span>
+<span class="nc" id="L130">                lock.unlock();</span>
+        }
+    }
+
+    public void apply()
+    {
+<span class="nc" id="L136">        applyCounterMutation();</span>
+<span class="nc" id="L137">    }</span>
+
+    private void grabCounterLocks(Keyspace keyspace, List&lt;Lock&gt; locks) throws WriteTimeoutException
+    {
+<span class="nc" id="L141">        long startTime = System.nanoTime();</span>
+
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        for (Lock lock : LOCKS.bulkGet(getCounterLockKeys()))</span>
+        {
+<span class="nc" id="L145">            long timeout = TimeUnit.MILLISECONDS.toNanos(getTimeout()) - (System.nanoTime() - startTime);</span>
+            try
+            {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                if (!lock.tryLock(timeout, TimeUnit.NANOSECONDS))</span>
+<span class="nc" id="L149">                    throw new WriteTimeoutException(WriteType.COUNTER, consistency(), 0, consistency().blockFor(keyspace));</span>
+<span class="nc" id="L150">                locks.add(lock);</span>
+            }
+<span class="nc" id="L152">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L154">                throw new WriteTimeoutException(WriteType.COUNTER, consistency(), 0, consistency().blockFor(keyspace));</span>
+<span class="nc" id="L155">            }</span>
+<span class="nc" id="L156">        }</span>
+<span class="nc" id="L157">    }</span>
+
+    /**
+     * Returns a wrapper for the Striped#bulkGet() call (via Keyspace#counterLocksFor())
+     * Striped#bulkGet() depends on Object#hashCode(), so here we make sure that the cf id and the partition key
+     * all get to be part of the hashCode() calculation.
+     */
+    private Iterable&lt;Object&gt; getCounterLockKeys()
+    {
+<span class="nc" id="L166">        return Iterables.concat(Iterables.transform(getPartitionUpdates(), new Function&lt;PartitionUpdate, Iterable&lt;Object&gt;&gt;()</span>
+<span class="nc" id="L167">        {</span>
+            public Iterable&lt;Object&gt; apply(final PartitionUpdate update)
+            {
+<span class="nc" id="L170">                return Iterables.concat(Iterables.transform(update, new Function&lt;Row, Iterable&lt;Object&gt;&gt;()</span>
+<span class="nc" id="L171">                {</span>
+                    public Iterable&lt;Object&gt; apply(final Row row)
+                    {
+<span class="nc" id="L174">                        return Iterables.concat(Iterables.transform(row, new Function&lt;ColumnData, Object&gt;()</span>
+<span class="nc" id="L175">                        {</span>
+                            public Object apply(final ColumnData data)
+                            {
+<span class="nc" id="L178">                                return Objects.hashCode(update.metadata().cfId, key(), row.clustering(), data.column());</span>
+                            }
+                        }));
+                    }
+                }));
+            }
+        }));
+    }
+
+    private PartitionUpdate processModifications(PartitionUpdate changes)
+    {
+<span class="nc" id="L189">        ColumnFamilyStore cfs = Keyspace.open(getKeyspaceName()).getColumnFamilyStore(changes.metadata().cfId);</span>
+
+<span class="nc" id="L191">        List&lt;PartitionUpdate.CounterMark&gt; marks = changes.collectCounterMarks();</span>
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (CacheService.instance.counterCache.getCapacity() != 0)</span>
+        {
+<span class="nc" id="L195">            Tracing.trace(&quot;Fetching {} counter values from cache&quot;, marks.size());</span>
+<span class="nc" id="L196">            updateWithCurrentValuesFromCache(marks, cfs);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (marks.isEmpty())</span>
+<span class="nc" id="L198">                return changes;</span>
+        }
+
+<span class="nc" id="L201">        Tracing.trace(&quot;Reading {} counter values from the CF&quot;, marks.size());</span>
+<span class="nc" id="L202">        updateWithCurrentValuesFromCFS(marks, cfs);</span>
+
+        // What's remain is new counters
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        for (PartitionUpdate.CounterMark mark : marks)</span>
+<span class="nc" id="L206">            updateWithCurrentValue(mark, ClockAndCount.BLANK, cfs);</span>
+
+<span class="nc" id="L208">        return changes;</span>
+    }
+
+    private void updateWithCurrentValue(PartitionUpdate.CounterMark mark, ClockAndCount currentValue, ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L213">        long clock = Math.max(FBUtilities.timestampMicros(), currentValue.clock + 1L);</span>
+<span class="nc" id="L214">        long count = currentValue.count + CounterContext.instance().total(mark.value());</span>
+
+<span class="nc" id="L216">        mark.setValue(CounterContext.instance().createGlobal(CounterId.getLocalId(), clock, count));</span>
+
+        // Cache the newly updated value
+<span class="nc" id="L219">        cfs.putCachedCounter(key().getKey(), mark.clustering(), mark.column(), mark.path(), ClockAndCount.create(clock, count));</span>
+<span class="nc" id="L220">    }</span>
+
+    // Returns the count of cache misses.
+    private void updateWithCurrentValuesFromCache(List&lt;PartitionUpdate.CounterMark&gt; marks, ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L225">        Iterator&lt;PartitionUpdate.CounterMark&gt; iter = marks.iterator();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L228">            PartitionUpdate.CounterMark mark = iter.next();</span>
+<span class="nc" id="L229">            ClockAndCount cached = cfs.getCachedCounter(key().getKey(), mark.clustering(), mark.column(), mark.path());</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (cached != null)</span>
+            {
+<span class="nc" id="L232">                updateWithCurrentValue(mark, cached, cfs);</span>
+<span class="nc" id="L233">                iter.remove();</span>
+            }
+<span class="nc" id="L235">        }</span>
+<span class="nc" id="L236">    }</span>
+
+    // Reads the missing current values from the CFS.
+    private void updateWithCurrentValuesFromCFS(List&lt;PartitionUpdate.CounterMark&gt; marks, ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L241">        ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();</span>
+<span class="nc" id="L242">        BTreeSet.Builder&lt;Clustering&gt; names = BTreeSet.builder(cfs.metadata.comparator);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        for (PartitionUpdate.CounterMark mark : marks)</span>
+        {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">            if (mark.clustering() != Clustering.STATIC_CLUSTERING)</span>
+<span class="nc" id="L246">                names.add(mark.clustering());</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (mark.path() == null)</span>
+<span class="nc" id="L248">                builder.add(mark.column());</span>
+            else
+<span class="nc" id="L250">                builder.select(mark.column(), mark.path());</span>
+<span class="nc" id="L251">        }</span>
+
+<span class="nc" id="L253">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L254">        ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(names.build(), false);</span>
+<span class="nc" id="L255">        SinglePartitionReadCommand cmd = SinglePartitionReadCommand.create(cfs.metadata, nowInSec, key(), builder.build(), filter);</span>
+<span class="nc" id="L256">        PeekingIterator&lt;PartitionUpdate.CounterMark&gt; markIter = Iterators.peekingIterator(marks.iterator());</span>
+<span class="nc" id="L257">        try (ReadExecutionController controller = cmd.executionController();</span>
+<span class="nc" id="L258">             RowIterator partition = UnfilteredRowIterators.filter(cmd.queryMemtableAndDisk(cfs, controller), nowInSec))</span>
+        {
+<span class="nc" id="L260">            updateForRow(markIter, partition.staticRow(), cfs);</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            while (partition.hasNext())</span>
+            {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                if (!markIter.hasNext())</span>
+<span class="nc" id="L265">                    return;</span>
+
+<span class="nc" id="L267">                updateForRow(markIter, partition.next(), cfs);</span>
+            }
+        }
+<span class="nc" id="L270">    }</span>
+
+    private int compare(Clustering c1, Clustering c2, ColumnFamilyStore cfs)
+    {
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (c1 == Clustering.STATIC_CLUSTERING)</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            return c2 == Clustering.STATIC_CLUSTERING ? 0 : -1;</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        if (c2 == Clustering.STATIC_CLUSTERING)</span>
+<span class="nc" id="L277">            return 1;</span>
+
+<span class="nc" id="L279">        return cfs.getComparator().compare(c1, c2);</span>
+    }
+
+    private void updateForRow(PeekingIterator&lt;PartitionUpdate.CounterMark&gt; markIter, Row row, ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L284">        int cmp = 0;</span>
+        // If the mark is before the row, we have no value for this mark, just consume it
+<span class="nc bnc" id="L286" title="All 4 branches missed.">        while (markIter.hasNext() &amp;&amp; (cmp = compare(markIter.peek().clustering(), row.clustering(), cfs)) &lt; 0)</span>
+<span class="nc" id="L287">            markIter.next();</span>
+
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (!markIter.hasNext())</span>
+<span class="nc" id="L290">            return;</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        while (cmp == 0)</span>
+        {
+<span class="nc" id="L294">            PartitionUpdate.CounterMark mark = markIter.next();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            Cell cell = mark.path() == null ? row.getCell(mark.column()) : row.getCell(mark.column(), mark.path());</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            if (cell != null)</span>
+            {
+<span class="nc" id="L298">                updateWithCurrentValue(mark, CounterContext.instance().getLocalClockAndCount(cell.value()), cfs);</span>
+<span class="nc" id="L299">                markIter.remove();</span>
+            }
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (!markIter.hasNext())</span>
+<span class="nc" id="L302">                return;</span>
+
+<span class="nc" id="L304">            cmp = compare(markIter.peek().clustering(), row.clustering(), cfs);</span>
+<span class="nc" id="L305">        }</span>
+<span class="nc" id="L306">    }</span>
+
+    public long getTimeout()
+    {
+<span class="nc" id="L310">        return DatabaseDescriptor.getCounterWriteRpcTimeout();</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L316">        return toString(false);</span>
+    }
+
+    public String toString(boolean shallow)
+    {
+<span class="nc" id="L321">        return String.format(&quot;CounterMutation(%s, %s)&quot;, mutation.toString(shallow), consistency);</span>
+    }
+
+<span class="fc" id="L324">    public static class CounterMutationSerializer implements IVersionedSerializer&lt;CounterMutation&gt;</span>
+    {
+        public void serialize(CounterMutation cm, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L328">            Mutation.serializer.serialize(cm.mutation, out, version);</span>
+<span class="nc" id="L329">            out.writeUTF(cm.consistency.name());</span>
+<span class="nc" id="L330">        }</span>
+
+        public CounterMutation deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L334">            Mutation m = Mutation.serializer.deserialize(in, version);</span>
+<span class="nc" id="L335">            ConsistencyLevel consistency = Enum.valueOf(ConsistencyLevel.class, in.readUTF());</span>
+<span class="nc" id="L336">            return new CounterMutation(m, consistency);</span>
+        }
+
+        public long serializedSize(CounterMutation cm, int version)
+        {
+<span class="nc" id="L341">            return Mutation.serializer.serializedSize(cm.mutation, version)</span>
+<span class="nc" id="L342">                 + TypeSizes.sizeof(cm.consistency.name());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

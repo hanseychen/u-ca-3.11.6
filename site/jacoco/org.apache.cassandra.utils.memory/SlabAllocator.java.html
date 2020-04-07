@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SlabAllocator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.memory</a> &gt; <span class="el_source">SlabAllocator.java</span></div><h1>SlabAllocator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils.memory;
+
+import java.nio.ByteBuffer;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import sun.nio.ch.DirectBuffer;
+
+/**
++ * The SlabAllocator is a bump-the-pointer allocator that allocates
++ * large (1MB) global regions and then doles them out to threads that
++ * request smaller sized (up to 128kb) slices into the array.
+ * &lt;p&gt;&lt;/p&gt;
+ * The purpose of this class is to combat heap fragmentation in long lived
+ * objects: by ensuring that all allocations with similar lifetimes
+ * only to large regions of contiguous memory, we ensure that large blocks
+ * get freed up at the same time.
+ * &lt;p&gt;&lt;/p&gt;
+ * Otherwise, variable length byte arrays allocated end up
+ * interleaved throughout the heap, and the old generation gets progressively
+ * more fragmented until a stop-the-world compacting collection occurs.
+ */
+<span class="pc bpc" id="L47" title="1 of 2 branches missed.">public class SlabAllocator extends MemtableBufferAllocator</span>
+{
+<span class="fc" id="L49">    private static final Logger logger = LoggerFactory.getLogger(SlabAllocator.class);</span>
+
+    private final static int REGION_SIZE = 1024 * 1024;
+    private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+
+    // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+<span class="fc" id="L55">    private static final ConcurrentLinkedQueue&lt;Region&gt; RACE_ALLOCATED = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+<span class="fc" id="L57">    private final AtomicReference&lt;Region&gt; currentRegion = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L58">    private final AtomicInteger regionCount = new AtomicInteger(0);</span>
+
+    // this queue is used to keep references to off-heap allocated regions so that we can free them when we are discarded
+<span class="fc" id="L61">    private final ConcurrentLinkedQueue&lt;Region&gt; offHeapRegions = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L62">    private final AtomicLong unslabbedSize = new AtomicLong(0);</span>
+    private final boolean allocateOnHeapOnly;
+    private final EnsureOnHeap ensureOnHeap;
+
+    SlabAllocator(SubAllocator onHeap, SubAllocator offHeap, boolean allocateOnHeapOnly)
+    {
+<span class="fc" id="L68">        super(onHeap, offHeap);</span>
+<span class="fc" id="L69">        this.allocateOnHeapOnly = allocateOnHeapOnly;</span>
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">        this.ensureOnHeap = allocateOnHeapOnly ? new EnsureOnHeap.NoOp() : new EnsureOnHeap.CloneToHeap();</span>
+<span class="fc" id="L71">    }</span>
+
+    public EnsureOnHeap ensureOnHeap()
+    {
+<span class="fc" id="L75">        return ensureOnHeap;</span>
+    }
+
+    public ByteBuffer allocate(int size)
+    {
+<span class="nc" id="L80">        return allocate(size, null);</span>
+    }
+
+    public ByteBuffer allocate(int size, OpOrder.Group opGroup)
+    {
+<span class="pc bpc" id="L85" title="2 of 4 branches missed.">        assert size &gt;= 0;</span>
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">        if (size == 0)</span>
+<span class="nc" id="L87">            return ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">        (allocateOnHeapOnly ? onHeap() : offHeap()).allocate(size, opGroup);</span>
+        // satisfy large allocations directly from JVM since they don't cause fragmentation
+        // as badly, and fill up our regions quickly
+<span class="pc bpc" id="L92" title="1 of 2 branches missed.">        if (size &gt; MAX_CLONED_SIZE)</span>
+        {
+<span class="nc" id="L94">            unslabbedSize.addAndGet(size);</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            if (allocateOnHeapOnly)</span>
+<span class="nc" id="L96">                return ByteBuffer.allocate(size);</span>
+<span class="nc" id="L97">            Region region = new Region(ByteBuffer.allocateDirect(size));</span>
+<span class="nc" id="L98">            offHeapRegions.add(region);</span>
+<span class="nc" id="L99">            return region.allocate(size);</span>
+        }
+
+        while (true)
+        {
+<span class="fc" id="L104">            Region region = getRegion();</span>
+
+            // Try to allocate from this region
+<span class="fc" id="L107">            ByteBuffer cloned = region.allocate(size);</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">            if (cloned != null)</span>
+<span class="fc" id="L109">                return cloned;</span>
+
+            // not enough space!
+<span class="nc" id="L112">            currentRegion.compareAndSet(region, null);</span>
+<span class="nc" id="L113">        }</span>
+    }
+
+    public void setDiscarded()
+    {
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        for (Region region : offHeapRegions)</span>
+<span class="nc" id="L119">            ((DirectBuffer) region.data).cleaner().clean();</span>
+<span class="fc" id="L120">        super.setDiscarded();</span>
+<span class="fc" id="L121">    }</span>
+
+    /**
+     * Get the current region, or, if there is no current region, allocate a new one
+     */
+    private Region getRegion()
+    {
+        while (true)
+        {
+            // Try to get the region
+<span class="fc" id="L131">            Region region = currentRegion.get();</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            if (region != null)</span>
+<span class="fc" id="L133">                return region;</span>
+
+            // No current region, so we want to allocate one. We race
+            // against other allocators to CAS in a Region, and if we fail we stash the region for re-use
+<span class="fc" id="L137">            region = RACE_ALLOCATED.poll();</span>
+<span class="fc bfc" id="L138" title="All 2 branches covered.">            if (region == null)</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">                region = new Region(allocateOnHeapOnly ? ByteBuffer.allocate(REGION_SIZE) : ByteBuffer.allocateDirect(REGION_SIZE));</span>
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (currentRegion.compareAndSet(null, region))</span>
+            {
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">                if (!allocateOnHeapOnly)</span>
+<span class="nc" id="L143">                    offHeapRegions.add(region);</span>
+<span class="fc" id="L144">                regionCount.incrementAndGet();</span>
+<span class="fc" id="L145">                logger.trace(&quot;{} regions now allocated in {}&quot;, regionCount, this);</span>
+<span class="fc" id="L146">                return region;</span>
+            }
+
+            // someone else won race - that's fine, we'll try to grab theirs
+            // in the next iteration of the loop.
+<span class="fc" id="L151">            RACE_ALLOCATED.add(region);</span>
+<span class="fc" id="L152">        }</span>
+    }
+
+    protected AbstractAllocator allocator(OpOrder.Group writeOp)
+    {
+<span class="fc" id="L157">        return new ContextAllocator(writeOp, this);</span>
+    }
+
+    /**
+     * A region of memory out of which allocations are sliced.
+     *
+     * This serves two purposes:
+     *  - to provide a step between initialization and allocation, so that racing to CAS a
+     *    new region in is harmless
+     *  - encapsulates the allocation offset
+     */
+    private static class Region
+    {
+        /**
+         * Actual underlying data
+         */
+        private final ByteBuffer data;
+
+        /**
+         * Offset for the next allocation, or the sentinel value -1
+         * which implies that the region is still uninitialized.
+         */
+<span class="fc" id="L179">        private final AtomicInteger nextFreeOffset = new AtomicInteger(0);</span>
+
+        /**
+         * Total number of allocations satisfied from this buffer
+         */
+<span class="fc" id="L184">        private final AtomicInteger allocCount = new AtomicInteger();</span>
+
+        /**
+         * Create an uninitialized region. Note that memory is not allocated yet, so
+         * this is cheap.
+         *
+         * @param buffer bytes
+         */
+        private Region(ByteBuffer buffer)
+<span class="fc" id="L193">        {</span>
+<span class="fc" id="L194">            data = buffer;</span>
+<span class="fc" id="L195">        }</span>
+
+        /**
+         * Try to allocate &lt;code&gt;size&lt;/code&gt; bytes from the region.
+         *
+         * @return the successful allocation, or null to indicate not-enough-space
+         */
+        public ByteBuffer allocate(int size)
+        {
+            while (true)
+            {
+<span class="fc" id="L206">                int oldOffset = nextFreeOffset.get();</span>
+
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">                if (oldOffset + size &gt; data.capacity()) // capacity == remaining</span>
+<span class="nc" id="L209">                    return null;</span>
+
+                // Try to atomically claim this region
+<span class="fc bfc" id="L212" title="All 2 branches covered.">                if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))</span>
+                {
+                    // we got the alloc
+<span class="fc" id="L215">                    allocCount.incrementAndGet();</span>
+<span class="fc" id="L216">                    return (ByteBuffer) data.duplicate().position(oldOffset).limit(oldOffset + size);</span>
+                }
+                // we raced and lost alloc, try again
+<span class="fc" id="L219">            }</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L225">            return &quot;Region@&quot; + System.identityHashCode(this) +</span>
+<span class="nc" id="L226">                   &quot; allocs=&quot; + allocCount.get() + &quot;waste=&quot; +</span>
+<span class="nc" id="L227">                   (data.capacity() - nextFreeOffset.get());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

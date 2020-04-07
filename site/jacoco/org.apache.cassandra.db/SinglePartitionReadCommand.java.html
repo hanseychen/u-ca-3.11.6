@@ -1,0 +1,1353 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SinglePartitionReadCommand.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">SinglePartitionReadCommand.java</span></div><h1>SinglePartitionReadCommand.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+
+import org.apache.commons.lang3.tuple.Pair;
+
+import org.apache.cassandra.cache.IRowCacheEntry;
+import org.apache.cassandra.cache.RowCacheKey;
+import org.apache.cassandra.cache.RowCacheSentinel;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.lifecycle.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.RTBoundValidator;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.pager.*;
+import org.apache.cassandra.thrift.ThriftResultsMerger;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
+
+/**
+ * A read command that selects a (part of a) single partition.
+ */
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">public class SinglePartitionReadCommand extends ReadCommand</span>
+{
+<span class="fc" id="L70">    protected static final SelectionDeserializer selectionDeserializer = new Deserializer();</span>
+
+    private final DecoratedKey partitionKey;
+    private final ClusteringIndexFilter clusteringIndexFilter;
+
+<span class="fc" id="L75">    private int oldestUnrepairedTombstone = Integer.MAX_VALUE;</span>
+
+    private SinglePartitionReadCommand(boolean isDigest,
+                                       int digestVersion,
+                                       boolean isForThrift,
+                                       CFMetaData metadata,
+                                       int nowInSec,
+                                       ColumnFilter columnFilter,
+                                       RowFilter rowFilter,
+                                       DataLimits limits,
+                                       DecoratedKey partitionKey,
+                                       ClusteringIndexFilter clusteringIndexFilter,
+                                       IndexMetadata index)
+    {
+<span class="fc" id="L89">        super(Kind.SINGLE_PARTITION, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, index);</span>
+<span class="pc bpc" id="L90" title="2 of 4 branches missed.">        assert partitionKey.getPartitioner() == metadata.partitioner;</span>
+<span class="fc" id="L91">        this.partitionKey = partitionKey;</span>
+<span class="fc" id="L92">        this.clusteringIndexFilter = clusteringIndexFilter;</span>
+<span class="fc" id="L93">    }</span>
+
+    /**
+     * Creates a new read command on a single partition.
+     *
+     * @param isForThrift whether the query is for thrift or not.
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param columnFilter the column filter to use for the query.
+     * @param rowFilter the row filter to use for the query.
+     * @param limits the limits to use for the query.
+     * @param partitionKey the partition key for the partition to query.
+     * @param clusteringIndexFilter the clustering index filter to use for the query.
+     * @param indexMetadata explicitly specified index to use for the query
+     *
+     * @return a newly created read command.
+     */
+    public static SinglePartitionReadCommand create(boolean isForThrift,
+                                                    CFMetaData metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter,
+                                                    IndexMetadata indexMetadata)
+    {
+<span class="fc" id="L120">        return new SinglePartitionReadCommand(false,</span>
+                                              0,
+                                              isForThrift,
+                                              metadata,
+                                              nowInSec,
+                                              columnFilter,
+                                              rowFilter,
+                                              limits,
+                                              partitionKey,
+                                              clusteringIndexFilter,
+                                              indexMetadata);
+    }
+
+    /**
+     * Creates a new read command on a single partition.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param columnFilter the column filter to use for the query.
+     * @param rowFilter the row filter to use for the query.
+     * @param limits the limits to use for the query.
+     * @param partitionKey the partition key for the partition to query.
+     * @param clusteringIndexFilter the clustering index filter to use for the query.
+     *
+     * @return a newly created read command.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter)
+    {
+<span class="fc" id="L154">        return create(false, metadata, nowInSec, columnFilter, rowFilter, limits, partitionKey, clusteringIndexFilter);</span>
+    }
+
+    /**
+     * Creates a new read command on a single partition.
+     *
+     * @param isForThrift whether the query is for thrift or not.
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param columnFilter the column filter to use for the query.
+     * @param rowFilter the row filter to use for the query.
+     * @param limits the limits to use for the query.
+     * @param partitionKey the partition key for the partition to query.
+     * @param clusteringIndexFilter the clustering index filter to use for the query.
+     *
+     * @return a newly created read command.
+     */
+    public static SinglePartitionReadCommand create(boolean isForThrift,
+                                                    CFMetaData metadata,
+                                                    int nowInSec,
+                                                    ColumnFilter columnFilter,
+                                                    RowFilter rowFilter,
+                                                    DataLimits limits,
+                                                    DecoratedKey partitionKey,
+                                                    ClusteringIndexFilter clusteringIndexFilter)
+    {
+<span class="fc" id="L180">        return create(isForThrift,</span>
+                      metadata,
+                      nowInSec,
+                      columnFilter,
+                      rowFilter,
+                      limits,
+                      partitionKey,
+                      clusteringIndexFilter,
+<span class="fc" id="L188">                      findIndex(metadata, rowFilter));</span>
+    }
+
+    /**
+     * Creates a new read command on a single partition.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param columnFilter the column filter to use for the query.
+     * @param filter the clustering index filter to use for the query.
+     *
+     * @return a newly created read command. The returned command will use no row filter and have no limits.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata,
+                                                    int nowInSec,
+                                                    DecoratedKey key,
+                                                    ColumnFilter columnFilter,
+                                                    ClusteringIndexFilter filter)
+    {
+<span class="nc" id="L208">        return create(metadata, nowInSec, columnFilter, RowFilter.NONE, DataLimits.NONE, key, filter);</span>
+    }
+
+    /**
+     * Creates a new read command that queries a single partition in its entirety.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     *
+     * @return a newly created read command that queries all the rows of {@code key}.
+     */
+    public static SinglePartitionReadCommand fullPartitionRead(CFMetaData metadata, int nowInSec, DecoratedKey key)
+    {
+<span class="nc" id="L222">        return create(metadata, nowInSec, key, Slices.ALL);</span>
+    }
+
+    /**
+     * Creates a new read command that queries a single partition in its entirety.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     *
+     * @return a newly created read command that queries all the rows of {@code key}.
+     */
+    public static SinglePartitionReadCommand fullPartitionRead(CFMetaData metadata, int nowInSec, ByteBuffer key)
+    {
+<span class="nc" id="L236">        return create(metadata, nowInSec, metadata.decorateKey(key), Slices.ALL);</span>
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided single slice.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param slice the slice of rows to query.
+     *
+     * @return a newly created read command that queries {@code slice} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Slice slice)
+    {
+<span class="nc" id="L252">        return create(metadata, nowInSec, key, Slices.with(metadata.comparator, slice));</span>
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided slices.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param slices the slices of rows to query.
+     *
+     * @return a newly created read command that queries the {@code slices} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Slices slices)
+    {
+<span class="nc" id="L268">        ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(slices, false);</span>
+<span class="nc" id="L269">        return create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);</span>
+    }
+
+    /**
+     * Creates a new single partition slice command for the provided slices.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param slices the slices of rows to query.
+     *
+     * @return a newly created read command that queries the {@code slices} in {@code key}. The returned query will
+     * query every columns for the table (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, ByteBuffer key, Slices slices)
+    {
+<span class="nc" id="L285">        return create(metadata, nowInSec, metadata.decorateKey(key), slices);</span>
+    }
+
+    /**
+     * Creates a new single partition name command for the provided rows.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param names the clustering for the rows to query.
+     *
+     * @return a newly created read command that queries the {@code names} in {@code key}. The returned query will
+     * query every columns (without limit or row filtering) and be in forward order.
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, NavigableSet&lt;Clustering&gt; names)
+    {
+<span class="nc" id="L301">        ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(names, false);</span>
+<span class="nc" id="L302">        return create(metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, DataLimits.NONE, key, filter);</span>
+    }
+
+    /**
+     * Creates a new single partition name command for the provided row.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     * @param key the partition key for the partition to query.
+     * @param name the clustering for the row to query.
+     *
+     * @return a newly created read command that queries {@code name} in {@code key}. The returned query will
+     * query every columns (without limit or row filtering).
+     */
+    public static SinglePartitionReadCommand create(CFMetaData metadata, int nowInSec, DecoratedKey key, Clustering name)
+    {
+<span class="nc" id="L318">        return create(metadata, nowInSec, key, FBUtilities.singleton(name, metadata.comparator));</span>
+    }
+
+    public SinglePartitionReadCommand copy()
+    {
+<span class="nc" id="L323">        return new SinglePartitionReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L324">                                              digestVersion(),</span>
+<span class="nc" id="L325">                                              isForThrift(),</span>
+<span class="nc" id="L326">                                              metadata(),</span>
+<span class="nc" id="L327">                                              nowInSec(),</span>
+<span class="nc" id="L328">                                              columnFilter(),</span>
+<span class="nc" id="L329">                                              rowFilter(),</span>
+<span class="nc" id="L330">                                              limits(),</span>
+<span class="nc" id="L331">                                              partitionKey(),</span>
+<span class="nc" id="L332">                                              clusteringIndexFilter(),</span>
+<span class="nc" id="L333">                                              indexMetadata());</span>
+    }
+
+    public SinglePartitionReadCommand copyAsDigestQuery()
+    {
+<span class="nc" id="L338">        return new SinglePartitionReadCommand(true,</span>
+<span class="nc" id="L339">                                              digestVersion(),</span>
+<span class="nc" id="L340">                                              isForThrift(),</span>
+<span class="nc" id="L341">                                              metadata(),</span>
+<span class="nc" id="L342">                                              nowInSec(),</span>
+<span class="nc" id="L343">                                              columnFilter(),</span>
+<span class="nc" id="L344">                                              rowFilter(),</span>
+<span class="nc" id="L345">                                              limits(),</span>
+<span class="nc" id="L346">                                              partitionKey(),</span>
+<span class="nc" id="L347">                                              clusteringIndexFilter(),</span>
+<span class="nc" id="L348">                                              indexMetadata());</span>
+    }
+
+    public SinglePartitionReadCommand withUpdatedLimit(DataLimits newLimits)
+    {
+<span class="nc" id="L353">        return new SinglePartitionReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L354">                                              digestVersion(),</span>
+<span class="nc" id="L355">                                              isForThrift(),</span>
+<span class="nc" id="L356">                                              metadata(),</span>
+<span class="nc" id="L357">                                              nowInSec(),</span>
+<span class="nc" id="L358">                                              columnFilter(),</span>
+<span class="nc" id="L359">                                              rowFilter(),</span>
+                                              newLimits,
+<span class="nc" id="L361">                                              partitionKey(),</span>
+<span class="nc" id="L362">                                              clusteringIndexFilter(),</span>
+<span class="nc" id="L363">                                              indexMetadata());</span>
+    }
+
+    public SinglePartitionReadCommand withUpdatedClusteringIndexFilter(ClusteringIndexFilter filter)
+    {
+<span class="nc" id="L368">        return new SinglePartitionReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L369">                                              digestVersion(),</span>
+<span class="nc" id="L370">                                              isForThrift(),</span>
+<span class="nc" id="L371">                                              metadata(),</span>
+<span class="nc" id="L372">                                              nowInSec(),</span>
+<span class="nc" id="L373">                                              columnFilter(),</span>
+<span class="nc" id="L374">                                              rowFilter(),</span>
+<span class="nc" id="L375">                                              limits(),</span>
+<span class="nc" id="L376">                                              partitionKey(),</span>
+                                              filter,
+<span class="nc" id="L378">                                              indexMetadata());</span>
+    }
+
+    static SinglePartitionReadCommand legacySliceCommand(boolean isDigest,
+                                                         int digestVersion,
+                                                         CFMetaData metadata,
+                                                         int nowInSec,
+                                                         ColumnFilter columnFilter,
+                                                         DataLimits limits,
+                                                         DecoratedKey partitionKey,
+                                                         ClusteringIndexSliceFilter filter)
+    {
+        // messages from old nodes will expect the thrift format, so always use 'true' for isForThrift
+<span class="nc" id="L391">        return new SinglePartitionReadCommand(isDigest,</span>
+                                              digestVersion,
+                                              true,
+                                              metadata,
+                                              nowInSec,
+                                              columnFilter,
+                                              RowFilter.NONE,
+                                              limits,
+                                              partitionKey,
+                                              filter,
+                                              null);
+    }
+
+    static SinglePartitionReadCommand legacyNamesCommand(boolean isDigest,
+                                                         int digestVersion,
+                                                         CFMetaData metadata,
+                                                         int nowInSec,
+                                                         ColumnFilter columnFilter,
+                                                         DecoratedKey partitionKey,
+                                                         ClusteringIndexNamesFilter filter)
+    {
+        // messages from old nodes will expect the thrift format, so always use 'true' for isForThrift
+<span class="nc" id="L413">        return new SinglePartitionReadCommand(isDigest, digestVersion, true, metadata, nowInSec, columnFilter, RowFilter.NONE, DataLimits.NONE, partitionKey, filter,null);</span>
+    }
+
+    public DecoratedKey partitionKey()
+    {
+<span class="fc" id="L418">        return partitionKey;</span>
+    }
+
+    public ClusteringIndexFilter clusteringIndexFilter()
+    {
+<span class="fc" id="L423">        return clusteringIndexFilter;</span>
+    }
+
+    public ClusteringIndexFilter clusteringIndexFilter(DecoratedKey key)
+    {
+<span class="nc" id="L428">        return clusteringIndexFilter;</span>
+    }
+
+    public long getTimeout()
+    {
+<span class="fc" id="L433">        return DatabaseDescriptor.getReadRpcTimeout();</span>
+    }
+
+    public boolean selectsKey(DecoratedKey key)
+    {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (!this.partitionKey().equals(key))</span>
+<span class="nc" id="L439">            return false;</span>
+
+<span class="nc" id="L441">        return rowFilter().partitionKeyRestrictionsAreSatisfiedBy(key, metadata().getKeyValidator());</span>
+    }
+
+    public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+    {
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (clustering == Clustering.STATIC_CLUSTERING)</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            return !columnFilter().fetchedColumns().statics.isEmpty();</span>
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (!clusteringIndexFilter().selects(clustering))</span>
+<span class="nc" id="L450">            return false;</span>
+
+<span class="nc" id="L452">        return rowFilter().clusteringKeyRestrictionsAreSatisfiedBy(clustering);</span>
+    }
+
+    /**
+     * Returns a new command suitable to paging from the last returned row.
+     *
+     * @param lastReturned the last row returned by the previous page. The newly created command
+     * will only query row that comes after this (in query order). This can be {@code null} if this
+     * is the first page.
+     * @param limits the limits to use for the page to query.
+     *
+     * @return the newly create command.
+     */
+    public SinglePartitionReadCommand forPaging(Clustering lastReturned, DataLimits limits)
+    {
+        // We shouldn't have set digest yet when reaching that point
+<span class="nc bnc" id="L468" title="All 4 branches missed.">        assert !isDigestQuery();</span>
+<span class="nc" id="L469">        return create(isForThrift(),</span>
+<span class="nc" id="L470">                      metadata(),</span>
+<span class="nc" id="L471">                      nowInSec(),</span>
+<span class="nc" id="L472">                      columnFilter(),</span>
+<span class="nc" id="L473">                      rowFilter(),</span>
+                      limits,
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                      partitionKey(),</span>
+<span class="nc" id="L476">                      lastReturned == null ? clusteringIndexFilter() : clusteringIndexFilter.forPaging(metadata().comparator, lastReturned, false));</span>
+    }
+
+    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+    {
+<span class="nc" id="L481">        return StorageProxy.read(Group.one(this), consistency, clientState, queryStartNanoTime);</span>
+    }
+
+    public SinglePartitionPager getPager(PagingState pagingState, ProtocolVersion protocolVersion)
+    {
+<span class="nc" id="L486">        return getPager(this, pagingState, protocolVersion);</span>
+    }
+
+    private static SinglePartitionPager getPager(SinglePartitionReadCommand command, PagingState pagingState, ProtocolVersion protocolVersion)
+    {
+<span class="nc" id="L491">        return new SinglePartitionPager(command, pagingState, protocolVersion);</span>
+    }
+
+    protected void recordLatency(TableMetrics metric, long latencyNanos)
+    {
+<span class="fc" id="L496">        metric.readLatency.addNano(latencyNanos);</span>
+<span class="fc" id="L497">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // we close the created iterator through closing the result of this method (and SingletonUnfilteredPartitionIterator ctor cannot fail)
+    protected UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
+    {
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">        UnfilteredRowIterator partition = cfs.isRowCacheEnabled()</span>
+<span class="pc" id="L503">                                        ? getThroughCache(cfs, executionController)</span>
+<span class="fc" id="L504">                                        : queryMemtableAndDisk(cfs, executionController);</span>
+<span class="fc" id="L505">        return new SingletonUnfilteredPartitionIterator(partition, isForThrift());</span>
+    }
+
+    /**
+     * Fetch the rows requested if in cache; if not, read it from disk and cache it.
+     * &lt;p&gt;
+     * If the partition is cached, and the filter given is within its bounds, we return
+     * from cache, otherwise from disk.
+     * &lt;p&gt;
+     * If the partition is is not cached, we figure out what filter is &quot;biggest&quot;, read
+     * that from disk, then filter the result and either cache that or return it.
+     */
+    private UnfilteredRowIterator getThroughCache(ColumnFamilyStore cfs, ReadExecutionController executionController)
+    {
+<span class="nc bnc" id="L519" title="All 4 branches missed.">        assert !cfs.isIndex(); // CASSANDRA-5732</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">        assert cfs.isRowCacheEnabled() : String.format(&quot;Row cache is not enabled on table [%s]&quot;, cfs.name);</span>
+
+<span class="nc" id="L522">        RowCacheKey key = new RowCacheKey(metadata().ksAndCFName, partitionKey());</span>
+
+        // Attempt a sentinel-read-cache sequence.  if a write invalidates our sentinel, we'll return our
+        // (now potentially obsolete) data, but won't cache it. see CASSANDRA-3862
+        // TODO: don't evict entire partitions on writes (#2864)
+<span class="nc" id="L527">        IRowCacheEntry cached = CacheService.instance.rowCache.get(key);</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        if (cached != null)</span>
+        {
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (cached instanceof RowCacheSentinel)</span>
+            {
+                // Some other read is trying to cache the value, just do a normal non-caching read
+<span class="nc" id="L533">                Tracing.trace(&quot;Row cache miss (race)&quot;);</span>
+<span class="nc" id="L534">                cfs.metric.rowCacheMiss.inc();</span>
+<span class="nc" id="L535">                return queryMemtableAndDisk(cfs, executionController);</span>
+            }
+
+<span class="nc" id="L538">            CachedPartition cachedPartition = (CachedPartition)cached;</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            if (cfs.isFilterFullyCoveredBy(clusteringIndexFilter(), limits(), cachedPartition, nowInSec()))</span>
+            {
+<span class="nc" id="L541">                cfs.metric.rowCacheHit.inc();</span>
+<span class="nc" id="L542">                Tracing.trace(&quot;Row cache hit&quot;);</span>
+<span class="nc" id="L543">                UnfilteredRowIterator unfilteredRowIterator = clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), cachedPartition);</span>
+<span class="nc" id="L544">                cfs.metric.updateSSTableIterated(0);</span>
+<span class="nc" id="L545">                return unfilteredRowIterator;</span>
+            }
+
+<span class="nc" id="L548">            cfs.metric.rowCacheHitOutOfRange.inc();</span>
+<span class="nc" id="L549">            Tracing.trace(&quot;Ignoring row cache as cached value could not satisfy query&quot;);</span>
+<span class="nc" id="L550">            return queryMemtableAndDisk(cfs, executionController);</span>
+        }
+
+<span class="nc" id="L553">        cfs.metric.rowCacheMiss.inc();</span>
+<span class="nc" id="L554">        Tracing.trace(&quot;Row cache miss&quot;);</span>
+
+        // Note that on tables with no clustering keys, any positive value of
+        // rowsToCache implies caching the full partition
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        boolean cacheFullPartitions = metadata().clusteringColumns().size() &gt; 0 ?</span>
+<span class="nc" id="L559">                                      metadata().params.caching.cacheAllRows() :</span>
+<span class="nc" id="L560">                                      metadata().params.caching.cacheRows();</span>
+
+        // To be able to cache what we read, what we read must at least covers what the cache holds, that
+        // is the 'rowsToCache' first rows of the partition. We could read those 'rowsToCache' first rows
+        // systematically, but we'd have to &quot;extend&quot; that to whatever is needed for the user query that the
+        // 'rowsToCache' first rows don't cover and it's not trivial with our existing filters. So currently
+        // we settle for caching what we read only if the user query does query the head of the partition since
+        // that's the common case of when we'll be able to use the cache anyway. One exception is if we cache
+        // full partitions, in which case we just always read it all and cache.
+<span class="nc bnc" id="L569" title="All 4 branches missed.">        if (cacheFullPartitions || clusteringIndexFilter().isHeadFilter())</span>
+        {
+<span class="nc" id="L571">            RowCacheSentinel sentinel = new RowCacheSentinel();</span>
+<span class="nc" id="L572">            boolean sentinelSuccess = CacheService.instance.rowCache.putIfAbsent(key, sentinel);</span>
+<span class="nc" id="L573">            boolean sentinelReplaced = false;</span>
+
+            try
+            {
+<span class="nc" id="L577">                final int rowsToCache = metadata().params.caching.rowsPerPartitionToCache();</span>
+<span class="nc" id="L578">                final boolean enforceStrictLiveness = metadata().enforceStrictLiveness();</span>
+
+                @SuppressWarnings(&quot;resource&quot;) // we close on exception or upon closing the result of this method
+<span class="nc" id="L581">                UnfilteredRowIterator iter = fullPartitionRead(metadata(), nowInSec(), partitionKey()).queryMemtableAndDisk(cfs, executionController);</span>
+                try
+                {
+                    // Use a custom iterator instead of DataLimits to avoid stopping the original iterator
+<span class="nc" id="L585">                    UnfilteredRowIterator toCacheIterator = new WrappingUnfilteredRowIterator(iter)</span>
+<span class="nc" id="L586">                    {</span>
+<span class="nc" id="L587">                        private int rowsCounted = 0;</span>
+
+                        @Override
+                        public boolean hasNext()
+                        {
+<span class="nc bnc" id="L592" title="All 4 branches missed.">                            return rowsCounted &lt; rowsToCache &amp;&amp; super.hasNext();</span>
+                        }
+
+                        @Override
+                        public Unfiltered next()
+                        {
+<span class="nc" id="L598">                            Unfiltered unfiltered = super.next();</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                            if (unfiltered.isRow())</span>
+                            {
+<span class="nc" id="L601">                                Row row = (Row) unfiltered;</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                                if (row.hasLiveData(nowInSec(), enforceStrictLiveness))</span>
+<span class="nc" id="L603">                                    rowsCounted++;</span>
+                            }
+<span class="nc" id="L605">                            return unfiltered;</span>
+                        }
+                    };
+
+                    // We want to cache only rowsToCache rows
+<span class="nc" id="L610">                    CachedPartition toCache = CachedBTreePartition.create(toCacheIterator, nowInSec());</span>
+
+<span class="nc bnc" id="L612" title="All 4 branches missed.">                    if (sentinelSuccess &amp;&amp; !toCache.isEmpty())</span>
+                    {
+<span class="nc" id="L614">                        Tracing.trace(&quot;Caching {} rows&quot;, toCache.rowCount());</span>
+<span class="nc" id="L615">                        CacheService.instance.rowCache.replace(key, sentinel, toCache);</span>
+                        // Whether or not the previous replace has worked, our sentinel is not in the cache anymore
+<span class="nc" id="L617">                        sentinelReplaced = true;</span>
+                    }
+
+                    // We then re-filter out what this query wants.
+                    // Note that in the case where we don't cache full partitions, it's possible that the current query is interested in more
+                    // than what we've cached, so we can't just use toCache.
+<span class="nc" id="L623">                    UnfilteredRowIterator cacheIterator = clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), toCache);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">                    if (cacheFullPartitions)</span>
+                    {
+                        // Everything is guaranteed to be in 'toCache', we're done with 'iter'
+<span class="nc bnc" id="L627" title="All 4 branches missed.">                        assert !iter.hasNext();</span>
+<span class="nc" id="L628">                        iter.close();</span>
+<span class="nc" id="L629">                        return cacheIterator;</span>
+                    }
+<span class="nc" id="L631">                    return UnfilteredRowIterators.concat(cacheIterator, clusteringIndexFilter().filterNotIndexed(columnFilter(), iter));</span>
+                }
+<span class="nc" id="L633">                catch (RuntimeException | Error e)</span>
+                {
+<span class="nc" id="L635">                    iter.close();</span>
+<span class="nc" id="L636">                    throw e;</span>
+                }
+            }
+            finally
+            {
+<span class="nc bnc" id="L641" title="All 4 branches missed.">                if (sentinelSuccess &amp;&amp; !sentinelReplaced)</span>
+<span class="nc" id="L642">                    cfs.invalidateCachedPartition(key);</span>
+            }
+        }
+
+<span class="nc" id="L646">        Tracing.trace(&quot;Fetching data but not populating cache as query does not query from the start of the partition&quot;);</span>
+<span class="nc" id="L647">        return queryMemtableAndDisk(cfs, executionController);</span>
+    }
+
+    /**
+     * Queries both memtable and sstables to fetch the result of this query.
+     * &lt;p&gt;
+     * Please note that this method:
+     *   1) does not check the row cache.
+     *   2) does not apply the query limit, nor the row filter (and so ignore 2ndary indexes).
+     *      Those are applied in {@link ReadCommand#executeLocally}.
+     *   3) does not record some of the read metrics (latency, scanned cells histograms) nor
+     *      throws TombstoneOverwhelmingException.
+     * It is publicly exposed because there is a few places where that is exactly what we want,
+     * but it should be used only where you know you don't need thoses things.
+     * &lt;p&gt;
+     * Also note that one must have created a {@code ReadExecutionController} on the queried table and we require it as
+     * a parameter to enforce that fact, even though it's not explicitlly used by the method.
+     */
+    public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController)
+    {
+<span class="pc bpc" id="L667" title="3 of 6 branches missed.">        assert executionController != null &amp;&amp; executionController.validForReadOn(cfs);</span>
+<span class="fc" id="L668">        Tracing.trace(&quot;Executing single-partition query on {}&quot;, cfs.name);</span>
+
+<span class="fc" id="L670">        return queryMemtableAndDiskInternal(cfs);</span>
+    }
+
+    @Override
+    protected int oldestUnrepairedTombstone()
+    {
+<span class="fc" id="L676">        return oldestUnrepairedTombstone;</span>
+    }
+
+    private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs)
+    {
+        /*
+         * We have 2 main strategies:
+         *   1) We query memtables and sstables simulateneously. This is our most generic strategy and the one we use
+         *      unless we have a names filter that we know we can optimize futher.
+         *   2) If we have a name filter (so we query specific rows), we can make a bet: that all column for all queried row
+         *      will have data in the most recent sstable(s), thus saving us from reading older ones. This does imply we
+         *      have a way to guarantee we have all the data for what is queried, which is only possible for name queries
+         *      and if we have neither non-frozen collections/UDTs nor counters (indeed, for a non-frozen collection or UDT,
+         *      we can't guarantee an older sstable won't have some elements that weren't in the most recent sstables,
+         *      and counters are intrinsically a collection of shards and so have the same problem).
+         */
+<span class="fc bfc" id="L692" title="All 4 branches covered.">        if (clusteringIndexFilter() instanceof ClusteringIndexNamesFilter &amp;&amp; !queriesMulticellType())</span>
+<span class="fc" id="L693">            return queryMemtableAndSSTablesInTimestampOrder(cfs, (ClusteringIndexNamesFilter)clusteringIndexFilter());</span>
+
+<span class="fc" id="L695">        Tracing.trace(&quot;Acquiring sstable references&quot;);</span>
+<span class="fc" id="L696">        ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));</span>
+<span class="fc" id="L697">        List&lt;UnfilteredRowIterator&gt; iterators = new ArrayList&lt;&gt;(Iterables.size(view.memtables) + view.sstables.size());</span>
+<span class="fc" id="L698">        ClusteringIndexFilter filter = clusteringIndexFilter();</span>
+<span class="fc" id="L699">        long minTimestamp = Long.MAX_VALUE;</span>
+
+        try
+        {
+<span class="fc bfc" id="L703" title="All 2 branches covered.">            for (Memtable memtable : view.memtables)</span>
+            {
+<span class="fc" id="L705">                Partition partition = memtable.getPartition(partitionKey());</span>
+<span class="fc bfc" id="L706" title="All 2 branches covered.">                if (partition == null)</span>
+<span class="fc" id="L707">                    continue;</span>
+
+<span class="fc" id="L709">                minTimestamp = Math.min(minTimestamp, memtable.getMinTimestamp());</span>
+
+                @SuppressWarnings(&quot;resource&quot;) // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
+<span class="fc" id="L712">                UnfilteredRowIterator iter = filter.getUnfilteredRowIterator(columnFilter(), partition);</span>
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">                if (isForThrift())</span>
+<span class="nc" id="L714">                    iter = ThriftResultsMerger.maybeWrap(iter, nowInSec());</span>
+<span class="fc" id="L715">                oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, partition.stats().minLocalDeletionTime);</span>
+<span class="fc" id="L716">                iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));</span>
+<span class="fc" id="L717">            }</span>
+
+            /*
+             * We can't eliminate full sstables based on the timestamp of what we've already read like
+             * in collectTimeOrderedData, but we still want to eliminate sstable whose maxTimestamp &lt; mostRecentTombstone
+             * we've read. We still rely on the sstable ordering by maxTimestamp since if
+             *   maxTimestamp_s1 &gt; maxTimestamp_s0,
+             * we're guaranteed that s1 cannot have a row tombstone such that
+             *   timestamp(tombstone) &gt; maxTimestamp_s0
+             * since we necessarily have
+             *   timestamp(tombstone) &lt;= maxTimestamp_s1
+             * In other words, iterating in maxTimestamp order allow to do our mostRecentPartitionTombstone elimination
+             * in one pass, and minimize the number of sstables for which we read a partition tombstone.
+             */
+<span class="fc" id="L731">            Collections.sort(view.sstables, SSTableReader.maxTimestampDescending);</span>
+<span class="fc" id="L732">            long mostRecentPartitionTombstone = Long.MIN_VALUE;</span>
+<span class="fc" id="L733">            int nonIntersectingSSTables = 0;</span>
+<span class="fc" id="L734">            List&lt;SSTableReader&gt; skippedSSTablesWithTombstones = null;</span>
+<span class="fc" id="L735">            SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();</span>
+
+<span class="fc bfc" id="L737" title="All 2 branches covered.">            for (SSTableReader sstable : view.sstables)</span>
+            {
+                // if we've already seen a partition tombstone with a timestamp greater
+                // than the most recent update to this sstable, we can skip it
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">                if (sstable.getMaxTimestamp() &lt; mostRecentPartitionTombstone)</span>
+<span class="nc" id="L742">                    break;</span>
+
+<span class="pc bpc" id="L744" title="1 of 2 branches missed.">                if (!shouldInclude(sstable))</span>
+                {
+<span class="nc" id="L746">                    nonIntersectingSSTables++;</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">                    if (sstable.mayHaveTombstones())</span>
+                    { // if sstable has tombstones we need to check after one pass if it can be safely skipped
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                        if (skippedSSTablesWithTombstones == null)</span>
+<span class="nc" id="L750">                            skippedSSTablesWithTombstones = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L751">                        skippedSSTablesWithTombstones.add(sstable);</span>
+
+                    }
+                    continue;
+                }
+
+<span class="fc" id="L757">                minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());</span>
+
+                @SuppressWarnings(&quot;resource&quot;) // 'iter' is added to iterators which is closed on exception,
+                                              // or through the closing of the final merged iterator
+<span class="fc" id="L761">                UnfilteredRowIteratorWithLowerBound iter = makeIterator(cfs, sstable, true, metricsCollector);</span>
+<span class="pc bpc" id="L762" title="1 of 2 branches missed.">                if (!sstable.isRepaired())</span>
+<span class="fc" id="L763">                    oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());</span>
+
+<span class="fc" id="L765">                iterators.add(iter);</span>
+<span class="fc" id="L766">                mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,</span>
+<span class="fc" id="L767">                                                        iter.partitionLevelDeletion().markedForDeleteAt());</span>
+<span class="fc" id="L768">            }</span>
+
+<span class="fc" id="L770">            int includedDueToTombstones = 0;</span>
+            // Check for sstables with tombstones that are not expired
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">            if (skippedSSTablesWithTombstones != null)</span>
+            {
+<span class="nc bnc" id="L774" title="All 2 branches missed.">                for (SSTableReader sstable : skippedSSTablesWithTombstones)</span>
+                {
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                    if (sstable.getMaxTimestamp() &lt;= minTimestamp)</span>
+<span class="nc" id="L777">                        continue;</span>
+
+                    @SuppressWarnings(&quot;resource&quot;) // 'iter' is added to iterators which is close on exception,
+                                                  // or through the closing of the final merged iterator
+<span class="nc" id="L781">                    UnfilteredRowIteratorWithLowerBound iter = makeIterator(cfs, sstable, false, metricsCollector);</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">                    if (!sstable.isRepaired())</span>
+<span class="nc" id="L783">                        oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());</span>
+
+<span class="nc" id="L785">                    iterators.add(iter);</span>
+<span class="nc" id="L786">                    includedDueToTombstones++;</span>
+<span class="nc" id="L787">                }</span>
+            }
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">            if (Tracing.isTracing())</span>
+<span class="nc" id="L790">                Tracing.trace(&quot;Skipped {}/{} non-slice-intersecting sstables, included {} due to tombstones&quot;,</span>
+<span class="nc" id="L791">                               nonIntersectingSSTables, view.sstables.size(), includedDueToTombstones);</span>
+
+<span class="fc bfc" id="L793" title="All 2 branches covered.">            if (iterators.isEmpty())</span>
+<span class="fc" id="L794">                return EmptyIterators.unfilteredRow(cfs.metadata, partitionKey(), filter.isReversed());</span>
+
+<span class="fc" id="L796">            StorageHook.instance.reportRead(cfs.metadata.cfId, partitionKey());</span>
+<span class="fc" id="L797">            return withSSTablesIterated(iterators, cfs.metric, metricsCollector);</span>
+        }
+<span class="nc" id="L799">        catch (RuntimeException | Error e)</span>
+        {
+            try
+            {
+<span class="nc" id="L803">                FBUtilities.closeAll(iterators);</span>
+            }
+<span class="nc" id="L805">            catch (Exception suppressed)</span>
+            {
+<span class="nc" id="L807">                e.addSuppressed(suppressed);</span>
+<span class="nc" id="L808">            }</span>
+<span class="nc" id="L809">            throw e;</span>
+        }
+    }
+
+    private boolean shouldInclude(SSTableReader sstable)
+    {
+        // If some static columns are queried, we should always include the sstable: the clustering values stats of the sstable
+        // don't tell us if the sstable contains static values in particular.
+        // TODO: we could record if a sstable contains any static value at all.
+<span class="pc bpc" id="L818" title="1 of 2 branches missed.">        if (!columnFilter().fetchedColumns().statics.isEmpty())</span>
+<span class="nc" id="L819">            return true;</span>
+
+<span class="fc" id="L821">        return clusteringIndexFilter().shouldInclude(sstable);</span>
+    }
+
+    private UnfilteredRowIteratorWithLowerBound makeIterator(ColumnFamilyStore cfs,
+                                                             final SSTableReader sstable,
+                                                             boolean applyThriftTransformation,
+                                                             SSTableReadsListener listener)
+    {
+<span class="fc" id="L829">        return StorageHook.instance.makeRowIteratorWithLowerBound(cfs,</span>
+<span class="fc" id="L830">                                                                  partitionKey(),</span>
+                                                                  sstable,
+<span class="fc" id="L832">                                                                  clusteringIndexFilter(),</span>
+<span class="fc" id="L833">                                                                  columnFilter(),</span>
+<span class="fc" id="L834">                                                                  isForThrift(),</span>
+<span class="fc" id="L835">                                                                  nowInSec(),</span>
+                                                                  applyThriftTransformation,
+                                                                  listener);
+
+    }
+
+    /**
+     * Return a wrapped iterator that when closed will update the sstables iterated and READ sample metrics.
+     * Note that we cannot use the Transformations framework because they greedily get the static row, which
+     * would cause all iterators to be initialized and hence all sstables to be accessed.
+     */
+    private UnfilteredRowIterator withSSTablesIterated(List&lt;UnfilteredRowIterator&gt; iterators,
+                                                       TableMetrics metrics,
+                                                       SSTableReadMetricsCollector metricsCollector)
+    {
+        @SuppressWarnings(&quot;resource&quot;) //  Closed through the closing of the result of the caller method.
+<span class="fc" id="L851">        UnfilteredRowIterator merged = UnfilteredRowIterators.merge(iterators, nowInSec());</span>
+
+<span class="fc bfc" id="L853" title="All 2 branches covered.">        if (!merged.isEmpty())</span>
+        {
+<span class="fc" id="L855">            DecoratedKey key = merged.partitionKey();</span>
+<span class="fc" id="L856">            metrics.samplers.get(TableMetrics.Sampler.READS).addSample(key.getKey(), key.hashCode(), 1);</span>
+        }
+
+<span class="fc" id="L859">        class UpdateSstablesIterated extends Transformation</span>
+        {
+           public void onPartitionClose()
+           {
+<span class="fc" id="L863">               int mergedSSTablesIterated = metricsCollector.getMergedSSTables();</span>
+<span class="fc" id="L864">               metrics.updateSSTableIterated(mergedSSTablesIterated);</span>
+<span class="fc" id="L865">               Tracing.trace(&quot;Merged data from memtables and {} sstables&quot;, mergedSSTablesIterated);</span>
+<span class="fc" id="L866">           }</span>
+        };
+<span class="fc" id="L868">        return Transformation.apply(merged, new UpdateSstablesIterated());</span>
+    }
+
+    private boolean queriesMulticellType()
+    {
+<span class="fc bfc" id="L873" title="All 2 branches covered.">        for (ColumnDefinition column : columnFilter().fetchedColumns())</span>
+        {
+<span class="pc bpc" id="L875" title="1 of 4 branches missed.">            if (column.type.isMultiCell() || column.type.isCounter())</span>
+<span class="fc" id="L876">                return true;</span>
+<span class="fc" id="L877">        }</span>
+<span class="fc" id="L878">        return false;</span>
+    }
+
+    /**
+     * Do a read by querying the memtable(s) first, and then each relevant sstables sequentially by order of the sstable
+     * max timestamp.
+     *
+     * This is used for names query in the hope of only having to query the 1 or 2 most recent query and then knowing nothing
+     * more recent could be in the older sstables (which we can only guarantee if we know exactly which row we queries, and if
+     * no collection or counters are included).
+     * This method assumes the filter is a {@code ClusteringIndexNamesFilter}.
+     */
+    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ClusteringIndexNamesFilter filter)
+    {
+<span class="fc" id="L892">        Tracing.trace(&quot;Acquiring sstable references&quot;);</span>
+<span class="fc" id="L893">        ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));</span>
+
+<span class="fc" id="L895">        ImmutableBTreePartition result = null;</span>
+
+<span class="fc" id="L897">        Tracing.trace(&quot;Merging memtable contents&quot;);</span>
+<span class="fc bfc" id="L898" title="All 2 branches covered.">        for (Memtable memtable : view.memtables)</span>
+        {
+<span class="fc" id="L900">            Partition partition = memtable.getPartition(partitionKey());</span>
+<span class="pc bpc" id="L901" title="1 of 2 branches missed.">            if (partition == null)</span>
+<span class="fc" id="L902">                continue;</span>
+
+<span class="nc" id="L904">            try (UnfilteredRowIterator iter = filter.getUnfilteredRowIterator(columnFilter(), partition))</span>
+            {
+<span class="nc bnc" id="L906" title="All 2 branches missed.">                if (iter.isEmpty())</span>
+                    continue;
+
+<span class="nc" id="L909">                result = add(</span>
+<span class="nc bnc" id="L910" title="All 2 branches missed.">                    RTBoundValidator.validate(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter, RTBoundValidator.Stage.MEMTABLE, false),</span>
+                    result,
+                    filter,
+                    false
+                );
+            }
+<span class="nc" id="L916">        }</span>
+
+        /* add the SSTables on disk */
+<span class="fc" id="L919">        Collections.sort(view.sstables, SSTableReader.maxTimestampDescending);</span>
+<span class="fc" id="L920">        boolean onlyUnrepaired = true;</span>
+        // read sorted sstables
+<span class="fc" id="L922">        SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();</span>
+<span class="fc bfc" id="L923" title="All 2 branches covered.">        for (SSTableReader sstable : view.sstables)</span>
+        {
+            // if we've already seen a partition tombstone with a timestamp greater
+            // than the most recent update to this sstable, we're done, since the rest of the sstables
+            // will also be older
+<span class="pc bpc" id="L928" title="3 of 4 branches missed.">            if (result != null &amp;&amp; sstable.getMaxTimestamp() &lt; result.partitionLevelDeletion().markedForDeleteAt())</span>
+<span class="nc" id="L929">                break;</span>
+
+<span class="fc" id="L931">            long currentMaxTs = sstable.getMaxTimestamp();</span>
+<span class="fc" id="L932">            filter = reduceFilter(filter, result, currentMaxTs);</span>
+<span class="pc bpc" id="L933" title="1 of 2 branches missed.">            if (filter == null)</span>
+<span class="nc" id="L934">                break;</span>
+
+<span class="pc bpc" id="L936" title="1 of 2 branches missed.">            if (!shouldInclude(sstable))</span>
+            {
+                // This mean that nothing queried by the filter can be in the sstable. One exception is the top-level partition deletion
+                // however: if it is set, it impacts everything and must be included. Getting that top-level partition deletion costs us
+                // some seek in general however (unless the partition is indexed and is in the key cache), so we first check if the sstable
+                // has any tombstone at all as a shortcut.
+<span class="nc bnc" id="L942" title="All 2 branches missed.">                if (!sstable.mayHaveTombstones())</span>
+<span class="nc" id="L943">                    continue; // no tombstone at all, we can skip that sstable</span>
+
+                // We need to get the partition deletion and include it if it's live. In any case though, we're done with that sstable.
+<span class="nc" id="L946">                try (UnfilteredRowIterator iter = StorageHook.instance.makeRowIterator(cfs,</span>
+                                                                                       sstable,
+<span class="nc" id="L948">                                                                                       partitionKey(),</span>
+<span class="nc" id="L949">                                                                                       filter.getSlices(metadata()),</span>
+<span class="nc" id="L950">                                                                                       columnFilter(),</span>
+<span class="nc" id="L951">                                                                                       filter.isReversed(),</span>
+<span class="nc" id="L952">                                                                                       isForThrift(),</span>
+                                                                                       metricsCollector))
+                {
+<span class="nc bnc" id="L955" title="All 2 branches missed.">                    if (!iter.partitionLevelDeletion().isLive())</span>
+                    {
+<span class="nc" id="L957">                        result = add(</span>
+<span class="nc" id="L958">                            UnfilteredRowIterators.noRowsIterator(iter.metadata(),</span>
+<span class="nc" id="L959">                                                                  iter.partitionKey(),</span>
+                                                                  Rows.EMPTY_STATIC_ROW,
+<span class="nc" id="L961">                                                                  iter.partitionLevelDeletion(),</span>
+<span class="nc" id="L962">                                                                  filter.isReversed()),</span>
+                            result,
+                            filter,
+<span class="nc" id="L965">                            sstable.isRepaired()</span>
+                        );
+                    }
+                    else
+                    {
+<span class="nc" id="L970">                        result = add(</span>
+<span class="nc" id="L971">                            RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false),</span>
+                            result,
+                            filter,
+<span class="nc" id="L974">                            sstable.isRepaired()</span>
+                        );
+                    }
+                }
+
+<span class="nc" id="L979">                continue;</span>
+            }
+
+<span class="fc" id="L982">            try (UnfilteredRowIterator iter = StorageHook.instance.makeRowIterator(cfs,</span>
+                                                                                   sstable,
+<span class="fc" id="L984">                                                                                   partitionKey(),</span>
+<span class="fc" id="L985">                                                                                   filter.getSlices(metadata()),</span>
+<span class="fc" id="L986">                                                                                   columnFilter(),</span>
+<span class="fc" id="L987">                                                                                   filter.isReversed(),</span>
+<span class="fc" id="L988">                                                                                   isForThrift(),</span>
+                                                                                   metricsCollector))
+            {
+<span class="pc bpc" id="L991" title="1 of 2 branches missed.">                if (iter.isEmpty())</span>
+                    continue;
+
+<span class="pc bpc" id="L994" title="1 of 2 branches missed.">                if (sstable.isRepaired())</span>
+<span class="nc" id="L995">                    onlyUnrepaired = false;</span>
+
+<span class="fc" id="L997">                result = add(</span>
+<span class="pc bpc" id="L998" title="1 of 2 branches missed.">                    RTBoundValidator.validate(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter, RTBoundValidator.Stage.SSTABLE, false),</span>
+                    result,
+                    filter,
+<span class="fc" id="L1001">                    sstable.isRepaired()</span>
+                );
+            }
+<span class="fc" id="L1004">        }</span>
+
+<span class="fc" id="L1006">        cfs.metric.updateSSTableIterated(metricsCollector.getMergedSSTables());</span>
+
+<span class="pc bpc" id="L1008" title="1 of 4 branches missed.">        if (result == null || result.isEmpty())</span>
+<span class="fc" id="L1009">            return EmptyIterators.unfilteredRow(metadata(), partitionKey(), false);</span>
+
+<span class="fc" id="L1011">        DecoratedKey key = result.partitionKey();</span>
+<span class="fc" id="L1012">        cfs.metric.samplers.get(TableMetrics.Sampler.READS).addSample(key.getKey(), key.hashCode(), 1);</span>
+<span class="fc" id="L1013">        StorageHook.instance.reportRead(cfs.metadata.cfId, partitionKey());</span>
+
+        // &quot;hoist up&quot; the requested data into a more recent sstable
+<span class="pc bpc" id="L1016" title="3 of 4 branches missed.">        if (metricsCollector.getMergedSSTables() &gt; cfs.getMinimumCompactionThreshold()</span>
+            &amp;&amp; onlyUnrepaired
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">            &amp;&amp; !cfs.isAutoCompactionDisabled()</span>
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">            &amp;&amp; cfs.getCompactionStrategyManager().shouldDefragment())</span>
+        {
+            // !!WARNING!!   if we stop copying our data to a heap-managed object,
+            //               we will need to track the lifetime of this mutation as well
+<span class="nc" id="L1023">            Tracing.trace(&quot;Defragmenting requested data&quot;);</span>
+
+<span class="nc" id="L1025">            try (UnfilteredRowIterator iter = result.unfilteredIterator(columnFilter(), Slices.ALL, false))</span>
+            {
+<span class="nc" id="L1027">                final Mutation mutation = new Mutation(PartitionUpdate.fromIterator(iter, columnFilter()));</span>
+<span class="nc" id="L1028">                StageManager.getStage(Stage.MUTATION).execute(() -&gt; {</span>
+                    // skipping commitlog and index updates is fine since we're just de-fragmenting existing data
+<span class="nc" id="L1030">                    Keyspace.open(mutation.getKeyspaceName()).apply(mutation, false, false);</span>
+<span class="nc" id="L1031">                });</span>
+            }
+        }
+
+<span class="fc" id="L1035">        return result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed());</span>
+    }
+
+    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired)
+    {
+<span class="pc bpc" id="L1040" title="1 of 2 branches missed.">        if (!isRepaired)</span>
+<span class="fc" id="L1041">            oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.stats().minLocalDeletionTime);</span>
+
+<span class="fc" id="L1043">        int maxRows = Math.max(filter.requestedRows().size(), 1);</span>
+<span class="pc bpc" id="L1044" title="1 of 2 branches missed.">        if (result == null)</span>
+<span class="fc" id="L1045">            return ImmutableBTreePartition.create(iter, maxRows);</span>
+
+<span class="nc" id="L1047">        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(columnFilter(), Slices.ALL, filter.isReversed())), nowInSec()))</span>
+        {
+<span class="nc" id="L1049">            return ImmutableBTreePartition.create(merged, maxRows);</span>
+        }
+    }
+
+    private ClusteringIndexNamesFilter reduceFilter(ClusteringIndexNamesFilter filter, Partition result, long sstableTimestamp)
+    {
+<span class="pc bpc" id="L1055" title="1 of 2 branches missed.">        if (result == null)</span>
+<span class="fc" id="L1056">            return filter;</span>
+
+<span class="nc" id="L1058">        SearchIterator&lt;Clustering, Row&gt; searchIter = result.searchIterator(columnFilter(), false);</span>
+
+<span class="nc" id="L1060">        PartitionColumns columns = columnFilter().fetchedColumns();</span>
+<span class="nc" id="L1061">        NavigableSet&lt;Clustering&gt; clusterings = filter.requestedRows();</span>
+
+        // We want to remove rows for which we have values for all requested columns. We have to deal with both static and regular rows.
+        // TODO: we could also remove a selected column if we've found values for every requested row but we'll leave
+        // that for later.
+
+<span class="nc" id="L1067">        boolean removeStatic = false;</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">        if (!columns.statics.isEmpty())</span>
+        {
+<span class="nc" id="L1070">            Row staticRow = searchIter.next(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc bnc" id="L1071" title="All 4 branches missed.">            removeStatic = staticRow != null &amp;&amp; canRemoveRow(staticRow, columns.statics, sstableTimestamp);</span>
+        }
+
+<span class="nc" id="L1074">        NavigableSet&lt;Clustering&gt; toRemove = null;</span>
+<span class="nc bnc" id="L1075" title="All 2 branches missed.">        for (Clustering clustering : clusterings)</span>
+        {
+<span class="nc" id="L1077">            Row row = searchIter.next(clustering);</span>
+<span class="nc bnc" id="L1078" title="All 4 branches missed.">            if (row == null || !canRemoveRow(row, columns.regulars, sstableTimestamp))</span>
+<span class="nc" id="L1079">                continue;</span>
+
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">            if (toRemove == null)</span>
+<span class="nc" id="L1082">                toRemove = new TreeSet&lt;&gt;(result.metadata().comparator);</span>
+<span class="nc" id="L1083">            toRemove.add(clustering);</span>
+<span class="nc" id="L1084">        }</span>
+
+<span class="nc bnc" id="L1086" title="All 4 branches missed.">        if (!removeStatic &amp;&amp; toRemove == null)</span>
+<span class="nc" id="L1087">            return filter;</span>
+
+        // Check if we have everything we need
+<span class="nc bnc" id="L1090" title="All 4 branches missed.">        boolean hasNoMoreStatic = columns.statics.isEmpty() || removeStatic;</span>
+<span class="nc bnc" id="L1091" title="All 6 branches missed.">        boolean hasNoMoreClusterings = clusterings.isEmpty() || (toRemove != null &amp;&amp; toRemove.size() == clusterings.size());</span>
+<span class="nc bnc" id="L1092" title="All 4 branches missed.">        if (hasNoMoreStatic &amp;&amp; hasNoMoreClusterings)</span>
+<span class="nc" id="L1093">            return null;</span>
+
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        if (toRemove != null)</span>
+        {
+<span class="nc" id="L1097">            BTreeSet.Builder&lt;Clustering&gt; newClusterings = BTreeSet.builder(result.metadata().comparator);</span>
+<span class="nc" id="L1098">            newClusterings.addAll(Sets.difference(clusterings, toRemove));</span>
+<span class="nc" id="L1099">            clusterings = newClusterings.build();</span>
+        }
+<span class="nc" id="L1101">        return new ClusteringIndexNamesFilter(clusterings, filter.isReversed());</span>
+    }
+
+    private boolean canRemoveRow(Row row, Columns requestedColumns, long sstableTimestamp)
+    {
+        // We can remove a row if it has data that is more recent that the next sstable to consider for the data that the query
+        // cares about. And the data we care about is 1) the row timestamp (since every query cares if the row exists or not)
+        // and 2) the requested columns.
+<span class="nc bnc" id="L1109" title="All 4 branches missed.">        if (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() &lt;= sstableTimestamp)</span>
+<span class="nc" id="L1110">            return false;</span>
+
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">        for (ColumnDefinition column : requestedColumns)</span>
+        {
+<span class="nc" id="L1114">            Cell cell = row.getCell(column);</span>
+<span class="nc bnc" id="L1115" title="All 4 branches missed.">            if (cell == null || cell.timestamp() &lt;= sstableTimestamp)</span>
+<span class="nc" id="L1116">                return false;</span>
+<span class="nc" id="L1117">        }</span>
+<span class="nc" id="L1118">        return true;</span>
+    }
+
+    @Override
+    public boolean selectsFullPartition()
+    {
+<span class="pc bpc" id="L1124" title="1 of 2 branches missed.">        return metadata().isStaticCompactTable() ||</span>
+<span class="pc bpc" id="L1125" title="1 of 4 branches missed.">               (clusteringIndexFilter.selectsAllPartition() &amp;&amp; !rowFilter().hasExpressionOnClusteringOrRegularColumns());</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L1131">        return String.format(&quot;Read(%s.%s columns=%s rowFilter=%s limits=%s key=%s filter=%s, nowInSec=%d)&quot;,</span>
+<span class="nc" id="L1132">                             metadata().ksName,</span>
+<span class="nc" id="L1133">                             metadata().cfName,</span>
+<span class="nc" id="L1134">                             columnFilter(),</span>
+<span class="nc" id="L1135">                             rowFilter(),</span>
+<span class="nc" id="L1136">                             limits(),</span>
+<span class="nc" id="L1137">                             metadata().getKeyValidator().getString(partitionKey().getKey()),</span>
+<span class="nc" id="L1138">                             clusteringIndexFilter.toString(metadata()),</span>
+<span class="nc" id="L1139">                             nowInSec());</span>
+    }
+
+    public MessageOut&lt;ReadCommand&gt; createMessage(int version)
+    {
+<span class="fc" id="L1144">        return new MessageOut&lt;&gt;(MessagingService.Verb.READ, this, readSerializer);</span>
+    }
+
+    protected void appendCQLWhereClause(StringBuilder sb)
+    {
+<span class="nc" id="L1149">        sb.append(&quot; WHERE &quot;);</span>
+
+<span class="nc" id="L1151">        sb.append(ColumnDefinition.toCQLString(metadata().partitionKeyColumns())).append(&quot; = &quot;);</span>
+<span class="nc" id="L1152">        DataRange.appendKeyString(sb, metadata().getKeyValidator(), partitionKey().getKey());</span>
+
+        // We put the row filter first because the clustering index filter can end by &quot;ORDER BY&quot;
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">        if (!rowFilter().isEmpty())</span>
+<span class="nc" id="L1156">            sb.append(&quot; AND &quot;).append(rowFilter());</span>
+
+<span class="nc" id="L1158">        String filterString = clusteringIndexFilter().toCQLString(metadata());</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">        if (!filterString.isEmpty())</span>
+<span class="nc" id="L1160">            sb.append(&quot; AND &quot;).append(filterString);</span>
+<span class="nc" id="L1161">    }</span>
+
+    protected void serializeSelection(DataOutputPlus out, int version) throws IOException
+    {
+<span class="fc" id="L1165">        metadata().getKeyValidator().writeValue(partitionKey().getKey(), out);</span>
+<span class="fc" id="L1166">        ClusteringIndexFilter.serializer.serialize(clusteringIndexFilter(), out, version);</span>
+<span class="fc" id="L1167">    }</span>
+
+    protected long selectionSerializedSize(int version)
+    {
+<span class="fc" id="L1171">        return metadata().getKeyValidator().writtenLength(partitionKey().getKey())</span>
+<span class="fc" id="L1172">             + ClusteringIndexFilter.serializer.serializedSize(clusteringIndexFilter(), version);</span>
+    }
+
+    public boolean isLimitedToOnePartition()
+    {
+<span class="nc" id="L1177">        return true;</span>
+    }
+
+    /**
+     * Groups multiple single partition read commands.
+     */
+<span class="pc bpc" id="L1183" title="1 of 2 branches missed.">    public static class Group implements ReadQuery</span>
+    {
+        public final List&lt;SinglePartitionReadCommand&gt; commands;
+        private final DataLimits limits;
+        private final int nowInSec;
+        private final boolean selectsFullPartitions;
+
+        public Group(List&lt;SinglePartitionReadCommand&gt; commands, DataLimits limits)
+<span class="fc" id="L1191">        {</span>
+<span class="pc bpc" id="L1192" title="2 of 4 branches missed.">            assert !commands.isEmpty();</span>
+<span class="fc" id="L1193">            this.commands = commands;</span>
+<span class="fc" id="L1194">            this.limits = limits;</span>
+<span class="fc" id="L1195">            SinglePartitionReadCommand firstCommand = commands.get(0);</span>
+<span class="fc" id="L1196">            this.nowInSec = firstCommand.nowInSec();</span>
+<span class="fc" id="L1197">            this.selectsFullPartitions = firstCommand.selectsFullPartition();</span>
+<span class="fc bfc" id="L1198" title="All 2 branches covered.">            for (int i = 1; i &lt; commands.size(); i++)</span>
+<span class="pc bpc" id="L1199" title="2 of 4 branches missed.">                assert commands.get(i).nowInSec() == nowInSec;</span>
+<span class="fc" id="L1200">        }</span>
+
+        public static Group one(SinglePartitionReadCommand command)
+        {
+<span class="nc" id="L1204">            return new Group(Collections.singletonList(command), command.limits());</span>
+        }
+
+        public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+        {
+<span class="fc" id="L1209">            return StorageProxy.read(this, consistency, clientState, queryStartNanoTime);</span>
+        }
+
+        public int nowInSec()
+        {
+<span class="nc" id="L1214">            return nowInSec;</span>
+        }
+
+        public DataLimits limits()
+        {
+<span class="nc" id="L1219">            return limits;</span>
+        }
+
+        public CFMetaData metadata()
+        {
+<span class="nc" id="L1224">            return commands.get(0).metadata();</span>
+        }
+
+        @Override
+        public boolean selectsFullPartition()
+        {
+<span class="nc" id="L1230">            return selectsFullPartitions;</span>
+        }
+
+        public ReadExecutionController executionController()
+        {
+            // Note that the only difference between the command in a group must be the partition key on which
+            // they applied. So as far as ReadOrderGroup is concerned, we can use any of the commands to start one.
+<span class="fc" id="L1237">            return commands.get(0).executionController();</span>
+        }
+
+        public PartitionIterator executeInternal(ReadExecutionController controller)
+        {
+            // Note that the only difference between the command in a group must be the partition key on which
+            // they applied.
+<span class="fc" id="L1244">            boolean enforceStrictLiveness = commands.get(0).metadata().enforceStrictLiveness();</span>
+<span class="fc" id="L1245">            return limits.filter(UnfilteredPartitionIterators.filter(executeLocally(controller, false), nowInSec),</span>
+                                 nowInSec,
+                                 selectsFullPartitions,
+                                 enforceStrictLiveness);
+        }
+
+        public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
+        {
+<span class="nc" id="L1253">            return executeLocally(executionController, true);</span>
+        }
+
+        /**
+         * Implementation of {@link ReadQuery#executeLocally(ReadExecutionController)}.
+         *
+         * @param executionController - the {@code ReadExecutionController} protecting the read.
+         * @param sort - whether to sort the inner commands by partition key, required for merging the iterator
+         *               later on. This will be false when called by {@link ReadQuery#executeInternal(ReadExecutionController)}
+         *               because in this case it is safe to do so as there is no merging involved and we don't want to
+         *               change the old behavior which was to not sort by partition.
+         *
+         * @return - the iterator that can be used to retrieve the query result.
+         */
+        private UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController, boolean sort)
+        {
+<span class="fc" id="L1269">            List&lt;Pair&lt;DecoratedKey, UnfilteredPartitionIterator&gt;&gt; partitions = new ArrayList&lt;&gt;(commands.size());</span>
+<span class="fc bfc" id="L1270" title="All 2 branches covered.">            for (SinglePartitionReadCommand cmd : commands)</span>
+<span class="fc" id="L1271">                partitions.add(Pair.of(cmd.partitionKey, cmd.executeLocally(executionController)));</span>
+
+<span class="pc bpc" id="L1273" title="1 of 2 branches missed.">            if (sort)</span>
+<span class="nc" id="L1274">                Collections.sort(partitions, (p1, p2) -&gt; p1.getLeft().compareTo(p2.getLeft()));</span>
+
+<span class="fc" id="L1276">            return UnfilteredPartitionIterators.concat(partitions.stream().map(p -&gt; p.getRight()).collect(Collectors.toList()));</span>
+        }
+
+        public QueryPager getPager(PagingState pagingState, ProtocolVersion protocolVersion)
+        {
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">            if (commands.size() == 1)</span>
+<span class="nc" id="L1282">                return SinglePartitionReadCommand.getPager(commands.get(0), pagingState, protocolVersion);</span>
+
+<span class="nc" id="L1284">            return new MultiPartitionPager(this, pagingState, protocolVersion);</span>
+        }
+
+        public boolean selectsKey(DecoratedKey key)
+        {
+<span class="nc" id="L1289">            return Iterables.any(commands, c -&gt; c.selectsKey(key));</span>
+        }
+
+        public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+        {
+<span class="nc" id="L1294">            return Iterables.any(commands, c -&gt; c.selectsClustering(key, clustering));</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1300">            return commands.toString();</span>
+        }
+    }
+
+    private static class Deserializer extends SelectionDeserializer
+    {
+        public ReadCommand deserialize(DataInputPlus in,
+                                       int version,
+                                       boolean isDigest,
+                                       int digestVersion,
+                                       boolean isForThrift,
+                                       CFMetaData metadata,
+                                       int nowInSec,
+                                       ColumnFilter columnFilter,
+                                       RowFilter rowFilter,
+                                       DataLimits limits,
+                                       IndexMetadata index)
+        throws IOException
+        {
+<span class="fc" id="L1319">            DecoratedKey key = metadata.decorateKey(metadata.getKeyValidator().readValue(in, DatabaseDescriptor.getMaxValueSize()));</span>
+<span class="fc" id="L1320">            ClusteringIndexFilter filter = ClusteringIndexFilter.serializer.deserialize(in, version, metadata);</span>
+<span class="fc" id="L1321">            return new SinglePartitionReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, key, filter, index);</span>
+        }
+    }
+
+    /**
+     * {@code SSTableReaderListener} used to collect metrics about SSTable read access.
+     */
+    private static final class SSTableReadMetricsCollector implements SSTableReadsListener
+    {
+        /**
+         * The number of SSTables that need to be merged. This counter is only updated for single partition queries
+         * since this has been the behavior so far.
+         */
+        private int mergedSSTables;
+
+        @Override
+        public void onSSTableSelected(SSTableReader sstable, RowIndexEntry&lt;?&gt; indexEntry, SelectionReason reason)
+        {
+<span class="fc" id="L1339">            sstable.incrementReadCount();</span>
+<span class="fc" id="L1340">            mergedSSTables++;</span>
+<span class="fc" id="L1341">        }</span>
+
+        /**
+         * Returns the number of SSTables that need to be merged.
+         * @return the number of SSTables that need to be merged.
+         */
+        public int getMergedSSTables()
+        {
+<span class="fc" id="L1349">            return mergedSSTables;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

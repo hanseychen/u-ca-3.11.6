@@ -1,0 +1,572 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RewindableDataInputStreamPlus.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">RewindableDataInputStreamPlus.java</span></div><h1>RewindableDataInputStreamPlus.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.io.util;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+import static org.apache.cassandra.utils.Throwables.merge;
+
+/**
+ * Adds mark/reset functionality to another input stream by caching read bytes to a memory buffer and
+ * spilling to disk if necessary.
+ *
+ * When the stream is marked via {@link #mark()} or {@link #mark(int)}, up to
+ * &lt;code&gt;maxMemBufferSize&lt;/code&gt; will be cached in memory (heap). If more than
+ * &lt;code&gt;maxMemBufferSize&lt;/code&gt; bytes are read while the stream is marked, the
+ * following bytes are cached on the &lt;code&gt;spillFile&lt;/code&gt; for up to &lt;code&gt;maxDiskBufferSize&lt;/code&gt;.
+ *
+ * Please note that successive calls to {@link #mark()} and {@link #reset()} will write
+ * sequentially to the same &lt;code&gt;spillFile&lt;/code&gt; until &lt;code&gt;maxDiskBufferSize&lt;/code&gt; is reached.
+ * At this point, if less than &lt;code&gt;maxDiskBufferSize&lt;/code&gt; bytes are currently cached on the
+ * &lt;code&gt;spillFile&lt;/code&gt;, the remaining bytes are written to the beginning of the file,
+ * treating the &lt;code&gt;spillFile&lt;/code&gt; as a circular buffer.
+ *
+ * If more than &lt;code&gt;maxMemBufferSize + maxDiskBufferSize&lt;/code&gt; are cached while the stream is marked,
+ * the following {@link #reset()} invocation will throw a {@link IllegalStateException}.
+ *
+ */
+public class RewindableDataInputStreamPlus extends FilterInputStream implements RewindableDataInput, Closeable
+{
+<span class="nc" id="L53">    private boolean marked = false;</span>
+<span class="nc" id="L54">    private boolean exhausted = false;</span>
+<span class="nc" id="L55">    private AtomicBoolean closed = new AtomicBoolean(false);</span>
+
+<span class="nc" id="L57">    protected int memAvailable = 0;</span>
+<span class="nc" id="L58">    protected int diskTailAvailable = 0;</span>
+<span class="nc" id="L59">    protected int diskHeadAvailable = 0;</span>
+
+    private final File spillFile;
+    private final int initialMemBufferSize;
+    private final int maxMemBufferSize;
+    private final int maxDiskBufferSize;
+
+    private volatile byte memBuffer[];
+    private int memBufferSize;
+    private RandomAccessFile spillBuffer;
+
+    private final DataInputPlus dataReader;
+
+    public RewindableDataInputStreamPlus(InputStream in, int initialMemBufferSize, int maxMemBufferSize,
+                                         File spillFile, int maxDiskBufferSize)
+    {
+<span class="nc" id="L75">        super(in);</span>
+<span class="nc" id="L76">        dataReader = new DataInputStreamPlus(this);</span>
+<span class="nc" id="L77">        this.initialMemBufferSize = initialMemBufferSize;</span>
+<span class="nc" id="L78">        this.maxMemBufferSize = maxMemBufferSize;</span>
+<span class="nc" id="L79">        this.spillFile = spillFile;</span>
+<span class="nc" id="L80">        this.maxDiskBufferSize = maxDiskBufferSize;</span>
+<span class="nc" id="L81">    }</span>
+
+    /* RewindableDataInput methods */
+
+    /**
+     * Marks the current position of a stream to return to this position later via the {@link #reset(DataPosition)} method.
+     * @return An empty @link{DataPosition} object
+     */
+    public DataPosition mark()
+    {
+<span class="nc" id="L91">        mark(0);</span>
+<span class="nc" id="L92">        return new RewindableDataInputPlusMark();</span>
+    }
+
+    /**
+     * Rewinds to the previously marked position via the {@link #mark()} method.
+     * @param mark it's not possible to return to a custom position, so this parameter is ignored.
+     * @throws IOException if an error ocurs while resetting
+     */
+    public void reset(DataPosition mark) throws IOException
+    {
+<span class="nc" id="L102">        reset();</span>
+<span class="nc" id="L103">    }</span>
+
+    public long bytesPastMark(DataPosition mark)
+    {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        return maxMemBufferSize - memAvailable + (diskTailAvailable == -1? 0 : maxDiskBufferSize - diskHeadAvailable - diskTailAvailable);</span>
+    }
+
+
+<span class="nc" id="L111">    protected static class RewindableDataInputPlusMark implements DataPosition</span>
+    {
+    }
+
+    /* InputStream methods */
+
+    public boolean markSupported()
+    {
+<span class="nc" id="L119">        return true;</span>
+    }
+
+    /**
+     * Marks the current position of a stream to return to this position
+     * later via the {@link #reset()} method.
+     * @param readlimit the maximum amount of bytes to cache
+     */
+    public synchronized void mark(int readlimit)
+    {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (marked)</span>
+<span class="nc" id="L130">            throw new IllegalStateException(&quot;Cannot mark already marked stream.&quot;);</span>
+
+<span class="nc bnc" id="L132" title="All 6 branches missed.">        if (memAvailable &gt; 0 || diskHeadAvailable &gt; 0 || diskTailAvailable &gt; 0)</span>
+<span class="nc" id="L133">            throw new IllegalStateException(&quot;Can only mark stream after reading previously marked data.&quot;);</span>
+
+<span class="nc" id="L135">        marked = true;</span>
+<span class="nc" id="L136">        memAvailable = maxMemBufferSize;</span>
+<span class="nc" id="L137">        diskHeadAvailable = -1;</span>
+<span class="nc" id="L138">        diskTailAvailable = -1;</span>
+<span class="nc" id="L139">    }</span>
+
+    public synchronized void reset() throws IOException
+    {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (!marked)</span>
+<span class="nc" id="L144">            throw new IOException(&quot;Must call mark() before calling reset().&quot;);</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (exhausted)</span>
+<span class="nc" id="L147">            throw new IOException(String.format(&quot;Read more than capacity: %d bytes.&quot;, maxMemBufferSize + maxDiskBufferSize));</span>
+
+<span class="nc" id="L149">        memAvailable = maxMemBufferSize - memAvailable;</span>
+<span class="nc" id="L150">        memBufferSize = memAvailable;</span>
+
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (diskTailAvailable == -1)</span>
+        {
+<span class="nc" id="L154">            diskHeadAvailable = 0;</span>
+<span class="nc" id="L155">            diskTailAvailable = 0;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            int initialPos = diskTailAvailable &gt; 0 ? 0 : (int)getIfNotClosed(spillBuffer).getFilePointer();</span>
+<span class="nc" id="L160">            int diskMarkpos = initialPos + diskHeadAvailable;</span>
+<span class="nc" id="L161">            getIfNotClosed(spillBuffer).seek(diskMarkpos);</span>
+
+<span class="nc" id="L163">            diskHeadAvailable = diskMarkpos - diskHeadAvailable;</span>
+<span class="nc" id="L164">            diskTailAvailable = (maxDiskBufferSize - diskTailAvailable) - diskMarkpos;</span>
+        }
+
+<span class="nc" id="L167">        marked = false;</span>
+<span class="nc" id="L168">    }</span>
+
+    public int available() throws IOException
+    {
+
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        return super.available() + (marked? 0 : memAvailable + diskHeadAvailable + diskTailAvailable);</span>
+    }
+
+    public int read() throws IOException
+    {
+<span class="nc" id="L178">        int read = readOne();</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (read == -1)</span>
+<span class="nc" id="L180">            return read;</span>
+
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (marked)</span>
+        {
+            //mark exhausted
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            if (isExhausted(1))</span>
+            {
+<span class="nc" id="L187">                exhausted = true;</span>
+<span class="nc" id="L188">                return read;</span>
+            }
+
+<span class="nc" id="L191">            writeOne(read);</span>
+        }
+
+<span class="nc" id="L194">        return read;</span>
+    }
+
+    public int read(byte[] b, int off, int len) throws IOException
+    {
+<span class="nc" id="L199">        int readBytes = readMulti(b, off, len);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (readBytes == -1)</span>
+<span class="nc" id="L201">            return readBytes;</span>
+
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (marked)</span>
+        {
+            //check we have space on buffer
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (isExhausted(readBytes))</span>
+            {
+<span class="nc" id="L208">                exhausted = true;</span>
+<span class="nc" id="L209">                return readBytes;</span>
+            }
+
+<span class="nc" id="L212">            writeMulti(b, off, readBytes);</span>
+        }
+
+<span class="nc" id="L215">        return readBytes;</span>
+    }
+
+    private void maybeCreateDiskBuffer() throws IOException
+    {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (spillBuffer == null)</span>
+        {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (!spillFile.getParentFile().exists())</span>
+<span class="nc" id="L223">                spillFile.getParentFile().mkdirs();</span>
+<span class="nc" id="L224">            spillFile.createNewFile();</span>
+
+<span class="nc" id="L226">            this.spillBuffer = new RandomAccessFile(spillFile, &quot;rw&quot;);</span>
+        }
+<span class="nc" id="L228">    }</span>
+
+
+    private int readOne() throws IOException
+    {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (!marked)</span>
+        {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (memAvailable &gt; 0)</span>
+            {
+<span class="nc" id="L237">                int pos = memBufferSize - memAvailable;</span>
+<span class="nc" id="L238">                memAvailable--;</span>
+<span class="nc" id="L239">                return getIfNotClosed(memBuffer)[pos] &amp; 0xff;</span>
+            }
+
+<span class="nc bnc" id="L242" title="All 4 branches missed.">            if (diskTailAvailable &gt; 0 || diskHeadAvailable &gt; 0)</span>
+            {
+<span class="nc" id="L244">                int read = getIfNotClosed(spillBuffer).read();</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                if (diskTailAvailable &gt; 0)</span>
+<span class="nc" id="L246">                    diskTailAvailable--;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                else if (diskHeadAvailable &gt; 0)</span>
+<span class="nc" id="L248">                    diskHeadAvailable++;</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (diskTailAvailable == 0)</span>
+<span class="nc" id="L250">                    spillBuffer.seek(0);</span>
+<span class="nc" id="L251">                return read;</span>
+            }
+        }
+
+<span class="nc" id="L255">        return getIfNotClosed(in).read();</span>
+    }
+
+    private boolean isExhausted(int readBytes)
+    {
+<span class="nc bnc" id="L260" title="All 6 branches missed.">        return exhausted || readBytes &gt; memAvailable + (long)(diskTailAvailable == -1? maxDiskBufferSize : diskTailAvailable + diskHeadAvailable);</span>
+    }
+
+    private int readMulti(byte[] b, int off, int len) throws IOException
+    {
+<span class="nc" id="L265">        int readBytes = 0;</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (!marked)</span>
+        {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            if (memAvailable &gt; 0)</span>
+            {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                readBytes += memAvailable &lt; len ? memAvailable : len;</span>
+<span class="nc" id="L271">                int pos = memBufferSize - memAvailable;</span>
+<span class="nc" id="L272">                System.arraycopy(memBuffer, pos, b, off, readBytes);</span>
+<span class="nc" id="L273">                memAvailable -= readBytes;</span>
+<span class="nc" id="L274">                off += readBytes;</span>
+<span class="nc" id="L275">                len -= readBytes;</span>
+            }
+<span class="nc bnc" id="L277" title="All 4 branches missed.">            if (len &gt; 0 &amp;&amp; diskTailAvailable &gt; 0)</span>
+            {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                int readFromTail = diskTailAvailable &lt; len? diskTailAvailable : len;</span>
+<span class="nc" id="L280">                readFromTail = getIfNotClosed(spillBuffer).read(b, off, readFromTail);</span>
+<span class="nc" id="L281">                readBytes += readFromTail;</span>
+<span class="nc" id="L282">                diskTailAvailable -= readFromTail;</span>
+<span class="nc" id="L283">                off += readFromTail;</span>
+<span class="nc" id="L284">                len -= readFromTail;</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                if (diskTailAvailable == 0)</span>
+<span class="nc" id="L286">                    spillBuffer.seek(0);</span>
+            }
+<span class="nc bnc" id="L288" title="All 4 branches missed.">            if (len &gt; 0 &amp;&amp; diskHeadAvailable &gt; 0)</span>
+            {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                int readFromHead = diskHeadAvailable &lt; len? diskHeadAvailable : len;</span>
+<span class="nc" id="L291">                readFromHead = getIfNotClosed(spillBuffer).read(b, off, readFromHead);</span>
+<span class="nc" id="L292">                readBytes += readFromHead;</span>
+<span class="nc" id="L293">                diskHeadAvailable -= readFromHead;</span>
+<span class="nc" id="L294">                off += readFromHead;</span>
+<span class="nc" id="L295">                len -= readFromHead;</span>
+            }
+        }
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (len &gt; 0)</span>
+<span class="nc" id="L300">            readBytes += getIfNotClosed(in).read(b, off, len);</span>
+
+<span class="nc" id="L302">        return readBytes;</span>
+    }
+
+    private void writeMulti(byte[] b, int off, int len) throws IOException
+    {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (memAvailable &gt; 0)</span>
+        {
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (memBuffer == null)</span>
+<span class="nc" id="L310">                memBuffer = new byte[initialMemBufferSize];</span>
+<span class="nc" id="L311">            int pos = maxMemBufferSize - memAvailable;</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            int memWritten = memAvailable &lt; len? memAvailable : len;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (pos + memWritten &gt;= getIfNotClosed(memBuffer).length)</span>
+<span class="nc" id="L314">                growMemBuffer(pos, memWritten);</span>
+<span class="nc" id="L315">            System.arraycopy(b, off, memBuffer, pos, memWritten);</span>
+<span class="nc" id="L316">            off += memWritten;</span>
+<span class="nc" id="L317">            len -= memWritten;</span>
+<span class="nc" id="L318">            memAvailable -= memWritten;</span>
+        }
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (len &gt; 0)</span>
+        {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (diskTailAvailable == -1)</span>
+            {
+<span class="nc" id="L325">                maybeCreateDiskBuffer();</span>
+<span class="nc" id="L326">                diskHeadAvailable = (int)spillBuffer.getFilePointer();</span>
+<span class="nc" id="L327">                diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;</span>
+            }
+
+<span class="nc bnc" id="L330" title="All 4 branches missed.">            if (len &gt; 0 &amp;&amp; diskTailAvailable &gt; 0)</span>
+            {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                int diskTailWritten = diskTailAvailable &lt; len? diskTailAvailable : len;</span>
+<span class="nc" id="L333">                getIfNotClosed(spillBuffer).write(b, off, diskTailWritten);</span>
+<span class="nc" id="L334">                off += diskTailWritten;</span>
+<span class="nc" id="L335">                len -= diskTailWritten;</span>
+<span class="nc" id="L336">                diskTailAvailable -= diskTailWritten;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (diskTailAvailable == 0)</span>
+<span class="nc" id="L338">                    spillBuffer.seek(0);</span>
+            }
+
+<span class="nc bnc" id="L341" title="All 4 branches missed.">            if (len &gt; 0 &amp;&amp; diskTailAvailable &gt; 0)</span>
+            {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                int diskHeadWritten = diskHeadAvailable &lt; len? diskHeadAvailable : len;</span>
+<span class="nc" id="L344">                getIfNotClosed(spillBuffer).write(b, off, diskHeadWritten);</span>
+            }
+        }
+<span class="nc" id="L347">    }</span>
+
+    private void writeOne(int value) throws IOException
+    {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (memAvailable &gt; 0)</span>
+        {
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (memBuffer == null)</span>
+<span class="nc" id="L354">                memBuffer = new byte[initialMemBufferSize];</span>
+<span class="nc" id="L355">            int pos = maxMemBufferSize - memAvailable;</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if (pos == getIfNotClosed(memBuffer).length)</span>
+<span class="nc" id="L357">                growMemBuffer(pos, 1);</span>
+<span class="nc" id="L358">            getIfNotClosed(memBuffer)[pos] = (byte)value;</span>
+<span class="nc" id="L359">            memAvailable--;</span>
+<span class="nc" id="L360">            return;</span>
+        }
+
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (diskTailAvailable == -1)</span>
+        {
+<span class="nc" id="L365">            maybeCreateDiskBuffer();</span>
+<span class="nc" id="L366">            diskHeadAvailable = (int)spillBuffer.getFilePointer();</span>
+<span class="nc" id="L367">            diskTailAvailable = maxDiskBufferSize - diskHeadAvailable;</span>
+        }
+
+<span class="nc bnc" id="L370" title="All 4 branches missed.">        if (diskTailAvailable &gt; 0 || diskHeadAvailable &gt; 0)</span>
+        {
+<span class="nc" id="L372">            getIfNotClosed(spillBuffer).write(value);</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            if (diskTailAvailable &gt; 0)</span>
+<span class="nc" id="L374">                diskTailAvailable--;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            else if (diskHeadAvailable &gt; 0)</span>
+<span class="nc" id="L376">                diskHeadAvailable--;</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (diskTailAvailable == 0)</span>
+<span class="nc" id="L378">                spillBuffer.seek(0);</span>
+<span class="nc" id="L379">            return;</span>
+        }
+<span class="nc" id="L381">    }</span>
+
+    public int read(byte[] b) throws IOException
+    {
+<span class="nc" id="L385">        return read(b, 0, b.length);</span>
+    }
+
+    private void growMemBuffer(int pos, int writeSize)
+    {
+<span class="nc" id="L390">        int newSize = Math.min(2 * (pos + writeSize), maxMemBufferSize);</span>
+<span class="nc" id="L391">        byte newBuffer[] = new byte[newSize];</span>
+<span class="nc" id="L392">        System.arraycopy(memBuffer, 0, newBuffer, 0, pos);</span>
+<span class="nc" id="L393">        memBuffer = newBuffer;</span>
+<span class="nc" id="L394">    }</span>
+
+    public long skip(long n) throws IOException
+    {
+<span class="nc" id="L398">        long skipped = 0;</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (marked)</span>
+        {
+            //if marked, we need to cache skipped bytes
+<span class="nc bnc" id="L403" title="All 4 branches missed.">            while (n-- &gt; 0 &amp;&amp; read() != -1)</span>
+            {
+<span class="nc" id="L405">                skipped++;</span>
+            }
+<span class="nc" id="L407">            return skipped;</span>
+        }
+
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (memAvailable &gt; 0)</span>
+        {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">            skipped += memAvailable &lt; n ? memAvailable : n;</span>
+<span class="nc" id="L413">            memAvailable -= skipped;</span>
+<span class="nc" id="L414">            n -= skipped;</span>
+        }
+<span class="nc bnc" id="L416" title="All 4 branches missed.">        if (n &gt; 0 &amp;&amp; diskTailAvailable &gt; 0)</span>
+        {
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            int skipFromTail = diskTailAvailable &lt; n? diskTailAvailable : (int)n;</span>
+<span class="nc" id="L419">            getIfNotClosed(spillBuffer).skipBytes(skipFromTail);</span>
+<span class="nc" id="L420">            diskTailAvailable -= skipFromTail;</span>
+<span class="nc" id="L421">            skipped += skipFromTail;</span>
+<span class="nc" id="L422">            n -= skipFromTail;</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (diskTailAvailable == 0)</span>
+<span class="nc" id="L424">                spillBuffer.seek(0);</span>
+        }
+<span class="nc bnc" id="L426" title="All 4 branches missed.">        if (n &gt; 0 &amp;&amp; diskHeadAvailable &gt; 0)</span>
+        {
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            int skipFromHead = diskHeadAvailable &lt; n? diskHeadAvailable : (int)n;</span>
+<span class="nc" id="L429">            getIfNotClosed(spillBuffer).skipBytes(skipFromHead);</span>
+<span class="nc" id="L430">            diskHeadAvailable -= skipFromHead;</span>
+<span class="nc" id="L431">            skipped += skipFromHead;</span>
+<span class="nc" id="L432">            n -= skipFromHead;</span>
+        }
+
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if (n &gt; 0)</span>
+<span class="nc" id="L436">            skipped += getIfNotClosed(in).skip(n);</span>
+
+<span class="nc" id="L438">        return skipped;</span>
+    }
+
+    private &lt;T&gt; T getIfNotClosed(T in) throws IOException
+    {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (closed.get())</span>
+<span class="nc" id="L444">            throw new IOException(&quot;Stream closed&quot;);</span>
+<span class="nc" id="L445">        return in;</span>
+    }
+
+    public void close() throws IOException
+    {
+<span class="nc" id="L450">        close(true);</span>
+<span class="nc" id="L451">    }</span>
+
+    public void close(boolean closeUnderlying) throws IOException
+    {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        if (closed.compareAndSet(false, true))</span>
+        {
+<span class="nc" id="L457">            Throwable fail = null;</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            if (closeUnderlying)</span>
+            {
+                try
+                {
+<span class="nc" id="L462">                    super.close();</span>
+                }
+<span class="nc" id="L464">                catch (IOException e)</span>
+                {
+<span class="nc" id="L466">                    fail = merge(fail, e);</span>
+<span class="nc" id="L467">                }</span>
+            }
+            try
+            {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (spillBuffer != null)</span>
+                {
+<span class="nc" id="L473">                    this.spillBuffer.close();</span>
+<span class="nc" id="L474">                    this.spillBuffer = null;</span>
+                }
+<span class="nc" id="L476">            } catch (IOException e)</span>
+            {
+<span class="nc" id="L478">                fail = merge(fail, e);</span>
+<span class="nc" id="L479">            }</span>
+            try
+            {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">                if (spillFile.exists())</span>
+                {
+<span class="nc" id="L484">                    spillFile.delete();</span>
+                }
+            }
+<span class="nc" id="L487">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L489">                fail = merge(fail, e);</span>
+<span class="nc" id="L490">            }</span>
+<span class="nc" id="L491">            maybeFail(fail, IOException.class);</span>
+        }
+<span class="nc" id="L493">    }</span>
+
+    /* DataInputPlus methods */
+
+    public void readFully(byte[] b) throws IOException
+    {
+<span class="nc" id="L499">        dataReader.readFully(b);</span>
+<span class="nc" id="L500">    }</span>
+
+    public void readFully(byte[] b, int off, int len) throws IOException
+    {
+<span class="nc" id="L504">        dataReader.readFully(b, off, len);</span>
+<span class="nc" id="L505">    }</span>
+
+    public int skipBytes(int n) throws IOException
+    {
+<span class="nc" id="L509">        return dataReader.skipBytes(n);</span>
+    }
+
+    public boolean readBoolean() throws IOException
+    {
+<span class="nc" id="L514">        return dataReader.readBoolean();</span>
+    }
+
+    public byte readByte() throws IOException
+    {
+<span class="nc" id="L519">        return dataReader.readByte();</span>
+    }
+
+    public int readUnsignedByte() throws IOException
+    {
+<span class="nc" id="L524">        return dataReader.readUnsignedByte();</span>
+    }
+
+    public short readShort() throws IOException
+    {
+<span class="nc" id="L529">        return dataReader.readShort();</span>
+    }
+
+    public int readUnsignedShort() throws IOException
+    {
+<span class="nc" id="L534">        return dataReader.readUnsignedShort();</span>
+    }
+
+    public char readChar() throws IOException
+    {
+<span class="nc" id="L539">        return dataReader.readChar();</span>
+    }
+
+    public int readInt() throws IOException
+    {
+<span class="nc" id="L544">        return dataReader.readInt();</span>
+    }
+
+    public long readLong() throws IOException
+    {
+<span class="nc" id="L549">        return dataReader.readLong();</span>
+    }
+
+    public float readFloat() throws IOException
+    {
+<span class="nc" id="L554">        return dataReader.readFloat();</span>
+    }
+
+    public double readDouble() throws IOException
+    {
+<span class="nc" id="L559">        return dataReader.readDouble();</span>
+    }
+
+    public String readLine() throws IOException
+    {
+<span class="nc" id="L564">        return dataReader.readLine();</span>
+    }
+
+    public String readUTF() throws IOException
+    {
+<span class="nc" id="L569">        return dataReader.readUTF();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

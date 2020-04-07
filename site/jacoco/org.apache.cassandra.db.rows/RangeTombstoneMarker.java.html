@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeTombstoneMarker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">RangeTombstoneMarker.java</span></div><h1>RangeTombstoneMarker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.utils.memory.AbstractAllocator;
+
+/**
+ * A marker for a range tombstone bound.
+ * &lt;p&gt;
+ * There is 2 types of markers: bounds (see {@link RangeTombstoneBoundMarker}) and boundaries (see {@link RangeTombstoneBoundaryMarker}).
+ */
+public interface RangeTombstoneMarker extends Unfiltered
+{
+    @Override
+    public ClusteringBoundOrBoundary clustering();
+
+    public boolean isBoundary();
+
+    public boolean isOpen(boolean reversed);
+    public boolean isClose(boolean reversed);
+
+    public DeletionTime openDeletionTime(boolean reversed);
+    public DeletionTime closeDeletionTime(boolean reversed);
+    public boolean openIsInclusive(boolean reversed);
+    public boolean closeIsInclusive(boolean reversed);
+
+    public ClusteringBound openBound(boolean reversed);
+    public ClusteringBound closeBound(boolean reversed);
+
+    public RangeTombstoneMarker copy(AbstractAllocator allocator);
+
+    default public boolean isEmpty()
+    {
+        // There is no such thing as an empty marker
+<span class="nc" id="L54">        return false;</span>
+    }
+
+    public RangeTombstoneMarker withNewOpeningDeletionTime(boolean reversed, DeletionTime newDeletionTime);
+
+    /**
+     * Utility class to help merging range tombstone markers coming from multiple inputs (UnfilteredRowIterators).
+     * &lt;p&gt;
+     * The assumption that each individual input must validate and that we must preserve in the output is that every
+     * open marker has a corresponding close marker with the exact same deletion info, and that there is no other range
+     * tombstone marker between those open and close marker (of course, they could be rows in between). In other word,
+     * for any {@code UnfilteredRowIterator}, you only ever have to remenber the last open marker (if any) to have the
+     * full picture of what is deleted by range tombstones at any given point of iterating that iterator.
+     * &lt;p&gt;
+     * Note that this class can merge both forward and reverse iterators. To deal with reverse, we just reverse how we
+     * deal with open and close markers (in forward order, we'll get open-close, open-close, ..., while in reverse we'll
+     * get close-open, close-open, ...).
+     */
+    public static class Merger
+    {
+        private final DeletionTime partitionDeletion;
+        private final boolean reversed;
+
+        private ClusteringBoundOrBoundary bound;
+        private final RangeTombstoneMarker[] markers;
+
+        // For each iterator, what is the currently open marker deletion time (or null if there is no open marker on that iterator)
+        private final DeletionTime[] openMarkers;
+        // The index in openMarkers of the &quot;biggest&quot; marker, the one with the biggest deletion time. Is &lt; 0 iff there is no open
+        // marker on any iterator.
+<span class="fc" id="L84">        private int biggestOpenMarker = -1;</span>
+
+        public Merger(int size, DeletionTime partitionDeletion, boolean reversed)
+<span class="fc" id="L87">        {</span>
+<span class="fc" id="L88">            this.partitionDeletion = partitionDeletion;</span>
+<span class="fc" id="L89">            this.reversed = reversed;</span>
+
+<span class="fc" id="L91">            this.markers = new RangeTombstoneMarker[size];</span>
+<span class="fc" id="L92">            this.openMarkers = new DeletionTime[size];</span>
+<span class="fc" id="L93">        }</span>
+
+        public void clear()
+        {
+<span class="fc" id="L97">            Arrays.fill(markers, null);</span>
+<span class="fc" id="L98">        }</span>
+
+        public void add(int i, RangeTombstoneMarker marker)
+        {
+<span class="nc" id="L102">            bound = marker.clustering();</span>
+<span class="nc" id="L103">            markers[i] = marker;</span>
+<span class="nc" id="L104">        }</span>
+
+        public RangeTombstoneMarker merge()
+        {
+            /*
+             * Merging of range tombstones works this way:
+             *   1) We remember what is the currently open marker in the merged stream
+             *   2) We update our internal states of what range is opened on the input streams based on the new markers to merge
+             *   3) We compute what should be the state in the merge stream after 2)
+             *   4) We return what marker should be issued on the merged stream based on the difference between the state from 1) and 3)
+             */
+
+<span class="fc" id="L116">            DeletionTime previousDeletionTimeInMerged = currentOpenDeletionTimeInMerged();</span>
+
+<span class="fc" id="L118">            updateOpenMarkers();</span>
+
+<span class="fc" id="L120">            DeletionTime newDeletionTimeInMerged = currentOpenDeletionTimeInMerged();</span>
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">            if (previousDeletionTimeInMerged.equals(newDeletionTimeInMerged))</span>
+<span class="fc" id="L122">                return null;</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">            boolean isBeforeClustering = bound.kind().comparedToClustering &lt; 0;</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            if (reversed)</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                isBeforeClustering = !isBeforeClustering;</span>
+
+<span class="nc" id="L128">            ByteBuffer[] values = bound.getRawValues();</span>
+            RangeTombstoneMarker merged;
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (previousDeletionTimeInMerged.isLive())</span>
+            {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">                merged = isBeforeClustering</span>
+<span class="nc" id="L133">                       ? RangeTombstoneBoundMarker.inclusiveOpen(reversed, values, newDeletionTimeInMerged)</span>
+<span class="nc" id="L134">                       : RangeTombstoneBoundMarker.exclusiveOpen(reversed, values, newDeletionTimeInMerged);</span>
+            }
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            else if (newDeletionTimeInMerged.isLive())</span>
+            {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                merged = isBeforeClustering</span>
+<span class="nc" id="L139">                       ? RangeTombstoneBoundMarker.exclusiveClose(reversed, values, previousDeletionTimeInMerged)</span>
+<span class="nc" id="L140">                       : RangeTombstoneBoundMarker.inclusiveClose(reversed, values, previousDeletionTimeInMerged);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                merged = isBeforeClustering</span>
+<span class="nc" id="L145">                       ? RangeTombstoneBoundaryMarker.exclusiveCloseInclusiveOpen(reversed, values, previousDeletionTimeInMerged, newDeletionTimeInMerged)</span>
+<span class="nc" id="L146">                       : RangeTombstoneBoundaryMarker.inclusiveCloseExclusiveOpen(reversed, values, previousDeletionTimeInMerged, newDeletionTimeInMerged);</span>
+            }
+
+<span class="nc" id="L149">            return merged;</span>
+        }
+
+        public RangeTombstoneMarker[] mergedMarkers()
+        {
+<span class="nc" id="L154">            return markers;</span>
+        }
+
+        private DeletionTime currentOpenDeletionTimeInMerged()
+        {
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">            if (biggestOpenMarker &lt; 0)</span>
+<span class="fc" id="L160">                return DeletionTime.LIVE;</span>
+
+<span class="nc" id="L162">            DeletionTime biggestDeletionTime = openMarkers[biggestOpenMarker];</span>
+            // it's only open in the merged iterator if it's not shadowed by the partition level deletion
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            return partitionDeletion.supersedes(biggestDeletionTime) ? DeletionTime.LIVE : biggestDeletionTime;</span>
+        }
+
+        private void updateOpenMarkers()
+        {
+<span class="fc bfc" id="L169" title="All 2 branches covered.">            for (int i = 0; i &lt; markers.length; i++)</span>
+            {
+<span class="fc" id="L171">                RangeTombstoneMarker marker = markers[i];</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">                if (marker == null)</span>
+<span class="fc" id="L173">                    continue;</span>
+
+                // Note that we can have boundaries that are both open and close, but in that case all we care about
+                // is what it the open deletion after the marker, so we favor the opening part in this case.
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                if (marker.isOpen(reversed))</span>
+<span class="nc" id="L178">                    openMarkers[i] = marker.openDeletionTime(reversed);</span>
+                else
+<span class="nc" id="L180">                    openMarkers[i] = null;</span>
+            }
+
+            // Recompute what is now the biggest open marker
+<span class="fc" id="L184">            biggestOpenMarker = -1;</span>
+<span class="fc bfc" id="L185" title="All 2 branches covered.">            for (int i = 0; i &lt; openMarkers.length; i++)</span>
+            {
+<span class="pc bpc" id="L187" title="5 of 6 branches missed.">                if (openMarkers[i] != null &amp;&amp; (biggestOpenMarker &lt; 0 || openMarkers[i].supersedes(openMarkers[biggestOpenMarker])))</span>
+<span class="nc" id="L188">                    biggestOpenMarker = i;</span>
+            }
+<span class="fc" id="L190">        }</span>
+
+        public DeletionTime activeDeletion()
+        {
+<span class="fc" id="L194">            DeletionTime openMarker = currentOpenDeletionTimeInMerged();</span>
+            // We only have an open marker in the merged stream if it's not shadowed by the partition deletion (which can be LIVE itself), so
+            // if have an open marker, we know it's the &quot;active&quot; deletion for the merged stream.
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">            return openMarker.isLive() ? partitionDeletion : openMarker;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,2386 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format</a> &gt; <span class="el_source">SSTableReader.java</span></div><h1>SSTableReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.format;
+
+import java.io.*;
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Ordering;
+import com.google.common.primitives.Longs;
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.clearspring.analytics.stream.cardinality.CardinalityMergeException;
+import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus;
+import com.clearspring.analytics.stream.cardinality.ICardinality;
+
+import org.apache.cassandra.cache.ChunkCache;
+import org.apache.cassandra.cache.InstrumentingCache;
+import org.apache.cassandra.cache.KeyCacheKey;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.sstable.metadata.*;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.metrics.RestorableMeter;
+import org.apache.cassandra.metrics.StorageMetrics;
+import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.SelfRefCounted;
+
+import static org.apache.cassandra.db.Directories.SECONDARY_INDEX_NAME_SEPARATOR;
+
+/**
+ * An SSTableReader can be constructed in a number of places, but typically is either
+ * read from disk at startup, or constructed from a flushed memtable, or after compaction
+ * to replace some existing sstables. However once created, an sstablereader may also be modified.
+ *
+ * A reader's OpenReason describes its current stage in its lifecycle, as follows:
+ *
+ *
+ * &lt;pre&gt; {@code
+ * NORMAL
+ * From:       None        =&gt; Reader has been read from disk, either at startup or from a flushed memtable
+ *             EARLY       =&gt; Reader is the final result of a compaction
+ *             MOVED_START =&gt; Reader WAS being compacted, but this failed and it has been restored to NORMAL status
+ *
+ * EARLY
+ * From:       None        =&gt; Reader is a compaction replacement that is either incomplete and has been opened
+ *                            to represent its partial result status, or has been finished but the compaction
+ *                            it is a part of has not yet completed fully
+ *             EARLY       =&gt; Same as from None, only it is not the first time it has been
+ *
+ * MOVED_START
+ * From:       NORMAL      =&gt; Reader is being compacted. This compaction has not finished, but the compaction result
+ *                            is either partially or fully opened, to either partially or fully replace this reader.
+ *                            This reader's start key has been updated to represent this, so that reads only hit
+ *                            one or the other reader.
+ *
+ * METADATA_CHANGE
+ * From:       NORMAL      =&gt; Reader has seen low traffic and the amount of memory available for index summaries is
+ *                            constrained, so its index summary has been downsampled.
+ *         METADATA_CHANGE =&gt; Same
+ * } &lt;/pre&gt;
+ *
+ * Note that in parallel to this, there are two different Descriptor types; TMPLINK and FINAL; the latter corresponds
+ * to NORMAL state readers and all readers that replace a NORMAL one. TMPLINK is used for EARLY state readers and
+ * no others.
+ *
+ * When a reader is being compacted, if the result is large its replacement may be opened as EARLY before compaction
+ * completes in order to present the result to consumers earlier. In this case the reader will itself be changed to
+ * a MOVED_START state, where its start no longer represents its on-disk minimum key. This is to permit reads to be
+ * directed to only one reader when the two represent the same data. The EARLY file can represent a compaction result
+ * that is either partially complete and still in-progress, or a complete and immutable sstable that is part of a larger
+ * macro compaction action that has not yet fully completed.
+ *
+ * Currently ALL compaction results at least briefly go through an EARLY open state prior to completion, regardless
+ * of if early opening is enabled.
+ *
+ * Since a reader can be created multiple times over the same shared underlying resources, and the exact resources
+ * it shares between each instance differ subtly, we track the lifetime of any underlying resource with its own
+ * reference count, which each instance takes a Ref to. Each instance then tracks references to itself, and once these
+ * all expire it releases its Refs to these underlying resources.
+ *
+ * There is some shared cleanup behaviour needed only once all sstablereaders in a certain stage of their lifecycle
+ * (i.e. EARLY or NORMAL opening), and some that must only occur once all readers of any kind over a single logical
+ * sstable have expired. These are managed by the TypeTidy and GlobalTidy classes at the bottom, and are effectively
+ * managed as another resource each instance tracks its own Ref instance to, to ensure all of these resources are
+ * cleaned up safely and can be debugged otherwise.
+ *
+ * TODO: fill in details about Tracker and lifecycle interactions for tools, and for compaction strategies
+ */
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">public abstract class SSTableReader extends SSTable implements SelfRefCounted&lt;SSTableReader&gt;</span>
+{
+<span class="fc" id="L140">    private static final Logger logger = LoggerFactory.getLogger(SSTableReader.class);</span>
+
+<span class="fc" id="L142">    private static final ScheduledThreadPoolExecutor syncExecutor = initSyncExecutor();</span>
+    private static ScheduledThreadPoolExecutor initSyncExecutor()
+    {
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">        if (DatabaseDescriptor.isClientOrToolInitialized())</span>
+<span class="nc" id="L146">            return null;</span>
+
+        // Do NOT start this thread pool in client mode
+
+<span class="fc" id="L150">        ScheduledThreadPoolExecutor syncExecutor = new ScheduledThreadPoolExecutor(1, new NamedThreadFactory(&quot;read-hotness-tracker&quot;));</span>
+        // Immediately remove readMeter sync task when cancelled.
+<span class="fc" id="L152">        syncExecutor.setRemoveOnCancelPolicy(true);</span>
+<span class="fc" id="L153">        return syncExecutor;</span>
+    }
+<span class="fc" id="L155">    private static final RateLimiter meterSyncThrottle = RateLimiter.create(100.0);</span>
+
+<span class="fc" id="L157">    public static final Comparator&lt;SSTableReader&gt; maxTimestampDescending = (o1, o2) -&gt; Long.compare(o2.getMaxTimestamp(), o1.getMaxTimestamp());</span>
+<span class="pc" id="L158">    public static final Comparator&lt;SSTableReader&gt; maxTimestampAscending = (o1, o2) -&gt; Long.compare(o1.getMaxTimestamp(), o2.getMaxTimestamp());</span>
+
+    // it's just an object, which we use regular Object equality on; we introduce a special class just for easy recognition
+<span class="fc" id="L161">    public static final class UniqueIdentifier {}</span>
+
+<span class="pc" id="L163">    public static final Comparator&lt;SSTableReader&gt; sstableComparator = (o1, o2) -&gt; o1.first.compareTo(o2.first);</span>
+
+<span class="fc" id="L165">    public static final Comparator&lt;SSTableReader&gt; generationReverseComparator = (o1, o2) -&gt; -Integer.compare(o1.descriptor.generation, o2.descriptor.generation);</span>
+
+<span class="fc" id="L167">    public static final Ordering&lt;SSTableReader&gt; sstableOrdering = Ordering.from(sstableComparator);</span>
+
+<span class="fc" id="L169">    public static final Comparator&lt;SSTableReader&gt; sizeComparator = new Comparator&lt;SSTableReader&gt;()</span>
+<span class="fc" id="L170">    {</span>
+        public int compare(SSTableReader o1, SSTableReader o2)
+        {
+<span class="nc" id="L173">            return Longs.compare(o1.onDiskLength(), o2.onDiskLength());</span>
+        }
+    };
+
+    /**
+     * maxDataAge is a timestamp in local server time (e.g. System.currentTimeMilli) which represents an upper bound
+     * to the newest piece of data stored in the sstable. In other words, this sstable does not contain items created
+     * later than maxDataAge.
+     *
+     * The field is not serialized to disk, so relying on it for more than what truncate does is not advised.
+     *
+     * When a new sstable is flushed, maxDataAge is set to the time of creation.
+     * When a sstable is created from compaction, maxDataAge is set to max of all merged sstables.
+     *
+     * The age is in milliseconds since epoc and is local to this host.
+     */
+    public final long maxDataAge;
+
+<span class="fc" id="L191">    public enum OpenReason</span>
+    {
+<span class="fc" id="L193">        NORMAL,</span>
+<span class="fc" id="L194">        EARLY,</span>
+<span class="fc" id="L195">        METADATA_CHANGE,</span>
+<span class="fc" id="L196">        MOVED_START</span>
+    }
+
+    public final OpenReason openReason;
+<span class="fc" id="L200">    public final UniqueIdentifier instanceId = new UniqueIdentifier();</span>
+
+    // indexfile and datafile: might be null before a call to load()
+    protected FileHandle ifile;
+    protected FileHandle dfile;
+    protected IndexSummary indexSummary;
+    protected IFilter bf;
+
+    protected final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+
+    protected InstrumentingCache&lt;KeyCacheKey, RowIndexEntry&gt; keyCache;
+
+<span class="fc" id="L212">    protected final BloomFilterTracker bloomFilterTracker = new BloomFilterTracker();</span>
+
+    // technically isCompacted is not necessary since it should never be unreferenced unless it is also compacted,
+    // but it seems like a good extra layer of protection against reference counting bugs to not delete data based on that alone
+<span class="fc" id="L216">    protected final AtomicBoolean isSuspect = new AtomicBoolean(false);</span>
+
+    // not final since we need to be able to change level on a file.
+    protected volatile StatsMetadata sstableMetadata;
+
+    public final SerializationHeader header;
+
+<span class="fc" id="L223">    protected final AtomicLong keyCacheHit = new AtomicLong(0);</span>
+<span class="fc" id="L224">    protected final AtomicLong keyCacheRequest = new AtomicLong(0);</span>
+
+<span class="fc" id="L226">    private final InstanceTidier tidy = new InstanceTidier(descriptor, metadata);</span>
+<span class="fc" id="L227">    private final Ref&lt;SSTableReader&gt; selfRef = new Ref&lt;&gt;(this, tidy);</span>
+
+    private RestorableMeter readMeter;
+
+    private volatile double crcCheckChance;
+
+    /**
+     * Calculate approximate key count.
+     * If cardinality estimator is available on all given sstables, then this method use them to estimate
+     * key count.
+     * If not, then this uses index summaries.
+     *
+     * @param sstables SSTables to calculate key count
+     * @return estimated key count
+     */
+    public static long getApproximateKeyCount(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L244">        long count = -1;</span>
+
+        // check if cardinality estimator is available for all SSTables
+<span class="pc bpc" id="L247" title="2 of 4 branches missed.">        boolean cardinalityAvailable = !Iterables.isEmpty(sstables) &amp;&amp; Iterables.all(sstables, new Predicate&lt;SSTableReader&gt;()</span>
+<span class="fc" id="L248">        {</span>
+            public boolean apply(SSTableReader sstable)
+            {
+<span class="fc" id="L251">                return sstable.descriptor.version.hasNewStatsFile();</span>
+            }
+        });
+
+        // if it is, load them to estimate key count
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">        if (cardinalityAvailable)</span>
+        {
+<span class="fc" id="L258">            boolean failed = false;</span>
+<span class="fc" id="L259">            ICardinality cardinality = null;</span>
+<span class="fc bfc" id="L260" title="All 2 branches covered.">            for (SSTableReader sstable : sstables)</span>
+            {
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">                if (sstable.openReason == OpenReason.EARLY)</span>
+<span class="nc" id="L263">                    continue;</span>
+
+                try
+                {
+<span class="fc" id="L267">                    CompactionMetadata metadata = (CompactionMetadata) sstable.descriptor.getMetadataSerializer().deserialize(sstable.descriptor, MetadataType.COMPACTION);</span>
+                    // If we can't load the CompactionMetadata, we are forced to estimate the keys using the index
+                    // summary. (CASSANDRA-10676)
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">                    if (metadata == null)</span>
+                    {
+<span class="nc" id="L272">                        logger.warn(&quot;Reading cardinality from Statistics.db failed for {}&quot;, sstable.getFilename());</span>
+<span class="nc" id="L273">                        failed = true;</span>
+<span class="nc" id="L274">                        break;</span>
+                    }
+
+<span class="fc bfc" id="L277" title="All 2 branches covered.">                    if (cardinality == null)</span>
+<span class="fc" id="L278">                        cardinality = metadata.cardinalityEstimator;</span>
+                    else
+<span class="fc" id="L280">                        cardinality = cardinality.merge(metadata.cardinalityEstimator);</span>
+                }
+<span class="nc" id="L282">                catch (IOException e)</span>
+                {
+<span class="nc" id="L284">                    logger.warn(&quot;Reading cardinality from Statistics.db failed.&quot;, e);</span>
+<span class="nc" id="L285">                    failed = true;</span>
+<span class="nc" id="L286">                    break;</span>
+                }
+<span class="nc" id="L288">                catch (CardinalityMergeException e)</span>
+                {
+<span class="nc" id="L290">                    logger.warn(&quot;Cardinality merge failed.&quot;, e);</span>
+<span class="nc" id="L291">                    failed = true;</span>
+<span class="nc" id="L292">                    break;</span>
+<span class="fc" id="L293">                }</span>
+<span class="fc" id="L294">            }</span>
+<span class="pc bpc" id="L295" title="2 of 4 branches missed.">            if (cardinality != null &amp;&amp; !failed)</span>
+<span class="fc" id="L296">                count = cardinality.cardinality();</span>
+        }
+
+        // if something went wrong above or cardinality is not available, calculate using index summary
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">        if (count &lt; 0)</span>
+        {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L303">                count += sstable.estimatedKeys();</span>
+        }
+<span class="fc" id="L305">        return count;</span>
+    }
+
+    /**
+     * Estimates how much of the keys we would keep if the sstables were compacted together
+     */
+    public static double estimateCompactionGain(Set&lt;SSTableReader&gt; overlapping)
+    {
+<span class="nc" id="L313">        Set&lt;ICardinality&gt; cardinalities = new HashSet&lt;&gt;(overlapping.size());</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        for (SSTableReader sstable : overlapping)</span>
+        {
+            try
+            {
+<span class="nc" id="L318">                ICardinality cardinality = ((CompactionMetadata) sstable.descriptor.getMetadataSerializer().deserialize(sstable.descriptor, MetadataType.COMPACTION)).cardinalityEstimator;</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                if (cardinality != null)</span>
+<span class="nc" id="L320">                    cardinalities.add(cardinality);</span>
+                else
+<span class="nc" id="L322">                    logger.trace(&quot;Got a null cardinality estimator in: {}&quot;, sstable.getFilename());</span>
+            }
+<span class="nc" id="L324">            catch (IOException e)</span>
+            {
+<span class="nc" id="L326">                logger.warn(&quot;Could not read up compaction metadata for {}&quot;, sstable, e);</span>
+<span class="nc" id="L327">            }</span>
+<span class="nc" id="L328">        }</span>
+<span class="nc" id="L329">        long totalKeyCountBefore = 0;</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        for (ICardinality cardinality : cardinalities)</span>
+        {
+<span class="nc" id="L332">            totalKeyCountBefore += cardinality.cardinality();</span>
+<span class="nc" id="L333">        }</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (totalKeyCountBefore == 0)</span>
+<span class="nc" id="L335">            return 1;</span>
+
+<span class="nc" id="L337">        long totalKeyCountAfter = mergeCardinalities(cardinalities).cardinality();</span>
+<span class="nc" id="L338">        logger.trace(&quot;Estimated compaction gain: {}/{}={}&quot;, totalKeyCountAfter, totalKeyCountBefore, ((double)totalKeyCountAfter)/totalKeyCountBefore);</span>
+<span class="nc" id="L339">        return ((double)totalKeyCountAfter)/totalKeyCountBefore;</span>
+    }
+
+    private static ICardinality mergeCardinalities(Collection&lt;ICardinality&gt; cardinalities)
+    {
+<span class="nc" id="L344">        ICardinality base = new HyperLogLogPlus(13, 25); // see MetadataCollector.cardinality</span>
+        try
+        {
+<span class="nc" id="L347">            base = base.merge(cardinalities.toArray(new ICardinality[cardinalities.size()]));</span>
+        }
+<span class="nc" id="L349">        catch (CardinalityMergeException e)</span>
+        {
+<span class="nc" id="L351">            logger.warn(&quot;Could not merge cardinalities&quot;, e);</span>
+<span class="nc" id="L352">        }</span>
+<span class="nc" id="L353">        return base;</span>
+    }
+
+    public static SSTableReader open(Descriptor descriptor) throws IOException
+    {
+        CFMetaData metadata;
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if (descriptor.cfname.contains(SECONDARY_INDEX_NAME_SEPARATOR))</span>
+        {
+<span class="nc" id="L361">            int i = descriptor.cfname.indexOf(SECONDARY_INDEX_NAME_SEPARATOR);</span>
+<span class="nc" id="L362">            String parentName = descriptor.cfname.substring(0, i);</span>
+<span class="nc" id="L363">            String indexName = descriptor.cfname.substring(i + 1);</span>
+<span class="nc" id="L364">            CFMetaData parent = Schema.instance.getCFMetaData(descriptor.ksname, parentName);</span>
+<span class="nc" id="L365">            IndexMetadata def = parent.getIndexes()</span>
+<span class="nc" id="L366">                                      .get(indexName)</span>
+<span class="nc" id="L367">                                      .orElseThrow(() -&gt; new AssertionError(</span>
+                                                                           &quot;Could not find index metadata for index cf &quot; + i));
+<span class="nc" id="L369">            metadata = CassandraIndex.indexCfsMetadata(parent, def);</span>
+<span class="nc" id="L370">        }</span>
+        else
+        {
+<span class="nc" id="L373">            metadata = Schema.instance.getCFMetaData(descriptor.ksname, descriptor.cfname);</span>
+        }
+<span class="nc" id="L375">        return open(descriptor, metadata);</span>
+    }
+
+    public static SSTableReader open(Descriptor desc, CFMetaData metadata) throws IOException
+    {
+<span class="nc" id="L380">        return open(desc, componentsFor(desc), metadata);</span>
+    }
+
+    public static SSTableReader open(Descriptor descriptor, Set&lt;Component&gt; components, CFMetaData metadata) throws IOException
+    {
+<span class="nc" id="L385">        return open(descriptor, components, metadata, true, false);</span>
+    }
+
+    // use only for offline or &quot;Standalone&quot; operations
+    public static SSTableReader openNoValidation(Descriptor descriptor, Set&lt;Component&gt; components, ColumnFamilyStore cfs) throws IOException
+    {
+<span class="nc" id="L391">        return open(descriptor, components, cfs.metadata, false, true);</span>
+    }
+
+    // use only for offline or &quot;Standalone&quot; operations
+    public static SSTableReader openNoValidation(Descriptor descriptor, CFMetaData metadata) throws IOException
+    {
+<span class="nc" id="L397">        return open(descriptor, componentsFor(descriptor), metadata, false, true);</span>
+    }
+
+    /**
+     * Open SSTable reader to be used in batch mode(such as sstableloader).
+     *
+     * @param descriptor
+     * @param components
+     * @param metadata
+     * @return opened SSTableReader
+     * @throws IOException
+     */
+    public static SSTableReader openForBatch(Descriptor descriptor, Set&lt;Component&gt; components, CFMetaData metadata) throws IOException
+    {
+        // Minimum components without which we can't do anything
+<span class="nc bnc" id="L412" title="All 4 branches missed.">        assert components.contains(Component.DATA) : &quot;Data component is missing for sstable &quot; + descriptor;</span>
+<span class="nc bnc" id="L413" title="All 4 branches missed.">        assert components.contains(Component.PRIMARY_INDEX) : &quot;Primary index component is missing for sstable &quot; + descriptor;</span>
+
+<span class="nc" id="L415">        EnumSet&lt;MetadataType&gt; types = EnumSet.of(MetadataType.VALIDATION, MetadataType.STATS, MetadataType.HEADER);</span>
+<span class="nc" id="L416">        Map&lt;MetadataType, MetadataComponent&gt; sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);</span>
+
+<span class="nc" id="L418">        ValidationMetadata validationMetadata = (ValidationMetadata) sstableMetadata.get(MetadataType.VALIDATION);</span>
+<span class="nc" id="L419">        StatsMetadata statsMetadata = (StatsMetadata) sstableMetadata.get(MetadataType.STATS);</span>
+<span class="nc" id="L420">        SerializationHeader.Component header = (SerializationHeader.Component) sstableMetadata.get(MetadataType.HEADER);</span>
+
+        // Check if sstable is created using same partitioner.
+        // Partitioner can be null, which indicates older version of sstable or no stats available.
+        // In that case, we skip the check.
+<span class="nc" id="L425">        String partitionerName = metadata.partitioner.getClass().getCanonicalName();</span>
+<span class="nc bnc" id="L426" title="All 4 branches missed.">        if (validationMetadata != null &amp;&amp; !partitionerName.equals(validationMetadata.partitioner))</span>
+        {
+<span class="nc" id="L428">            logger.error(&quot;Cannot open {}; partitioner {} does not match system partitioner {}.  Note that the default partitioner starting with Cassandra 1.2 is Murmur3Partitioner, so you will need to edit that to match your old partitioner if upgrading.&quot;,</span>
+                         descriptor, validationMetadata.partitioner, partitionerName);
+<span class="nc" id="L430">            System.exit(1);</span>
+        }
+
+<span class="nc" id="L433">        long fileLength = new File(descriptor.filenameFor(Component.DATA)).length();</span>
+<span class="nc" id="L434">        logger.debug(&quot;Opening {} ({})&quot;, descriptor, FBUtilities.prettyPrintMemory(fileLength));</span>
+<span class="nc" id="L435">        SSTableReader sstable = internalOpen(descriptor,</span>
+                                             components,
+                                             metadata,
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                                             System.currentTimeMillis(),</span>
+                                             statsMetadata,
+                                             OpenReason.NORMAL,
+<span class="nc" id="L441">                                             header == null? null : header.toHeader(metadata));</span>
+
+<span class="nc" id="L443">        try(FileHandle.Builder ibuilder = new FileHandle.Builder(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX))</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                                                     .mmapped(DatabaseDescriptor.getIndexAccessMode() == Config.DiskAccessMode.mmap)</span>
+<span class="nc" id="L445">                                                     .withChunkCache(ChunkCache.instance);</span>
+<span class="nc" id="L446">            FileHandle.Builder dbuilder = new FileHandle.Builder(sstable.descriptor.filenameFor(Component.DATA)).compressed(sstable.compression)</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                                                     .mmapped(DatabaseDescriptor.getDiskAccessMode() == Config.DiskAccessMode.mmap)</span>
+<span class="nc" id="L448">                                                     .withChunkCache(ChunkCache.instance))</span>
+        {
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (!sstable.loadSummary())</span>
+<span class="nc" id="L451">                sstable.buildSummary(false, false, Downsampling.BASE_SAMPLING_LEVEL);</span>
+<span class="nc" id="L452">            long indexFileLength = new File(descriptor.filenameFor(Component.PRIMARY_INDEX)).length();</span>
+<span class="nc" id="L453">            int dataBufferSize = sstable.optimizationStrategy.bufferSize(statsMetadata.estimatedPartitionSize.percentile(DatabaseDescriptor.getDiskOptimizationEstimatePercentile()));</span>
+<span class="nc" id="L454">            int indexBufferSize = sstable.optimizationStrategy.bufferSize(indexFileLength / sstable.indexSummary.size());</span>
+<span class="nc" id="L455">            sstable.ifile = ibuilder.bufferSize(indexBufferSize).complete();</span>
+<span class="nc" id="L456">            sstable.dfile = dbuilder.bufferSize(dataBufferSize).complete();</span>
+<span class="nc" id="L457">            sstable.bf = FilterFactory.AlwaysPresent;</span>
+<span class="nc" id="L458">            sstable.setup(false);</span>
+<span class="nc" id="L459">            return sstable;</span>
+        }
+    }
+
+    /**
+     * Open an SSTable for reading
+     * @param descriptor SSTable to open
+     * @param components Components included with this SSTable
+     * @param metadata for this SSTables CF
+     * @param validate Check SSTable for corruption (limited)
+     * @param isOffline Whether we are opening this SSTable &quot;offline&quot;, for example from an external tool or not for inclusion in queries (validations)
+     *                  This stops regenerating BF + Summaries and also disables tracking of hotness for the SSTable.
+     * @return {@link SSTableReader}
+     * @throws IOException
+     */
+    public static SSTableReader open(Descriptor descriptor,
+                                     Set&lt;Component&gt; components,
+                                     CFMetaData metadata,
+                                     boolean validate,
+                                     boolean isOffline) throws IOException
+    {
+        // Minimum components without which we can't do anything
+<span class="nc bnc" id="L481" title="All 4 branches missed.">        assert components.contains(Component.DATA) : &quot;Data component is missing for sstable &quot; + descriptor;</span>
+<span class="nc bnc" id="L482" title="All 6 branches missed.">        assert !validate || components.contains(Component.PRIMARY_INDEX) : &quot;Primary index component is missing for sstable &quot; + descriptor;</span>
+
+        // For the 3.0+ sstable format, the (misnomed) stats component hold the serialization header which we need to deserialize the sstable content
+<span class="nc bnc" id="L485" title="All 6 branches missed.">        assert !descriptor.version.storeRows() || components.contains(Component.STATS) : &quot;Stats component is missing for sstable &quot; + descriptor;</span>
+
+<span class="nc" id="L487">        EnumSet&lt;MetadataType&gt; types = EnumSet.of(MetadataType.VALIDATION, MetadataType.STATS, MetadataType.HEADER);</span>
+
+        Map&lt;MetadataType, MetadataComponent&gt; sstableMetadata;
+        try
+        {
+<span class="nc" id="L492">            sstableMetadata = descriptor.getMetadataSerializer().deserialize(descriptor, types);</span>
+        }
+<span class="nc" id="L494">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L496">            throw new CorruptSSTableException(t, descriptor.filenameFor(Component.STATS));</span>
+<span class="nc" id="L497">        }</span>
+<span class="nc" id="L498">        ValidationMetadata validationMetadata = (ValidationMetadata) sstableMetadata.get(MetadataType.VALIDATION);</span>
+<span class="nc" id="L499">        StatsMetadata statsMetadata = (StatsMetadata) sstableMetadata.get(MetadataType.STATS);</span>
+<span class="nc" id="L500">        SerializationHeader.Component header = (SerializationHeader.Component) sstableMetadata.get(MetadataType.HEADER);</span>
+<span class="nc bnc" id="L501" title="All 6 branches missed.">        assert !descriptor.version.storeRows() || header != null;</span>
+
+        // Check if sstable is created using same partitioner.
+        // Partitioner can be null, which indicates older version of sstable or no stats available.
+        // In that case, we skip the check.
+<span class="nc" id="L506">        String partitionerName = metadata.partitioner.getClass().getCanonicalName();</span>
+<span class="nc bnc" id="L507" title="All 4 branches missed.">        if (validationMetadata != null &amp;&amp; !partitionerName.equals(validationMetadata.partitioner))</span>
+        {
+<span class="nc" id="L509">            logger.error(&quot;Cannot open {}; partitioner {} does not match system partitioner {}.  Note that the default partitioner starting with Cassandra 1.2 is Murmur3Partitioner, so you will need to edit that to match your old partitioner if upgrading.&quot;,</span>
+                         descriptor, validationMetadata.partitioner, partitionerName);
+<span class="nc" id="L511">            System.exit(1);</span>
+        }
+
+<span class="nc" id="L514">        long fileLength = new File(descriptor.filenameFor(Component.DATA)).length();</span>
+<span class="nc" id="L515">        logger.debug(&quot;Opening {} ({})&quot;, descriptor, FBUtilities.prettyPrintMemory(fileLength));</span>
+<span class="nc" id="L516">        SSTableReader sstable = internalOpen(descriptor,</span>
+                                             components,
+                                             metadata,
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                                             System.currentTimeMillis(),</span>
+                                             statsMetadata,
+                                             OpenReason.NORMAL,
+<span class="nc" id="L522">                                             header == null ? null : header.toHeader(metadata));</span>
+
+        try
+        {
+            // load index and filter
+<span class="nc" id="L527">            long start = System.nanoTime();</span>
+<span class="nc" id="L528">            sstable.load(validationMetadata, isOffline);</span>
+<span class="nc" id="L529">            logger.trace(&quot;INDEX LOAD TIME for {}: {} ms.&quot;, descriptor, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));</span>
+
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            sstable.setup(!isOffline); // Don't track hotness if we're offline.</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (validate)</span>
+<span class="nc" id="L533">                sstable.validate();</span>
+
+<span class="nc bnc" id="L535" title="All 2 branches missed.">            if (sstable.getKeyCache() != null)</span>
+<span class="nc" id="L536">                logger.trace(&quot;key cache contains {}/{} keys&quot;, sstable.getKeyCache().size(), sstable.getKeyCache().getCapacity());</span>
+
+<span class="nc" id="L538">            return sstable;</span>
+        }
+<span class="nc" id="L540">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L542">            sstable.selfRef().release();</span>
+<span class="nc" id="L543">            throw new CorruptSSTableException(t, sstable.getFilename());</span>
+        }
+    }
+
+    public static void logOpenException(Descriptor descriptor, IOException e)
+    {
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (e instanceof FileNotFoundException)</span>
+<span class="nc" id="L550">            logger.error(&quot;Missing sstable component in {}; skipped because of {}&quot;, descriptor, e.getMessage());</span>
+        else
+<span class="nc" id="L552">            logger.error(&quot;Corrupt sstable {}; skipped&quot;, descriptor, e);</span>
+<span class="nc" id="L553">    }</span>
+
+    public static Collection&lt;SSTableReader&gt; openAll(Set&lt;Map.Entry&lt;Descriptor, Set&lt;Component&gt;&gt;&gt; entries,
+                                                    final CFMetaData metadata)
+    {
+<span class="fc" id="L558">        final Collection&lt;SSTableReader&gt; sstables = new LinkedBlockingQueue&lt;&gt;();</span>
+
+<span class="fc" id="L560">        ExecutorService executor = DebuggableThreadPoolExecutor.createWithFixedPoolSize(&quot;SSTableBatchOpen&quot;, FBUtilities.getAvailableProcessors());</span>
+<span class="pc bpc" id="L561" title="1 of 2 branches missed.">        for (final Map.Entry&lt;Descriptor, Set&lt;Component&gt;&gt; entry : entries)</span>
+        {
+<span class="nc" id="L563">            Runnable runnable = new Runnable()</span>
+<span class="nc" id="L564">            {</span>
+                public void run()
+                {
+                    SSTableReader sstable;
+                    try
+                    {
+<span class="nc" id="L570">                        sstable = open(entry.getKey(), entry.getValue(), metadata);</span>
+                    }
+<span class="nc" id="L572">                    catch (CorruptSSTableException ex)</span>
+                    {
+<span class="nc" id="L574">                        FileUtils.handleCorruptSSTable(ex);</span>
+<span class="nc" id="L575">                        logger.error(&quot;Corrupt sstable {}; skipping table&quot;, entry, ex);</span>
+<span class="nc" id="L576">                        return;</span>
+                    }
+<span class="nc" id="L578">                    catch (FSError ex)</span>
+                    {
+<span class="nc" id="L580">                        FileUtils.handleFSError(ex);</span>
+<span class="nc" id="L581">                        logger.error(&quot;Cannot read sstable {}; file system error, skipping table&quot;, entry, ex);</span>
+<span class="nc" id="L582">                        return;</span>
+                    }
+<span class="nc" id="L584">                    catch (IOException ex)</span>
+                    {
+<span class="nc" id="L586">                        FileUtils.handleCorruptSSTable(new CorruptSSTableException(ex, entry.getKey().filenameFor(Component.DATA)));</span>
+<span class="nc" id="L587">                        logger.error(&quot;Cannot read sstable {}; other IO error, skipping table&quot;, entry, ex);</span>
+<span class="nc" id="L588">                        return;</span>
+<span class="nc" id="L589">                    }</span>
+<span class="nc" id="L590">                    sstables.add(sstable);</span>
+<span class="nc" id="L591">                }</span>
+            };
+<span class="nc" id="L593">            executor.submit(runnable);</span>
+<span class="nc" id="L594">        }</span>
+
+<span class="fc" id="L596">        executor.shutdown();</span>
+        try
+        {
+<span class="fc" id="L599">            executor.awaitTermination(7, TimeUnit.DAYS);</span>
+        }
+<span class="nc" id="L601">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L603">            throw new AssertionError(e);</span>
+<span class="fc" id="L604">        }</span>
+
+<span class="fc" id="L606">        return sstables;</span>
+
+    }
+
+    /**
+     * Open a RowIndexedReader which already has its state initialized (by SSTableWriter).
+     */
+    public static SSTableReader internalOpen(Descriptor desc,
+                                      Set&lt;Component&gt; components,
+                                      CFMetaData metadata,
+                                      FileHandle ifile,
+                                      FileHandle dfile,
+                                      IndexSummary isummary,
+                                      IFilter bf,
+                                      long maxDataAge,
+                                      StatsMetadata sstableMetadata,
+                                      OpenReason openReason,
+                                      SerializationHeader header)
+    {
+<span class="pc bpc" id="L625" title="7 of 14 branches missed.">        assert desc != null &amp;&amp; ifile != null &amp;&amp; dfile != null &amp;&amp; isummary != null &amp;&amp; bf != null &amp;&amp; sstableMetadata != null;</span>
+
+<span class="fc" id="L627">        SSTableReader reader = internalOpen(desc, components, metadata, maxDataAge, sstableMetadata, openReason, header);</span>
+
+<span class="fc" id="L629">        reader.bf = bf;</span>
+<span class="fc" id="L630">        reader.ifile = ifile;</span>
+<span class="fc" id="L631">        reader.dfile = dfile;</span>
+<span class="fc" id="L632">        reader.indexSummary = isummary;</span>
+<span class="fc" id="L633">        reader.setup(true);</span>
+
+<span class="fc" id="L635">        return reader;</span>
+    }
+
+
+    private static SSTableReader internalOpen(final Descriptor descriptor,
+                                            Set&lt;Component&gt; components,
+                                            CFMetaData metadata,
+                                            Long maxDataAge,
+                                            StatsMetadata sstableMetadata,
+                                            OpenReason openReason,
+                                            SerializationHeader header)
+    {
+<span class="fc" id="L647">        Factory readerFactory = descriptor.getFormat().getReaderFactory();</span>
+
+<span class="fc" id="L649">        return readerFactory.open(descriptor, components, metadata, maxDataAge, sstableMetadata, openReason, header);</span>
+    }
+
+    protected SSTableReader(final Descriptor desc,
+                            Set&lt;Component&gt; components,
+                            CFMetaData metadata,
+                            long maxDataAge,
+                            StatsMetadata sstableMetadata,
+                            OpenReason openReason,
+                            SerializationHeader header)
+    {
+<span class="fc" id="L660">        super(desc, components, metadata, DatabaseDescriptor.getDiskOptimizationStrategy());</span>
+<span class="fc" id="L661">        this.sstableMetadata = sstableMetadata;</span>
+<span class="fc" id="L662">        this.header = header;</span>
+<span class="fc" id="L663">        this.maxDataAge = maxDataAge;</span>
+<span class="fc" id="L664">        this.openReason = openReason;</span>
+<span class="fc" id="L665">        this.rowIndexEntrySerializer = descriptor.version.getSSTableFormat().getIndexSerializer(metadata, desc.version, header);</span>
+<span class="fc" id="L666">    }</span>
+
+    public static long getTotalBytes(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L670">        long sum = 0;</span>
+<span class="fc bfc" id="L671" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+<span class="fc" id="L672">            sum += sstable.onDiskLength();</span>
+<span class="fc" id="L673">        return sum;</span>
+    }
+
+    public static long getTotalUncompressedBytes(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L678">        long sum = 0;</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L680">            sum += sstable.uncompressedLength();</span>
+
+<span class="nc" id="L682">        return sum;</span>
+    }
+
+    public boolean equals(Object that)
+    {
+<span class="pc bpc" id="L687" title="1 of 4 branches missed.">        return that instanceof SSTableReader &amp;&amp; ((SSTableReader) that).descriptor.equals(this.descriptor);</span>
+    }
+
+    public int hashCode()
+    {
+<span class="fc" id="L692">        return this.descriptor.hashCode();</span>
+    }
+
+    public String getFilename()
+    {
+<span class="fc" id="L697">        return dfile.path();</span>
+    }
+
+    public void setupOnline()
+    {
+        // under normal operation we can do this at any time, but SSTR is also used outside C* proper,
+        // e.g. by BulkLoader, which does not initialize the cache.  As a kludge, we set up the cache
+        // here when we know we're being wired into the rest of the server infrastructure.
+<span class="fc" id="L705">        keyCache = CacheService.instance.keyCache;</span>
+<span class="fc" id="L706">        final ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(metadata.cfId);</span>
+<span class="pc bpc" id="L707" title="1 of 2 branches missed.">        if (cfs != null)</span>
+<span class="fc" id="L708">            setCrcCheckChance(cfs.getCrcCheckChance());</span>
+<span class="fc" id="L709">    }</span>
+
+    public boolean isKeyCacheSetup()
+    {
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        return keyCache != null;</span>
+    }
+
+    /**
+     * See {@link #load(boolean, boolean)}
+     * @param validation Metadata for SSTable being loaded
+     * @param isOffline Whether the SSTable is being loaded by an offline tool (sstabledump, scrub, etc)
+     * @throws IOException
+     */
+    private void load(ValidationMetadata validation, boolean isOffline) throws IOException
+    {
+<span class="nc bnc" id="L724" title="All 2 branches missed.">        if (metadata.params.bloomFilterFpChance == 1.0)</span>
+        {
+            // bf is disabled.
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            load(false, !isOffline);</span>
+<span class="nc" id="L728">            bf = FilterFactory.AlwaysPresent;</span>
+        }
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        else if (!components.contains(Component.PRIMARY_INDEX)) // What happens if filter component and primary index is missing?</span>
+        {
+            // avoid any reading of the missing primary index component.
+            // this should only happen during StandaloneScrubber
+<span class="nc bnc" id="L734" title="All 2 branches missed.">            load(false, !isOffline);</span>
+        }
+<span class="nc bnc" id="L736" title="All 4 branches missed.">        else if (!components.contains(Component.FILTER) || validation == null)</span>
+        {
+            // bf is enabled, but filter component is missing.
+<span class="nc bnc" id="L739" title="All 4 branches missed.">            load(!isOffline, !isOffline);</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">            if (isOffline)</span>
+<span class="nc" id="L741">                bf = FilterFactory.AlwaysPresent;</span>
+        }
+        else
+        {
+            // bf is enabled and fp chance matches the currently configured value.
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            load(false, !isOffline);</span>
+<span class="nc" id="L747">            loadBloomFilter(descriptor.version.hasOldBfHashOrder());</span>
+        }
+<span class="nc" id="L749">    }</span>
+
+    /**
+     * Load bloom filter from Filter.db file.
+     *
+     * @throws IOException
+     */
+    private void loadBloomFilter(boolean oldBfHashOrder) throws IOException
+    {
+<span class="nc" id="L758">        try (DataInputStream stream = new DataInputStream(new BufferedInputStream(new FileInputStream(descriptor.filenameFor(Component.FILTER)))))</span>
+        {
+<span class="nc" id="L760">            bf = FilterFactory.deserialize(stream, true, oldBfHashOrder);</span>
+        }
+<span class="nc" id="L762">    }</span>
+
+    /**
+     * Loads ifile, dfile and indexSummary, and optionally recreates and persists the bloom filter.
+     * @param recreateBloomFilter Recreate the bloomfilter.
+     * @param saveSummaryIfCreated for bulk loading purposes, if the summary was absent and needed to be built, you can
+     *                             avoid persisting it to disk by setting this to false
+     */
+    private void load(boolean recreateBloomFilter, boolean saveSummaryIfCreated) throws IOException
+    {
+<span class="nc" id="L772">        try(FileHandle.Builder ibuilder = new FileHandle.Builder(descriptor.filenameFor(Component.PRIMARY_INDEX))</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                                                     .mmapped(DatabaseDescriptor.getIndexAccessMode() == Config.DiskAccessMode.mmap)</span>
+<span class="nc" id="L774">                                                     .withChunkCache(ChunkCache.instance);</span>
+<span class="nc" id="L775">            FileHandle.Builder dbuilder = new FileHandle.Builder(descriptor.filenameFor(Component.DATA)).compressed(compression)</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                                                     .mmapped(DatabaseDescriptor.getDiskAccessMode() == Config.DiskAccessMode.mmap)</span>
+<span class="nc" id="L777">                                                     .withChunkCache(ChunkCache.instance))</span>
+        {
+<span class="nc" id="L779">            boolean summaryLoaded = loadSummary();</span>
+<span class="nc bnc" id="L780" title="All 4 branches missed.">            boolean buildSummary = !summaryLoaded || recreateBloomFilter;</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            if (buildSummary)</span>
+<span class="nc" id="L782">                buildSummary(recreateBloomFilter, summaryLoaded, Downsampling.BASE_SAMPLING_LEVEL);</span>
+
+<span class="nc" id="L784">            int dataBufferSize = optimizationStrategy.bufferSize(sstableMetadata.estimatedPartitionSize.percentile(DatabaseDescriptor.getDiskOptimizationEstimatePercentile()));</span>
+
+<span class="nc bnc" id="L786" title="All 2 branches missed.">            if (components.contains(Component.PRIMARY_INDEX))</span>
+            {
+<span class="nc" id="L788">                long indexFileLength = new File(descriptor.filenameFor(Component.PRIMARY_INDEX)).length();</span>
+<span class="nc" id="L789">                int indexBufferSize = optimizationStrategy.bufferSize(indexFileLength / indexSummary.size());</span>
+<span class="nc" id="L790">                ifile = ibuilder.bufferSize(indexBufferSize).complete();</span>
+            }
+
+<span class="nc" id="L793">            dfile = dbuilder.bufferSize(dataBufferSize).complete();</span>
+
+<span class="nc bnc" id="L795" title="All 2 branches missed.">            if (buildSummary)</span>
+            {
+<span class="nc bnc" id="L797" title="All 2 branches missed.">                if (saveSummaryIfCreated)</span>
+<span class="nc" id="L798">                    saveSummary();</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">                if (recreateBloomFilter)</span>
+<span class="nc" id="L800">                    saveBloomFilter();</span>
+            }
+        }
+<span class="nc" id="L803">        catch (Throwable t)</span>
+        { // Because the tidier has not been set-up yet in SSTableReader.open(), we must release the files in case of error
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            if (ifile != null)</span>
+            {
+<span class="nc" id="L807">                ifile.close();</span>
+<span class="nc" id="L808">                ifile = null;</span>
+            }
+
+<span class="nc bnc" id="L811" title="All 2 branches missed.">            if (dfile != null)</span>
+            {
+<span class="nc" id="L813">                dfile.close();</span>
+<span class="nc" id="L814">                dfile = null;</span>
+            }
+
+<span class="nc bnc" id="L817" title="All 2 branches missed.">            if (indexSummary != null)</span>
+            {
+<span class="nc" id="L819">                indexSummary.close();</span>
+<span class="nc" id="L820">                indexSummary = null;</span>
+            }
+
+<span class="nc" id="L823">            throw t;</span>
+<span class="nc" id="L824">        }</span>
+<span class="nc" id="L825">    }</span>
+
+    /**
+     * Build index summary(and optionally bloom filter) by reading through Index.db file.
+     *
+     * @param recreateBloomFilter true if recreate bloom filter
+     * @param summaryLoaded true if index summary is already loaded and not need to build again
+     * @throws IOException
+     */
+    private void buildSummary(boolean recreateBloomFilter, boolean summaryLoaded, int samplingLevel) throws IOException
+    {
+<span class="nc bnc" id="L836" title="All 2 branches missed.">         if (!components.contains(Component.PRIMARY_INDEX))</span>
+<span class="nc" id="L837">             return;</span>
+
+        // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
+<span class="nc" id="L840">        try (RandomAccessReader primaryIndex = RandomAccessReader.open(new File(descriptor.filenameFor(Component.PRIMARY_INDEX))))</span>
+        {
+<span class="nc" id="L842">            long indexSize = primaryIndex.length();</span>
+<span class="nc" id="L843">            long histogramCount = sstableMetadata.estimatedPartitionSize.count();</span>
+<span class="nc bnc" id="L844" title="All 4 branches missed.">            long estimatedKeys = histogramCount &gt; 0 &amp;&amp; !sstableMetadata.estimatedPartitionSize.isOverflowed()</span>
+                    ? histogramCount
+<span class="nc" id="L846">                    : estimateRowsFromIndex(primaryIndex); // statistics is supposed to be optional</span>
+
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            if (recreateBloomFilter)</span>
+<span class="nc" id="L849">                bf = FilterFactory.getFilter(estimatedKeys, metadata.params.bloomFilterFpChance, true, descriptor.version.hasOldBfHashOrder());</span>
+
+<span class="nc bnc" id="L851" title="All 2 branches missed.">            try (IndexSummaryBuilder summaryBuilder = summaryLoaded ? null : new IndexSummaryBuilder(estimatedKeys, metadata.params.minIndexInterval, samplingLevel))</span>
+            {
+                long indexPosition;
+
+<span class="nc bnc" id="L855" title="All 2 branches missed.">                while ((indexPosition = primaryIndex.getFilePointer()) != indexSize)</span>
+                {
+<span class="nc" id="L857">                    ByteBuffer key = ByteBufferUtil.readWithShortLength(primaryIndex);</span>
+<span class="nc" id="L858">                    RowIndexEntry.Serializer.skip(primaryIndex, descriptor.version);</span>
+<span class="nc" id="L859">                    DecoratedKey decoratedKey = decorateKey(key);</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">                    if (first == null)</span>
+<span class="nc" id="L861">                        first = decoratedKey;</span>
+<span class="nc" id="L862">                    last = decoratedKey;</span>
+
+<span class="nc bnc" id="L864" title="All 2 branches missed.">                    if (recreateBloomFilter)</span>
+<span class="nc" id="L865">                        bf.add(decoratedKey);</span>
+
+                    // if summary was already read from disk we don't want to re-populate it using primary index
+<span class="nc bnc" id="L868" title="All 2 branches missed.">                    if (!summaryLoaded)</span>
+                    {
+<span class="nc" id="L870">                        summaryBuilder.maybeAddEntry(decoratedKey, indexPosition);</span>
+                    }
+<span class="nc" id="L872">                }</span>
+
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                if (!summaryLoaded)</span>
+<span class="nc" id="L875">                    indexSummary = summaryBuilder.build(getPartitioner());</span>
+            }
+        }
+
+<span class="nc" id="L879">        first = getMinimalKey(first);</span>
+<span class="nc" id="L880">        last = getMinimalKey(last);</span>
+<span class="nc" id="L881">    }</span>
+
+    /**
+     * Load index summary from Summary.db file if it exists.
+     *
+     * if loaded index summary has different index interval from current value stored in schema,
+     * then Summary.db file will be deleted and this returns false to rebuild summary.
+     *
+     * @return true if index summary is loaded successfully from Summary.db file.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public boolean loadSummary()
+    {
+<span class="nc" id="L894">        File summariesFile = new File(descriptor.filenameFor(Component.SUMMARY));</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">        if (!summariesFile.exists())</span>
+<span class="nc" id="L896">            return false;</span>
+
+<span class="nc" id="L898">        DataInputStream iStream = null;</span>
+        try
+        {
+<span class="nc" id="L901">            iStream = new DataInputStream(new FileInputStream(summariesFile));</span>
+<span class="nc" id="L902">            indexSummary = IndexSummary.serializer.deserialize(</span>
+<span class="nc" id="L903">                    iStream, getPartitioner(), descriptor.version.hasSamplingLevel(),</span>
+                    metadata.params.minIndexInterval, metadata.params.maxIndexInterval);
+<span class="nc" id="L905">            first = decorateKey(ByteBufferUtil.readWithLength(iStream));</span>
+<span class="nc" id="L906">            last = decorateKey(ByteBufferUtil.readWithLength(iStream));</span>
+        }
+<span class="nc" id="L908">        catch (IOException e)</span>
+        {
+<span class="nc bnc" id="L910" title="All 2 branches missed.">            if (indexSummary != null)</span>
+<span class="nc" id="L911">                indexSummary.close();</span>
+<span class="nc" id="L912">            logger.trace(&quot;Cannot deserialize SSTable Summary File {}: {}&quot;, summariesFile.getPath(), e.getMessage());</span>
+            // corrupted; delete it and fall back to creating a new summary
+<span class="nc" id="L914">            FileUtils.closeQuietly(iStream);</span>
+            // delete it and fall back to creating a new summary
+<span class="nc" id="L916">            FileUtils.deleteWithConfirm(summariesFile);</span>
+<span class="nc" id="L917">            return false;</span>
+        }
+        finally
+        {
+<span class="nc" id="L921">            FileUtils.closeQuietly(iStream);</span>
+        }
+
+<span class="nc" id="L924">        return true;</span>
+    }
+
+    /**
+     * Save index summary to Summary.db file.
+     */
+
+    public void saveSummary()
+    {
+<span class="nc" id="L933">        saveSummary(this.descriptor, this.first, this.last, indexSummary);</span>
+<span class="nc" id="L934">    }</span>
+
+    private void saveSummary(IndexSummary newSummary)
+    {
+<span class="nc" id="L938">        saveSummary(this.descriptor, this.first, this.last, newSummary);</span>
+<span class="nc" id="L939">    }</span>
+
+    /**
+     * Save index summary to Summary.db file.
+     */
+    public static void saveSummary(Descriptor descriptor, DecoratedKey first, DecoratedKey last, IndexSummary summary)
+    {
+<span class="fc" id="L946">        File summariesFile = new File(descriptor.filenameFor(Component.SUMMARY));</span>
+<span class="pc bpc" id="L947" title="1 of 2 branches missed.">        if (summariesFile.exists())</span>
+<span class="nc" id="L948">            FileUtils.deleteWithConfirm(summariesFile);</span>
+
+<span class="fc" id="L950">        try (DataOutputStreamPlus oStream = new BufferedDataOutputStreamPlus(new FileOutputStream(summariesFile));)</span>
+        {
+<span class="fc" id="L952">            IndexSummary.serializer.serialize(summary, oStream, descriptor.version.hasSamplingLevel());</span>
+<span class="fc" id="L953">            ByteBufferUtil.writeWithLength(first.getKey(), oStream);</span>
+<span class="fc" id="L954">            ByteBufferUtil.writeWithLength(last.getKey(), oStream);</span>
+        }
+<span class="nc" id="L956">        catch (IOException e)</span>
+        {
+<span class="nc" id="L958">            logger.trace(&quot;Cannot save SSTable Summary: &quot;, e);</span>
+
+            // corrupted hence delete it and let it load it now.
+<span class="nc bnc" id="L961" title="All 2 branches missed.">            if (summariesFile.exists())</span>
+<span class="nc" id="L962">                FileUtils.deleteWithConfirm(summariesFile);</span>
+<span class="fc" id="L963">        }</span>
+<span class="fc" id="L964">    }</span>
+
+    public void saveBloomFilter()
+    {
+<span class="nc" id="L968">        saveBloomFilter(this.descriptor, bf);</span>
+<span class="nc" id="L969">    }</span>
+
+    public static void saveBloomFilter(Descriptor descriptor, IFilter filter)
+    {
+<span class="nc" id="L973">        File filterFile = new File(descriptor.filenameFor(Component.FILTER));</span>
+<span class="nc" id="L974">        try (DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(new FileOutputStream(filterFile)))</span>
+        {
+<span class="nc" id="L976">            FilterFactory.serialize(filter, stream);</span>
+<span class="nc" id="L977">            stream.flush();</span>
+        }
+<span class="nc" id="L979">        catch (IOException e)</span>
+        {
+<span class="nc" id="L981">            logger.trace(&quot;Cannot save SSTable bloomfilter: &quot;, e);</span>
+
+            // corrupted hence delete it and let it load it now.
+<span class="nc bnc" id="L984" title="All 2 branches missed.">            if (filterFile.exists())</span>
+<span class="nc" id="L985">                FileUtils.deleteWithConfirm(filterFile);</span>
+<span class="nc" id="L986">        }</span>
+
+<span class="nc" id="L988">    }</span>
+
+    public void setReplaced()
+    {
+<span class="fc" id="L992">        synchronized (tidy.global)</span>
+        {
+<span class="pc bpc" id="L994" title="2 of 4 branches missed.">            assert !tidy.isReplaced;</span>
+<span class="fc" id="L995">            tidy.isReplaced = true;</span>
+<span class="fc" id="L996">        }</span>
+<span class="fc" id="L997">    }</span>
+
+    public boolean isReplaced()
+    {
+<span class="fc" id="L1001">        synchronized (tidy.global)</span>
+        {
+<span class="fc" id="L1003">            return tidy.isReplaced;</span>
+        }
+    }
+
+    // These runnables must NOT be an anonymous or non-static inner class, nor must it retain a reference chain to this reader
+    public void runOnClose(final Runnable runOnClose)
+    {
+<span class="fc" id="L1010">        synchronized (tidy.global)</span>
+        {
+<span class="fc" id="L1012">            final Runnable existing = tidy.runOnClose;</span>
+<span class="fc" id="L1013">            tidy.runOnClose = AndThen.get(existing, runOnClose);</span>
+<span class="fc" id="L1014">        }</span>
+<span class="fc" id="L1015">    }</span>
+
+    private static class AndThen implements Runnable
+    {
+        final Runnable runFirst;
+        final Runnable runSecond;
+
+        private AndThen(Runnable runFirst, Runnable runSecond)
+<span class="nc" id="L1023">        {</span>
+<span class="nc" id="L1024">            this.runFirst = runFirst;</span>
+<span class="nc" id="L1025">            this.runSecond = runSecond;</span>
+<span class="nc" id="L1026">        }</span>
+
+        public void run()
+        {
+<span class="nc" id="L1030">            runFirst.run();</span>
+<span class="nc" id="L1031">            runSecond.run();</span>
+<span class="nc" id="L1032">        }</span>
+
+        static Runnable get(Runnable runFirst, Runnable runSecond)
+        {
+<span class="pc bpc" id="L1036" title="1 of 2 branches missed.">            if (runFirst == null)</span>
+<span class="fc" id="L1037">                return runSecond;</span>
+<span class="nc" id="L1038">            return new AndThen(runFirst, runSecond);</span>
+        }
+    }
+
+    /**
+     * Clone this reader with the provided start and open reason, and set the clone as replacement.
+     *
+     * @param newFirst the first key for the replacement (which can be different from the original due to the pre-emptive
+     * opening of compaction results).
+     * @param reason the {@code OpenReason} for the replacement.
+     *
+     * @return the cloned reader. That reader is set as a replacement by the method.
+     */
+    private SSTableReader cloneAndReplace(DecoratedKey newFirst, OpenReason reason)
+    {
+<span class="nc" id="L1053">        return cloneAndReplace(newFirst, reason, indexSummary.sharedCopy());</span>
+    }
+
+    /**
+     * Clone this reader with the new values and set the clone as replacement.
+     *
+     * @param newFirst the first key for the replacement (which can be different from the original due to the pre-emptive
+     * opening of compaction results).
+     * @param reason the {@code OpenReason} for the replacement.
+     * @param newSummary the index summary for the replacement.
+     *
+     * @return the cloned reader. That reader is set as a replacement by the method.
+     */
+    private SSTableReader cloneAndReplace(DecoratedKey newFirst, OpenReason reason, IndexSummary newSummary)
+    {
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">        SSTableReader replacement = internalOpen(descriptor,</span>
+                                                 components,
+                                                 metadata,
+<span class="nc" id="L1071">                                                 ifile != null ? ifile.sharedCopy() : null,</span>
+<span class="nc" id="L1072">                                                 dfile.sharedCopy(),</span>
+                                                 newSummary,
+<span class="nc" id="L1074">                                                 bf.sharedCopy(),</span>
+                                                 maxDataAge,
+                                                 sstableMetadata,
+                                                 reason,
+                                                 header);
+<span class="nc" id="L1079">        replacement.first = newFirst;</span>
+<span class="nc" id="L1080">        replacement.last = last;</span>
+<span class="nc" id="L1081">        replacement.isSuspect.set(isSuspect.get());</span>
+<span class="nc" id="L1082">        return replacement;</span>
+    }
+
+    public SSTableReader cloneWithRestoredStart(DecoratedKey restoredStart)
+    {
+<span class="nc" id="L1087">        synchronized (tidy.global)</span>
+        {
+<span class="nc" id="L1089">            return cloneAndReplace(restoredStart, OpenReason.NORMAL);</span>
+        }
+    }
+
+    // runOnClose must NOT be an anonymous or non-static inner class, nor must it retain a reference chain to this reader
+    public SSTableReader cloneWithNewStart(DecoratedKey newStart, final Runnable runOnClose)
+    {
+<span class="nc" id="L1096">        synchronized (tidy.global)</span>
+        {
+<span class="nc bnc" id="L1098" title="All 4 branches missed.">            assert openReason != OpenReason.EARLY;</span>
+            // TODO: merge with caller's firstKeyBeyond() work,to save time
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            if (newStart.compareTo(first) &gt; 0)</span>
+            {
+<span class="nc" id="L1102">                final long dataStart = getPosition(newStart, Operator.EQ).position;</span>
+<span class="nc" id="L1103">                final long indexStart = getIndexScanPosition(newStart);</span>
+<span class="nc" id="L1104">                this.tidy.runOnClose = new DropPageCache(dfile, dataStart, ifile, indexStart, runOnClose);</span>
+            }
+
+<span class="nc" id="L1107">            return cloneAndReplace(newStart, OpenReason.MOVED_START);</span>
+        }
+    }
+
+    private static class DropPageCache implements Runnable
+    {
+        final FileHandle dfile;
+        final long dfilePosition;
+        final FileHandle ifile;
+        final long ifilePosition;
+        final Runnable andThen;
+
+        private DropPageCache(FileHandle dfile, long dfilePosition, FileHandle ifile, long ifilePosition, Runnable andThen)
+<span class="nc" id="L1120">        {</span>
+<span class="nc" id="L1121">            this.dfile = dfile;</span>
+<span class="nc" id="L1122">            this.dfilePosition = dfilePosition;</span>
+<span class="nc" id="L1123">            this.ifile = ifile;</span>
+<span class="nc" id="L1124">            this.ifilePosition = ifilePosition;</span>
+<span class="nc" id="L1125">            this.andThen = andThen;</span>
+<span class="nc" id="L1126">        }</span>
+
+        public void run()
+        {
+<span class="nc" id="L1130">            dfile.dropPageCache(dfilePosition);</span>
+
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">            if (ifile != null)</span>
+<span class="nc" id="L1133">                ifile.dropPageCache(ifilePosition);</span>
+<span class="nc bnc" id="L1134" title="All 2 branches missed.">            if (andThen != null)</span>
+<span class="nc" id="L1135">                andThen.run();</span>
+<span class="nc" id="L1136">        }</span>
+    }
+
+    /**
+     * Returns a new SSTableReader with the same properties as this SSTableReader except that a new IndexSummary will
+     * be built at the target samplingLevel.  This (original) SSTableReader instance will be marked as replaced, have
+     * its DeletingTask removed, and have its periodic read-meter sync task cancelled.
+     * @param samplingLevel the desired sampling level for the index summary on the new SSTableReader
+     * @return a new SSTableReader
+     * @throws IOException
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public SSTableReader cloneWithNewSummarySamplingLevel(ColumnFamilyStore parent, int samplingLevel) throws IOException
+    {
+<span class="nc bnc" id="L1150" title="All 4 branches missed.">        assert descriptor.version.hasSamplingLevel();</span>
+
+<span class="nc" id="L1152">        synchronized (tidy.global)</span>
+        {
+<span class="nc bnc" id="L1154" title="All 4 branches missed.">            assert openReason != OpenReason.EARLY;</span>
+
+<span class="nc" id="L1156">            int minIndexInterval = metadata.params.minIndexInterval;</span>
+<span class="nc" id="L1157">            int maxIndexInterval = metadata.params.maxIndexInterval;</span>
+<span class="nc" id="L1158">            double effectiveInterval = indexSummary.getEffectiveIndexInterval();</span>
+
+            IndexSummary newSummary;
+<span class="nc" id="L1161">            long oldSize = bytesOnDisk();</span>
+
+            // We have to rebuild the summary from the on-disk primary index in three cases:
+            // 1. The sampling level went up, so we need to read more entries off disk
+            // 2. The min_index_interval changed (in either direction); this changes what entries would be in the summary
+            //    at full sampling (and consequently at any other sampling level)
+            // 3. The max_index_interval was lowered, forcing us to raise the sampling level
+<span class="nc bnc" id="L1168" title="All 6 branches missed.">            if (samplingLevel &gt; indexSummary.getSamplingLevel() || indexSummary.getMinIndexInterval() != minIndexInterval || effectiveInterval &gt; maxIndexInterval)</span>
+            {
+<span class="nc" id="L1170">                newSummary = buildSummaryAtLevel(samplingLevel);</span>
+            }
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">            else if (samplingLevel &lt; indexSummary.getSamplingLevel())</span>
+            {
+                // we can use the existing index summary to make a smaller one
+<span class="nc" id="L1175">                newSummary = IndexSummaryBuilder.downsample(indexSummary, samplingLevel, minIndexInterval, getPartitioner());</span>
+            }
+            else
+            {
+<span class="nc" id="L1179">                throw new AssertionError(&quot;Attempted to clone SSTableReader with the same index summary sampling level and &quot; +</span>
+                        &quot;no adjustments to min/max_index_interval&quot;);
+            }
+
+            // Always save the resampled index
+<span class="nc" id="L1184">            saveSummary(newSummary);</span>
+
+            // The new size will be added in Transactional.commit() as an updated SSTable, more details: CASSANDRA-13738
+<span class="nc" id="L1187">            StorageMetrics.load.dec(oldSize);</span>
+<span class="nc" id="L1188">            parent.metric.liveDiskSpaceUsed.dec(oldSize);</span>
+<span class="nc" id="L1189">            parent.metric.totalDiskSpaceUsed.dec(oldSize);</span>
+
+<span class="nc" id="L1191">            return cloneAndReplace(first, OpenReason.METADATA_CHANGE, newSummary);</span>
+        }
+    }
+
+    private IndexSummary buildSummaryAtLevel(int newSamplingLevel) throws IOException
+    {
+        // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
+<span class="nc" id="L1198">        RandomAccessReader primaryIndex = RandomAccessReader.open(new File(descriptor.filenameFor(Component.PRIMARY_INDEX)));</span>
+        try
+        {
+<span class="nc" id="L1201">            long indexSize = primaryIndex.length();</span>
+<span class="nc" id="L1202">            try (IndexSummaryBuilder summaryBuilder = new IndexSummaryBuilder(estimatedKeys(), metadata.params.minIndexInterval, newSamplingLevel))</span>
+            {
+                long indexPosition;
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">                while ((indexPosition = primaryIndex.getFilePointer()) != indexSize)</span>
+                {
+<span class="nc" id="L1207">                    summaryBuilder.maybeAddEntry(decorateKey(ByteBufferUtil.readWithShortLength(primaryIndex)), indexPosition);</span>
+<span class="nc" id="L1208">                    RowIndexEntry.Serializer.skip(primaryIndex, descriptor.version);</span>
+                }
+
+<span class="nc" id="L1211">                return summaryBuilder.build(getPartitioner());</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L1216">            FileUtils.closeQuietly(primaryIndex);</span>
+        }
+    }
+
+    public RestorableMeter getReadMeter()
+    {
+<span class="fc" id="L1222">        return readMeter;</span>
+    }
+
+    public int getIndexSummarySamplingLevel()
+    {
+<span class="nc" id="L1227">        return indexSummary.getSamplingLevel();</span>
+    }
+
+    public long getIndexSummaryOffHeapSize()
+    {
+<span class="nc" id="L1232">        return indexSummary.getOffHeapSize();</span>
+    }
+
+    public int getMinIndexInterval()
+    {
+<span class="nc" id="L1237">        return indexSummary.getMinIndexInterval();</span>
+    }
+
+    public double getEffectiveIndexInterval()
+    {
+<span class="nc" id="L1242">        return indexSummary.getEffectiveIndexInterval();</span>
+    }
+
+    public void releaseSummary()
+    {
+<span class="nc" id="L1247">        tidy.releaseSummary();</span>
+<span class="nc" id="L1248">        indexSummary = null;</span>
+<span class="nc" id="L1249">    }</span>
+
+    private void validate()
+    {
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">        if (this.first.compareTo(this.last) &gt; 0)</span>
+        {
+<span class="nc" id="L1255">            throw new CorruptSSTableException(new IllegalStateException(String.format(&quot;SSTable first key %s &gt; last key %s&quot;, this.first, this.last)), getFilename());</span>
+        }
+<span class="nc" id="L1257">    }</span>
+
+    /**
+     * Gets the position in the index file to start scanning to find the given key (at most indexInterval keys away,
+     * modulo downsampling of the index summary). Always returns a {@code value &gt;= 0}
+     */
+    public long getIndexScanPosition(PartitionPosition key)
+    {
+<span class="pc bpc" id="L1265" title="3 of 4 branches missed.">        if (openReason == OpenReason.MOVED_START &amp;&amp; key.compareTo(first) &lt; 0)</span>
+<span class="nc" id="L1266">            key = first;</span>
+
+<span class="fc" id="L1268">        return getIndexScanPositionFromBinarySearchResult(indexSummary.binarySearch(key), indexSummary);</span>
+    }
+
+    @VisibleForTesting
+    public static long getIndexScanPositionFromBinarySearchResult(int binarySearchResult, IndexSummary referencedIndexSummary)
+    {
+<span class="pc bpc" id="L1274" title="1 of 2 branches missed.">        if (binarySearchResult == -1)</span>
+<span class="nc" id="L1275">            return 0;</span>
+        else
+<span class="fc" id="L1277">            return referencedIndexSummary.getPosition(getIndexSummaryIndexFromBinarySearchResult(binarySearchResult));</span>
+    }
+
+    public static int getIndexSummaryIndexFromBinarySearchResult(int binarySearchResult)
+    {
+<span class="fc bfc" id="L1282" title="All 2 branches covered.">        if (binarySearchResult &lt; 0)</span>
+        {
+            // binary search gives us the first index _greater_ than the key searched for,
+            // i.e., its insertion position
+<span class="fc" id="L1286">            int greaterThan = (binarySearchResult + 1) * -1;</span>
+<span class="pc bpc" id="L1287" title="1 of 2 branches missed.">            if (greaterThan == 0)</span>
+<span class="nc" id="L1288">                return -1;</span>
+<span class="fc" id="L1289">            return greaterThan - 1;</span>
+        }
+        else
+        {
+<span class="fc" id="L1293">            return binarySearchResult;</span>
+        }
+    }
+
+    /**
+     * Returns the compression metadata for this sstable.
+     * @throws IllegalStateException if the sstable is not compressed
+     */
+    public CompressionMetadata getCompressionMetadata()
+    {
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">        if (!compression)</span>
+<span class="nc" id="L1304">            throw new IllegalStateException(this + &quot; is not compressed&quot;);</span>
+
+<span class="nc" id="L1306">        return dfile.compressionMetadata().get();</span>
+    }
+
+    /**
+     * Returns the amount of memory in bytes used off heap by the compression meta-data.
+     * @return the amount of memory in bytes used off heap by the compression meta-data
+     */
+    public long getCompressionMetadataOffHeapSize()
+    {
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">        if (!compression)</span>
+<span class="nc" id="L1316">            return 0;</span>
+
+<span class="nc" id="L1318">        return getCompressionMetadata().offHeapSize();</span>
+    }
+
+    /**
+     * For testing purposes only.
+     */
+    public void forceFilterFailures()
+    {
+<span class="nc" id="L1326">        bf = FilterFactory.AlwaysPresent;</span>
+<span class="nc" id="L1327">    }</span>
+
+    public IFilter getBloomFilter()
+    {
+<span class="nc" id="L1331">        return bf;</span>
+    }
+
+    public long getBloomFilterSerializedSize()
+    {
+<span class="nc" id="L1336">        return bf.serializedSize();</span>
+    }
+
+    /**
+     * Returns the amount of memory in bytes used off heap by the bloom filter.
+     * @return the amount of memory in bytes used off heap by the bloom filter
+     */
+    public long getBloomFilterOffHeapSize()
+    {
+<span class="nc" id="L1345">        return bf.offHeapSize();</span>
+    }
+
+    /**
+     * @return An estimate of the number of keys in this SSTable based on the index summary.
+     */
+    public long estimatedKeys()
+    {
+<span class="nc" id="L1353">        return indexSummary.getEstimatedKeyCount();</span>
+    }
+
+    /**
+     * @param ranges
+     * @return An estimate of the number of keys for given ranges in this SSTable.
+     */
+    public long estimatedKeysForRanges(Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L1362">        long sampleKeyCount = 0;</span>
+<span class="nc" id="L1363">        List&lt;Pair&lt;Integer, Integer&gt;&gt; sampleIndexes = getSampleIndexesForRanges(indexSummary, ranges);</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">        for (Pair&lt;Integer, Integer&gt; sampleIndexRange : sampleIndexes)</span>
+<span class="nc" id="L1365">            sampleKeyCount += (sampleIndexRange.right - sampleIndexRange.left + 1);</span>
+
+        // adjust for the current sampling level: (BSL / SL) * index_interval_at_full_sampling
+<span class="nc" id="L1368">        long estimatedKeys = sampleKeyCount * ((long) Downsampling.BASE_SAMPLING_LEVEL * indexSummary.getMinIndexInterval()) / indexSummary.getSamplingLevel();</span>
+<span class="nc" id="L1369">        return Math.max(1, estimatedKeys);</span>
+    }
+
+    /**
+     * Returns the number of entries in the IndexSummary.  At full sampling, this is approximately 1/INDEX_INTERVALth of
+     * the keys in this SSTable.
+     */
+    public int getIndexSummarySize()
+    {
+<span class="nc" id="L1378">        return indexSummary.size();</span>
+    }
+
+    /**
+     * Returns the approximate number of entries the IndexSummary would contain if it were at full sampling.
+     */
+    public int getMaxIndexSummarySize()
+    {
+<span class="nc" id="L1386">        return indexSummary.getMaxNumberOfEntries();</span>
+    }
+
+    /**
+     * Returns the key for the index summary entry at `index`.
+     */
+    public byte[] getIndexSummaryKey(int index)
+    {
+<span class="nc" id="L1394">        return indexSummary.getKey(index);</span>
+    }
+
+    private static List&lt;Pair&lt;Integer,Integer&gt;&gt; getSampleIndexesForRanges(IndexSummary summary, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+        // use the index to determine a minimal section for each range
+<span class="nc" id="L1400">        List&lt;Pair&lt;Integer,Integer&gt;&gt; positions = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : Range.normalize(ranges))</span>
+        {
+<span class="nc" id="L1404">            PartitionPosition leftPosition = range.left.maxKeyBound();</span>
+<span class="nc" id="L1405">            PartitionPosition rightPosition = range.right.maxKeyBound();</span>
+
+<span class="nc" id="L1407">            int left = summary.binarySearch(leftPosition);</span>
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">            if (left &lt; 0)</span>
+<span class="nc" id="L1409">                left = (left + 1) * -1;</span>
+            else
+                // left range are start exclusive
+<span class="nc" id="L1412">                left = left + 1;</span>
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">            if (left == summary.size())</span>
+                // left is past the end of the sampling
+<span class="nc" id="L1415">                continue;</span>
+
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">            int right = Range.isWrapAround(range.left, range.right)</span>
+<span class="nc" id="L1418">                    ? summary.size() - 1</span>
+<span class="nc" id="L1419">                    : summary.binarySearch(rightPosition);</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">            if (right &lt; 0)</span>
+            {
+                // range are end inclusive so we use the previous index from what binarySearch give us
+                // since that will be the last index we will return
+<span class="nc" id="L1424">                right = (right + 1) * -1;</span>
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">                if (right == 0)</span>
+                    // Means the first key is already stricly greater that the right bound
+<span class="nc" id="L1427">                    continue;</span>
+<span class="nc" id="L1428">                right--;</span>
+            }
+
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">            if (left &gt; right)</span>
+                // empty range
+<span class="nc" id="L1433">                continue;</span>
+<span class="nc" id="L1434">            positions.add(Pair.create(left, right));</span>
+<span class="nc" id="L1435">        }</span>
+<span class="nc" id="L1436">        return positions;</span>
+    }
+
+    public Iterable&lt;DecoratedKey&gt; getKeySamples(final Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L1441">        final List&lt;Pair&lt;Integer, Integer&gt;&gt; indexRanges = getSampleIndexesForRanges(indexSummary, Collections.singletonList(range));</span>
+
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">        if (indexRanges.isEmpty())</span>
+<span class="nc" id="L1444">            return Collections.emptyList();</span>
+
+<span class="nc" id="L1446">        return new Iterable&lt;DecoratedKey&gt;()</span>
+<span class="nc" id="L1447">        {</span>
+            public Iterator&lt;DecoratedKey&gt; iterator()
+            {
+<span class="nc" id="L1450">                return new Iterator&lt;DecoratedKey&gt;()</span>
+<span class="nc" id="L1451">                {</span>
+<span class="nc" id="L1452">                    private Iterator&lt;Pair&lt;Integer, Integer&gt;&gt; rangeIter = indexRanges.iterator();</span>
+                    private Pair&lt;Integer, Integer&gt; current;
+                    private int idx;
+
+                    public boolean hasNext()
+                    {
+<span class="nc bnc" id="L1458" title="All 4 branches missed.">                        if (current == null || idx &gt; current.right)</span>
+                        {
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">                            if (rangeIter.hasNext())</span>
+                            {
+<span class="nc" id="L1462">                                current = rangeIter.next();</span>
+<span class="nc" id="L1463">                                idx = current.left;</span>
+<span class="nc" id="L1464">                                return true;</span>
+                            }
+<span class="nc" id="L1466">                            return false;</span>
+                        }
+
+<span class="nc" id="L1469">                        return true;</span>
+                    }
+
+                    public DecoratedKey next()
+                    {
+<span class="nc" id="L1474">                        byte[] bytes = indexSummary.getKey(idx++);</span>
+<span class="nc" id="L1475">                        return decorateKey(ByteBuffer.wrap(bytes));</span>
+                    }
+
+                    public void remove()
+                    {
+<span class="nc" id="L1480">                        throw new UnsupportedOperationException();</span>
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Determine the minimal set of sections that can be extracted from this SSTable to cover the given ranges.
+     * @return A sorted list of (offset,end) pairs that cover the given ranges in the datafile for this SSTable.
+     */
+    public List&lt;Pair&lt;Long,Long&gt;&gt; getPositionsForRanges(Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+        // use the index to determine a minimal section for each range
+<span class="nc" id="L1494">        List&lt;Pair&lt;Long,Long&gt;&gt; positions = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1495" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : Range.normalize(ranges))</span>
+        {
+<span class="nc bnc" id="L1497" title="All 6 branches missed.">            assert !range.isWrapAround() || range.right.isMinimum();</span>
+            // truncate the range so it at most covers the sstable
+<span class="nc" id="L1499">            AbstractBounds&lt;PartitionPosition&gt; bounds = Range.makeRowRange(range);</span>
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">            PartitionPosition leftBound = bounds.left.compareTo(first) &gt; 0 ? bounds.left : first.getToken().minKeyBound();</span>
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">            PartitionPosition rightBound = bounds.right.isMinimum() ? last.getToken().maxKeyBound() : bounds.right;</span>
+
+<span class="nc bnc" id="L1503" title="All 4 branches missed.">            if (leftBound.compareTo(last) &gt; 0 || rightBound.compareTo(first) &lt; 0)</span>
+<span class="nc" id="L1504">                continue;</span>
+
+<span class="nc" id="L1506">            long left = getPosition(leftBound, Operator.GT).position;</span>
+<span class="nc bnc" id="L1507" title="All 2 branches missed.">            long right = (rightBound.compareTo(last) &gt; 0)</span>
+<span class="nc" id="L1508">                         ? uncompressedLength()</span>
+<span class="nc" id="L1509">                         : getPosition(rightBound, Operator.GT).position;</span>
+
+<span class="nc bnc" id="L1511" title="All 2 branches missed.">            if (left == right)</span>
+                // empty range
+<span class="nc" id="L1513">                continue;</span>
+
+<span class="nc bnc" id="L1515" title="All 4 branches missed.">            assert left &lt; right : String.format(&quot;Range=%s openReason=%s first=%s last=%s left=%d right=%d&quot;, range, openReason, first, last, left, right);</span>
+<span class="nc" id="L1516">            positions.add(Pair.create(left, right));</span>
+<span class="nc" id="L1517">        }</span>
+<span class="nc" id="L1518">        return positions;</span>
+    }
+
+    public KeyCacheKey getCacheKey(DecoratedKey key)
+    {
+<span class="fc" id="L1523">        return new KeyCacheKey(metadata.ksAndCFName, descriptor, key.getKey());</span>
+    }
+
+    public void cacheKey(DecoratedKey key, RowIndexEntry info)
+    {
+<span class="fc" id="L1528">        CachingParams caching = metadata.params.caching;</span>
+
+<span class="pc bpc" id="L1530" title="3 of 6 branches missed.">        if (!caching.cacheKeys() || keyCache == null || keyCache.getCapacity() == 0)</span>
+<span class="nc" id="L1531">            return;</span>
+
+<span class="fc" id="L1533">        KeyCacheKey cacheKey = new KeyCacheKey(metadata.ksAndCFName, descriptor, key.getKey());</span>
+<span class="fc" id="L1534">        logger.trace(&quot;Adding cache entry for {} -&gt; {}&quot;, cacheKey, info);</span>
+<span class="fc" id="L1535">        keyCache.put(cacheKey, info);</span>
+<span class="fc" id="L1536">    }</span>
+
+    public RowIndexEntry getCachedPosition(DecoratedKey key, boolean updateStats)
+    {
+<span class="fc" id="L1540">        return getCachedPosition(new KeyCacheKey(metadata.ksAndCFName, descriptor, key.getKey()), updateStats);</span>
+    }
+
+    protected RowIndexEntry getCachedPosition(KeyCacheKey unifiedKey, boolean updateStats)
+    {
+<span class="pc bpc" id="L1545" title="3 of 6 branches missed.">        if (keyCache != null &amp;&amp; keyCache.getCapacity() &gt; 0 &amp;&amp; metadata.params.caching.cacheKeys())</span>
+        {
+<span class="fc bfc" id="L1547" title="All 2 branches covered.">            if (updateStats)</span>
+            {
+<span class="fc" id="L1549">                RowIndexEntry cachedEntry = keyCache.get(unifiedKey);</span>
+<span class="fc" id="L1550">                keyCacheRequest.incrementAndGet();</span>
+<span class="fc bfc" id="L1551" title="All 2 branches covered.">                if (cachedEntry != null)</span>
+                {
+<span class="fc" id="L1553">                    keyCacheHit.incrementAndGet();</span>
+<span class="fc" id="L1554">                    bloomFilterTracker.addTruePositive();</span>
+                }
+<span class="fc" id="L1556">                return cachedEntry;</span>
+            }
+            else
+            {
+<span class="fc" id="L1560">                return keyCache.getInternal(unifiedKey);</span>
+            }
+        }
+<span class="nc" id="L1563">        return null;</span>
+    }
+
+    /**
+     * Retrieves the position while updating the key cache and the stats.
+     * @param key The key to apply as the rhs to the given Operator. A 'fake' key is allowed to
+     * allow key selection by token bounds but only if op != * EQ
+     * @param op The Operator defining matching keys: the nearest key to the target matching the operator wins.
+     */
+    public final RowIndexEntry getPosition(PartitionPosition key, Operator op)
+    {
+<span class="nc" id="L1574">        return getPosition(key, op, SSTableReadsListener.NOOP_LISTENER);</span>
+    }
+
+    /**
+     * Retrieves the position while updating the key cache and the stats.
+     * @param key The key to apply as the rhs to the given Operator. A 'fake' key is allowed to
+     * allow key selection by token bounds but only if op != * EQ
+     * @param op The Operator defining matching keys: the nearest key to the target matching the operator wins.
+     * @param listener the {@code SSTableReaderListener} that must handle the notifications.
+     */
+    public final RowIndexEntry getPosition(PartitionPosition key, Operator op, SSTableReadsListener listener)
+    {
+<span class="fc" id="L1586">        return getPosition(key, op, true, false, listener);</span>
+    }
+
+    public final RowIndexEntry getPosition(PartitionPosition key, Operator op, boolean updateCacheAndStats)
+    {
+<span class="nc" id="L1591">        return getPosition(key, op, updateCacheAndStats, false, SSTableReadsListener.NOOP_LISTENER);</span>
+    }
+    /**
+     * @param key The key to apply as the rhs to the given Operator. A 'fake' key is allowed to
+     * allow key selection by token bounds but only if op != * EQ
+     * @param op The Operator defining matching keys: the nearest key to the target matching the operator wins.
+     * @param updateCacheAndStats true if updating stats and cache
+     * @param listener a listener used to handle internal events
+     * @return The index entry corresponding to the key, or null if the key is not present
+     */
+    protected abstract RowIndexEntry getPosition(PartitionPosition key,
+                                                 Operator op,
+                                                 boolean updateCacheAndStats,
+                                                 boolean permitMatchPastLast,
+                                                 SSTableReadsListener listener);
+
+    public abstract UnfilteredRowIterator iterator(DecoratedKey key,
+                                                   Slices slices,
+                                                   ColumnFilter selectedColumns,
+                                                   boolean reversed,
+                                                   boolean isForThrift,
+                                                   SSTableReadsListener listener);
+
+    public abstract UnfilteredRowIterator iterator(FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry, Slices slices, ColumnFilter selectedColumns, boolean reversed, boolean isForThrift);
+
+    public abstract UnfilteredRowIterator simpleIterator(FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry, boolean tombstoneOnly);
+
+    /**
+     * Finds and returns the first key beyond a given token in this SSTable or null if no such key exists.
+     */
+    public DecoratedKey firstKeyBeyond(PartitionPosition token)
+    {
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">        if (token.compareTo(first) &lt; 0)</span>
+<span class="nc" id="L1624">            return first;</span>
+
+<span class="nc" id="L1626">        long sampledPosition = getIndexScanPosition(token);</span>
+
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">        if (ifile == null)</span>
+<span class="nc" id="L1629">            return null;</span>
+
+<span class="nc" id="L1631">        String path = null;</span>
+<span class="nc" id="L1632">        try (FileDataInput in = ifile.createReader(sampledPosition))</span>
+        {
+<span class="nc" id="L1634">            path = in.getPath();</span>
+<span class="nc bnc" id="L1635" title="All 2 branches missed.">            while (!in.isEOF())</span>
+            {
+<span class="nc" id="L1637">                ByteBuffer indexKey = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L1638">                DecoratedKey indexDecoratedKey = decorateKey(indexKey);</span>
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">                if (indexDecoratedKey.compareTo(token) &gt; 0)</span>
+<span class="nc" id="L1640">                    return indexDecoratedKey;</span>
+
+<span class="nc" id="L1642">                RowIndexEntry.Serializer.skip(in, descriptor.version);</span>
+<span class="nc" id="L1643">            }</span>
+        }
+<span class="nc" id="L1645">        catch (IOException e)</span>
+        {
+<span class="nc" id="L1647">            markSuspect();</span>
+<span class="nc" id="L1648">            throw new CorruptSSTableException(e, path);</span>
+<span class="nc" id="L1649">        }</span>
+
+<span class="nc" id="L1651">        return null;</span>
+    }
+
+    /**
+     * @return The length in bytes of the data for this SSTable. For
+     * compressed files, this is not the same thing as the on disk size (see
+     * onDiskLength())
+     */
+    public long uncompressedLength()
+    {
+<span class="nc" id="L1661">        return dfile.dataLength();</span>
+    }
+
+    /**
+     * @return The length in bytes of the on disk size for this SSTable. For
+     * compressed files, this is not the same thing as the data length (see
+     * length())
+     */
+    public long onDiskLength()
+    {
+<span class="fc" id="L1671">        return dfile.onDiskLength;</span>
+    }
+
+    @VisibleForTesting
+    public double getCrcCheckChance()
+    {
+<span class="nc" id="L1677">        return crcCheckChance;</span>
+    }
+
+    /**
+     * Set the value of CRC check chance. The argument supplied is obtained
+     * from the the property of the owning CFS. Called when either the SSTR
+     * is initialized, or the CFS's property is updated via JMX
+     * @param crcCheckChance
+     */
+    public void setCrcCheckChance(double crcCheckChance)
+    {
+<span class="fc" id="L1688">        this.crcCheckChance = crcCheckChance;</span>
+<span class="fc" id="L1689">        dfile.compressionMetadata().ifPresent(metadata -&gt; metadata.parameters.setCrcCheckChance(crcCheckChance));</span>
+<span class="fc" id="L1690">    }</span>
+
+    /**
+     * Mark the sstable as obsolete, i.e., compacted into newer sstables.
+     *
+     * When calling this function, the caller must ensure that the SSTableReader is not referenced anywhere
+     * except for threads holding a reference.
+     *
+     * multiple times is usually buggy (see exceptions in Tracker.unmarkCompacting and removeOldSSTablesSize).
+     */
+    public void markObsolete(Runnable tidier)
+    {
+<span class="pc bpc" id="L1702" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1703">            logger.trace(&quot;Marking {} compacted&quot;, getFilename());</span>
+
+<span class="fc" id="L1705">        synchronized (tidy.global)</span>
+        {
+<span class="pc bpc" id="L1707" title="2 of 4 branches missed.">            assert !tidy.isReplaced;</span>
+<span class="pc bpc" id="L1708" title="2 of 4 branches missed.">            assert tidy.global.obsoletion == null: this + &quot; was already marked compacted&quot;;</span>
+
+<span class="fc" id="L1710">            tidy.global.obsoletion = tidier;</span>
+<span class="fc" id="L1711">            tidy.global.stopReadMeterPersistence();</span>
+<span class="fc" id="L1712">        }</span>
+<span class="fc" id="L1713">    }</span>
+
+    public boolean isMarkedCompacted()
+    {
+<span class="pc bpc" id="L1717" title="1 of 2 branches missed.">        return tidy.global.obsoletion != null;</span>
+    }
+
+    public void markSuspect()
+    {
+<span class="nc bnc" id="L1722" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1723">            logger.trace(&quot;Marking {} as a suspect for blacklisting.&quot;, getFilename());</span>
+
+<span class="nc" id="L1725">        isSuspect.getAndSet(true);</span>
+<span class="nc" id="L1726">    }</span>
+
+    public boolean isMarkedSuspect()
+    {
+<span class="fc" id="L1730">        return isSuspect.get();</span>
+    }
+
+
+    /**
+     * I/O SSTableScanner
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public ISSTableScanner getScanner()
+    {
+<span class="nc" id="L1740">        return getScanner((RateLimiter) null);</span>
+    }
+
+    /**
+     * @param columns the columns to return.
+     * @param dataRange filter to use when reading the columns
+     * @param listener a listener used to handle internal read events
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public ISSTableScanner getScanner(ColumnFilter columns,
+                                      DataRange dataRange,
+                                      boolean isForThrift,
+                                      SSTableReadsListener listener)
+    {
+<span class="fc" id="L1754">        return getScanner(columns, dataRange, null, isForThrift, listener);</span>
+    }
+
+    /**
+     * Direct I/O SSTableScanner over a defined range of tokens.
+     *
+     * @param range the range of keys to cover
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public ISSTableScanner getScanner(Range&lt;Token&gt; range, RateLimiter limiter)
+    {
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">        if (range == null)</span>
+<span class="nc" id="L1766">            return getScanner(limiter);</span>
+<span class="nc" id="L1767">        return getScanner(Collections.singletonList(range), limiter);</span>
+    }
+
+    /**
+     * Direct I/O SSTableScanner over the entirety of the sstable..
+     *
+     * @return A Scanner over the full content of the SSTable.
+     */
+    public abstract ISSTableScanner getScanner(RateLimiter limiter);
+
+    /**
+     * Direct I/O SSTableScanner over a defined collection of ranges of tokens.
+     *
+     * @param ranges the range of keys to cover
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public abstract ISSTableScanner getScanner(Collection&lt;Range&lt;Token&gt;&gt; ranges, RateLimiter limiter);
+
+    /**
+     * Direct I/O SSTableScanner over an iterator of bounds.
+     *
+     * @param rangeIterator the keys to cover
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public abstract ISSTableScanner getScanner(Iterator&lt;AbstractBounds&lt;PartitionPosition&gt;&gt; rangeIterator);
+
+    /**
+     * @param columns the columns to return.
+     * @param dataRange filter to use when reading the columns
+     * @param listener a listener used to handle internal read events
+     * @return A Scanner for seeking over the rows of the SSTable.
+     */
+    public abstract ISSTableScanner getScanner(ColumnFilter columns,
+                                               DataRange dataRange,
+                                               RateLimiter limiter,
+                                               boolean isForThrift,
+                                               SSTableReadsListener listener);
+
+    public FileDataInput getFileDataInput(long position)
+    {
+<span class="fc" id="L1807">        return dfile.createReader(position);</span>
+    }
+
+    /**
+     * Tests if the sstable contains data newer than the given age param (in localhost currentMilli time).
+     * This works in conjunction with maxDataAge which is an upper bound on the create of data in this sstable.
+     * @param age The age to compare the maxDataAre of this sstable. Measured in millisec since epoc on this host
+     * @return True iff this sstable contains data that's newer than the given age parameter.
+     */
+    public boolean newSince(long age)
+    {
+<span class="nc bnc" id="L1818" title="All 2 branches missed.">        return maxDataAge &gt; age;</span>
+    }
+
+    public void createLinks(String snapshotDirectoryPath)
+    {
+<span class="nc" id="L1823">        createLinks(descriptor, components, snapshotDirectoryPath);</span>
+<span class="nc" id="L1824">    }</span>
+
+    public static void createLinks(Descriptor descriptor, Set&lt;Component&gt; components, String snapshotDirectoryPath)
+    {
+<span class="nc bnc" id="L1828" title="All 2 branches missed.">        for (Component component : components)</span>
+        {
+<span class="nc" id="L1830">            File sourceFile = new File(descriptor.filenameFor(component));</span>
+<span class="nc bnc" id="L1831" title="All 2 branches missed.">            if (!sourceFile.exists())</span>
+<span class="nc" id="L1832">                continue;</span>
+<span class="nc" id="L1833">            File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());</span>
+<span class="nc" id="L1834">            FileUtils.createHardLink(sourceFile, targetLink);</span>
+<span class="nc" id="L1835">        }</span>
+<span class="nc" id="L1836">    }</span>
+
+    public boolean isRepaired()
+    {
+<span class="pc bpc" id="L1840" title="1 of 2 branches missed.">        return sstableMetadata.repairedAt != ActiveRepairService.UNREPAIRED_SSTABLE;</span>
+    }
+
+    public DecoratedKey keyAt(long indexPosition) throws IOException
+    {
+        DecoratedKey key;
+<span class="nc" id="L1846">        try (FileDataInput in = ifile.createReader(indexPosition))</span>
+        {
+<span class="nc bnc" id="L1848" title="All 2 branches missed.">            if (in.isEOF())</span>
+<span class="nc" id="L1849">                return null;</span>
+
+<span class="nc" id="L1851">            key = decorateKey(ByteBufferUtil.readWithShortLength(in));</span>
+
+            // hint read path about key location if caching is enabled
+            // this saves index summary lookup and index file iteration which whould be pretty costly
+            // especially in presence of promoted column indexes
+<span class="nc bnc" id="L1856" title="All 2 branches missed.">            if (isKeyCacheSetup())</span>
+<span class="nc" id="L1857">                cacheKey(key, rowIndexEntrySerializer.deserialize(in, in.getFilePointer()));</span>
+        }
+
+<span class="nc" id="L1860">        return key;</span>
+    }
+
+    /**
+     * TODO: Move someplace reusable
+     */
+<span class="fc" id="L1866">    public abstract static class Operator</span>
+    {
+<span class="fc" id="L1868">        public static final Operator EQ = new Equals();</span>
+<span class="fc" id="L1869">        public static final Operator GE = new GreaterThanOrEqualTo();</span>
+<span class="fc" id="L1870">        public static final Operator GT = new GreaterThan();</span>
+
+        /**
+         * @param comparison The result of a call to compare/compareTo, with the desired field on the rhs.
+         * @return less than 0 if the operator cannot match forward, 0 if it matches, greater than 0 if it might match forward.
+         */
+        public abstract int apply(int comparison);
+
+<span class="fc" id="L1878">        final static class Equals extends Operator</span>
+        {
+<span class="nc" id="L1880">            public int apply(int comparison) { return -comparison; }</span>
+        }
+
+<span class="fc" id="L1883">        final static class GreaterThanOrEqualTo extends Operator</span>
+        {
+<span class="nc bnc" id="L1885" title="All 2 branches missed.">            public int apply(int comparison) { return comparison &gt;= 0 ? 0 : 1; }</span>
+        }
+
+<span class="fc" id="L1888">        final static class GreaterThan extends Operator</span>
+        {
+<span class="nc bnc" id="L1890" title="All 2 branches missed.">            public int apply(int comparison) { return comparison &gt; 0 ? 0 : 1; }</span>
+        }
+    }
+
+    public long getBloomFilterFalsePositiveCount()
+    {
+<span class="nc" id="L1896">        return bloomFilterTracker.getFalsePositiveCount();</span>
+    }
+
+    public long getRecentBloomFilterFalsePositiveCount()
+    {
+<span class="nc" id="L1901">        return bloomFilterTracker.getRecentFalsePositiveCount();</span>
+    }
+
+    public long getBloomFilterTruePositiveCount()
+    {
+<span class="nc" id="L1906">        return bloomFilterTracker.getTruePositiveCount();</span>
+    }
+
+    public long getRecentBloomFilterTruePositiveCount()
+    {
+<span class="nc" id="L1911">        return bloomFilterTracker.getRecentTruePositiveCount();</span>
+    }
+
+    public InstrumentingCache&lt;KeyCacheKey, RowIndexEntry&gt; getKeyCache()
+    {
+<span class="fc" id="L1916">        return keyCache;</span>
+    }
+
+    public EstimatedHistogram getEstimatedPartitionSize()
+    {
+<span class="nc" id="L1921">        return sstableMetadata.estimatedPartitionSize;</span>
+    }
+
+    public EstimatedHistogram getEstimatedColumnCount()
+    {
+<span class="nc" id="L1926">        return sstableMetadata.estimatedColumnCount;</span>
+    }
+
+    public double getEstimatedDroppableTombstoneRatio(int gcBefore)
+    {
+<span class="nc" id="L1931">        return sstableMetadata.getEstimatedDroppableTombstoneRatio(gcBefore);</span>
+    }
+
+    public double getDroppableTombstonesBefore(int gcBefore)
+    {
+<span class="nc" id="L1936">        return sstableMetadata.getDroppableTombstonesBefore(gcBefore);</span>
+    }
+
+    public double getCompressionRatio()
+    {
+<span class="nc" id="L1941">        return sstableMetadata.compressionRatio;</span>
+    }
+
+    public long getMinTimestamp()
+    {
+<span class="fc" id="L1946">        return sstableMetadata.minTimestamp;</span>
+    }
+
+    public long getMaxTimestamp()
+    {
+<span class="fc" id="L1951">        return sstableMetadata.maxTimestamp;</span>
+    }
+
+    public int getMinLocalDeletionTime()
+    {
+<span class="fc" id="L1956">        return sstableMetadata.minLocalDeletionTime;</span>
+    }
+
+    public int getMaxLocalDeletionTime()
+    {
+<span class="nc" id="L1961">        return sstableMetadata.maxLocalDeletionTime;</span>
+    }
+
+    /**
+     * Whether the sstable may contain tombstones or if it is guaranteed to not contain any.
+     * &lt;p&gt;
+     * Note that having that method return {@code false} guarantees the sstable has no tombstones whatsoever (so no
+     * cell tombstone, no range tombstone maker and no expiring columns), but having it return {@code true} doesn't
+     * guarantee it contains any as 1) it may simply have non-expired cells and 2) old-format sstables didn't contain
+     * enough information to decide this and so always return {@code true}.
+     */
+    public boolean mayHaveTombstones()
+    {
+        // A sstable is guaranteed to have no tombstones if it properly tracked the minLocalDeletionTime (which we only
+        // do since 3.0 - see CASSANDRA-13366) and that value is still set to its default, Cell.NO_DELETION_TIME, which
+        // is bigger than any valid deletion times.
+<span class="pc bpc" id="L1977" title="1 of 4 branches missed.">        return !descriptor.version.storeRows() || getMinLocalDeletionTime() != Cell.NO_DELETION_TIME;</span>
+    }
+
+    public int getMinTTL()
+    {
+<span class="fc" id="L1982">        return sstableMetadata.minTTL;</span>
+    }
+
+    public int getMaxTTL()
+    {
+<span class="nc" id="L1987">        return sstableMetadata.maxTTL;</span>
+    }
+
+    public long getTotalColumnsSet()
+    {
+<span class="nc" id="L1992">        return sstableMetadata.totalColumnsSet;</span>
+    }
+
+    public long getTotalRows()
+    {
+<span class="nc" id="L1997">        return sstableMetadata.totalRows;</span>
+    }
+
+    public int getAvgColumnSetPerRow()
+    {
+<span class="nc bnc" id="L2002" title="All 4 branches missed.">        return sstableMetadata.totalRows &lt; 0</span>
+             ? -1
+             : (sstableMetadata.totalRows == 0 ? 0 : (int)(sstableMetadata.totalColumnsSet / sstableMetadata.totalRows));
+    }
+
+    public int getSSTableLevel()
+    {
+<span class="fc" id="L2009">        return sstableMetadata.sstableLevel;</span>
+    }
+
+    /**
+     * Reloads the sstable metadata from disk.
+     *
+     * Called after level is changed on sstable, for example if the sstable is dropped to L0
+     *
+     * Might be possible to remove in future versions
+     *
+     * @throws IOException
+     */
+    public void reloadSSTableMetadata() throws IOException
+    {
+<span class="nc" id="L2023">        this.sstableMetadata = (StatsMetadata) descriptor.getMetadataSerializer().deserialize(descriptor, MetadataType.STATS);</span>
+<span class="nc" id="L2024">    }</span>
+
+    public StatsMetadata getSSTableMetadata()
+    {
+<span class="fc" id="L2028">        return sstableMetadata;</span>
+    }
+
+    public RandomAccessReader openDataReader(RateLimiter limiter)
+    {
+<span class="nc bnc" id="L2033" title="All 4 branches missed.">        assert limiter != null;</span>
+<span class="nc" id="L2034">        return dfile.createReader(limiter);</span>
+    }
+
+    public RandomAccessReader openDataReader()
+    {
+<span class="fc" id="L2039">        return dfile.createReader();</span>
+    }
+
+    public RandomAccessReader openIndexReader()
+    {
+<span class="pc bpc" id="L2044" title="1 of 2 branches missed.">        if (ifile != null)</span>
+<span class="fc" id="L2045">            return ifile.createReader();</span>
+<span class="nc" id="L2046">        return null;</span>
+    }
+
+    public ChannelProxy getDataChannel()
+    {
+<span class="nc" id="L2051">        return dfile.channel;</span>
+    }
+
+    public ChannelProxy getIndexChannel()
+    {
+<span class="nc" id="L2056">        return ifile.channel;</span>
+    }
+
+    public FileHandle getIndexFile()
+    {
+<span class="nc" id="L2061">        return ifile;</span>
+    }
+
+    /**
+     * @param component component to get timestamp.
+     * @return last modified time for given component. 0 if given component does not exist or IO error occurs.
+     */
+    public long getCreationTimeFor(Component component)
+    {
+<span class="fc" id="L2070">        return new File(descriptor.filenameFor(component)).lastModified();</span>
+    }
+
+    /**
+     * @return Number of key cache hit
+     */
+    public long getKeyCacheHit()
+    {
+<span class="nc" id="L2078">        return keyCacheHit.get();</span>
+    }
+
+    /**
+     * @return Number of key cache request
+     */
+    public long getKeyCacheRequest()
+    {
+<span class="nc" id="L2086">        return keyCacheRequest.get();</span>
+    }
+
+    /**
+     * Increment the total read count and read rate for this SSTable.  This should not be incremented for non-query reads,
+     * like compaction.
+     */
+    public void incrementReadCount()
+    {
+<span class="pc bpc" id="L2095" title="1 of 2 branches missed.">        if (readMeter != null)</span>
+<span class="nc" id="L2096">            readMeter.mark();</span>
+<span class="fc" id="L2097">    }</span>
+
+    public EncodingStats stats()
+    {
+        // We could return sstable.header.stats(), but this may not be as accurate than the actual sstable stats (see
+        // SerializationHeader.make() for details) so we use the latter instead.
+<span class="fc" id="L2103">        return new EncodingStats(getMinTimestamp(), getMinLocalDeletionTime(), getMinTTL());</span>
+    }
+
+    public Ref&lt;SSTableReader&gt; tryRef()
+    {
+<span class="fc" id="L2108">        return selfRef.tryRef();</span>
+    }
+
+    public Ref&lt;SSTableReader&gt; selfRef()
+    {
+<span class="fc" id="L2113">        return selfRef;</span>
+    }
+
+    public Ref&lt;SSTableReader&gt; ref()
+    {
+<span class="nc" id="L2118">        return selfRef.ref();</span>
+    }
+
+    void setup(boolean trackHotness)
+    {
+<span class="fc" id="L2123">        tidy.setup(this, trackHotness);</span>
+<span class="fc" id="L2124">        this.readMeter = tidy.global.readMeter;</span>
+<span class="fc" id="L2125">    }</span>
+
+    @VisibleForTesting
+    public void overrideReadMeter(RestorableMeter readMeter)
+    {
+<span class="nc" id="L2130">        this.readMeter = tidy.global.readMeter = readMeter;</span>
+<span class="nc" id="L2131">    }</span>
+
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L2135">        identities.add(this);</span>
+<span class="nc" id="L2136">        identities.add(tidy.globalRef);</span>
+<span class="nc" id="L2137">        dfile.addTo(identities);</span>
+<span class="nc" id="L2138">        ifile.addTo(identities);</span>
+<span class="nc" id="L2139">        bf.addTo(identities);</span>
+<span class="nc" id="L2140">        indexSummary.addTo(identities);</span>
+
+<span class="nc" id="L2142">    }</span>
+
+    /**
+     * One instance per SSTableReader we create.
+     *
+     * We can create many InstanceTidiers (one for every time we reopen an sstable with MOVED_START for example),
+     * but there can only be one GlobalTidy for one single logical sstable.
+     *
+     * When the InstanceTidier cleansup, it releases its reference to its GlobalTidy; when all InstanceTidiers
+     * for that type have run, the GlobalTidy cleans up.
+     */
+<span class="pc bpc" id="L2153" title="1 of 2 branches missed.">    private static final class InstanceTidier implements Tidy</span>
+    {
+        private final Descriptor descriptor;
+        private final CFMetaData metadata;
+        private IFilter bf;
+        private IndexSummary summary;
+
+        private FileHandle dfile;
+        private FileHandle ifile;
+        private Runnable runOnClose;
+<span class="fc" id="L2163">        private boolean isReplaced = false;</span>
+
+        // a reference to our shared tidy instance, that
+        // we will release when we are ourselves released
+        private Ref&lt;GlobalTidy&gt; globalRef;
+        private GlobalTidy global;
+
+        private volatile boolean setup;
+
+        void setup(SSTableReader reader, boolean trackHotness)
+        {
+<span class="fc" id="L2174">            this.setup = true;</span>
+<span class="fc" id="L2175">            this.bf = reader.bf;</span>
+<span class="fc" id="L2176">            this.summary = reader.indexSummary;</span>
+<span class="fc" id="L2177">            this.dfile = reader.dfile;</span>
+<span class="fc" id="L2178">            this.ifile = reader.ifile;</span>
+            // get a new reference to the shared descriptor-type tidy
+<span class="fc" id="L2180">            this.globalRef = GlobalTidy.get(reader);</span>
+<span class="fc" id="L2181">            this.global = globalRef.get();</span>
+<span class="pc bpc" id="L2182" title="1 of 2 branches missed.">            if (trackHotness)</span>
+<span class="fc" id="L2183">                global.ensureReadMeter();</span>
+<span class="fc" id="L2184">        }</span>
+
+        InstanceTidier(Descriptor descriptor, CFMetaData metadata)
+<span class="fc" id="L2187">        {</span>
+<span class="fc" id="L2188">            this.descriptor = descriptor;</span>
+<span class="fc" id="L2189">            this.metadata = metadata;</span>
+<span class="fc" id="L2190">        }</span>
+
+        public void tidy()
+        {
+<span class="pc bpc" id="L2194" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L2195">                logger.trace(&quot;Running instance tidier for {} with setup {}&quot;, descriptor, setup);</span>
+
+            // don't try to cleanup if the sstablereader was never fully constructed
+<span class="pc bpc" id="L2198" title="1 of 2 branches missed.">            if (!setup)</span>
+<span class="nc" id="L2199">                return;</span>
+
+<span class="fc" id="L2201">            final ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(metadata.cfId);</span>
+            final OpOrder.Barrier barrier;
+<span class="pc bpc" id="L2203" title="1 of 2 branches missed.">            if (cfs != null)</span>
+            {
+<span class="fc" id="L2205">                barrier = cfs.readOrdering.newBarrier();</span>
+<span class="fc" id="L2206">                barrier.issue();</span>
+            }
+            else
+<span class="nc" id="L2209">                barrier = null;</span>
+
+<span class="fc" id="L2211">            ScheduledExecutors.nonPeriodicTasks.execute(new Runnable()</span>
+<span class="fc" id="L2212">            {</span>
+                public void run()
+                {
+<span class="pc bpc" id="L2215" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L2216">                        logger.trace(&quot;Async instance tidier for {}, before barrier&quot;, descriptor);</span>
+
+<span class="pc bpc" id="L2218" title="1 of 2 branches missed.">                    if (barrier != null)</span>
+<span class="fc" id="L2219">                        barrier.await();</span>
+
+<span class="pc bpc" id="L2221" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L2222">                        logger.trace(&quot;Async instance tidier for {}, after barrier&quot;, descriptor);</span>
+
+<span class="pc bpc" id="L2224" title="1 of 2 branches missed.">                    if (bf != null)</span>
+<span class="fc" id="L2225">                        bf.close();</span>
+<span class="pc bpc" id="L2226" title="1 of 2 branches missed.">                    if (summary != null)</span>
+<span class="fc" id="L2227">                        summary.close();</span>
+<span class="fc bfc" id="L2228" title="All 2 branches covered.">                    if (runOnClose != null)</span>
+<span class="fc" id="L2229">                        runOnClose.run();</span>
+<span class="pc bpc" id="L2230" title="1 of 2 branches missed.">                    if (dfile != null)</span>
+<span class="fc" id="L2231">                        dfile.close();</span>
+<span class="pc bpc" id="L2232" title="1 of 2 branches missed.">                    if (ifile != null)</span>
+<span class="fc" id="L2233">                        ifile.close();</span>
+<span class="fc" id="L2234">                    globalRef.release();</span>
+
+<span class="pc bpc" id="L2236" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L2237">                        logger.trace(&quot;Async instance tidier for {}, completed&quot;, descriptor);</span>
+<span class="fc" id="L2238">                }</span>
+            });
+<span class="fc" id="L2240">        }</span>
+
+        public String name()
+        {
+<span class="nc" id="L2244">            return descriptor.toString();</span>
+        }
+
+        void releaseSummary()
+        {
+<span class="nc" id="L2249">            summary.close();</span>
+<span class="nc bnc" id="L2250" title="All 4 branches missed.">            assert summary.isCleanedUp();</span>
+<span class="nc" id="L2251">            summary = null;</span>
+<span class="nc" id="L2252">        }</span>
+    }
+
+    /**
+     * One instance per logical sstable. This both tracks shared cleanup and some shared state related
+     * to the sstable's lifecycle.
+     *
+     * All InstanceTidiers, on setup(), ask the static get() method for their shared state,
+     * and stash a reference to it to be released when they are. Once all such references are
+     * released, this shared tidy will be performed.
+     */
+    static final class GlobalTidy implements Tidy
+    {
+<span class="fc" id="L2265">        static WeakReference&lt;ScheduledFuture&lt;?&gt;&gt; NULL = new WeakReference&lt;&gt;(null);</span>
+        // keyed by descriptor, mapping to the shared GlobalTidy for that descriptor
+<span class="fc" id="L2267">        static final ConcurrentMap&lt;Descriptor, Ref&lt;GlobalTidy&gt;&gt; lookup = new ConcurrentHashMap&lt;&gt;();</span>
+
+        private final Descriptor desc;
+        // the readMeter that is shared between all instances of the sstable, and can be overridden in all of them
+        // at once also, for testing purposes
+        private RestorableMeter readMeter;
+        // the scheduled persistence of the readMeter, that we will cancel once all instances of this logical
+        // sstable have been released
+<span class="fc" id="L2275">        private WeakReference&lt;ScheduledFuture&lt;?&gt;&gt; readMeterSyncFuture = NULL;</span>
+        // shared state managing if the logical sstable has been compacted; this is used in cleanup
+        private volatile Runnable obsoletion;
+
+        GlobalTidy(final SSTableReader reader)
+<span class="fc" id="L2280">        {</span>
+<span class="fc" id="L2281">            this.desc = reader.descriptor;</span>
+<span class="fc" id="L2282">        }</span>
+
+        void ensureReadMeter()
+        {
+<span class="pc bpc" id="L2286" title="1 of 2 branches missed.">            if (readMeter != null)</span>
+<span class="nc" id="L2287">                return;</span>
+
+            // Don't track read rates for tables in the system keyspace and don't bother trying to load or persist
+            // the read meter when in client mode.
+            // Also, do not track read rates when running in client or tools mode (syncExecuter isn't available in these modes)
+<span class="pc bpc" id="L2292" title="3 of 4 branches missed.">            if (SchemaConstants.isLocalSystemKeyspace(desc.ksname) || DatabaseDescriptor.isClientOrToolInitialized())</span>
+            {
+<span class="fc" id="L2294">                readMeter = null;</span>
+<span class="fc" id="L2295">                readMeterSyncFuture = NULL;</span>
+<span class="fc" id="L2296">                return;</span>
+            }
+
+<span class="nc" id="L2299">            readMeter = SystemKeyspace.getSSTableReadMeter(desc.ksname, desc.cfname, desc.generation);</span>
+            // sync the average read rate to system.sstable_activity every five minutes, starting one minute from now
+<span class="nc" id="L2301">            readMeterSyncFuture = new WeakReference&lt;&gt;(syncExecutor.scheduleAtFixedRate(new Runnable()</span>
+<span class="nc" id="L2302">            {</span>
+                public void run()
+                {
+<span class="nc bnc" id="L2305" title="All 2 branches missed.">                    if (obsoletion == null)</span>
+                    {
+<span class="nc" id="L2307">                        meterSyncThrottle.acquire();</span>
+<span class="nc" id="L2308">                        SystemKeyspace.persistSSTableReadMeter(desc.ksname, desc.cfname, desc.generation, readMeter);</span>
+                    }
+<span class="nc" id="L2310">                }</span>
+            }, 1, 5, TimeUnit.MINUTES));
+<span class="nc" id="L2312">        }</span>
+
+        private void stopReadMeterPersistence()
+        {
+<span class="fc" id="L2316">            ScheduledFuture&lt;?&gt; readMeterSyncFutureLocal = readMeterSyncFuture.get();</span>
+<span class="pc bpc" id="L2317" title="1 of 2 branches missed.">            if (readMeterSyncFutureLocal != null)</span>
+            {
+<span class="nc" id="L2319">                readMeterSyncFutureLocal.cancel(true);</span>
+<span class="nc" id="L2320">                readMeterSyncFuture = NULL;</span>
+            }
+<span class="fc" id="L2322">        }</span>
+
+        public void tidy()
+        {
+<span class="fc" id="L2326">            lookup.remove(desc);</span>
+
+<span class="pc bpc" id="L2328" title="1 of 2 branches missed.">            if (obsoletion != null)</span>
+<span class="fc" id="L2329">                obsoletion.run();</span>
+
+            // don't ideally want to dropPageCache for the file until all instances have been released
+<span class="fc" id="L2332">            NativeLibrary.trySkipCache(desc.filenameFor(Component.DATA), 0, 0);</span>
+<span class="fc" id="L2333">            NativeLibrary.trySkipCache(desc.filenameFor(Component.PRIMARY_INDEX), 0, 0);</span>
+<span class="fc" id="L2334">        }</span>
+
+        public String name()
+        {
+<span class="nc" id="L2338">            return desc.toString();</span>
+        }
+
+        // get a new reference to the shared GlobalTidy for this sstable
+        @SuppressWarnings(&quot;resource&quot;)
+        public static Ref&lt;GlobalTidy&gt; get(SSTableReader sstable)
+        {
+<span class="fc" id="L2345">            Descriptor descriptor = sstable.descriptor;</span>
+<span class="fc" id="L2346">            Ref&lt;GlobalTidy&gt; refc = lookup.get(descriptor);</span>
+<span class="fc bfc" id="L2347" title="All 2 branches covered.">            if (refc != null)</span>
+<span class="fc" id="L2348">                return refc.ref();</span>
+<span class="fc" id="L2349">            final GlobalTidy tidy = new GlobalTidy(sstable);</span>
+<span class="fc" id="L2350">            refc = new Ref&lt;&gt;(tidy, tidy);</span>
+<span class="fc" id="L2351">            Ref&lt;?&gt; ex = lookup.putIfAbsent(descriptor, refc);</span>
+<span class="pc bpc" id="L2352" title="1 of 2 branches missed.">            if (ex != null)</span>
+            {
+<span class="nc" id="L2354">                refc.close();</span>
+<span class="nc" id="L2355">                throw new AssertionError();</span>
+            }
+<span class="fc" id="L2357">            return refc;</span>
+        }
+    }
+
+    @VisibleForTesting
+    public static void resetTidying()
+    {
+<span class="nc" id="L2364">        GlobalTidy.lookup.clear();</span>
+<span class="nc" id="L2365">    }</span>
+
+<span class="fc" id="L2367">    public static abstract class Factory</span>
+    {
+        public abstract SSTableReader open(final Descriptor descriptor,
+                                           Set&lt;Component&gt; components,
+                                           CFMetaData metadata,
+                                           Long maxDataAge,
+                                           StatsMetadata sstableMetadata,
+                                           OpenReason openReason,
+                                           SerializationHeader header);
+
+    }
+
+    public static void shutdownBlocking(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+
+<span class="nc" id="L2382">        ExecutorUtils.shutdownNowAndWait(timeout, unit, syncExecutor);</span>
+<span class="nc" id="L2383">        resetTidying();</span>
+<span class="nc" id="L2384">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

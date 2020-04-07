@@ -1,0 +1,922 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableHeaderFix.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTableHeaderFix.java</span></div><h1>SSTableHeaderFix.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.marshal.AbstractCompositeType;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.DynamicCompositeType;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
+import org.apache.cassandra.io.sstable.metadata.MetadataType;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Validates and fixes type issues in the serialization-header of sstables.
+ */
+public abstract class SSTableHeaderFix
+{
+    // C* 3.0 upgrade code
+
+    private static final String SKIPAUTOMATICUDTFIX = &quot;cassandra.skipautomaticudtfix&quot;;
+<span class="fc" id="L77">    private static final boolean SKIP_AUTOMATIC_FIX_ON_UPGRADE = Boolean.getBoolean(SKIPAUTOMATICUDTFIX);</span>
+
+    public static void fixNonFrozenUDTIfUpgradeFrom30()
+    {
+<span class="fc" id="L81">        String previousVersionString = FBUtilities.getPreviousReleaseVersionString();</span>
+<span class="pc bpc" id="L82" title="1 of 2 branches missed.">        if (previousVersionString == null)</span>
+<span class="nc" id="L83">            return;</span>
+<span class="fc" id="L84">        CassandraVersion previousVersion = new CassandraVersion(previousVersionString);</span>
+<span class="pc bpc" id="L85" title="3 of 4 branches missed.">        if (previousVersion.major != 3 || previousVersion.minor &gt; 0)</span>
+        {
+            // Not an upgrade from 3.0 to 3.x, nothing to do here
+<span class="fc" id="L88">            return;</span>
+        }
+
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        if (SKIP_AUTOMATIC_FIX_ON_UPGRADE)</span>
+        {
+<span class="nc" id="L93">            logger.warn(&quot;Detected upgrade from {} to {}, but -D{}=true, NOT fixing UDT type references in &quot; +</span>
+                        &quot;sstable metadata serialization-headers&quot;,
+                        previousVersionString,
+<span class="nc" id="L96">                        FBUtilities.getReleaseVersionString(),</span>
+                        SKIPAUTOMATICUDTFIX);
+<span class="nc" id="L98">            return;</span>
+        }
+
+<span class="nc" id="L101">        logger.info(&quot;Detected upgrade from {} to {}, fixing UDT type references in sstable metadata serialization-headers&quot;,</span>
+                    previousVersionString,
+<span class="nc" id="L103">                    FBUtilities.getReleaseVersionString());</span>
+
+<span class="nc" id="L105">        SSTableHeaderFix instance = SSTableHeaderFix.builder()</span>
+<span class="nc" id="L106">                                                    .schemaCallback(() -&gt; Schema.instance::getCFMetaData)</span>
+<span class="nc" id="L107">                                                    .build();</span>
+<span class="nc" id="L108">        instance.execute();</span>
+<span class="nc" id="L109">    }</span>
+
+    // &quot;regular&quot; SSTableHeaderFix code, also used by StandaloneScrubber.
+
+<span class="fc" id="L113">    private static final Logger logger = LoggerFactory.getLogger(SSTableHeaderFix.class);</span>
+
+    protected final Consumer&lt;String&gt; info;
+    protected final Consumer&lt;String&gt; warn;
+    protected final Consumer&lt;String&gt; error;
+    protected final boolean dryRun;
+    protected final Function&lt;Descriptor, CFMetaData&gt; schemaCallback;
+
+    private final List&lt;Descriptor&gt; descriptors;
+
+<span class="nc" id="L123">    private final List&lt;Pair&lt;Descriptor, Map&lt;MetadataType, MetadataComponent&gt;&gt;&gt; updates = new ArrayList&lt;&gt;();</span>
+    private boolean hasErrors;
+
+    SSTableHeaderFix(Builder builder)
+<span class="nc" id="L127">    {</span>
+<span class="nc" id="L128">        this.info = builder.info;</span>
+<span class="nc" id="L129">        this.warn = builder.warn;</span>
+<span class="nc" id="L130">        this.error = builder.error;</span>
+<span class="nc" id="L131">        this.dryRun = builder.dryRun;</span>
+<span class="nc" id="L132">        this.schemaCallback = builder.schemaCallback.get();</span>
+<span class="nc" id="L133">        this.descriptors = new ArrayList&lt;&gt;(builder.descriptors);</span>
+<span class="nc" id="L134">        Objects.requireNonNull(this.info, &quot;info is null&quot;);</span>
+<span class="nc" id="L135">        Objects.requireNonNull(this.warn, &quot;warn is null&quot;);</span>
+<span class="nc" id="L136">        Objects.requireNonNull(this.error, &quot;error is null&quot;);</span>
+<span class="nc" id="L137">        Objects.requireNonNull(this.schemaCallback, &quot;schemaCallback is null&quot;);</span>
+<span class="nc" id="L138">    }</span>
+
+    public static Builder builder()
+    {
+<span class="nc" id="L142">        return new Builder();</span>
+    }
+
+    /**
+     * Builder to configure and construct an instance of {@link SSTableHeaderFix}.
+     * Default settings:
+     * &lt;ul&gt;
+     *     &lt;li&gt;log via the slf4j logger of {@link SSTableHeaderFix}&lt;/li&gt;
+     *     &lt;li&gt;no dry-run (i.e. validate and fix, if no serious errors are detected)&lt;/li&gt;
+     *     &lt;li&gt;no schema callback&lt;/li&gt;
+     * &lt;/ul&gt;
+     * If neither {@link #withDescriptor(Descriptor)} nor {@link #withPath(Path)} are used,
+     * all &quot;live&quot; sstables in all data directories will be scanned.
+     */
+    public static class Builder
+    {
+<span class="nc" id="L158">        private final List&lt;Path&gt; paths = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L159">        private final List&lt;Descriptor&gt; descriptors = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L160">        private Consumer&lt;String&gt; info = (ln) -&gt; logger.info(&quot;{}&quot;, ln);</span>
+<span class="nc" id="L161">        private Consumer&lt;String&gt; warn = (ln) -&gt; logger.warn(&quot;{}&quot;, ln);</span>
+<span class="nc" id="L162">        private Consumer&lt;String&gt; error = (ln) -&gt; logger.error(&quot;{}&quot;, ln);</span>
+        private boolean dryRun;
+<span class="nc" id="L164">        private Supplier&lt;Function&lt;Descriptor, CFMetaData&gt;&gt; schemaCallback = () -&gt; null;</span>
+
+        private Builder()
+<span class="nc" id="L167">        {}</span>
+
+        /**
+         * Only validate and prepare fix, but do not write updated (fixed) sstable serialization-headers.
+         */
+        public Builder dryRun()
+        {
+<span class="nc" id="L174">            dryRun = true;</span>
+<span class="nc" id="L175">            return this;</span>
+        }
+
+        public Builder info(Consumer&lt;String&gt; output)
+        {
+<span class="nc" id="L180">            this.info = output;</span>
+<span class="nc" id="L181">            return this;</span>
+        }
+
+        public Builder warn(Consumer&lt;String&gt; warn)
+        {
+<span class="nc" id="L186">            this.warn = warn;</span>
+<span class="nc" id="L187">            return this;</span>
+        }
+
+        public Builder error(Consumer&lt;String&gt; error)
+        {
+<span class="nc" id="L192">            this.error = error;</span>
+<span class="nc" id="L193">            return this;</span>
+        }
+
+        /**
+         * Manually provide an individual sstable or directory containing sstables.
+         *
+         * Implementation note: procesing &quot;live&quot; sstables in their data directories as well as sstables
+         * in snapshots and backups in the data directories works.
+         *
+         * But processing sstables that reside somewhere else (i.e. verifying sstables before import)
+         * requires the use of {@link #withDescriptor(Descriptor)}.
+         */
+        public Builder withPath(Path path)
+        {
+<span class="nc" id="L207">            this.paths.add(path);</span>
+<span class="nc" id="L208">            return this;</span>
+        }
+
+        public Builder withDescriptor(Descriptor descriptor)
+        {
+<span class="nc" id="L213">            this.descriptors.add(descriptor);</span>
+<span class="nc" id="L214">            return this;</span>
+        }
+
+        /**
+         * Schema callback to retrieve the schema of a table. Production code always delegates to the
+         * live schema ({@code Schema.instance}). Unit tests use this method to feed a custom schema.
+         */
+        public Builder schemaCallback(Supplier&lt;Function&lt;Descriptor, CFMetaData&gt;&gt; schemaCallback)
+        {
+<span class="nc" id="L223">            this.schemaCallback = schemaCallback;</span>
+<span class="nc" id="L224">            return this;</span>
+        }
+
+        public SSTableHeaderFix build()
+        {
+<span class="nc bnc" id="L229" title="All 4 branches missed.">            if (paths.isEmpty() &amp;&amp; descriptors.isEmpty())</span>
+<span class="nc" id="L230">                return new AutomaticHeaderFix(this);</span>
+
+<span class="nc" id="L232">            return new ManualHeaderFix(this);</span>
+        }
+
+        public Builder logToList(List&lt;String&gt; output)
+        {
+<span class="nc" id="L237">            return info(ln -&gt; output.add(&quot;INFO  &quot; + ln))</span>
+<span class="nc" id="L238">                   .warn(ln -&gt; output.add(&quot;WARN  &quot; + ln))</span>
+<span class="nc" id="L239">                   .error(ln -&gt; output.add(&quot;ERROR &quot; + ln));</span>
+        }
+    }
+
+    public final void execute()
+    {
+<span class="nc" id="L245">        prepare();</span>
+
+<span class="nc" id="L247">        logger.debug(&quot;Processing {} sstables:{}&quot;,</span>
+<span class="nc" id="L248">                     descriptors.size(),</span>
+<span class="nc" id="L249">                     descriptors.stream().map(Descriptor::toString).collect(Collectors.joining(&quot;\n    &quot;, &quot;\n    &quot;, &quot;&quot;)));</span>
+
+<span class="nc" id="L251">        descriptors.forEach(this::processSSTable);</span>
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (updates.isEmpty())</span>
+<span class="nc" id="L254">            return;</span>
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (hasErrors)</span>
+        {
+<span class="nc" id="L258">            info.accept(&quot;Stopping due to previous errors. Either fix the errors or specify the ignore-errors option.&quot;);</span>
+<span class="nc" id="L259">            return;</span>
+        }
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if (dryRun)</span>
+        {
+<span class="nc" id="L264">            info.accept(&quot;Not fixing identified and fixable serialization-header issues.&quot;);</span>
+<span class="nc" id="L265">            return;</span>
+        }
+
+<span class="nc" id="L268">        info.accept(&quot;Writing new metadata files&quot;);</span>
+<span class="nc" id="L269">        updates.forEach(descAndMeta -&gt; writeNewMetadata(descAndMeta.left, descAndMeta.right));</span>
+<span class="nc" id="L270">        info.accept(&quot;Finished writing new metadata files&quot;);</span>
+<span class="nc" id="L271">    }</span>
+
+    /**
+     * Whether {@link #execute()} encountered an error.
+     */
+    public boolean hasError()
+    {
+<span class="nc" id="L278">        return hasErrors;</span>
+    }
+
+    /**
+     * Whether {@link #execute()} found mismatches.
+     */
+    public boolean hasChanges()
+    {
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        return !updates.isEmpty();</span>
+    }
+
+    abstract void prepare();
+
+    private void error(String format, Object... args)
+    {
+<span class="nc" id="L293">        hasErrors = true;</span>
+<span class="nc" id="L294">        error.accept(String.format(format, args));</span>
+<span class="nc" id="L295">    }</span>
+
+    void processFileOrDirectory(Path path)
+    {
+<span class="nc" id="L299">        Stream.of(path)</span>
+<span class="nc" id="L300">              .flatMap(SSTableHeaderFix::maybeExpandDirectory)</span>
+<span class="nc" id="L301">              .filter(p -&gt; {</span>
+<span class="nc" id="L302">                  File f = p.toFile();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                  return Component.fromFilename(f.getParentFile(), f.getName()).right.type == Component.Type.DATA;</span>
+              })
+<span class="nc" id="L305">              .map(Path::toString)</span>
+<span class="nc" id="L306">              .map(Descriptor::fromFilename)</span>
+<span class="nc" id="L307">              .forEach(descriptors::add);</span>
+<span class="nc" id="L308">    }</span>
+
+    private static Stream&lt;Path&gt; maybeExpandDirectory(Path path)
+    {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (Files.isRegularFile(path))</span>
+<span class="nc" id="L313">            return Stream.of(path);</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        return LifecycleTransaction.getFiles(path, (file, fileType) -&gt; fileType == Directories.FileType.FINAL, Directories.OnTxnErr.IGNORE)</span>
+<span class="nc" id="L315">                                   .stream()</span>
+<span class="nc" id="L316">                                   .map(File::toPath);</span>
+    }
+
+    private void processSSTable(Descriptor desc)
+    {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (desc.cfname.indexOf('.') != -1)</span>
+        {
+            // secondary index not checked
+
+            // partition-key is the indexed column type
+            // clustering-key is org.apache.cassandra.db.marshal.PartitionerDefinedOrder
+            // no static columns, no regular columns
+<span class="nc" id="L328">            return;</span>
+        }
+
+<span class="nc" id="L331">        CFMetaData tableMetadata = schemaCallback.apply(desc);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (tableMetadata == null)</span>
+        {
+<span class="nc" id="L334">            error(&quot;Table %s.%s not found in the schema - NOT checking sstable %s&quot;, desc.ksname, desc.cfname, desc);</span>
+<span class="nc" id="L335">            return;</span>
+        }
+
+<span class="nc" id="L338">        Set&lt;Component&gt; components = SSTable.discoverComponentsFor(desc);</span>
+<span class="nc bnc" id="L339" title="All 4 branches missed.">        if (components.stream().noneMatch(c -&gt; c.type == Component.Type.STATS))</span>
+        {
+<span class="nc" id="L341">            error(&quot;sstable %s has no -Statistics.db component.&quot;, desc);</span>
+<span class="nc" id="L342">            return;</span>
+        }
+
+<span class="nc" id="L345">        Map&lt;MetadataType, MetadataComponent&gt; metadata = readSSTableMetadata(desc);</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (metadata == null)</span>
+<span class="nc" id="L347">            return;</span>
+
+<span class="nc" id="L349">        MetadataComponent component = metadata.get(MetadataType.HEADER);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (!(component instanceof SerializationHeader.Component))</span>
+        {
+<span class="nc" id="L352">            error(&quot;sstable %s: Expected %s, but got %s from metadata.get(MetadataType.HEADER)&quot;,</span>
+                  desc,
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                  SerializationHeader.Component.class.getName(),</span>
+<span class="nc" id="L355">                  component != null ? component.getClass().getName() : &quot;'null'&quot;);</span>
+<span class="nc" id="L356">            return;</span>
+        }
+<span class="nc" id="L358">        SerializationHeader.Component header = (SerializationHeader.Component) component;</span>
+
+        // check partition key type
+<span class="nc" id="L361">        AbstractType&lt;?&gt; keyType = validatePartitionKey(desc, tableMetadata, header);</span>
+
+        // check clustering columns
+<span class="nc" id="L364">        List&lt;AbstractType&lt;?&gt;&gt; clusteringTypes = validateClusteringColumns(desc, tableMetadata, header);</span>
+
+        // check static and regular columns
+<span class="nc" id="L367">        Map&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; staticColumns = validateColumns(desc, tableMetadata, header.getStaticColumns(), ColumnDefinition.Kind.STATIC);</span>
+<span class="nc" id="L368">        Map&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; regularColumns = validateColumns(desc, tableMetadata, header.getRegularColumns(), ColumnDefinition.Kind.REGULAR);</span>
+
+<span class="nc" id="L370">        SerializationHeader.Component newHeader = SerializationHeader.Component.buildComponentForTools(keyType,</span>
+                                                                                                       clusteringTypes,
+                                                                                                       staticColumns,
+                                                                                                       regularColumns,
+<span class="nc" id="L374">                                                                                                       header.getEncodingStats());</span>
+
+        // SerializationHeader.Component has no equals(), but a &quot;good&quot; toString()
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (header.toString().equals(newHeader.toString()))</span>
+<span class="nc" id="L378">            return;</span>
+
+<span class="nc" id="L380">        Map&lt;MetadataType, MetadataComponent&gt; newMetadata = new LinkedHashMap&lt;&gt;(metadata);</span>
+<span class="nc" id="L381">        newMetadata.put(MetadataType.HEADER, newHeader);</span>
+
+<span class="nc" id="L383">        updates.add(Pair.create(desc, newMetadata));</span>
+<span class="nc" id="L384">    }</span>
+
+    private AbstractType&lt;?&gt; validatePartitionKey(Descriptor desc, CFMetaData tableMetadata, SerializationHeader.Component header)
+    {
+<span class="nc" id="L388">        boolean keyMismatch = false;</span>
+<span class="nc" id="L389">        AbstractType&lt;?&gt; headerKeyType = header.getKeyType();</span>
+<span class="nc" id="L390">        AbstractType&lt;?&gt; schemaKeyType = tableMetadata.getKeyValidator();</span>
+<span class="nc" id="L391">        boolean headerKeyComposite = headerKeyType instanceof CompositeType;</span>
+<span class="nc" id="L392">        boolean schemaKeyComposite = schemaKeyType instanceof CompositeType;</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (headerKeyComposite != schemaKeyComposite)</span>
+        {
+            // one is a composite partition key, the other is not - very suspicious
+<span class="nc" id="L396">            keyMismatch = true;</span>
+        }
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        else if (headerKeyComposite) // &amp;&amp; schemaKeyComposite</span>
+        {
+            // Note, the logic is similar as just calling 'fixType()' using the composite partition key,
+            // but the log messages should use the composite partition key column names.
+<span class="nc" id="L402">            List&lt;AbstractType&lt;?&gt;&gt; headerKeyComponents = ((CompositeType) headerKeyType).types;</span>
+<span class="nc" id="L403">            List&lt;AbstractType&lt;?&gt;&gt; schemaKeyComponents = ((CompositeType) schemaKeyType).types;</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (headerKeyComponents.size() != schemaKeyComponents.size())</span>
+            {
+                // different number of components in composite partition keys - very suspicious
+<span class="nc" id="L407">                keyMismatch = true;</span>
+                // Just use the original type from the header. Since the number of partition key components
+                // don't match, there's nothing to meaningfully validate against.
+            }
+            else
+            {
+                // fix components in composite partition key, if necessary
+<span class="nc" id="L414">                List&lt;AbstractType&lt;?&gt;&gt; newComponents = new ArrayList&lt;&gt;(schemaKeyComponents.size());</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                for (int i = 0; i &lt; schemaKeyComponents.size(); i++)</span>
+                {
+<span class="nc" id="L417">                    AbstractType&lt;?&gt; headerKeyComponent = headerKeyComponents.get(i);</span>
+<span class="nc" id="L418">                    AbstractType&lt;?&gt; schemaKeyComponent = schemaKeyComponents.get(i);</span>
+<span class="nc" id="L419">                    AbstractType&lt;?&gt; fixedType = fixType(desc,</span>
+<span class="nc" id="L420">                                                        tableMetadata.partitionKeyColumns().get(i).name.bytes,</span>
+                                                        headerKeyComponent,
+                                                        schemaKeyComponent,
+                                                        false);
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                    if (fixedType == null)</span>
+<span class="nc" id="L425">                        keyMismatch = true;</span>
+                    else
+<span class="nc" id="L427">                        headerKeyComponent = fixedType;</span>
+<span class="nc" id="L428">                    newComponents.add(fixType(desc,</span>
+<span class="nc" id="L429">                                              tableMetadata.partitionKeyColumns().get(i).name.bytes,</span>
+                                              headerKeyComponent,
+                                              schemaKeyComponent,
+                                              false));
+                }
+<span class="nc" id="L434">                headerKeyType = CompositeType.getInstance(newComponents);</span>
+            }
+<span class="nc" id="L436">        }</span>
+        else
+        {
+            // fix non-composite partition key, if necessary
+<span class="nc" id="L440">            AbstractType&lt;?&gt; fixedType = fixType(desc, tableMetadata.partitionKeyColumns().get(0).name.bytes, headerKeyType, schemaKeyType, false);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (fixedType == null)</span>
+                // non-composite partition key doesn't match and cannot be fixed
+<span class="nc" id="L443">                keyMismatch = true;</span>
+            else
+<span class="nc" id="L445">                headerKeyType = fixedType;</span>
+        }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (keyMismatch)</span>
+<span class="nc" id="L448">            error(&quot;sstable %s: Mismatch in partition key type between sstable serialization-header and schema (%s vs %s)&quot;,</span>
+                  desc,
+<span class="nc" id="L450">                  headerKeyType.asCQL3Type(),</span>
+<span class="nc" id="L451">                  schemaKeyType.asCQL3Type());</span>
+<span class="nc" id="L452">        return headerKeyType;</span>
+    }
+
+    private List&lt;AbstractType&lt;?&gt;&gt; validateClusteringColumns(Descriptor desc, CFMetaData tableMetadata, SerializationHeader.Component header)
+    {
+<span class="nc" id="L457">        List&lt;AbstractType&lt;?&gt;&gt; headerClusteringTypes = header.getClusteringTypes();</span>
+<span class="nc" id="L458">        List&lt;AbstractType&lt;?&gt;&gt; clusteringTypes = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L459">        boolean clusteringMismatch = false;</span>
+<span class="nc" id="L460">        List&lt;ColumnDefinition&gt; schemaClustering = tableMetadata.clusteringColumns();</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">        if (schemaClustering.size() != headerClusteringTypes.size())</span>
+        {
+<span class="nc" id="L463">            clusteringMismatch = true;</span>
+            // Just use the original types. Since the number of clustering columns don't match, there's nothing to
+            // meaningfully validate against.
+<span class="nc" id="L466">            clusteringTypes.addAll(headerClusteringTypes);</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L470" title="All 2 branches missed.">            for (int i = 0; i &lt; headerClusteringTypes.size(); i++)</span>
+            {
+<span class="nc" id="L472">                AbstractType&lt;?&gt; headerType = headerClusteringTypes.get(i);</span>
+<span class="nc" id="L473">                ColumnDefinition column = schemaClustering.get(i);</span>
+<span class="nc" id="L474">                AbstractType&lt;?&gt; schemaType = column.type;</span>
+<span class="nc" id="L475">                AbstractType&lt;?&gt; fixedType = fixType(desc, column.name.bytes, headerType, schemaType, false);</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">                if (fixedType == null)</span>
+<span class="nc" id="L477">                    clusteringMismatch = true;</span>
+                else
+<span class="nc" id="L479">                    headerType = fixedType;</span>
+<span class="nc" id="L480">                clusteringTypes.add(headerType);</span>
+            }
+        }
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        if (clusteringMismatch)</span>
+<span class="nc" id="L484">            error(&quot;sstable %s: mismatch in clustering columns between sstable serialization-header and schema (%s vs %s)&quot;,</span>
+                  desc,
+<span class="nc" id="L486">                  headerClusteringTypes.stream().map(AbstractType::asCQL3Type).map(CQL3Type::toString).collect(Collectors.joining(&quot;,&quot;)),</span>
+<span class="nc" id="L487">                  schemaClustering.stream().map(cd -&gt; cd.type.asCQL3Type().toString()).collect(Collectors.joining(&quot;,&quot;)));</span>
+<span class="nc" id="L488">        return clusteringTypes;</span>
+    }
+
+    private Map&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; validateColumns(Descriptor desc, CFMetaData tableMetadata, Map&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; columns, ColumnDefinition.Kind kind)
+    {
+<span class="nc" id="L493">        Map&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; target = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        for (Map.Entry&lt;ByteBuffer, AbstractType&lt;?&gt;&gt; nameAndType : columns.entrySet())</span>
+        {
+<span class="nc" id="L496">            ByteBuffer name = nameAndType.getKey();</span>
+<span class="nc" id="L497">            AbstractType&lt;?&gt; type = nameAndType.getValue();</span>
+
+<span class="nc" id="L499">            AbstractType&lt;?&gt; fixedType = validateColumn(desc, tableMetadata, kind, name, type);</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            if (fixedType == null)</span>
+            {
+<span class="nc" id="L502">                error(&quot;sstable %s: contains column '%s' of type '%s', which could not be validated&quot;,</span>
+                      desc,
+                      type,
+<span class="nc" id="L505">                      logColumnName(name));</span>
+                // don't use a &quot;null&quot; type instance
+<span class="nc" id="L507">                fixedType = type;</span>
+            }
+
+<span class="nc" id="L510">            target.put(name, fixedType);</span>
+<span class="nc" id="L511">        }</span>
+<span class="nc" id="L512">        return target;</span>
+    }
+
+    private AbstractType&lt;?&gt; validateColumn(Descriptor desc, CFMetaData tableMetadata, ColumnDefinition.Kind kind, ByteBuffer name, AbstractType&lt;?&gt; type)
+    {
+<span class="nc" id="L517">        ColumnDefinition cd = tableMetadata.getColumnDefinition(name);</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (cd == null)</span>
+        {
+            // In case the column was dropped, there is not much that we can actually validate.
+            // The column could have been recreated using the same or a different kind or the same or
+            // a different type. Lottery...
+
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            cd = tableMetadata.getDroppedColumnDefinition(name, kind == ColumnDefinition.Kind.STATIC);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (cd == null)</span>
+            {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                for (IndexMetadata indexMetadata : tableMetadata.getIndexes())</span>
+                {
+<span class="nc" id="L529">                    String target = indexMetadata.options.get(IndexTarget.TARGET_OPTION_NAME);</span>
+<span class="nc bnc" id="L530" title="All 4 branches missed.">                    if (target != null &amp;&amp; ByteBufferUtil.bytes(target).equals(name))</span>
+                    {
+<span class="nc" id="L532">                        warn.accept(String.format(&quot;sstable %s: contains column '%s', which is not a column in the table '%s.%s', but a target for that table's index '%s'&quot;,</span>
+                                                  desc,
+<span class="nc" id="L534">                                                  logColumnName(name),</span>
+                                                  tableMetadata.ksName,
+                                                  tableMetadata.cfName,
+                                                  indexMetadata.name));
+<span class="nc" id="L538">                        return type;</span>
+                    }
+<span class="nc" id="L540">                }</span>
+
+<span class="nc" id="L542">                warn.accept(String.format(&quot;sstable %s: contains column '%s', which is not present in the schema&quot;,</span>
+                                          desc,
+<span class="nc" id="L544">                                          logColumnName(name)));</span>
+            }
+            else
+            {
+                // This is a best-effort approach to handle the case of a UDT column created *AND* dropped in
+                // C* 3.0.
+<span class="nc bnc" id="L550" title="All 4 branches missed.">                if (type instanceof UserType &amp;&amp; cd.type instanceof TupleType)</span>
+                {
+                    // At this point, we know that the type belongs to a dropped column, recorded with the
+                    // dropped column type &quot;TupleType&quot; and using &quot;UserType&quot; in the sstable. So it is very
+                    // likely, that this belongs to a dropped UDT. Fix that information to tuple-type.
+<span class="nc" id="L555">                    return fixType(desc, name, type, cd.type, true);</span>
+                }
+            }
+
+<span class="nc" id="L559">            return type;</span>
+        }
+
+        // At this point, the column name is known to be a &quot;non-dropped&quot; column in the table.
+<span class="nc bnc" id="L563" title="All 2 branches missed.">        if (cd.kind != kind)</span>
+<span class="nc" id="L564">            error(&quot;sstable %s: contains column '%s' as a %s column, but is of kind %s in the schema&quot;,</span>
+                  desc,
+<span class="nc" id="L566">                  logColumnName(name),</span>
+<span class="nc" id="L567">                  kind.name().toLowerCase(),</span>
+<span class="nc" id="L568">                  cd.kind.name().toLowerCase());</span>
+        else
+<span class="nc" id="L570">            type = fixType(desc, name, type, cd.type, false);</span>
+<span class="nc" id="L571">        return type;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixType(Descriptor desc, ByteBuffer name, AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema, boolean droppedColumnMode)
+    {
+<span class="nc" id="L576">        AbstractType&lt;?&gt; fixedType = fixTypeInner(typeInHeader, typeInSchema, droppedColumnMode);</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">        if (fixedType != null)</span>
+        {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (fixedType != typeInHeader)</span>
+<span class="nc" id="L580">                info.accept(String.format(&quot;sstable %s: Column '%s' needs to be updated from type '%s' to '%s'&quot;,</span>
+                                          desc,
+<span class="nc" id="L582">                                          logColumnName(name),</span>
+<span class="nc" id="L583">                                          typeInHeader.asCQL3Type(),</span>
+<span class="nc" id="L584">                                          fixedType.asCQL3Type()));</span>
+<span class="nc" id="L585">            return fixedType;</span>
+        }
+
+<span class="nc" id="L588">        error(&quot;sstable %s: contains column '%s' as type '%s', but schema mentions '%s'&quot;,</span>
+              desc,
+<span class="nc" id="L590">              logColumnName(name),</span>
+<span class="nc" id="L591">              typeInHeader.asCQL3Type(),</span>
+<span class="nc" id="L592">              typeInSchema.asCQL3Type());</span>
+
+<span class="nc" id="L594">        return typeInHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInner(AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema, boolean droppedColumnMode)
+    {
+<span class="nc bnc" id="L599" title="All 2 branches missed.">        if (typeEquals(typeInHeader, typeInSchema))</span>
+<span class="nc" id="L600">            return typeInHeader;</span>
+
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (typeInHeader instanceof CollectionType)</span>
+<span class="nc" id="L603">            return fixTypeInnerCollection(typeInHeader, typeInSchema, droppedColumnMode);</span>
+
+<span class="nc bnc" id="L605" title="All 2 branches missed.">        if (typeInHeader instanceof AbstractCompositeType)</span>
+<span class="nc" id="L606">            return fixTypeInnerAbstractComposite(typeInHeader, typeInSchema, droppedColumnMode);</span>
+
+<span class="nc bnc" id="L608" title="All 2 branches missed.">        if (typeInHeader instanceof TupleType)</span>
+<span class="nc" id="L609">            return fixTypeInnerAbstractTuple(typeInHeader, typeInSchema, droppedColumnMode);</span>
+
+        // all types, beside CollectionType + AbstractCompositeType + TupleType, should be ok (no nested types) - just check for compatibility
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (typeInHeader.isCompatibleWith(typeInSchema))</span>
+<span class="nc" id="L613">            return typeInHeader;</span>
+
+<span class="nc" id="L615">        return null;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerAbstractTuple(AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema, boolean droppedColumnMode)
+    {
+        // This first 'if' handles the case when a UDT has been dropped, as a dropped UDT is recorded as a tuple
+        // in dropped_columns. If a UDT is to be replaced with a tuple, then also do that for the inner UDTs.
+<span class="nc bnc" id="L622" title="All 6 branches missed.">        if (droppedColumnMode &amp;&amp; typeInHeader.getClass() == UserType.class &amp;&amp; typeInSchema instanceof TupleType)</span>
+<span class="nc" id="L623">            return fixTypeInnerUserTypeDropped((UserType) typeInHeader, (TupleType) typeInSchema);</span>
+
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if (typeInHeader.getClass() != typeInSchema.getClass())</span>
+<span class="nc" id="L626">            return null;</span>
+
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        if (typeInHeader.getClass() == UserType.class)</span>
+<span class="nc" id="L629">            return fixTypeInnerUserType((UserType) typeInHeader, (UserType) typeInSchema);</span>
+
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (typeInHeader.getClass() == TupleType.class)</span>
+<span class="nc" id="L632">            return fixTypeInnerTuple((TupleType) typeInHeader, (TupleType) typeInSchema, droppedColumnMode);</span>
+
+<span class="nc" id="L634">        throw new IllegalArgumentException(&quot;Unknown tuple type class &quot; + typeInHeader.getClass().getName());</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerCollection(AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema, boolean droppedColumnMode)
+    {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (typeInHeader.getClass() != typeInSchema.getClass())</span>
+<span class="nc" id="L640">            return null;</span>
+
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (typeInHeader.getClass() == ListType.class)</span>
+<span class="nc" id="L643">            return fixTypeInnerList((ListType&lt;?&gt;) typeInHeader, (ListType&lt;?&gt;) typeInSchema, droppedColumnMode);</span>
+
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (typeInHeader.getClass() == SetType.class)</span>
+<span class="nc" id="L646">            return fixTypeInnerSet((SetType&lt;?&gt;) typeInHeader, (SetType&lt;?&gt;) typeInSchema, droppedColumnMode);</span>
+
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (typeInHeader.getClass() == MapType.class)</span>
+<span class="nc" id="L649">            return fixTypeInnerMap((MapType&lt;?, ?&gt;) typeInHeader, (MapType&lt;?, ?&gt;) typeInSchema, droppedColumnMode);</span>
+
+<span class="nc" id="L651">        throw new IllegalArgumentException(&quot;Unknown collection type class &quot; + typeInHeader.getClass().getName());</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerAbstractComposite(AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema, boolean droppedColumnMode)
+    {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">        if (typeInHeader.getClass() != typeInSchema.getClass())</span>
+<span class="nc" id="L657">            return null;</span>
+
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        if (typeInHeader.getClass() == CompositeType.class)</span>
+<span class="nc" id="L660">            return fixTypeInnerComposite((CompositeType) typeInHeader, (CompositeType) typeInSchema, droppedColumnMode);</span>
+
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (typeInHeader.getClass() == DynamicCompositeType.class)</span>
+        {
+            // Not sure if we should care about UDTs in DynamicCompositeType at all...
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            if (!typeInHeader.isCompatibleWith(typeInSchema))</span>
+<span class="nc" id="L666">                return null;</span>
+
+<span class="nc" id="L668">            return typeInHeader;</span>
+        }
+
+<span class="nc" id="L671">        throw new IllegalArgumentException(&quot;Unknown composite type class &quot; + typeInHeader.getClass().getName());</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerUserType(UserType cHeader, UserType cSchema)
+    {
+<span class="nc bnc" id="L676" title="All 4 branches missed.">        if (!cHeader.keyspace.equals(cSchema.keyspace) || !cHeader.name.equals(cSchema.name))</span>
+            // different UDT - bummer...
+<span class="nc" id="L678">            return null;</span>
+
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        if (cHeader.isMultiCell() != cSchema.isMultiCell())</span>
+        {
+<span class="nc bnc" id="L682" title="All 4 branches missed.">            if (cHeader.isMultiCell() &amp;&amp; !cSchema.isMultiCell())</span>
+            {
+                // C* 3.0 writes broken SerializationHeader.Component instances - i.e. broken UDT type
+                // definitions into the sstable -Stats.db file, because 3.0 does not enclose frozen UDTs
+                // (and all UDTs in 3.0 were frozen) with an '' bracket. Since CASSANDRA-7423 (support
+                // for non-frozen UDTs, committed to C* 3.6), that frozen-bracket is quite important.
+                // Non-frozen (= multi-cell) UDTs are serialized in a fundamentally different way than
+                // frozen UDTs in sstables - most importantly, the order of serialized columns depends on
+                // the type: fixed-width types first, then variable length types (like frozen types),
+                // multi-cell types last. If C* &gt;= 3.6 reads an sstable with a UDT that's written by
+                // C* &lt; 3.6, a variety of CorruptSSTableExceptions get logged and clients will encounter
+                // read errors.
+                // At this point, we know that the type belongs to a &quot;live&quot; (non-dropped) column, so it
+                // is safe to correct the information from the header.
+<span class="nc" id="L696">                return cSchema;</span>
+            }
+
+            // In all other cases, there's not much we can do.
+<span class="nc" id="L700">            return null;</span>
+        }
+
+<span class="nc" id="L703">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerUserTypeDropped(UserType cHeader, TupleType cSchema)
+    {
+        // Do not mess around with the UserType in the serialization header, if the column has been dropped.
+        // Only fix the multi-cell status when the header contains it as a multicell (non-frozen) UserType,
+        // but the schema says &quot;frozen&quot;.
+<span class="nc bnc" id="L711" title="All 4 branches missed.">        if (cHeader.isMultiCell() &amp;&amp; !cSchema.isMultiCell())</span>
+        {
+<span class="nc" id="L713">            return new UserType(cHeader.keyspace, cHeader.name, cHeader.fieldNames(), cHeader.fieldTypes(), cSchema.isMultiCell());</span>
+        }
+
+<span class="nc" id="L716">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerTuple(TupleType cHeader, TupleType cSchema, boolean droppedColumnMode)
+    {
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        if (cHeader.size() != cSchema.size())</span>
+            // different number of components - bummer...
+<span class="nc" id="L723">            return null;</span>
+<span class="nc" id="L724">        List&lt;AbstractType&lt;?&gt;&gt; cHeaderFixed = new ArrayList&lt;&gt;(cHeader.size());</span>
+<span class="nc" id="L725">        boolean anyChanged = false;</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        for (int i = 0; i &lt; cHeader.size(); i++)</span>
+        {
+<span class="nc" id="L728">            AbstractType&lt;?&gt; cHeaderComp = cHeader.type(i);</span>
+<span class="nc" id="L729">            AbstractType&lt;?&gt; cHeaderCompFixed = fixTypeInner(cHeaderComp, cSchema.type(i), droppedColumnMode);</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">            if (cHeaderCompFixed == null)</span>
+                // incompatible, bummer...
+<span class="nc" id="L732">                return null;</span>
+<span class="nc" id="L733">            cHeaderFixed.add(cHeaderCompFixed);</span>
+<span class="nc bnc" id="L734" title="All 2 branches missed.">            anyChanged |= cHeaderComp != cHeaderCompFixed;</span>
+        }
+<span class="nc bnc" id="L736" title="All 4 branches missed.">        if (anyChanged || cSchema.isMultiCell() != cHeader.isMultiCell())</span>
+            // TODO this should create a non-frozen tuple type for the sake of handling a dropped, non-frozen UDT
+<span class="nc" id="L738">            return new TupleType(cHeaderFixed);</span>
+<span class="nc" id="L739">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerComposite(CompositeType cHeader, CompositeType cSchema, boolean droppedColumnMode)
+    {
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        if (cHeader.types.size() != cSchema.types.size())</span>
+            // different number of components - bummer...
+<span class="nc" id="L746">            return null;</span>
+<span class="nc" id="L747">        List&lt;AbstractType&lt;?&gt;&gt; cHeaderFixed = new ArrayList&lt;&gt;(cHeader.types.size());</span>
+<span class="nc" id="L748">        boolean anyChanged = false;</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">        for (int i = 0; i &lt; cHeader.types.size(); i++)</span>
+        {
+<span class="nc" id="L751">            AbstractType&lt;?&gt; cHeaderComp = cHeader.types.get(i);</span>
+<span class="nc" id="L752">            AbstractType&lt;?&gt; cHeaderCompFixed = fixTypeInner(cHeaderComp, cSchema.types.get(i), droppedColumnMode);</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">            if (cHeaderCompFixed == null)</span>
+                // incompatible, bummer...
+<span class="nc" id="L755">                return null;</span>
+<span class="nc" id="L756">            cHeaderFixed.add(cHeaderCompFixed);</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">            anyChanged |= cHeaderComp != cHeaderCompFixed;</span>
+        }
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        if (anyChanged)</span>
+<span class="nc" id="L760">            return CompositeType.getInstance(cHeaderFixed);</span>
+<span class="nc" id="L761">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerList(ListType&lt;?&gt; cHeader, ListType&lt;?&gt; cSchema, boolean droppedColumnMode)
+    {
+<span class="nc" id="L766">        AbstractType&lt;?&gt; cHeaderElem = cHeader.getElementsType();</span>
+<span class="nc" id="L767">        AbstractType&lt;?&gt; cHeaderElemFixed = fixTypeInner(cHeaderElem, cSchema.getElementsType(), droppedColumnMode);</span>
+<span class="nc bnc" id="L768" title="All 2 branches missed.">        if (cHeaderElemFixed == null)</span>
+            // bummer...
+<span class="nc" id="L770">            return null;</span>
+<span class="nc bnc" id="L771" title="All 2 branches missed.">        if (cHeaderElem != cHeaderElemFixed)</span>
+            // element type changed
+<span class="nc" id="L773">            return ListType.getInstance(cHeaderElemFixed, cHeader.isMultiCell());</span>
+<span class="nc" id="L774">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerSet(SetType&lt;?&gt; cHeader, SetType&lt;?&gt; cSchema, boolean droppedColumnMode)
+    {
+<span class="nc" id="L779">        AbstractType&lt;?&gt; cHeaderElem = cHeader.getElementsType();</span>
+<span class="nc" id="L780">        AbstractType&lt;?&gt; cHeaderElemFixed = fixTypeInner(cHeaderElem, cSchema.getElementsType(), droppedColumnMode);</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">        if (cHeaderElemFixed == null)</span>
+            // bummer...
+<span class="nc" id="L783">            return null;</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (cHeaderElem != cHeaderElemFixed)</span>
+            // element type changed
+<span class="nc" id="L786">            return SetType.getInstance(cHeaderElemFixed, cHeader.isMultiCell());</span>
+<span class="nc" id="L787">        return cHeader;</span>
+    }
+
+    private AbstractType&lt;?&gt; fixTypeInnerMap(MapType&lt;?, ?&gt; cHeader, MapType&lt;?, ?&gt; cSchema, boolean droppedColumnMode)
+    {
+<span class="nc" id="L792">        AbstractType&lt;?&gt; cHeaderKey = cHeader.getKeysType();</span>
+<span class="nc" id="L793">        AbstractType&lt;?&gt; cHeaderVal = cHeader.getValuesType();</span>
+<span class="nc" id="L794">        AbstractType&lt;?&gt; cHeaderKeyFixed = fixTypeInner(cHeaderKey, cSchema.getKeysType(), droppedColumnMode);</span>
+<span class="nc" id="L795">        AbstractType&lt;?&gt; cHeaderValFixed = fixTypeInner(cHeaderVal, cSchema.getValuesType(), droppedColumnMode);</span>
+<span class="nc bnc" id="L796" title="All 4 branches missed.">        if (cHeaderKeyFixed == null || cHeaderValFixed == null)</span>
+            // bummer...
+<span class="nc" id="L798">            return null;</span>
+<span class="nc bnc" id="L799" title="All 4 branches missed.">        if (cHeaderKey != cHeaderKeyFixed || cHeaderVal != cHeaderValFixed)</span>
+            // element type changed
+<span class="nc" id="L801">            return MapType.getInstance(cHeaderKeyFixed, cHeaderValFixed, cHeader.isMultiCell());</span>
+<span class="nc" id="L802">        return cHeader;</span>
+    }
+
+    private boolean typeEquals(AbstractType&lt;?&gt; typeInHeader, AbstractType&lt;?&gt; typeInSchema)
+    {
+        // Quite annoying, but the implementations of equals() on some implementation of AbstractType seems to be
+        // wrong, but toString() seems to work in such cases.
+<span class="nc bnc" id="L809" title="All 4 branches missed.">        return typeInHeader.equals(typeInSchema) || typeInHeader.toString().equals(typeInSchema.toString());</span>
+    }
+
+    private static String logColumnName(ByteBuffer columnName)
+    {
+        try
+        {
+<span class="nc" id="L816">            return ByteBufferUtil.string(columnName);</span>
+        }
+<span class="nc" id="L818">        catch (CharacterCodingException e)</span>
+        {
+<span class="nc" id="L820">            return &quot;?? &quot; + e;</span>
+        }
+    }
+
+    private Map&lt;MetadataType, MetadataComponent&gt; readSSTableMetadata(Descriptor desc)
+    {
+        Map&lt;MetadataType, MetadataComponent&gt; metadata;
+        try
+        {
+<span class="nc" id="L829">            metadata = desc.getMetadataSerializer().deserialize(desc, EnumSet.allOf(MetadataType.class));</span>
+        }
+<span class="nc" id="L831">        catch (IOException e)</span>
+        {
+<span class="nc" id="L833">            error(&quot;Failed to deserialize metadata for sstable %s: %s&quot;, desc, e.toString());</span>
+<span class="nc" id="L834">            return null;</span>
+<span class="nc" id="L835">        }</span>
+<span class="nc" id="L836">        return metadata;</span>
+    }
+
+    private void writeNewMetadata(Descriptor desc, Map&lt;MetadataType, MetadataComponent&gt; newMetadata)
+    {
+<span class="nc" id="L841">        String file = desc.filenameFor(Component.STATS);</span>
+<span class="nc" id="L842">        info.accept(String.format(&quot;  Writing new metadata file %s&quot;, file));</span>
+        try
+        {
+<span class="nc" id="L845">            desc.getMetadataSerializer().rewriteSSTableMetadata(desc, newMetadata);</span>
+        }
+<span class="nc" id="L847">        catch (IOException e)</span>
+        {
+<span class="nc" id="L849">            error(&quot;Failed to write metadata component for %s: %s&quot;, file, e.toString());</span>
+<span class="nc" id="L850">            throw new RuntimeException(e);</span>
+<span class="nc" id="L851">        }</span>
+<span class="nc" id="L852">    }</span>
+
+    /**
+     * Fix individually provided sstables or directories containing sstables.
+     */
+    static class ManualHeaderFix extends SSTableHeaderFix
+    {
+        private final List&lt;Path&gt; paths;
+
+        ManualHeaderFix(Builder builder)
+        {
+<span class="nc" id="L863">            super(builder);</span>
+<span class="nc" id="L864">            this.paths = builder.paths;</span>
+<span class="nc" id="L865">        }</span>
+
+        public void prepare()
+        {
+<span class="nc" id="L869">            paths.forEach(this::processFileOrDirectory);</span>
+<span class="nc" id="L870">        }</span>
+    }
+
+    /**
+     * Fix all sstables in the configured data-directories.
+     */
+    static class AutomaticHeaderFix extends SSTableHeaderFix
+    {
+        AutomaticHeaderFix(Builder builder)
+        {
+<span class="nc" id="L880">            super(builder);</span>
+<span class="nc" id="L881">        }</span>
+
+        public void prepare()
+        {
+<span class="nc" id="L885">            info.accept(&quot;Scanning all data directories...&quot;);</span>
+<span class="nc bnc" id="L886" title="All 2 branches missed.">            for (Directories.DataDirectory dataDirectory : Directories.dataDirectories)</span>
+<span class="nc" id="L887">                scanDataDirectory(dataDirectory);</span>
+<span class="nc" id="L888">            info.accept(&quot;Finished scanning all data directories...&quot;);</span>
+<span class="nc" id="L889">        }</span>
+
+        private void scanDataDirectory(Directories.DataDirectory dataDirectory)
+        {
+<span class="nc" id="L893">            info.accept(String.format(&quot;Scanning data directory %s&quot;, dataDirectory.location));</span>
+<span class="nc" id="L894">            File[] ksDirs = dataDirectory.location.listFiles();</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">            if (ksDirs == null)</span>
+<span class="nc" id="L896">                return;</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">            for (File ksDir : ksDirs)</span>
+            {
+<span class="nc bnc" id="L899" title="All 4 branches missed.">                if (!ksDir.isDirectory() || !ksDir.canRead())</span>
+<span class="nc" id="L900">                    continue;</span>
+
+<span class="nc" id="L902">                String name = ksDir.getName();</span>
+
+                // silently ignore all system keyspaces
+<span class="nc bnc" id="L905" title="All 4 branches missed.">                if (SchemaConstants.isLocalSystemKeyspace(name) || SchemaConstants.isReplicatedSystemKeyspace(name))</span>
+<span class="nc" id="L906">                    continue;</span>
+
+<span class="nc" id="L908">                File[] tabDirs = ksDir.listFiles();</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">                if (tabDirs == null)</span>
+<span class="nc" id="L910">                    continue;</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">                for (File tabDir : tabDirs)</span>
+                {
+<span class="nc bnc" id="L913" title="All 4 branches missed.">                    if (!tabDir.isDirectory() || !tabDir.canRead())</span>
+<span class="nc" id="L914">                        continue;</span>
+
+<span class="nc" id="L916">                    processFileOrDirectory(tabDir.toPath());</span>
+                }
+            }
+<span class="nc" id="L919">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

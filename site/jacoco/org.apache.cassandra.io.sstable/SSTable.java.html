@@ -1,0 +1,324 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTable.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTable.java</span></div><h1>SSTable.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArraySet;
+
+import com.google.common.base.Predicates;
+import com.google.common.collect.Collections2;
+import com.google.common.collect.Sets;
+import com.google.common.io.Files;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.BufferDecoratedKey;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.DiskOptimizationStrategy;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.memory.HeapAllocator;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * This class is built on top of the SequenceFile. It stores
+ * data on disk in sorted fashion. However the sorting is upto
+ * the application. This class expects keys to be handed to it
+ * in sorted order.
+ *
+ * A separate index file is maintained as well, containing the
+ * SSTable keys and the offset into the SSTable at which they are found.
+ * Every 1/indexInterval key is read into memory when the SSTable is opened.
+ *
+ * Finally, a bloom filter file is also kept for the keys in each SSTable.
+ */
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">public abstract class SSTable</span>
+{
+<span class="fc" id="L60">    static final Logger logger = LoggerFactory.getLogger(SSTable.class);</span>
+
+    public static final int TOMBSTONE_HISTOGRAM_BIN_SIZE = 100;
+    public static final int TOMBSTONE_HISTOGRAM_SPOOL_SIZE = 100000;
+<span class="fc" id="L64">    public static final int TOMBSTONE_HISTOGRAM_TTL_ROUND_SECONDS = Integer.valueOf(System.getProperty(&quot;cassandra.streaminghistogram.roundseconds&quot;, &quot;60&quot;));</span>
+
+    public final Descriptor descriptor;
+    protected final Set&lt;Component&gt; components;
+    public final CFMetaData metadata;
+    public final boolean compression;
+
+    public DecoratedKey first;
+    public DecoratedKey last;
+
+    protected final DiskOptimizationStrategy optimizationStrategy;
+
+    protected SSTable(Descriptor descriptor, Set&lt;Component&gt; components, CFMetaData metadata, DiskOptimizationStrategy optimizationStrategy)
+<span class="fc" id="L77">    {</span>
+        // In almost all cases, metadata shouldn't be null, but allowing null allows to create a mostly functional SSTable without
+        // full schema definition. SSTableLoader use that ability
+<span class="pc bpc" id="L80" title="2 of 4 branches missed.">        assert descriptor != null;</span>
+<span class="pc bpc" id="L81" title="2 of 4 branches missed.">        assert components != null;</span>
+<span class="pc bpc" id="L82" title="2 of 4 branches missed.">        assert metadata != null;</span>
+
+<span class="fc" id="L84">        this.descriptor = descriptor;</span>
+<span class="fc" id="L85">        Set&lt;Component&gt; dataComponents = new HashSet&lt;&gt;(components);</span>
+<span class="fc" id="L86">        this.compression = dataComponents.contains(Component.COMPRESSION_INFO);</span>
+<span class="fc" id="L87">        this.components = new CopyOnWriteArraySet&lt;&gt;(dataComponents);</span>
+<span class="fc" id="L88">        this.metadata = metadata;</span>
+<span class="fc" id="L89">        this.optimizationStrategy = Objects.requireNonNull(optimizationStrategy);</span>
+<span class="fc" id="L90">    }</span>
+
+    /**
+     * We use a ReferenceQueue to manage deleting files that have been compacted
+     * and for which no more SSTable references exist.  But this is not guaranteed
+     * to run for each such file because of the semantics of the JVM gc.  So,
+     * we write a marker to `compactedFilename` when a file is compacted;
+     * if such a marker exists on startup, the file should be removed.
+     *
+     * This method will also remove SSTables that are marked as temporary.
+     *
+     * @return true if the file was deleted
+     */
+    public static boolean delete(Descriptor desc, Set&lt;Component&gt; components)
+    {
+<span class="fc" id="L105">        logger.debug(&quot;Deleting sstable: {}&quot;, desc);</span>
+        // remove the DATA component first if it exists
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if (components.contains(Component.DATA))</span>
+<span class="nc" id="L108">            FileUtils.deleteWithConfirm(desc.filenameFor(Component.DATA));</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        for (Component component : components)</span>
+        {
+<span class="pc bpc" id="L111" title="1 of 4 branches missed.">            if (component.equals(Component.DATA) || component.equals(Component.SUMMARY))</span>
+<span class="fc" id="L112">                continue;</span>
+
+<span class="fc" id="L114">            FileUtils.deleteWithConfirm(desc.filenameFor(component));</span>
+<span class="fc" id="L115">        }</span>
+
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">        if (components.contains(Component.SUMMARY))</span>
+<span class="fc" id="L118">            FileUtils.delete(desc.filenameFor(Component.SUMMARY));</span>
+
+<span class="fc" id="L120">        return true;</span>
+    }
+
+    public IPartitioner getPartitioner()
+    {
+<span class="fc" id="L125">        return metadata.partitioner;</span>
+    }
+
+    public DecoratedKey decorateKey(ByteBuffer key)
+    {
+<span class="fc" id="L130">        return getPartitioner().decorateKey(key);</span>
+    }
+
+    /**
+     * If the given @param key occupies only part of a larger buffer, allocate a new buffer that is only
+     * as large as necessary.
+     */
+    public static DecoratedKey getMinimalKey(DecoratedKey key)
+    {
+<span class="pc bpc" id="L139" title="3 of 6 branches missed.">        return key.getKey().position() &gt; 0 || key.getKey().hasRemaining() || !key.getKey().hasArray()</span>
+<span class="pc" id="L140">                                       ? new BufferDecoratedKey(key.getToken(), HeapAllocator.instance.clone(key.getKey()))</span>
+                                       : key;
+    }
+
+    public String getFilename()
+    {
+<span class="fc" id="L146">        return descriptor.filenameFor(Component.DATA);</span>
+    }
+
+    public String getIndexFilename()
+    {
+<span class="nc" id="L151">        return descriptor.filenameFor(Component.PRIMARY_INDEX);</span>
+    }
+
+    public String getColumnFamilyName()
+    {
+<span class="nc" id="L156">        return descriptor.cfname;</span>
+    }
+
+    public String getKeyspaceName()
+    {
+<span class="nc" id="L161">        return descriptor.ksname;</span>
+    }
+
+    public List&lt;String&gt; getAllFilePaths()
+    {
+<span class="fc" id="L166">        List&lt;String&gt; ret = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L167" title="All 2 branches covered.">        for (Component component : components)</span>
+<span class="fc" id="L168">            ret.add(descriptor.filenameFor(component));</span>
+<span class="fc" id="L169">        return ret;</span>
+    }
+
+    /**
+     * @return Descriptor and Component pair. null if given file is not acceptable as SSTable component.
+     *         If component is of unknown type, returns CUSTOM component.
+     */
+    public static Pair&lt;Descriptor, Component&gt; tryComponentFromFilename(File dir, String name)
+    {
+        try
+        {
+<span class="nc" id="L180">            return Component.fromFilename(dir, name);</span>
+        }
+<span class="nc" id="L182">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L184">            return null;</span>
+        }
+    }
+
+    /**
+     * Discovers existing components for the descriptor. Slow: only intended for use outside the critical path.
+     */
+    public static Set&lt;Component&gt; componentsFor(final Descriptor desc)
+    {
+        try
+        {
+            try
+            {
+<span class="nc" id="L197">                return readTOC(desc);</span>
+            }
+<span class="nc" id="L199">            catch (FileNotFoundException e)</span>
+            {
+<span class="nc" id="L201">                Set&lt;Component&gt; components = discoverComponentsFor(desc);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                if (components.isEmpty())</span>
+<span class="nc" id="L203">                    return components; // sstable doesn't exist yet</span>
+
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                if (!components.contains(Component.TOC))</span>
+<span class="nc" id="L206">                    components.add(Component.TOC);</span>
+<span class="nc" id="L207">                appendTOC(desc, components);</span>
+<span class="nc" id="L208">                return components;</span>
+            }
+        }
+<span class="nc" id="L211">        catch (IOException e)</span>
+        {
+<span class="nc" id="L213">            throw new IOError(e);</span>
+        }
+    }
+
+    public static Set&lt;Component&gt; discoverComponentsFor(Descriptor desc)
+    {
+<span class="fc" id="L219">        Set&lt;Component.Type&gt; knownTypes = Sets.difference(Component.TYPES, Collections.singleton(Component.Type.CUSTOM));</span>
+<span class="fc" id="L220">        Set&lt;Component&gt; components = Sets.newHashSetWithExpectedSize(knownTypes.size());</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        for (Component.Type componentType : knownTypes)</span>
+        {
+<span class="fc bfc" id="L223" title="All 2 branches covered.">            if (componentType == Component.Type.DIGEST)</span>
+            {
+<span class="pc bpc" id="L225" title="2 of 4 branches missed.">                if (desc.digestComponent != null &amp;&amp; new File(desc.filenameFor(desc.digestComponent)).exists())</span>
+<span class="fc" id="L226">                    components.add(desc.digestComponent);</span>
+            }
+            else
+            {
+<span class="fc" id="L230">                Component component = new Component(componentType);</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">                if (new File(desc.filenameFor(component)).exists())</span>
+<span class="fc" id="L232">                    components.add(component);</span>
+            }
+<span class="fc" id="L234">        }</span>
+<span class="fc" id="L235">        return components;</span>
+    }
+
+    /** @return An estimate of the number of keys contained in the given index file. */
+    protected long estimateRowsFromIndex(RandomAccessReader ifile) throws IOException
+    {
+        // collect sizes for the first 10000 keys, or first 10 megabytes of data
+<span class="nc" id="L242">        final int SAMPLES_CAP = 10000, BYTES_CAP = (int)Math.min(10000000, ifile.length());</span>
+<span class="nc" id="L243">        int keys = 0;</span>
+<span class="nc bnc" id="L244" title="All 4 branches missed.">        while (ifile.getFilePointer() &lt; BYTES_CAP &amp;&amp; keys &lt; SAMPLES_CAP)</span>
+        {
+<span class="nc" id="L246">            ByteBufferUtil.skipShortLength(ifile);</span>
+<span class="nc" id="L247">            RowIndexEntry.Serializer.skip(ifile, descriptor.version);</span>
+<span class="nc" id="L248">            keys++;</span>
+        }
+<span class="nc bnc" id="L250" title="All 8 branches missed.">        assert keys &gt; 0 &amp;&amp; ifile.getFilePointer() &gt; 0 &amp;&amp; ifile.length() &gt; 0 : &quot;Unexpected empty index file: &quot; + ifile;</span>
+<span class="nc" id="L251">        long estimatedRows = ifile.length() / (ifile.getFilePointer() / keys);</span>
+<span class="nc" id="L252">        ifile.seek(0);</span>
+<span class="nc" id="L253">        return estimatedRows;</span>
+    }
+
+    public long bytesOnDisk()
+    {
+<span class="fc" id="L258">        long bytes = 0;</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">        for (Component component : components)</span>
+        {
+<span class="fc" id="L261">            bytes += new File(descriptor.filenameFor(component)).length();</span>
+<span class="fc" id="L262">        }</span>
+<span class="fc" id="L263">        return bytes;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L269">        return getClass().getSimpleName() + &quot;(&quot; +</span>
+<span class="fc" id="L270">               &quot;path='&quot; + getFilename() + '\'' +</span>
+               ')';
+    }
+
+    /**
+     * Reads the list of components from the TOC component.
+     * @return set of components found in the TOC
+     */
+    protected static Set&lt;Component&gt; readTOC(Descriptor descriptor) throws IOException
+    {
+<span class="nc" id="L280">        File tocFile = new File(descriptor.filenameFor(Component.TOC));</span>
+<span class="nc" id="L281">        List&lt;String&gt; componentNames = Files.readLines(tocFile, Charset.defaultCharset());</span>
+<span class="nc" id="L282">        Set&lt;Component&gt; components = Sets.newHashSetWithExpectedSize(componentNames.size());</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        for (String componentName : componentNames)</span>
+        {
+<span class="nc" id="L285">            Component component = new Component(Component.Type.fromRepresentation(componentName), componentName);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if (!new File(descriptor.filenameFor(component)).exists())</span>
+<span class="nc" id="L287">                logger.error(&quot;Missing component: {}&quot;, descriptor.filenameFor(component));</span>
+            else
+<span class="nc" id="L289">                components.add(component);</span>
+<span class="nc" id="L290">        }</span>
+<span class="nc" id="L291">        return components;</span>
+    }
+
+    /**
+     * Appends new component names to the TOC component.
+     */
+    protected static void appendTOC(Descriptor descriptor, Collection&lt;Component&gt; components)
+    {
+<span class="fc" id="L299">        File tocFile = new File(descriptor.filenameFor(Component.TOC));</span>
+<span class="fc" id="L300">        try (PrintWriter w = new PrintWriter(new FileWriter(tocFile, true)))</span>
+        {
+<span class="fc bfc" id="L302" title="All 2 branches covered.">            for (Component component : components)</span>
+<span class="fc" id="L303">                w.println(component.name);</span>
+        }
+<span class="nc" id="L305">        catch (IOException e)</span>
+        {
+<span class="nc" id="L307">            throw new FSWriteError(e, tocFile);</span>
+<span class="fc" id="L308">        }</span>
+<span class="fc" id="L309">    }</span>
+
+    /**
+     * Registers new custom components. Used by custom compaction strategies.
+     * Adding a component for the second time is a no-op.
+     * Don't remove this - this method is a part of the public API, intended for use by custom compaction strategies.
+     * @param newComponents collection of components to be added
+     */
+    public synchronized void addComponents(Collection&lt;Component&gt; newComponents)
+    {
+<span class="nc" id="L319">        Collection&lt;Component&gt; componentsToAdd = Collections2.filter(newComponents, Predicates.not(Predicates.in(components)));</span>
+<span class="nc" id="L320">        appendTOC(descriptor, componentsToAdd);</span>
+<span class="nc" id="L321">        components.addAll(componentsToAdd);</span>
+<span class="nc" id="L322">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

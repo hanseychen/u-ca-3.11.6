@@ -1,0 +1,1189 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SecondaryIndexManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index</a> &gt; <span class="el_source">SecondaryIndexManager.java</span></div><h1>SecondaryIndexManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index;
+
+import java.lang.reflect.Constructor;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.common.primitives.Longs;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.MoreExecutors;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.transactions.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
+import org.apache.cassandra.service.pager.SinglePartitionPager;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdown;
+
+/**
+ * Handles the core maintenance functionality associated with indexes: adding/removing them to or from
+ * a table, (re)building during bootstrap or other streaming operations, flushing, reloading metadata
+ * and so on.
+ *
+ * The Index interface defines a number of methods which return {@code Callable&lt;?&gt;}. These are primarily the
+ * management tasks for an index implementation. Most of them are currently executed in a blocking
+ * fashion via submission to SIM's blockingExecutor. This provides the desired behaviour in pretty
+ * much all cases, as tasks like flushing an index needs to be executed synchronously to avoid potentially
+ * deadlocking on the FlushWriter or PostFlusher. Several of these {@code Callable&lt;?&gt;} returning methods on Index could
+ * then be defined with as void and called directly from SIM (rather than being run via the executor service).
+ * Separating the task defintion from execution gives us greater flexibility though, so that in future, for example,
+ * if the flush process allows it we leave open the possibility of executing more of these tasks asynchronously.
+ *
+ * The primary exception to the above is the Callable returned from Index#addIndexedColumn. This may
+ * involve a significant effort, building a new index over any existing data. We perform this task asynchronously;
+ * as it is called as part of a schema update, which we do not want to block for a long period. Building non-custom
+ * indexes is performed on the CompactionManager.
+ *
+ * This class also provides instances of processors which listen to updates to the base table and forward to
+ * registered Indexes the info required to keep those indexes up to date.
+ * There are two variants of these processors, each with a factory method provided by SIM:
+ *      IndexTransaction: deals with updates generated on the regular write path.
+ *      CleanupTransaction: used when partitions are modified during compaction or cleanup operations.
+ * Further details on their usage and lifecycles can be found in the interface definitions below.
+ *
+ * Finally, the bestIndexFor method is used at query time to identify the most selective index of those able
+ * to satisfy any search predicates defined by a ReadCommand's RowFilter. It returns a thin IndexAccessor object
+ * which enables the ReadCommand to access the appropriate functions of the Index at various stages in its lifecycle.
+ * e.g. the getEstimatedResultRows is required when StorageProxy calculates the initial concurrency factor for
+ * distributing requests to replicas, whereas a Searcher instance is needed when the ReadCommand is executed locally on
+ * a target replica.
+ */
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">public class SecondaryIndexManager implements IndexRegistry</span>
+{
+<span class="fc" id="L106">    private static final Logger logger = LoggerFactory.getLogger(SecondaryIndexManager.class);</span>
+
+    // default page size (in rows) when rebuilding the index for a whole partition
+    public static final int DEFAULT_PAGE_SIZE = 10000;
+
+<span class="fc" id="L111">    private Map&lt;String, Index&gt; indexes = Maps.newConcurrentMap();</span>
+
+    /**
+     * The indexes that are ready to server requests.
+     */
+<span class="fc" id="L116">    private Set&lt;String&gt; builtIndexes = Sets.newConcurrentHashSet();</span>
+
+    // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
+<span class="fc" id="L119">    private static final ExecutorService asyncExecutor =</span>
+        new JMXEnabledThreadPoolExecutor(1,
+                                         StageManager.KEEPALIVE,
+                                         TimeUnit.SECONDS,
+                                         new LinkedBlockingQueue&lt;&gt;(),
+                                         new NamedThreadFactory(&quot;SecondaryIndexManagement&quot;),
+                                         &quot;internal&quot;);
+
+    // executes all blocking tasks produced by Indexers e.g. getFlushTask, getMetadataReloadTask etc
+<span class="fc" id="L128">    private static final ExecutorService blockingExecutor = MoreExecutors.newDirectExecutorService();</span>
+
+    /**
+     * The underlying column family containing the source data for these indexes
+     */
+    public final ColumnFamilyStore baseCfs;
+
+    public SecondaryIndexManager(ColumnFamilyStore baseCfs)
+<span class="fc" id="L136">    {</span>
+<span class="fc" id="L137">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L138">    }</span>
+
+
+    /**
+     * Drops and adds new indexes associated with the underlying CF
+     */
+    public void reload()
+    {
+        // figure out what needs to be added and dropped.
+<span class="fc" id="L147">        Indexes tableIndexes = baseCfs.metadata.getIndexes();</span>
+<span class="fc" id="L148">        indexes.keySet()</span>
+<span class="fc" id="L149">               .stream()</span>
+<span class="pc bnc" id="L150" title="All 2 branches missed.">               .filter(indexName -&gt; !tableIndexes.has(indexName))</span>
+<span class="fc" id="L151">               .forEach(this::removeIndex);</span>
+
+        // we call add for every index definition in the collection as
+        // some may not have been created here yet, only added to schema
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">        for (IndexMetadata tableIndex : tableIndexes)</span>
+<span class="nc" id="L156">            addIndex(tableIndex);</span>
+<span class="fc" id="L157">    }</span>
+
+    private Future&lt;?&gt; reloadIndex(IndexMetadata indexDef)
+    {
+<span class="nc" id="L161">        Index index = indexes.get(indexDef.name);</span>
+<span class="nc" id="L162">        Callable&lt;?&gt; reloadTask = index.getMetadataReloadTask(indexDef);</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        return reloadTask == null</span>
+<span class="nc" id="L164">               ? Futures.immediateFuture(null)</span>
+<span class="nc" id="L165">               : blockingExecutor.submit(reloadTask);</span>
+    }
+
+    private Future&lt;?&gt; createIndex(IndexMetadata indexDef)
+    {
+<span class="nc" id="L170">        Index index = createInstance(indexDef);</span>
+<span class="nc" id="L171">        index.register(this);</span>
+
+        // if the index didn't register itself, we can probably assume that no initialization needs to happen
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        final Callable&lt;?&gt; initialBuildTask = indexes.containsKey(indexDef.name)</span>
+<span class="nc" id="L175">                                           ? index.getInitializationTask()</span>
+                                           : null;
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (initialBuildTask == null)</span>
+        {
+            // We need to make sure that the index is marked as built in the case where the initialBuildTask
+            // does not need to be run (if the index didn't register itself or if the base table was empty).
+<span class="nc" id="L181">            markIndexBuilt(indexDef.name);</span>
+<span class="nc" id="L182">            return Futures.immediateFuture(null);</span>
+        }
+<span class="nc" id="L184">        return asyncExecutor.submit(index.getInitializationTask());</span>
+    }
+
+    /**
+     * Adds and builds a index
+     * @param indexDef the IndexMetadata describing the index
+     */
+    public synchronized Future&lt;?&gt; addIndex(IndexMetadata indexDef)
+    {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (indexes.containsKey(indexDef.name))</span>
+<span class="nc" id="L194">            return reloadIndex(indexDef);</span>
+        else
+<span class="nc" id="L196">            return createIndex(indexDef);</span>
+    }
+
+    /**
+     * Checks if the specified index is queryable.
+     *
+     * @param index the index
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified index is queryable, &lt;code&gt;false&lt;/code&gt; otherwise
+     */
+    public boolean isIndexQueryable(Index index)
+    {
+<span class="nc" id="L207">        return builtIndexes.contains(index.getIndexMetadata().name);</span>
+    }
+
+    public synchronized void removeIndex(String indexName)
+    {
+<span class="nc" id="L212">        Index index = unregisterIndex(indexName);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (null != index)</span>
+        {
+<span class="nc" id="L215">            markIndexRemoved(indexName);</span>
+<span class="nc" id="L216">            executeBlocking(index.getInvalidateTask());</span>
+        }
+<span class="nc" id="L218">    }</span>
+
+
+    public Set&lt;IndexMetadata&gt; getDependentIndexes(ColumnDefinition column)
+    {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (indexes.isEmpty())</span>
+<span class="nc" id="L224">            return Collections.emptySet();</span>
+
+<span class="nc" id="L226">        Set&lt;IndexMetadata&gt; dependentIndexes = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        for (Index index : indexes.values())</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            if (index.dependsOn(column))</span>
+<span class="nc" id="L229">                dependentIndexes.add(index.getIndexMetadata());</span>
+
+<span class="nc" id="L231">        return dependentIndexes;</span>
+    }
+
+    /**
+     * Called when dropping a Table
+     */
+    public void markAllIndexesRemoved()
+    {
+<span class="fc" id="L239">       getBuiltIndexNames().forEach(this::markIndexRemoved);</span>
+<span class="fc" id="L240">    }</span>
+
+    /**
+    * Does a full, blocking rebuild of the indexes specified by columns from the sstables.
+    * Caller must acquire and release references to the sstables used here.
+    * Note also that only this method of (re)building indexes:
+    *   a) takes a set of index *names* rather than Indexers
+    *   b) marks exsiting indexes removed prior to rebuilding
+    *
+    * @param sstables the data to build from
+    * @param indexNames the list of indexes to be rebuilt
+    */
+    public void rebuildIndexesBlocking(Collection&lt;SSTableReader&gt; sstables, Set&lt;String&gt; indexNames)
+    {
+<span class="nc" id="L254">        Set&lt;Index&gt; toRebuild = indexes.values().stream()</span>
+<span class="nc" id="L255">                                               .filter(index -&gt; indexNames.contains(index.getIndexMetadata().name))</span>
+<span class="nc" id="L256">                                               .filter(Index::shouldBuildBlocking)</span>
+<span class="nc" id="L257">                                               .collect(Collectors.toSet());</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">        if (toRebuild.isEmpty())</span>
+        {
+<span class="nc" id="L260">            logger.info(&quot;No defined indexes with the supplied names: {}&quot;, Joiner.on(',').join(indexNames));</span>
+<span class="nc" id="L261">            return;</span>
+        }
+
+<span class="nc" id="L264">        toRebuild.forEach(indexer -&gt; markIndexRemoved(indexer.getIndexMetadata().name));</span>
+
+<span class="nc" id="L266">        buildIndexesBlocking(sstables, toRebuild);</span>
+
+<span class="nc" id="L268">        toRebuild.forEach(indexer -&gt; markIndexBuilt(indexer.getIndexMetadata().name));</span>
+<span class="nc" id="L269">    }</span>
+
+    public void buildAllIndexesBlocking(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L273">        buildIndexesBlocking(sstables, indexes.values()</span>
+<span class="nc" id="L274">                                              .stream()</span>
+<span class="nc" id="L275">                                              .filter(Index::shouldBuildBlocking)</span>
+<span class="nc" id="L276">                                              .collect(Collectors.toSet()));</span>
+<span class="nc" id="L277">    }</span>
+
+    // For convenience, may be called directly from Index impls
+    public void buildIndexBlocking(Index index)
+    {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (index.shouldBuildBlocking())</span>
+        {
+<span class="nc" id="L284">            try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL));</span>
+<span class="nc" id="L285">                 Refs&lt;SSTableReader&gt; sstables = viewFragment.refs)</span>
+            {
+<span class="nc" id="L287">                buildIndexesBlocking(sstables, Collections.singleton(index));</span>
+<span class="nc" id="L288">                markIndexBuilt(index.getIndexMetadata().name);</span>
+            }
+        }
+<span class="nc" id="L291">    }</span>
+
+    /**
+     * Checks if the specified {@link ColumnFamilyStore} is a secondary index.
+     *
+     * @param cfs the &lt;code&gt;ColumnFamilyStore&lt;/code&gt; to check.
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified &lt;code&gt;ColumnFamilyStore&lt;/code&gt; is a secondary index,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public static boolean isIndexColumnFamilyStore(ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L302">        return isIndexColumnFamily(cfs.name);</span>
+    }
+
+    /**
+     * Checks if the specified {@link ColumnFamilyStore} is the one secondary index.
+     *
+     * @param cfName the name of the &lt;code&gt;ColumnFamilyStore&lt;/code&gt; to check.
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified &lt;code&gt;ColumnFamilyStore&lt;/code&gt; is a secondary index,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public static boolean isIndexColumnFamily(String cfName)
+    {
+<span class="nc" id="L314">        return cfName.contains(Directories.SECONDARY_INDEX_NAME_SEPARATOR);</span>
+    }
+
+    /**
+     * Returns the parent of the specified {@link ColumnFamilyStore}.
+     *
+     * @param cfs the &lt;code&gt;ColumnFamilyStore&lt;/code&gt;
+     * @return the parent of the specified &lt;code&gt;ColumnFamilyStore&lt;/code&gt;
+     */
+    public static ColumnFamilyStore getParentCfs(ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L325">        String parentCfs = getParentCfsName(cfs.name);</span>
+<span class="nc" id="L326">        return cfs.keyspace.getColumnFamilyStore(parentCfs);</span>
+    }
+
+    /**
+     * Returns the parent name of the specified {@link ColumnFamilyStore}.
+     *
+     * @param cfName the &lt;code&gt;ColumnFamilyStore&lt;/code&gt; name
+     * @return the parent name of the specified &lt;code&gt;ColumnFamilyStore&lt;/code&gt;
+     */
+    public static String getParentCfsName(String cfName)
+    {
+<span class="nc bnc" id="L337" title="All 4 branches missed.">        assert isIndexColumnFamily(cfName);</span>
+<span class="nc" id="L338">        return StringUtils.substringBefore(cfName, Directories.SECONDARY_INDEX_NAME_SEPARATOR);</span>
+    }
+
+    /**
+     * Returns the index name
+     *
+     * @param cfs the &lt;code&gt;ColumnFamilyStore&lt;/code&gt;
+     * @return the index name
+     */
+    public static String getIndexName(ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L349">        return getIndexName(cfs.name);</span>
+    }
+
+    /**
+     * Returns the index name
+     *
+     * @param cfName the &lt;code&gt;ColumnFamilyStore&lt;/code&gt; name
+     * @return the index name
+     */
+    public static String getIndexName(String cfName)
+    {
+<span class="nc bnc" id="L360" title="All 4 branches missed.">        assert isIndexColumnFamily(cfName);</span>
+<span class="nc" id="L361">        return StringUtils.substringAfter(cfName, Directories.SECONDARY_INDEX_NAME_SEPARATOR);</span>
+    }
+
+    private void buildIndexesBlocking(Collection&lt;SSTableReader&gt; sstables, Set&lt;Index&gt; indexes)
+    {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if (indexes.isEmpty())</span>
+<span class="nc" id="L367">            return;</span>
+
+<span class="nc" id="L369">        logger.info(&quot;Submitting index build of {} for data in {}&quot;,</span>
+<span class="nc" id="L370">                    indexes.stream().map(i -&gt; i.getIndexMetadata().name).collect(Collectors.joining(&quot;,&quot;)),</span>
+<span class="nc" id="L371">                    sstables.stream().map(SSTableReader::toString).collect(Collectors.joining(&quot;,&quot;)));</span>
+
+<span class="nc" id="L373">        Map&lt;Index.IndexBuildingSupport, Set&lt;Index&gt;&gt; byType = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        for (Index index : indexes)</span>
+        {
+<span class="nc" id="L376">            Set&lt;Index&gt; stored = byType.computeIfAbsent(index.getBuildTaskSupport(), i -&gt; new HashSet&lt;&gt;());</span>
+<span class="nc" id="L377">            stored.add(index);</span>
+<span class="nc" id="L378">        }</span>
+
+<span class="nc" id="L380">        List&lt;Future&lt;?&gt;&gt; futures = byType.entrySet()</span>
+<span class="nc" id="L381">                                        .stream()</span>
+<span class="nc" id="L382">                                        .map((e) -&gt; e.getKey().getIndexBuildTask(baseCfs, e.getValue(), sstables))</span>
+<span class="nc" id="L383">                                        .map(CompactionManager.instance::submitIndexBuild)</span>
+<span class="nc" id="L384">                                        .collect(Collectors.toList());</span>
+
+<span class="nc" id="L386">        FBUtilities.waitOnFutures(futures);</span>
+
+<span class="nc" id="L388">        flushIndexesBlocking(indexes);</span>
+<span class="nc" id="L389">        logger.info(&quot;Index build of {} complete&quot;,</span>
+<span class="nc" id="L390">                    indexes.stream().map(i -&gt; i.getIndexMetadata().name).collect(Collectors.joining(&quot;,&quot;)));</span>
+<span class="nc" id="L391">    }</span>
+
+    /**
+     * Marks the specified index as build.
+     * &lt;p&gt;This method is public as it need to be accessible from the {@link Index} implementations&lt;/p&gt;
+     * @param indexName the index name
+     */
+    public void markIndexBuilt(String indexName)
+    {
+<span class="nc" id="L400">        builtIndexes.add(indexName);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (DatabaseDescriptor.isDaemonInitialized())</span>
+<span class="nc" id="L402">            SystemKeyspace.setIndexBuilt(baseCfs.keyspace.getName(), indexName);</span>
+<span class="nc" id="L403">    }</span>
+
+    /**
+     * Marks the specified index as removed.
+     * &lt;p&gt;This method is public as it need to be accessible from the {@link Index} implementations&lt;/p&gt;
+     * @param indexName the index name
+     */
+    public void markIndexRemoved(String indexName)
+    {
+<span class="nc" id="L412">        SystemKeyspace.setIndexRemoved(baseCfs.keyspace.getName(), indexName);</span>
+<span class="nc" id="L413">    }</span>
+
+    public Index getIndexByName(String indexName)
+    {
+<span class="nc" id="L417">        return indexes.get(indexName);</span>
+    }
+
+    private Index createInstance(IndexMetadata indexDef)
+    {
+        Index newIndex;
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if (indexDef.isCustom())</span>
+        {
+<span class="nc bnc" id="L425" title="All 4 branches missed.">            assert indexDef.options != null;</span>
+<span class="nc" id="L426">            String className = indexDef.options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME);</span>
+<span class="nc bnc" id="L427" title="All 4 branches missed.">            assert ! Strings.isNullOrEmpty(className);</span>
+            try
+            {
+<span class="nc" id="L430">                Class&lt;? extends Index&gt; indexClass = FBUtilities.classForName(className, &quot;Index&quot;);</span>
+<span class="nc" id="L431">                Constructor&lt;? extends Index&gt; ctor = indexClass.getConstructor(ColumnFamilyStore.class, IndexMetadata.class);</span>
+<span class="nc" id="L432">                newIndex = ctor.newInstance(baseCfs, indexDef);</span>
+            }
+<span class="nc" id="L434">            catch (Exception e)</span>
+            {
+<span class="nc" id="L436">                throw new RuntimeException(e);</span>
+<span class="nc" id="L437">            }</span>
+<span class="nc" id="L438">        }</span>
+        else
+        {
+<span class="nc" id="L441">            newIndex = CassandraIndex.newIndex(baseCfs, indexDef);</span>
+        }
+<span class="nc" id="L443">        return newIndex;</span>
+    }
+
+    /**
+     * Truncate all indexes
+     */
+    public void truncateAllIndexesBlocking(final long truncatedAt)
+    {
+<span class="nc" id="L451">        executeAllBlocking(indexes.values().stream(), (index) -&gt; index.getTruncateTask(truncatedAt));</span>
+<span class="nc" id="L452">    }</span>
+
+    /**
+     * Remove all indexes
+     */
+    public void invalidateAllIndexesBlocking()
+    {
+<span class="fc" id="L459">        markAllIndexesRemoved();</span>
+<span class="fc" id="L460">        executeAllBlocking(indexes.values().stream(), Index::getInvalidateTask);</span>
+<span class="fc" id="L461">    }</span>
+
+    /**
+     * Perform a blocking flush all indexes
+     */
+    public void flushAllIndexesBlocking()
+    {
+<span class="nc" id="L468">       flushIndexesBlocking(ImmutableSet.copyOf(indexes.values()));</span>
+<span class="nc" id="L469">    }</span>
+
+    /**
+     * Perform a blocking flush of selected indexes
+     */
+    public void flushIndexesBlocking(Set&lt;Index&gt; indexes)
+    {
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (indexes.isEmpty())</span>
+<span class="nc" id="L477">            return;</span>
+
+<span class="nc" id="L479">        List&lt;Future&lt;?&gt;&gt; wait = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L480">        List&lt;Index&gt; nonCfsIndexes = new ArrayList&lt;&gt;();</span>
+
+        // for each CFS backed index, submit a flush task which we'll wait on for completion
+        // for the non-CFS backed indexes, we'll flush those while we wait.
+<span class="nc" id="L484">        synchronized (baseCfs.getTracker())</span>
+        {
+<span class="nc" id="L486">            indexes.forEach(index -&gt;</span>
+<span class="nc" id="L487">                index.getBackingTable()</span>
+<span class="nc" id="L488">                     .map(cfs -&gt; wait.add(cfs.forceFlush()))</span>
+<span class="nc" id="L489">                     .orElseGet(() -&gt; nonCfsIndexes.add(index)));</span>
+<span class="nc" id="L490">        }</span>
+
+<span class="nc" id="L492">        executeAllBlocking(nonCfsIndexes.stream(), Index::getBlockingFlushTask);</span>
+<span class="nc" id="L493">        FBUtilities.waitOnFutures(wait);</span>
+<span class="nc" id="L494">    }</span>
+
+    /**
+     * Performs a blocking flush of all custom indexes
+     */
+    public void flushAllNonCFSBackedIndexesBlocking()
+    {
+<span class="fc" id="L501">        executeAllBlocking(indexes.values()</span>
+<span class="fc" id="L502">                                  .stream()</span>
+<span class="pc bnc" id="L503" title="All 2 branches missed.">                                  .filter(index -&gt; !index.getBackingTable().isPresent()),</span>
+                           Index::getBlockingFlushTask);
+<span class="fc" id="L505">    }</span>
+
+    /**
+     * Performs a blocking execution of pre-join tasks of all indexes
+     */
+    public void executePreJoinTasksBlocking(boolean hadBootstrap)
+    {
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        logger.info(&quot;Executing pre-join{} tasks for: {}&quot;, hadBootstrap ? &quot; post-bootstrap&quot; : &quot;&quot;, this.baseCfs);</span>
+<span class="nc" id="L513">        executeAllBlocking(indexes.values().stream(), (index) -&gt; {</span>
+<span class="nc" id="L514">            return index.getPreJoinTask(hadBootstrap);</span>
+        });
+<span class="nc" id="L516">    }</span>
+
+    /**
+     * @return all indexes which are marked as built and ready to use
+     */
+    public List&lt;String&gt; getBuiltIndexNames()
+    {
+<span class="fc" id="L523">        Set&lt;String&gt; allIndexNames = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L524">        indexes.values().stream()</span>
+<span class="pc" id="L525">                .map(i -&gt; i.getIndexMetadata().name)</span>
+<span class="fc" id="L526">                .forEach(allIndexNames::add);</span>
+<span class="fc" id="L527">        return SystemKeyspace.getBuiltIndexes(baseCfs.keyspace.getName(), allIndexNames);</span>
+    }
+
+    /**
+     * @return all backing Tables used by registered indexes
+     */
+    public Set&lt;ColumnFamilyStore&gt; getAllIndexColumnFamilyStores()
+    {
+<span class="fc" id="L535">        Set&lt;ColumnFamilyStore&gt; backingTables = new HashSet&lt;&gt;();</span>
+<span class="pc" id="L536">        indexes.values().forEach(index -&gt; index.getBackingTable().ifPresent(backingTables::add));</span>
+<span class="fc" id="L537">        return backingTables;</span>
+    }
+
+    /**
+     * @return if there are ANY indexes registered for this table
+     */
+    public boolean hasIndexes()
+    {
+<span class="pc bpc" id="L545" title="1 of 2 branches missed.">        return !indexes.isEmpty();</span>
+    }
+
+    /**
+     * When building an index against existing data in sstables, add the given partition to the index
+     */
+    public void indexPartition(DecoratedKey key, Set&lt;Index&gt; indexes, int pageSize)
+    {
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L554">            logger.trace(&quot;Indexing partition {}&quot;, baseCfs.metadata.getKeyValidator().getString(key.getKey()));</span>
+
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (!indexes.isEmpty())</span>
+        {
+<span class="nc" id="L558">            SinglePartitionReadCommand cmd = SinglePartitionReadCommand.fullPartitionRead(baseCfs.metadata,</span>
+<span class="nc" id="L559">                                                                                          FBUtilities.nowInSeconds(),</span>
+                                                                                          key);
+<span class="nc" id="L561">            int nowInSec = cmd.nowInSec();</span>
+<span class="nc" id="L562">            boolean readStatic = false;</span>
+
+<span class="nc" id="L564">            SinglePartitionPager pager = new SinglePartitionPager(cmd, null, ProtocolVersion.CURRENT);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">            while (!pager.isExhausted())</span>
+            {
+<span class="nc" id="L567">                try (ReadExecutionController controller = cmd.executionController();</span>
+<span class="nc" id="L568">                     OpOrder.Group writeGroup = Keyspace.writeOrder.start();</span>
+<span class="nc" id="L569">                     UnfilteredPartitionIterator page = pager.fetchPageUnfiltered(baseCfs.metadata, pageSize, controller))</span>
+                {
+<span class="nc bnc" id="L571" title="All 2 branches missed.">                    if (!page.hasNext())</span>
+                        break;
+
+<span class="nc" id="L574">                    try (UnfilteredRowIterator partition = page.next()) {</span>
+<span class="nc" id="L575">                        Set&lt;Index.Indexer&gt; indexers = indexes.stream()</span>
+<span class="nc" id="L576">                                                             .map(index -&gt; index.indexerFor(key,</span>
+<span class="nc" id="L577">                                                                                            partition.columns(),</span>
+                                                                                            nowInSec,
+                                                                                            writeGroup,
+                                                                                            IndexTransaction.Type.UPDATE))
+<span class="nc" id="L581">                                                             .filter(Objects::nonNull)</span>
+<span class="nc" id="L582">                                                             .collect(Collectors.toSet());</span>
+
+                        // Short-circuit empty partitions if static row is processed or isn't read
+<span class="nc bnc" id="L585" title="All 6 branches missed.">                        if (!readStatic &amp;&amp; partition.isEmpty() &amp;&amp; partition.staticRow().isEmpty())</span>
+                            break;
+
+<span class="nc" id="L588">                        indexers.forEach(Index.Indexer::begin);</span>
+
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                        if (!readStatic)</span>
+                        {
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                            if (!partition.staticRow().isEmpty())</span>
+<span class="nc" id="L593">                                indexers.forEach(indexer -&gt; indexer.insertRow(partition.staticRow()));</span>
+<span class="nc" id="L594">                            indexers.forEach((Index.Indexer i) -&gt; i.partitionDelete(partition.partitionLevelDeletion()));</span>
+<span class="nc" id="L595">                            readStatic = true;</span>
+                        }
+
+<span class="nc" id="L598">                        MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(partition.partitionLevelDeletion(), baseCfs.getComparator(), false);</span>
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                        while (partition.hasNext())</span>
+                        {
+<span class="nc" id="L602">                            Unfiltered unfilteredRow = partition.next();</span>
+
+<span class="nc bnc" id="L604" title="All 2 branches missed.">                            if (unfilteredRow.isRow())</span>
+                            {
+<span class="nc" id="L606">                                Row row = (Row) unfilteredRow;</span>
+<span class="nc" id="L607">                                indexers.forEach(indexer -&gt; indexer.insertRow(row));</span>
+<span class="nc" id="L608">                            }</span>
+                            else
+                            {
+<span class="nc bnc" id="L611" title="All 4 branches missed.">                                assert unfilteredRow.isRangeTombstoneMarker();</span>
+<span class="nc" id="L612">                                RangeTombstoneMarker marker = (RangeTombstoneMarker) unfilteredRow;</span>
+<span class="nc" id="L613">                                deletionBuilder.add(marker);</span>
+                            }
+<span class="nc" id="L615">                        }</span>
+
+<span class="nc" id="L617">                        MutableDeletionInfo deletionInfo = deletionBuilder.build();</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                        if (deletionInfo.hasRanges())</span>
+                        {
+<span class="nc" id="L620">                            Iterator&lt;RangeTombstone&gt; iter = deletionInfo.rangeIterator(false);</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">                            while (iter.hasNext())</span>
+                            {
+<span class="nc" id="L623">                                RangeTombstone rt = iter.next();</span>
+<span class="nc" id="L624">                                indexers.forEach(indexer -&gt; indexer.rangeTombstone(rt));</span>
+<span class="nc" id="L625">                            }</span>
+                        }
+
+<span class="nc" id="L628">                        indexers.forEach(Index.Indexer::finish);</span>
+                    }
+<span class="nc" id="L630">                }</span>
+            }
+        }
+<span class="nc" id="L633">    }</span>
+
+    /**
+     * Return the page size used when indexing an entire partition
+     */
+    public int calculateIndexingPageSize()
+    {
+<span class="nc bnc" id="L640" title="All 2 branches missed.">        if (Boolean.getBoolean(&quot;cassandra.force_default_indexing_page_size&quot;))</span>
+<span class="nc" id="L641">            return DEFAULT_PAGE_SIZE;</span>
+
+<span class="nc" id="L643">        double targetPageSizeInBytes = 32 * 1024 * 1024;</span>
+<span class="nc" id="L644">        double meanPartitionSize = baseCfs.getMeanPartitionSize();</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (meanPartitionSize &lt;= 0)</span>
+<span class="nc" id="L646">            return DEFAULT_PAGE_SIZE;</span>
+
+<span class="nc" id="L648">        int meanCellsPerPartition = baseCfs.getMeanColumns();</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        if (meanCellsPerPartition &lt;= 0)</span>
+<span class="nc" id="L650">            return DEFAULT_PAGE_SIZE;</span>
+
+<span class="nc" id="L652">        int columnsPerRow = baseCfs.metadata.partitionColumns().regulars.size();</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        if (columnsPerRow &lt;= 0)</span>
+<span class="nc" id="L654">            return DEFAULT_PAGE_SIZE;</span>
+
+<span class="nc" id="L656">        int meanRowsPerPartition = meanCellsPerPartition / columnsPerRow;</span>
+<span class="nc" id="L657">        double meanRowSize = meanPartitionSize / meanRowsPerPartition;</span>
+
+<span class="nc" id="L659">        int pageSize = (int) Math.max(1, Math.min(DEFAULT_PAGE_SIZE, targetPageSizeInBytes / meanRowSize));</span>
+
+<span class="nc" id="L661">        logger.trace(&quot;Calculated page size {} for indexing {}.{} ({}/{}/{}/{})&quot;,</span>
+<span class="nc" id="L662">                     pageSize,</span>
+                     baseCfs.metadata.ksName,
+                     baseCfs.metadata.cfName,
+<span class="nc" id="L665">                     meanPartitionSize,</span>
+<span class="nc" id="L666">                     meanCellsPerPartition,</span>
+<span class="nc" id="L667">                     meanRowsPerPartition,</span>
+<span class="nc" id="L668">                     meanRowSize);</span>
+
+<span class="nc" id="L670">        return pageSize;</span>
+    }
+
+    /**
+     * Delete all data from all indexes for this partition.
+     * For when cleanup rips a partition out entirely.
+     *
+     * TODO : improve cleanup transaction to batch updates and perform them async
+     */
+    public void deletePartition(UnfilteredRowIterator partition, int nowInSec)
+    {
+        // we need to acquire memtable lock because secondary index deletion may
+        // cause a race (see CASSANDRA-3712). This is done internally by the
+        // index transaction when it commits
+<span class="nc" id="L684">        CleanupTransaction indexTransaction = newCleanupTransaction(partition.partitionKey(),</span>
+<span class="nc" id="L685">                                                                    partition.columns(),</span>
+                                                                    nowInSec);
+<span class="nc" id="L687">        indexTransaction.start();</span>
+<span class="nc" id="L688">        indexTransaction.onPartitionDeletion(new DeletionTime(FBUtilities.timestampMicros(), nowInSec));</span>
+<span class="nc" id="L689">        indexTransaction.commit();</span>
+
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        while (partition.hasNext())</span>
+        {
+<span class="nc" id="L693">            Unfiltered unfiltered = partition.next();</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">            if (unfiltered.kind() != Unfiltered.Kind.ROW)</span>
+<span class="nc" id="L695">                continue;</span>
+
+<span class="nc" id="L697">            indexTransaction = newCleanupTransaction(partition.partitionKey(),</span>
+<span class="nc" id="L698">                                                     partition.columns(),</span>
+                                                     nowInSec);
+<span class="nc" id="L700">            indexTransaction.start();</span>
+<span class="nc" id="L701">            indexTransaction.onRowDelete((Row)unfiltered);</span>
+<span class="nc" id="L702">            indexTransaction.commit();</span>
+<span class="nc" id="L703">        }</span>
+<span class="nc" id="L704">    }</span>
+
+    /**
+     * Called at query time to choose which (if any) of the registered index implementations to use for a given query.
+     *
+     * This is a two step processes, firstly compiling the set of searchable indexes then choosing the one which reduces
+     * the search space the most.
+     *
+     * In the first phase, if the command's RowFilter contains any custom index expressions, the indexes that they
+     * specify are automatically included. Following that, the registered indexes are filtered to include only those
+     * which support the standard expressions in the RowFilter.
+     *
+     * The filtered set then sorted by selectivity, as reported by the Index implementations' getEstimatedResultRows
+     * method.
+     *
+     * Implementation specific validation of the target expression, either custom or standard, by the selected
+     * index should be performed in the searcherFor method to ensure that we pick the right index regardless of
+     * the validity of the expression.
+     *
+     * This method is only called once during the lifecycle of a ReadCommand and the result is
+     * cached for future use when obtaining a Searcher, getting the index's underlying CFS for
+     * ReadOrderGroup, or an estimate of the result size from an average index query.
+     *
+     * @param rowFilter RowFilter of the command to be executed
+     * @return an Index instance, ready to use during execution of the command, or null if none
+     * of the registered indexes can support the command.
+     */
+    public Index getBestIndexFor(RowFilter rowFilter)
+    {
+<span class="nc bnc" id="L733" title="All 4 branches missed.">        if (indexes.isEmpty() || rowFilter.isEmpty())</span>
+<span class="nc" id="L734">            return null;</span>
+
+<span class="nc" id="L736">        Set&lt;Index&gt; searchableIndexes = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        for (RowFilter.Expression expression : rowFilter)</span>
+        {
+<span class="nc bnc" id="L739" title="All 2 branches missed.">            if (expression.isCustom())</span>
+            {
+                // Only a single custom expression is allowed per query and, if present,
+                // we want to always favour the index specified in such an expression
+<span class="nc" id="L743">                RowFilter.CustomExpression customExpression = (RowFilter.CustomExpression)expression;</span>
+<span class="nc" id="L744">                logger.trace(&quot;Command contains a custom index expression, using target index {}&quot;, customExpression.getTargetIndex().name);</span>
+<span class="nc" id="L745">                Tracing.trace(&quot;Command contains a custom index expression, using target index {}&quot;, customExpression.getTargetIndex().name);</span>
+<span class="nc" id="L746">                return indexes.get(customExpression.getTargetIndex().name);</span>
+            }
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            else if (!expression.isUserDefined())</span>
+            {
+<span class="nc" id="L750">                indexes.values().stream()</span>
+<span class="nc" id="L751">                       .filter(index -&gt; index.supportsExpression(expression.column(), expression.operator()))</span>
+<span class="nc" id="L752">                       .forEach(searchableIndexes::add);</span>
+            }
+<span class="nc" id="L754">        }</span>
+
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (searchableIndexes.isEmpty())</span>
+        {
+<span class="nc" id="L758">            logger.trace(&quot;No applicable indexes found&quot;);</span>
+<span class="nc" id="L759">            Tracing.trace(&quot;No applicable indexes found&quot;);</span>
+<span class="nc" id="L760">            return null;</span>
+        }
+
+<span class="nc bnc" id="L763" title="All 2 branches missed.">        Index selected = searchableIndexes.size() == 1</span>
+<span class="nc" id="L764">                         ? Iterables.getOnlyElement(searchableIndexes)</span>
+<span class="nc" id="L765">                         : searchableIndexes.stream()</span>
+<span class="nc" id="L766">                                            .min((a, b) -&gt; Longs.compare(a.getEstimatedResultRows(),</span>
+<span class="nc" id="L767">                                                                         b.getEstimatedResultRows()))</span>
+<span class="nc" id="L768">                                            .orElseThrow(() -&gt; new AssertionError(&quot;Could not select most selective index&quot;));</span>
+
+        // pay for an additional threadlocal get() rather than build the strings unnecessarily
+<span class="nc bnc" id="L771" title="All 2 branches missed.">        if (Tracing.isTracing())</span>
+        {
+<span class="nc" id="L773">            Tracing.trace(&quot;Index mean cardinalities are {}. Scanning with {}.&quot;,</span>
+<span class="nc" id="L774">                          searchableIndexes.stream().map(i -&gt; i.getIndexMetadata().name + ':' + i.getEstimatedResultRows())</span>
+<span class="nc" id="L775">                                           .collect(Collectors.joining(&quot;,&quot;)),</span>
+<span class="nc" id="L776">                          selected.getIndexMetadata().name);</span>
+        }
+<span class="nc" id="L778">        return selected;</span>
+    }
+
+    public Optional&lt;Index&gt; getBestIndexFor(RowFilter.Expression expression)
+    {
+<span class="nc" id="L783">        return indexes.values().stream().filter((i) -&gt; i.supportsExpression(expression.column(), expression.operator())).findFirst();</span>
+    }
+
+    /**
+     * Called at write time to ensure that values present in the update
+     * are valid according to the rules of all registered indexes which
+     * will process it. The partition key as well as the clustering and
+     * cell values for each row in the update may be checked by index
+     * implementations
+     * @param update PartitionUpdate containing the values to be validated by registered Index implementations
+     * @throws InvalidRequestException
+     */
+    public void validate(PartitionUpdate update) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L797" title="1 of 2 branches missed.">        for (Index index : indexes.values())</span>
+<span class="nc" id="L798">            index.validate(update);</span>
+<span class="fc" id="L799">    }</span>
+
+    /**
+     * IndexRegistry methods
+     */
+    public void registerIndex(Index index)
+    {
+<span class="nc" id="L806">        String name = index.getIndexMetadata().name;</span>
+<span class="nc" id="L807">        indexes.put(name, index);</span>
+<span class="nc" id="L808">        logger.trace(&quot;Registered index {}&quot;, name);</span>
+<span class="nc" id="L809">    }</span>
+
+    public void unregisterIndex(Index index)
+    {
+<span class="nc" id="L813">        unregisterIndex(index.getIndexMetadata().name);</span>
+<span class="nc" id="L814">    }</span>
+
+    private Index unregisterIndex(String name)
+    {
+<span class="nc" id="L818">        Index removed = indexes.remove(name);</span>
+<span class="nc" id="L819">        builtIndexes.remove(name);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        logger.trace(removed == null ? &quot;Index {} was not registered&quot; : &quot;Removed index {} from registry&quot;,</span>
+                     name);
+<span class="nc" id="L822">        return removed;</span>
+    }
+
+    public Index getIndex(IndexMetadata metadata)
+    {
+<span class="nc" id="L827">        return indexes.get(metadata.name);</span>
+    }
+
+    public Collection&lt;Index&gt; listIndexes()
+    {
+<span class="fc" id="L832">        return ImmutableSet.copyOf(indexes.values());</span>
+    }
+
+    /**
+     * Handling of index updates.
+     * Implementations of the various IndexTransaction interfaces, for keeping indexes in sync with base data
+     * during updates, compaction and cleanup. Plus factory methods for obtaining transaction instances.
+     */
+
+    /**
+     * Transaction for updates on the write path.
+     */
+    public UpdateTransaction newUpdateTransaction(PartitionUpdate update, OpOrder.Group opGroup, int nowInSec)
+    {
+<span class="pc bpc" id="L846" title="1 of 2 branches missed.">        if (!hasIndexes())</span>
+<span class="fc" id="L847">            return UpdateTransaction.NO_OP;</span>
+
+<span class="nc" id="L849">        Index.Indexer[] indexers = indexes.values().stream()</span>
+<span class="nc" id="L850">                                          .map(i -&gt; i.indexerFor(update.partitionKey(),</span>
+<span class="nc" id="L851">                                                                 update.columns(),</span>
+                                                                 nowInSec,
+                                                                 opGroup,
+                                                                 IndexTransaction.Type.UPDATE))
+<span class="nc" id="L855">                                          .filter(Objects::nonNull)</span>
+<span class="nc" id="L856">                                          .toArray(Index.Indexer[]::new);</span>
+
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        return indexers.length == 0 ? UpdateTransaction.NO_OP : new WriteTimeTransaction(indexers);</span>
+    }
+
+    /**
+     * Transaction for use when merging rows during compaction
+     */
+    public CompactionTransaction newCompactionTransaction(DecoratedKey key,
+                                                          PartitionColumns partitionColumns,
+                                                          int versions,
+                                                          int nowInSec)
+    {
+        // the check for whether there are any registered indexes is already done in CompactionIterator
+<span class="nc" id="L870">        return new IndexGCTransaction(key, partitionColumns, versions, nowInSec, listIndexes());</span>
+    }
+
+    /**
+     * Transaction for use when removing partitions during cleanup
+     */
+    public CleanupTransaction newCleanupTransaction(DecoratedKey key,
+                                                    PartitionColumns partitionColumns,
+                                                    int nowInSec)
+    {
+<span class="nc bnc" id="L880" title="All 2 branches missed.">        if (!hasIndexes())</span>
+<span class="nc" id="L881">            return CleanupTransaction.NO_OP;</span>
+
+<span class="nc" id="L883">        return new CleanupGCTransaction(key, partitionColumns, nowInSec, listIndexes());</span>
+    }
+
+    /**
+     * A single use transaction for processing a partition update on the regular write path
+     */
+<span class="nc bnc" id="L889" title="All 2 branches missed.">    private static final class WriteTimeTransaction implements UpdateTransaction</span>
+    {
+        private final Index.Indexer[] indexers;
+
+        private WriteTimeTransaction(Index.Indexer...indexers)
+<span class="nc" id="L894">        {</span>
+            // don't allow null indexers, if we don't need any use a NullUpdater object
+<span class="nc bnc" id="L896" title="All 6 branches missed.">            for (Index.Indexer indexer : indexers) assert indexer != null;</span>
+<span class="nc" id="L897">            this.indexers = indexers;</span>
+<span class="nc" id="L898">        }</span>
+
+        public void start()
+        {
+<span class="nc bnc" id="L902" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L903">                indexer.begin();</span>
+<span class="nc" id="L904">        }</span>
+
+        public void onPartitionDeletion(DeletionTime deletionTime)
+        {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L909">                indexer.partitionDelete(deletionTime);</span>
+<span class="nc" id="L910">        }</span>
+
+        public void onRangeTombstone(RangeTombstone tombstone)
+        {
+<span class="nc bnc" id="L914" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L915">                indexer.rangeTombstone(tombstone);</span>
+<span class="nc" id="L916">        }</span>
+
+        public void onInserted(Row row)
+        {
+<span class="nc bnc" id="L920" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L921">                indexer.insertRow(row);</span>
+<span class="nc" id="L922">        }</span>
+
+        public void onUpdated(Row existing, Row updated)
+        {
+<span class="nc" id="L926">            final Row.Builder toRemove = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L927">            toRemove.newRow(existing.clustering());</span>
+<span class="nc" id="L928">            toRemove.addPrimaryKeyLivenessInfo(existing.primaryKeyLivenessInfo());</span>
+<span class="nc" id="L929">            toRemove.addRowDeletion(existing.deletion());</span>
+<span class="nc" id="L930">            final Row.Builder toInsert = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L931">            toInsert.newRow(updated.clustering());</span>
+<span class="nc" id="L932">            toInsert.addPrimaryKeyLivenessInfo(updated.primaryKeyLivenessInfo());</span>
+<span class="nc" id="L933">            toInsert.addRowDeletion(updated.deletion());</span>
+            // diff listener collates the columns to be added &amp; removed from the indexes
+<span class="nc" id="L935">            RowDiffListener diffListener = new RowDiffListener()</span>
+<span class="nc" id="L936">            {</span>
+                public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
+                {
+<span class="nc" id="L939">                }</span>
+
+                public void onDeletion(int i, Clustering clustering, Row.Deletion merged, Row.Deletion original)
+                {
+<span class="nc" id="L943">                }</span>
+
+                public void onComplexDeletion(int i, Clustering clustering, ColumnDefinition column, DeletionTime merged, DeletionTime original)
+                {
+<span class="nc" id="L947">                }</span>
+
+                public void onCell(int i, Clustering clustering, Cell merged, Cell original)
+                {
+<span class="nc bnc" id="L951" title="All 4 branches missed.">                    if (merged != null &amp;&amp; !merged.equals(original))</span>
+<span class="nc" id="L952">                        toInsert.addCell(merged);</span>
+
+<span class="nc bnc" id="L954" title="All 6 branches missed.">                    if (merged == null || (original != null &amp;&amp; shouldCleanupOldValue(original, merged)))</span>
+<span class="nc" id="L955">                        toRemove.addCell(original);</span>
+
+<span class="nc" id="L957">                }</span>
+            };
+<span class="nc" id="L959">            Rows.diff(diffListener, updated, existing);</span>
+<span class="nc" id="L960">            Row oldRow = toRemove.build();</span>
+<span class="nc" id="L961">            Row newRow = toInsert.build();</span>
+<span class="nc bnc" id="L962" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L963">                indexer.updateRow(oldRow, newRow);</span>
+<span class="nc" id="L964">        }</span>
+
+        public void commit()
+        {
+<span class="nc bnc" id="L968" title="All 2 branches missed.">            for (Index.Indexer indexer : indexers)</span>
+<span class="nc" id="L969">                indexer.finish();</span>
+<span class="nc" id="L970">        }</span>
+
+        private boolean shouldCleanupOldValue(Cell oldCell, Cell newCell)
+        {
+            // If either the value or timestamp is different, then we
+            // should delete from the index. If not, then we can infer that
+            // at least one of the cells is an ExpiringColumn and that the
+            // difference is in the expiry time. In this case, we don't want to
+            // delete the old value from the index as the tombstone we insert
+            // will just hide the inserted value.
+            // Completely identical cells (including expiring columns with
+            // identical ttl &amp; localExpirationTime) will not get this far due
+            // to the oldCell.equals(newCell) in StandardUpdater.update
+<span class="nc bnc" id="L983" title="All 4 branches missed.">            return !oldCell.value().equals(newCell.value()) || oldCell.timestamp() != newCell.timestamp();</span>
+        }
+    }
+
+    /**
+     * A single-use transaction for updating indexes for a single partition during compaction where the only
+     * operation is to merge rows
+     * TODO : make this smarter at batching updates so we can use a single transaction to process multiple rows in
+     * a single partition
+     */
+    private static final class IndexGCTransaction implements CompactionTransaction
+    {
+        private final DecoratedKey key;
+        private final PartitionColumns columns;
+        private final int versions;
+        private final int nowInSec;
+        private final Collection&lt;Index&gt; indexes;
+
+        private Row[] rows;
+
+        private IndexGCTransaction(DecoratedKey key,
+                                   PartitionColumns columns,
+                                   int versions,
+                                   int nowInSec,
+                                   Collection&lt;Index&gt; indexes)
+<span class="nc" id="L1008">        {</span>
+<span class="nc" id="L1009">            this.key = key;</span>
+<span class="nc" id="L1010">            this.columns = columns;</span>
+<span class="nc" id="L1011">            this.versions = versions;</span>
+<span class="nc" id="L1012">            this.indexes = indexes;</span>
+<span class="nc" id="L1013">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L1014">        }</span>
+
+        public void start()
+        {
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">            if (versions &gt; 0)</span>
+<span class="nc" id="L1019">                rows = new Row[versions];</span>
+<span class="nc" id="L1020">        }</span>
+
+        public void onRowMerge(Row merged, Row...versions)
+        {
+            // Diff listener constructs rows representing deltas between the merged and original versions
+            // These delta rows are then passed to registered indexes for removal processing
+<span class="nc" id="L1026">            final Row.Builder[] builders = new Row.Builder[versions.length];</span>
+<span class="nc" id="L1027">            RowDiffListener diffListener = new RowDiffListener()</span>
+<span class="nc" id="L1028">            {</span>
+                public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
+                {
+<span class="nc bnc" id="L1031" title="All 6 branches missed.">                    if (original != null &amp;&amp; (merged == null || !merged.isLive(nowInSec)))</span>
+<span class="nc" id="L1032">                        getBuilder(i, clustering).addPrimaryKeyLivenessInfo(original);</span>
+<span class="nc" id="L1033">                }</span>
+
+                public void onDeletion(int i, Clustering clustering, Row.Deletion merged, Row.Deletion original)
+                {
+<span class="nc" id="L1037">                }</span>
+
+                public void onComplexDeletion(int i, Clustering clustering, ColumnDefinition column, DeletionTime merged, DeletionTime original)
+                {
+<span class="nc" id="L1041">                }</span>
+
+                public void onCell(int i, Clustering clustering, Cell merged, Cell original)
+                {
+<span class="nc bnc" id="L1045" title="All 6 branches missed.">                    if (original != null &amp;&amp; (merged == null || !merged.isLive(nowInSec)))</span>
+<span class="nc" id="L1046">                        getBuilder(i, clustering).addCell(original);</span>
+<span class="nc" id="L1047">                }</span>
+
+                private Row.Builder getBuilder(int index, Clustering clustering)
+                {
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">                    if (builders[index] == null)</span>
+                    {
+<span class="nc" id="L1053">                        builders[index] = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L1054">                        builders[index].newRow(clustering);</span>
+                    }
+<span class="nc" id="L1056">                    return builders[index];</span>
+                }
+            };
+
+<span class="nc" id="L1060">            Rows.diff(diffListener, merged, versions);</span>
+
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">            for(int i = 0; i &lt; builders.length; i++)</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">                if (builders[i] != null)</span>
+<span class="nc" id="L1064">                    rows[i] = builders[i].build();</span>
+<span class="nc" id="L1065">        }</span>
+
+        public void commit()
+        {
+<span class="nc bnc" id="L1069" title="All 2 branches missed.">            if (rows == null)</span>
+<span class="nc" id="L1070">                return;</span>
+
+<span class="nc" id="L1072">            try (OpOrder.Group opGroup = Keyspace.writeOrder.start())</span>
+            {
+<span class="nc bnc" id="L1074" title="All 2 branches missed.">                for (Index index : indexes)</span>
+                {
+<span class="nc" id="L1076">                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.COMPACTION);</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">                    if (indexer == null)</span>
+<span class="nc" id="L1078">                        continue;</span>
+
+<span class="nc" id="L1080">                    indexer.begin();</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">                    for (Row row : rows)</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">                        if (row != null)</span>
+<span class="nc" id="L1083">                            indexer.removeRow(row);</span>
+<span class="nc" id="L1084">                    indexer.finish();</span>
+<span class="nc" id="L1085">                }</span>
+            }
+<span class="nc" id="L1087">        }</span>
+    }
+
+    /**
+     * A single-use transaction for updating indexes for a single partition during cleanup, where
+     * partitions and rows are only removed
+     * TODO : make this smarter at batching updates so we can use a single transaction to process multiple rows in
+     * a single partition
+     */
+    private static final class CleanupGCTransaction implements CleanupTransaction
+    {
+        private final DecoratedKey key;
+        private final PartitionColumns columns;
+        private final int nowInSec;
+        private final Collection&lt;Index&gt; indexes;
+
+        private Row row;
+        private DeletionTime partitionDelete;
+
+        private CleanupGCTransaction(DecoratedKey key,
+                                     PartitionColumns columns,
+                                     int nowInSec,
+                                     Collection&lt;Index&gt; indexes)
+<span class="nc" id="L1110">        {</span>
+<span class="nc" id="L1111">            this.key = key;</span>
+<span class="nc" id="L1112">            this.columns = columns;</span>
+<span class="nc" id="L1113">            this.indexes = indexes;</span>
+<span class="nc" id="L1114">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L1115">        }</span>
+
+        public void start()
+        {
+<span class="nc" id="L1119">        }</span>
+
+        public void onPartitionDeletion(DeletionTime deletionTime)
+        {
+<span class="nc" id="L1123">            partitionDelete = deletionTime;</span>
+<span class="nc" id="L1124">        }</span>
+
+        public void onRowDelete(Row row)
+        {
+<span class="nc" id="L1128">            this.row = row;</span>
+<span class="nc" id="L1129">        }</span>
+
+        public void commit()
+        {
+<span class="nc bnc" id="L1133" title="All 4 branches missed.">            if (row == null &amp;&amp; partitionDelete == null)</span>
+<span class="nc" id="L1134">                return;</span>
+
+<span class="nc" id="L1136">            try (OpOrder.Group opGroup = Keyspace.writeOrder.start())</span>
+            {
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">                for (Index index : indexes)</span>
+                {
+<span class="nc" id="L1140">                    Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, opGroup, Type.CLEANUP);</span>
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">                    if (indexer == null)</span>
+<span class="nc" id="L1142">                        continue;</span>
+
+<span class="nc" id="L1144">                    indexer.begin();</span>
+
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">                    if (partitionDelete != null)</span>
+<span class="nc" id="L1147">                        indexer.partitionDelete(partitionDelete);</span>
+
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">                    if (row != null)</span>
+<span class="nc" id="L1150">                        indexer.removeRow(row);</span>
+
+<span class="nc" id="L1152">                    indexer.finish();</span>
+<span class="nc" id="L1153">                }</span>
+            }
+<span class="nc" id="L1155">        }</span>
+    }
+
+    private static void executeBlocking(Callable&lt;?&gt; task)
+    {
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">        if (null != task)</span>
+<span class="nc" id="L1161">            FBUtilities.waitOnFuture(blockingExecutor.submit(task));</span>
+<span class="nc" id="L1162">    }</span>
+
+    private static void executeAllBlocking(Stream&lt;Index&gt; indexers, Function&lt;Index, Callable&lt;?&gt;&gt; function)
+    {
+<span class="pc bpc" id="L1166" title="1 of 2 branches missed.">        if (function == null)</span>
+        {
+<span class="nc" id="L1168">            logger.error(&quot;failed to flush indexes: {} because flush task is missing.&quot;, indexers);</span>
+<span class="nc" id="L1169">            return;</span>
+        }
+
+<span class="fc" id="L1172">        List&lt;Future&lt;?&gt;&gt; waitFor = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1173">        indexers.forEach(indexer -&gt; {</span>
+<span class="nc" id="L1174">            Callable&lt;?&gt; task = function.apply(indexer);</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">            if (null != task)</span>
+<span class="nc" id="L1176">                waitFor.add(blockingExecutor.submit(task));</span>
+<span class="nc" id="L1177">        });</span>
+<span class="fc" id="L1178">        FBUtilities.waitOnFutures(waitFor);</span>
+<span class="fc" id="L1179">    }</span>
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L1184">        ExecutorService[] executors = new ExecutorService[]{ asyncExecutor, blockingExecutor };</span>
+<span class="nc" id="L1185">        shutdown(executors);</span>
+<span class="nc" id="L1186">        awaitTermination(timeout, unit, executors);</span>
+<span class="nc" id="L1187">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

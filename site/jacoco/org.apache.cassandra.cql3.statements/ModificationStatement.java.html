@@ -1,0 +1,924 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ModificationStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">ModificationStatement.java</span></div><h1>ModificationStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.ColumnDefinition.Raw;
+import org.apache.cassandra.config.ViewDefinition;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.selection.Selection;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.thrift.ThriftValidation;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.triggers.TriggerExecutor;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.UUIDGen;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNull;
+
+/*
+ * Abstract parent class of individual modifications, i.e. INSERT, UPDATE and DELETE.
+ */
+<span class="pc bpc" id="L61" title="1 of 2 branches missed.">public abstract class ModificationStatement implements CQLStatement</span>
+{
+<span class="fc" id="L63">    protected static final Logger logger = LoggerFactory.getLogger(ModificationStatement.class);</span>
+
+    public static final String CUSTOM_EXPRESSIONS_NOT_ALLOWED =
+        &quot;Custom index expressions cannot be used in WHERE clauses for UPDATE or DELETE statements&quot;;
+
+<span class="fc" id="L68">    private static final ColumnIdentifier CAS_RESULT_COLUMN = new ColumnIdentifier(&quot;[applied]&quot;, false);</span>
+
+    protected final StatementType type;
+
+    private final int boundTerms;
+    public final CFMetaData cfm;
+    private final Attributes attrs;
+
+    private final StatementRestrictions restrictions;
+
+    private final Operations operations;
+
+    private final PartitionColumns updatedColumns;
+
+    private final Conditions conditions;
+
+    private final PartitionColumns conditionColumns;
+
+    private final PartitionColumns requiresRead;
+
+    public ModificationStatement(StatementType type,
+                                 int boundTerms,
+                                 CFMetaData cfm,
+                                 Operations operations,
+                                 StatementRestrictions restrictions,
+                                 Conditions conditions,
+                                 Attributes attrs)
+<span class="fc" id="L95">    {</span>
+<span class="fc" id="L96">        this.type = type;</span>
+<span class="fc" id="L97">        this.boundTerms = boundTerms;</span>
+<span class="fc" id="L98">        this.cfm = cfm;</span>
+<span class="fc" id="L99">        this.restrictions = restrictions;</span>
+<span class="fc" id="L100">        this.operations = operations;</span>
+<span class="fc" id="L101">        this.conditions = conditions;</span>
+<span class="fc" id="L102">        this.attrs = attrs;</span>
+
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        if (!conditions.isEmpty())</span>
+        {
+<span class="nc" id="L106">            checkFalse(cfm.isCounter(), &quot;Conditional updates are not supported on counter tables&quot;);</span>
+<span class="nc" id="L107">            checkFalse(attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+        }
+
+<span class="fc" id="L110">        PartitionColumns.Builder conditionColumnsBuilder = PartitionColumns.builder();</span>
+<span class="fc" id="L111">        Iterable&lt;ColumnDefinition&gt; columns = conditions.getColumns();</span>
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">        if (columns != null)</span>
+<span class="fc" id="L113">            conditionColumnsBuilder.addAll(columns);</span>
+
+<span class="fc" id="L115">        PartitionColumns.Builder updatedColumnsBuilder = PartitionColumns.builder();</span>
+<span class="fc" id="L116">        PartitionColumns.Builder requiresReadBuilder = PartitionColumns.builder();</span>
+<span class="fc bfc" id="L117" title="All 2 branches covered.">        for (Operation operation : operations)</span>
+        {
+<span class="fc" id="L119">            updatedColumnsBuilder.add(operation.column);</span>
+            // If the operation requires a read-before-write and we're doing a conditional read, we want to read
+            // the affected column as part of the read-for-conditions paxos phase (see #7499).
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">            if (operation.requiresRead())</span>
+            {
+<span class="nc" id="L124">                conditionColumnsBuilder.add(operation.column);</span>
+<span class="nc" id="L125">                requiresReadBuilder.add(operation.column);</span>
+            }
+<span class="fc" id="L127">        }</span>
+
+<span class="fc" id="L129">        PartitionColumns modifiedColumns = updatedColumnsBuilder.build();</span>
+        // Compact tables have not row marker. So if we don't actually update any particular column,
+        // this means that we're only updating the PK, which we allow if only those were declared in
+        // the definition. In that case however, we do went to write the compactValueColumn (since again
+        // we can't use a &quot;row marker&quot;) so add it automatically.
+<span class="pc bpc" id="L134" title="5 of 6 branches missed.">        if (cfm.isCompactTable() &amp;&amp; modifiedColumns.isEmpty() &amp;&amp; updatesRegularRows())</span>
+<span class="nc" id="L135">            modifiedColumns = cfm.partitionColumns();</span>
+
+<span class="fc" id="L137">        this.updatedColumns = modifiedColumns;</span>
+<span class="fc" id="L138">        this.conditionColumns = conditionColumnsBuilder.build();</span>
+<span class="fc" id="L139">        this.requiresRead = requiresReadBuilder.build();</span>
+<span class="fc" id="L140">    }</span>
+
+    public Iterable&lt;Function&gt; getFunctions()
+    {
+<span class="fc" id="L144">        List&lt;Function&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L145">        addFunctionsTo(functions);</span>
+<span class="fc" id="L146">        return functions;</span>
+    }
+
+    public void addFunctionsTo(List&lt;Function&gt; functions)
+    {
+<span class="fc" id="L151">        attrs.addFunctionsTo(functions);</span>
+<span class="fc" id="L152">        restrictions.addFunctionsTo(functions);</span>
+<span class="fc" id="L153">        operations.addFunctionsTo(functions);</span>
+<span class="fc" id="L154">        conditions.addFunctionsTo(functions);</span>
+<span class="fc" id="L155">    }</span>
+
+    /*
+     * May be used by QueryHandler implementations
+     */
+    public StatementRestrictions getRestrictions()
+    {
+<span class="fc" id="L162">        return restrictions;</span>
+    }
+
+    public abstract void addUpdateForKey(PartitionUpdate update, Clustering clustering, UpdateParameters params);
+
+    public abstract void addUpdateForKey(PartitionUpdate update, Slice slice, UpdateParameters params);
+
+    public int getBoundTerms()
+    {
+<span class="fc" id="L171">        return boundTerms;</span>
+    }
+
+    public String keyspace()
+    {
+<span class="fc" id="L176">        return cfm.ksName;</span>
+    }
+
+    public String columnFamily()
+    {
+<span class="fc" id="L181">        return cfm.cfName;</span>
+    }
+
+    public boolean isCounter()
+    {
+<span class="fc" id="L186">        return cfm.isCounter();</span>
+    }
+
+    public boolean isView()
+    {
+<span class="fc" id="L191">        return cfm.isView();</span>
+    }
+
+    public long getTimestamp(long now, QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L196">        return attrs.getTimestamp(now, options);</span>
+    }
+
+    public boolean isTimestampSet()
+    {
+<span class="nc" id="L201">        return attrs.isTimestampSet();</span>
+    }
+
+    public int getTimeToLive(QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L206">        return attrs.getTimeToLive(options, cfm);</span>
+    }
+
+    public void checkAccess(ClientState state) throws InvalidRequestException, UnauthorizedException
+    {
+<span class="fc" id="L211">        state.hasColumnFamilyAccess(cfm, Permission.MODIFY);</span>
+
+        // CAS updates can be used to simulate a SELECT query, so should require Permission.SELECT as well.
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">        if (hasConditions())</span>
+<span class="nc" id="L215">            state.hasColumnFamilyAccess(cfm, Permission.SELECT);</span>
+
+        // MV updates need to get the current state from the table, and might update the views
+        // Require Permission.SELECT on the base table, and Permission.MODIFY on the views
+<span class="fc" id="L219">        Iterator&lt;ViewDefinition&gt; views = View.findAll(keyspace(), columnFamily()).iterator();</span>
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">        if (views.hasNext())</span>
+        {
+<span class="nc" id="L222">            state.hasColumnFamilyAccess(cfm, Permission.SELECT);</span>
+            do
+            {
+<span class="nc" id="L225">                state.hasColumnFamilyAccess(views.next().metadata, Permission.MODIFY);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            } while (views.hasNext());</span>
+        }
+
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        for (Function function : getFunctions())</span>
+<span class="nc" id="L230">            state.ensureHasPermission(Permission.EXECUTE, function);</span>
+<span class="fc" id="L231">    }</span>
+
+    public void validate(ClientState state) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L235" title="3 of 4 branches missed.">        checkFalse(hasConditions() &amp;&amp; attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+<span class="pc bpc" id="L236" title="3 of 4 branches missed.">        checkFalse(isCounter() &amp;&amp; attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for counter updates&quot;);</span>
+<span class="pc bpc" id="L237" title="3 of 4 branches missed.">        checkFalse(isCounter() &amp;&amp; attrs.isTimeToLiveSet(), &quot;Cannot provide custom TTL for counter updates&quot;);</span>
+<span class="fc" id="L238">        checkFalse(isView(), &quot;Cannot directly modify a materialized view&quot;);</span>
+<span class="fc" id="L239">    }</span>
+
+    public PartitionColumns updatedColumns()
+    {
+<span class="fc" id="L243">        return updatedColumns;</span>
+    }
+
+    public PartitionColumns conditionColumns()
+    {
+<span class="nc" id="L248">        return conditionColumns;</span>
+    }
+
+    public boolean updatesRegularRows()
+    {
+        // We're updating regular rows if all the clustering columns are provided.
+        // Note that the only case where we're allowed not to provide clustering
+        // columns is if we set some static columns, and in that case no clustering
+        // columns should be given. So in practice, it's enough to check if we have
+        // either the table has no clustering or if it has at least one of them set.
+<span class="pc bpc" id="L258" title="3 of 4 branches missed.">        return cfm.clusteringColumns().isEmpty() || restrictions.hasClusteringColumnsRestrictions();</span>
+    }
+
+    public boolean updatesStaticRow()
+    {
+<span class="fc" id="L263">        return operations.appliesToStaticColumns();</span>
+    }
+
+    public List&lt;Operation&gt; getRegularOperations()
+    {
+<span class="fc" id="L268">        return operations.regularOperations();</span>
+    }
+
+    public List&lt;Operation&gt; getStaticOperations()
+    {
+<span class="fc" id="L273">        return operations.staticOperations();</span>
+    }
+
+    public Iterable&lt;Operation&gt; allOperations()
+    {
+<span class="fc" id="L278">        return operations;</span>
+    }
+
+    public Iterable&lt;ColumnDefinition&gt; getColumnsWithConditions()
+    {
+<span class="nc" id="L283">         return conditions.getColumns();</span>
+    }
+
+    public boolean hasIfNotExistCondition()
+    {
+<span class="nc" id="L288">        return conditions.isIfNotExists();</span>
+    }
+
+    public boolean hasIfExistCondition()
+    {
+<span class="nc" id="L293">        return conditions.isIfExists();</span>
+    }
+
+    public List&lt;ByteBuffer&gt; buildPartitionKeyNames(QueryOptions options)
+    throws InvalidRequestException
+    {
+<span class="fc" id="L299">        List&lt;ByteBuffer&gt; partitionKeys = restrictions.getPartitionKeys(options);</span>
+<span class="fc bfc" id="L300" title="All 2 branches covered.">        for (ByteBuffer key : partitionKeys)</span>
+<span class="fc" id="L301">            QueryProcessor.validateKey(key);</span>
+
+<span class="fc" id="L303">        return partitionKeys;</span>
+    }
+
+    public NavigableSet&lt;Clustering&gt; createClustering(QueryOptions options)
+    throws InvalidRequestException
+    {
+<span class="pc bpc" id="L309" title="3 of 4 branches missed.">        if (appliesOnlyToStaticColumns() &amp;&amp; !restrictions.hasClusteringColumnsRestrictions())</span>
+<span class="nc" id="L310">            return FBUtilities.singleton(CBuilder.STATIC_BUILDER.build(), cfm.comparator);</span>
+
+<span class="fc" id="L312">        return restrictions.getClusteringColumns(options);</span>
+    }
+
+    /**
+     * Checks that the modification only apply to static columns.
+     * @return &lt;code&gt;true&lt;/code&gt; if the modification only apply to static columns, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    private boolean appliesOnlyToStaticColumns()
+    {
+<span class="fc" id="L321">        return appliesOnlyToStaticColumns(operations, conditions);</span>
+    }
+
+    /**
+     * Checks that the specified operations and conditions only apply to static columns.
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified operations and conditions only apply to static columns,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public static boolean appliesOnlyToStaticColumns(Operations operation, Conditions conditions)
+    {
+<span class="pc bpc" id="L331" title="3 of 4 branches missed.">        return !operation.appliesToRegularColumns() &amp;&amp; !conditions.appliesToRegularColumns()</span>
+<span class="pc bnc" id="L332" title="All 4 branches missed.">                &amp;&amp; (operation.appliesToStaticColumns() || conditions.appliesToStaticColumns());</span>
+    }
+
+    public boolean requiresRead()
+    {
+        // Lists SET operation incurs a read.
+<span class="fc bfc" id="L338" title="All 2 branches covered.">        for (Operation op : allOperations())</span>
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">            if (op.requiresRead())</span>
+<span class="nc" id="L340">                return true;</span>
+
+<span class="fc" id="L342">        return false;</span>
+    }
+
+    private Map&lt;DecoratedKey, Partition&gt; readRequiredLists(Collection&lt;ByteBuffer&gt; partitionKeys,
+                                                           ClusteringIndexFilter filter,
+                                                           DataLimits limits,
+                                                           boolean local,
+                                                           ConsistencyLevel cl,
+                                                           long queryStartNanoTime)
+    {
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">        if (!requiresRead())</span>
+<span class="fc" id="L353">            return null;</span>
+
+        try
+        {
+<span class="nc" id="L357">            cl.validateForRead(keyspace());</span>
+        }
+<span class="nc" id="L359">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L361">            throw new InvalidRequestException(String.format(&quot;Write operation require a read but consistency %s is not supported on reads&quot;, cl));</span>
+<span class="nc" id="L362">        }</span>
+
+<span class="nc" id="L364">        List&lt;SinglePartitionReadCommand&gt; commands = new ArrayList&lt;&gt;(partitionKeys.size());</span>
+<span class="nc" id="L365">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (ByteBuffer key : partitionKeys)</span>
+<span class="nc" id="L367">            commands.add(SinglePartitionReadCommand.create(cfm,</span>
+                                                           nowInSec,
+<span class="nc" id="L369">                                                           ColumnFilter.selection(this.requiresRead),</span>
+                                                           RowFilter.NONE,
+                                                           limits,
+<span class="nc" id="L372">                                                           cfm.decorateKey(key),</span>
+                                                           filter));
+
+<span class="nc" id="L375">        SinglePartitionReadCommand.Group group = new SinglePartitionReadCommand.Group(commands, DataLimits.NONE);</span>
+
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (local)</span>
+        {
+<span class="nc" id="L379">            try (ReadExecutionController executionController = group.executionController();</span>
+<span class="nc" id="L380">                 PartitionIterator iter = group.executeInternal(executionController))</span>
+            {
+<span class="nc" id="L382">                return asMaterializedMap(iter);</span>
+            }
+        }
+
+<span class="nc" id="L386">        try (PartitionIterator iter = group.execute(cl, null, queryStartNanoTime))</span>
+        {
+<span class="nc" id="L388">            return asMaterializedMap(iter);</span>
+        }
+    }
+
+    private Map&lt;DecoratedKey, Partition&gt; asMaterializedMap(PartitionIterator iterator)
+    {
+<span class="nc" id="L394">        Map&lt;DecoratedKey, Partition&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        while (iterator.hasNext())</span>
+        {
+<span class="nc" id="L397">            try (RowIterator partition = iterator.next())</span>
+            {
+<span class="nc" id="L399">                map.put(partition.partitionKey(), FilteredPartition.create(partition));</span>
+<span class="nc" id="L400">            }</span>
+        }
+<span class="nc" id="L402">        return map;</span>
+    }
+
+    public boolean hasConditions()
+    {
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">        return !conditions.isEmpty();</span>
+    }
+
+    public boolean hasSlices()
+    {
+<span class="fc bfc" id="L412" title="All 2 branches covered.">        return type.allowClusteringColumnSlices()</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">               &amp;&amp; getRestrictions().hasClusteringColumnsRestrictions()</span>
+<span class="pc bnc" id="L414" title="All 2 branches missed.">               &amp;&amp; getRestrictions().isColumnRange();</span>
+    }
+
+    public ResultMessage execute(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">        if (options.getConsistency() == null)</span>
+<span class="nc" id="L421">            throw new InvalidRequestException(&quot;Invalid empty consistency level&quot;);</span>
+
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">        return hasConditions()</span>
+<span class="pc" id="L424">             ? executeWithCondition(queryState, options, queryStartNanoTime)</span>
+<span class="fc" id="L425">             : executeWithoutCondition(queryState, options, queryStartNanoTime);</span>
+    }
+
+    private ResultMessage executeWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L431">        ConsistencyLevel cl = options.getConsistency();</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">        if (isCounter())</span>
+<span class="nc" id="L433">            cl.validateCounterForWrite(cfm);</span>
+        else
+<span class="fc" id="L435">            cl.validateForWrite(cfm.ksName);</span>
+
+<span class="fc" id="L437">        Collection&lt;? extends IMutation&gt; mutations = getMutations(options, false, options.getTimestamp(queryState), queryStartNanoTime);</span>
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">        if (!mutations.isEmpty())</span>
+<span class="fc" id="L439">            StorageProxy.mutateWithTriggers(mutations, cl, false, queryStartNanoTime);</span>
+
+<span class="fc" id="L441">        return null;</span>
+    }
+
+    public ResultMessage executeWithCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L447">        CQL3CasRequest request = makeCasRequest(queryState, options);</span>
+
+<span class="nc" id="L449">        try (RowIterator result = StorageProxy.cas(keyspace(),</span>
+<span class="nc" id="L450">                                                   columnFamily(),</span>
+                                                   request.key,
+                                                   request,
+<span class="nc" id="L453">                                                   options.getSerialConsistency(),</span>
+<span class="nc" id="L454">                                                   options.getConsistency(),</span>
+<span class="nc" id="L455">                                                   queryState.getClientState(),</span>
+                                                   queryStartNanoTime))
+        {
+<span class="nc" id="L458">            return new ResultMessage.Rows(buildCasResultSet(result, options));</span>
+        }
+    }
+
+    private CQL3CasRequest makeCasRequest(QueryState queryState, QueryOptions options)
+    {
+<span class="nc" id="L464">        List&lt;ByteBuffer&gt; keys = buildPartitionKeyNames(options);</span>
+        // We don't support IN for CAS operation so far
+<span class="nc" id="L466">        checkFalse(restrictions.keyIsInRelation(),</span>
+                   &quot;IN on the partition key is not supported with conditional %s&quot;,
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                   type.isUpdate()? &quot;updates&quot; : &quot;deletions&quot;);</span>
+
+<span class="nc" id="L470">        DecoratedKey key = cfm.decorateKey(keys.get(0));</span>
+<span class="nc" id="L471">        long now = options.getTimestamp(queryState);</span>
+
+<span class="nc" id="L473">        checkFalse(restrictions.clusteringKeyRestrictionsHasIN(),</span>
+                   &quot;IN on the clustering key columns is not supported with conditional %s&quot;,
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                    type.isUpdate()? &quot;updates&quot; : &quot;deletions&quot;);</span>
+
+<span class="nc" id="L477">        Clustering clustering = Iterables.getOnlyElement(createClustering(options));</span>
+<span class="nc" id="L478">        CQL3CasRequest request = new CQL3CasRequest(cfm, key, false, conditionColumns(), updatesRegularRows(), updatesStaticRow());</span>
+
+<span class="nc" id="L480">        addConditions(clustering, request, options);</span>
+<span class="nc" id="L481">        request.addRowUpdate(clustering, this, options, now);</span>
+
+<span class="nc" id="L483">        return request;</span>
+    }
+
+    public void addConditions(Clustering clustering, CQL3CasRequest request, QueryOptions options) throws InvalidRequestException
+    {
+<span class="nc" id="L488">        conditions.addConditionsTo(request, clustering, options);</span>
+<span class="nc" id="L489">    }</span>
+
+    private ResultSet buildCasResultSet(RowIterator partition, QueryOptions options) throws InvalidRequestException
+    {
+<span class="nc" id="L493">        return buildCasResultSet(keyspace(), columnFamily(), partition, getColumnsWithConditions(), false, options);</span>
+    }
+
+    public static ResultSet buildCasResultSet(String ksName, String tableName, RowIterator partition, Iterable&lt;ColumnDefinition&gt; columnsWithConditions, boolean isBatch, QueryOptions options)
+    throws InvalidRequestException
+    {
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        boolean success = partition == null;</span>
+
+<span class="nc" id="L501">        ColumnSpecification spec = new ColumnSpecification(ksName, tableName, CAS_RESULT_COLUMN, BooleanType.instance);</span>
+<span class="nc" id="L502">        ResultSet.ResultMetadata metadata = new ResultSet.ResultMetadata(Collections.singletonList(spec));</span>
+<span class="nc" id="L503">        List&lt;List&lt;ByteBuffer&gt;&gt; rows = Collections.singletonList(Collections.singletonList(BooleanType.instance.decompose(success)));</span>
+
+<span class="nc" id="L505">        ResultSet rs = new ResultSet(metadata, rows);</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">        return success ? rs : merge(rs, buildCasFailureResultSet(partition, columnsWithConditions, isBatch, options));</span>
+    }
+
+    private static ResultSet merge(ResultSet left, ResultSet right)
+    {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (left.size() == 0)</span>
+<span class="nc" id="L512">            return right;</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        else if (right.size() == 0)</span>
+<span class="nc" id="L514">            return left;</span>
+
+<span class="nc bnc" id="L516" title="All 4 branches missed.">        assert left.size() == 1;</span>
+<span class="nc" id="L517">        int size = left.metadata.names.size() + right.metadata.names.size();</span>
+<span class="nc" id="L518">        List&lt;ColumnSpecification&gt; specs = new ArrayList&lt;ColumnSpecification&gt;(size);</span>
+<span class="nc" id="L519">        specs.addAll(left.metadata.names);</span>
+<span class="nc" id="L520">        specs.addAll(right.metadata.names);</span>
+<span class="nc" id="L521">        List&lt;List&lt;ByteBuffer&gt;&gt; rows = new ArrayList&lt;&gt;(right.size());</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        for (int i = 0; i &lt; right.size(); i++)</span>
+        {
+<span class="nc" id="L524">            List&lt;ByteBuffer&gt; row = new ArrayList&lt;ByteBuffer&gt;(size);</span>
+<span class="nc" id="L525">            row.addAll(left.rows.get(0));</span>
+<span class="nc" id="L526">            row.addAll(right.rows.get(i));</span>
+<span class="nc" id="L527">            rows.add(row);</span>
+        }
+<span class="nc" id="L529">        return new ResultSet(new ResultSet.ResultMetadata(specs), rows);</span>
+    }
+
+    private static ResultSet buildCasFailureResultSet(RowIterator partition, Iterable&lt;ColumnDefinition&gt; columnsWithConditions, boolean isBatch, QueryOptions options)
+    throws InvalidRequestException
+    {
+<span class="nc" id="L535">        CFMetaData cfm = partition.metadata();</span>
+        Selection selection;
+<span class="nc bnc" id="L537" title="All 2 branches missed.">        if (columnsWithConditions == null)</span>
+        {
+<span class="nc" id="L539">            selection = Selection.wildcard(cfm);</span>
+        }
+        else
+        {
+            // We can have multiple conditions on the same columns (for collections) so use a set
+            // to avoid duplicate, but preserve the order just to it follows the order of IF in the query in general
+<span class="nc" id="L545">            Set&lt;ColumnDefinition&gt; defs = new LinkedHashSet&lt;&gt;();</span>
+            // Adding the partition key for batches to disambiguate if the conditions span multipe rows (we don't add them outside
+            // of batches for compatibility sakes).
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (isBatch)</span>
+            {
+<span class="nc" id="L550">                defs.addAll(cfm.partitionKeyColumns());</span>
+<span class="nc" id="L551">                defs.addAll(cfm.clusteringColumns());</span>
+            }
+
+
+<span class="nc bnc" id="L555" title="All 4 branches missed.">            if (cfm.isSuper() &amp;&amp; cfm.isDense())</span>
+            {
+<span class="nc" id="L557">                defs.add(cfm.superColumnValueColumn());</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                for (ColumnDefinition def : columnsWithConditions)</span>
+<span class="nc" id="L562">                    defs.add(def);</span>
+            }
+
+<span class="nc" id="L565">            selection = Selection.forColumns(cfm, new ArrayList&lt;&gt;(defs));</span>
+        }
+
+<span class="nc" id="L568">        Selection.ResultSetBuilder builder = selection.resultSetBuilder(options, false);</span>
+<span class="nc" id="L569">        SelectStatement.forSelection(cfm, selection).processPartition(partition,</span>
+                                                                      options,
+                                                                      builder,
+<span class="nc" id="L572">                                                                      FBUtilities.nowInSeconds());</span>
+
+<span class="nc" id="L574">        return builder.build();</span>
+    }
+
+    public ResultMessage executeInternal(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    {
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">        return hasConditions()</span>
+<span class="pc" id="L580">               ? executeInternalWithCondition(queryState, options)</span>
+<span class="fc" id="L581">               : executeInternalWithoutCondition(queryState, options, System.nanoTime());</span>
+    }
+
+    public ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc bfc" id="L586" title="All 2 branches covered.">        for (IMutation mutation : getMutations(options, true, queryState.getTimestamp(), queryStartNanoTime))</span>
+<span class="fc" id="L587">            mutation.apply();</span>
+<span class="fc" id="L588">        return null;</span>
+    }
+
+    public ResultMessage executeInternalWithCondition(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L593">        CQL3CasRequest request = makeCasRequest(state, options);</span>
+<span class="nc" id="L594">        try (RowIterator result = casInternal(request, state))</span>
+        {
+<span class="nc" id="L596">            return new ResultMessage.Rows(buildCasResultSet(result, options));</span>
+        }
+    }
+
+    static RowIterator casInternal(CQL3CasRequest request, QueryState state)
+    {
+<span class="nc" id="L602">        UUID ballot = UUIDGen.getTimeUUIDFromMicros(state.getTimestamp());</span>
+
+<span class="nc" id="L604">        SinglePartitionReadCommand readCommand = request.readCommand(FBUtilities.nowInSeconds());</span>
+        FilteredPartition current;
+<span class="nc" id="L606">        try (ReadExecutionController executionController = readCommand.executionController();</span>
+<span class="nc" id="L607">             PartitionIterator iter = readCommand.executeInternal(executionController))</span>
+        {
+<span class="nc" id="L609">            current = FilteredPartition.create(PartitionIterators.getOnlyElement(iter, readCommand));</span>
+        }
+
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (!request.appliesTo(current))</span>
+<span class="nc" id="L613">            return current.rowIterator();</span>
+
+<span class="nc" id="L615">        PartitionUpdate updates = request.makeUpdates(current);</span>
+<span class="nc" id="L616">        updates = TriggerExecutor.instance.execute(updates);</span>
+
+<span class="nc" id="L618">        Commit proposal = Commit.newProposal(ballot, updates);</span>
+<span class="nc" id="L619">        proposal.makeMutation().apply();</span>
+<span class="nc" id="L620">        return null;</span>
+    }
+
+    /**
+     * Convert statement into a list of mutations to apply on the server
+     *
+     * @param options value for prepared statement markers
+     * @param local if true, any requests (for collections) performed by getMutation should be done locally only.
+     * @param now the current timestamp in microseconds to use if no timestamp is user provided.
+     *
+     * @return list of the mutations
+     */
+    private Collection&lt;? extends IMutation&gt; getMutations(QueryOptions options, boolean local, long now, long queryStartNanoTime)
+    {
+<span class="fc" id="L634">        UpdatesCollector collector = new UpdatesCollector(Collections.singletonMap(cfm.cfId, updatedColumns), 1);</span>
+<span class="fc" id="L635">        addUpdates(collector, options, local, now, queryStartNanoTime);</span>
+<span class="fc" id="L636">        collector.validateIndexedColumns();</span>
+
+<span class="fc" id="L638">        return collector.toMutations();</span>
+    }
+
+    final void addUpdates(UpdatesCollector collector,
+                          QueryOptions options,
+                          boolean local,
+                          long now,
+                          long queryStartNanoTime)
+    {
+<span class="fc" id="L647">        List&lt;ByteBuffer&gt; keys = buildPartitionKeyNames(options);</span>
+
+<span class="pc bpc" id="L649" title="1 of 2 branches missed.">        if (hasSlices())</span>
+        {
+<span class="nc" id="L651">            Slices slices = createSlices(options);</span>
+
+            // If all the ranges were invalid we do not need to do anything.
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            if (slices.isEmpty())</span>
+<span class="nc" id="L655">                return;</span>
+
+<span class="nc" id="L657">            UpdateParameters params = makeUpdateParameters(keys,</span>
+                                                           new ClusteringIndexSliceFilter(slices, false),
+                                                           options,
+                                                           DataLimits.NONE,
+                                                           local,
+                                                           now,
+                                                           queryStartNanoTime);
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="nc" id="L666">                ThriftValidation.validateKey(cfm, key);</span>
+<span class="nc" id="L667">                DecoratedKey dk = cfm.decorateKey(key);</span>
+
+<span class="nc" id="L669">                PartitionUpdate upd = collector.getPartitionUpdate(cfm, dk, options.getConsistency());</span>
+
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                for (Slice slice : slices)</span>
+<span class="nc" id="L672">                    addUpdateForKey(upd, slice, params);</span>
+<span class="nc" id="L673">            }</span>
+<span class="nc" id="L674">        }</span>
+        else
+        {
+<span class="fc" id="L677">            NavigableSet&lt;Clustering&gt; clusterings = createClustering(options);</span>
+
+            // If some of the restrictions were unspecified (e.g. empty IN restrictions) we do not need to do anything.
+<span class="pc bpc" id="L680" title="3 of 4 branches missed.">            if (restrictions.hasClusteringColumnsRestrictions() &amp;&amp; clusterings.isEmpty())</span>
+<span class="nc" id="L681">                return;</span>
+
+<span class="fc" id="L683">            UpdateParameters params = makeUpdateParameters(keys, clusterings, options, local, now, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L685" title="All 2 branches covered.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="fc" id="L687">                ThriftValidation.validateKey(cfm, key);</span>
+<span class="fc" id="L688">                DecoratedKey dk = cfm.decorateKey(key);</span>
+
+<span class="fc" id="L690">                PartitionUpdate upd = collector.getPartitionUpdate(cfm, dk, options.getConsistency());</span>
+
+<span class="pc bpc" id="L692" title="1 of 2 branches missed.">                if (!restrictions.hasClusteringColumnsRestrictions())</span>
+                {
+<span class="fc" id="L694">                    addUpdateForKey(upd, Clustering.EMPTY, params);</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                    for (Clustering clustering : clusterings)</span>
+                    {
+<span class="nc bnc" id="L700" title="All 2 branches missed.">                       for (ByteBuffer c : clustering.getRawValues())</span>
+                       {
+<span class="nc bnc" id="L702" title="All 4 branches missed.">                           if (c != null &amp;&amp; c.remaining() &gt; FBUtilities.MAX_UNSIGNED_SHORT)</span>
+<span class="nc" id="L703">                               throw new InvalidRequestException(String.format(&quot;Key length of %d is longer than maximum of %d&quot;,</span>
+<span class="nc" id="L704">                                                                               clustering.dataSize(),</span>
+<span class="nc" id="L705">                                                                               FBUtilities.MAX_UNSIGNED_SHORT));</span>
+                       }
+
+<span class="nc" id="L708">                        addUpdateForKey(upd, clustering, params);</span>
+<span class="nc" id="L709">                    }</span>
+                }
+<span class="fc" id="L711">            }</span>
+        }
+<span class="fc" id="L713">    }</span>
+
+    Slices createSlices(QueryOptions options)
+    {
+<span class="nc" id="L717">        SortedSet&lt;ClusteringBound&gt; startBounds = restrictions.getClusteringColumnsBounds(Bound.START, options);</span>
+<span class="nc" id="L718">        SortedSet&lt;ClusteringBound&gt; endBounds = restrictions.getClusteringColumnsBounds(Bound.END, options);</span>
+
+<span class="nc" id="L720">        return toSlices(startBounds, endBounds);</span>
+    }
+
+    private UpdateParameters makeUpdateParameters(Collection&lt;ByteBuffer&gt; keys,
+                                                  NavigableSet&lt;Clustering&gt; clusterings,
+                                                  QueryOptions options,
+                                                  boolean local,
+                                                  long now,
+                                                  long queryStartNanoTime)
+    {
+<span class="pc bpc" id="L730" title="1 of 2 branches missed.">        if (clusterings.contains(Clustering.STATIC_CLUSTERING))</span>
+<span class="nc" id="L731">            return makeUpdateParameters(keys,</span>
+                                        new ClusteringIndexSliceFilter(Slices.ALL, false),
+                                        options,
+<span class="nc" id="L734">                                        DataLimits.cqlLimits(1),</span>
+                                        local,
+                                        now,
+                                        queryStartNanoTime);
+
+<span class="fc" id="L739">        return makeUpdateParameters(keys,</span>
+                                    new ClusteringIndexNamesFilter(clusterings, false),
+                                    options,
+                                    DataLimits.NONE,
+                                    local,
+                                    now,
+                                    queryStartNanoTime);
+    }
+
+    private UpdateParameters makeUpdateParameters(Collection&lt;ByteBuffer&gt; keys,
+                                                  ClusteringIndexFilter filter,
+                                                  QueryOptions options,
+                                                  DataLimits limits,
+                                                  boolean local,
+                                                  long now,
+                                                  long queryStartNanoTime)
+    {
+        // Some lists operation requires reading
+<span class="fc" id="L757">        Map&lt;DecoratedKey, Partition&gt; lists = readRequiredLists(keys, filter, limits, local, options.getConsistency(), queryStartNanoTime);</span>
+<span class="fc" id="L758">        return new UpdateParameters(cfm, updatedColumns(), options, getTimestamp(now, options), getTimeToLive(options), lists);</span>
+    }
+
+    private Slices toSlices(SortedSet&lt;ClusteringBound&gt; startBounds, SortedSet&lt;ClusteringBound&gt; endBounds)
+    {
+<span class="nc bnc" id="L763" title="All 4 branches missed.">        assert startBounds.size() == endBounds.size();</span>
+
+<span class="nc" id="L765">        Slices.Builder builder = new Slices.Builder(cfm.comparator);</span>
+
+<span class="nc" id="L767">        Iterator&lt;ClusteringBound&gt; starts = startBounds.iterator();</span>
+<span class="nc" id="L768">        Iterator&lt;ClusteringBound&gt; ends = endBounds.iterator();</span>
+
+<span class="nc bnc" id="L770" title="All 2 branches missed.">        while (starts.hasNext())</span>
+        {
+<span class="nc" id="L772">            Slice slice = Slice.make(starts.next(), ends.next());</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            if (!slice.isEmpty(cfm.comparator))</span>
+            {
+<span class="nc" id="L775">                builder.add(slice);</span>
+            }
+<span class="nc" id="L777">        }</span>
+
+<span class="nc" id="L779">        return builder.build();</span>
+    }
+
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">    public static abstract class Parsed extends CFStatement</span>
+    {
+        protected final StatementType type;
+        private final Attributes.Raw attrs;
+        private final List&lt;Pair&lt;ColumnDefinition.Raw, ColumnCondition.Raw&gt;&gt; conditions;
+        private final boolean ifNotExists;
+        private final boolean ifExists;
+
+        protected Parsed(CFName name,
+                         StatementType type,
+                         Attributes.Raw attrs,
+                         List&lt;Pair&lt;ColumnDefinition.Raw, ColumnCondition.Raw&gt;&gt; conditions,
+                         boolean ifNotExists,
+                         boolean ifExists)
+        {
+<span class="fc" id="L797">            super(name);</span>
+<span class="fc" id="L798">            this.type = type;</span>
+<span class="fc" id="L799">            this.attrs = attrs;</span>
+<span class="fc bfc" id="L800" title="All 2 branches covered.">            this.conditions = conditions == null ? Collections.&lt;Pair&lt;ColumnDefinition.Raw, ColumnCondition.Raw&gt;&gt;emptyList() : conditions;</span>
+<span class="fc" id="L801">            this.ifNotExists = ifNotExists;</span>
+<span class="fc" id="L802">            this.ifExists = ifExists;</span>
+<span class="fc" id="L803">        }</span>
+
+        public ParsedStatement.Prepared prepare(ClientState clientState)
+        {
+<span class="fc" id="L807">            VariableSpecifications boundNames = getBoundVariables();</span>
+<span class="fc" id="L808">            ModificationStatement statement = prepare(boundNames, clientState);</span>
+<span class="fc" id="L809">            return new ParsedStatement.Prepared(statement, boundNames, boundNames.getPartitionKeyBindIndexes(statement.cfm));</span>
+        }
+
+        public ModificationStatement prepare(VariableSpecifications boundNames, ClientState clientState)
+        {
+<span class="fc" id="L814">            CFMetaData metadata = ThriftValidation.validateColumnFamilyWithCompactMode(keyspace(), columnFamily(), clientState.isNoCompactMode());</span>
+
+<span class="fc" id="L816">            Attributes preparedAttributes = attrs.prepare(keyspace(), columnFamily());</span>
+<span class="fc" id="L817">            preparedAttributes.collectMarkerSpecification(boundNames);</span>
+
+<span class="fc" id="L819">            Conditions preparedConditions = prepareConditions(metadata, boundNames);</span>
+
+<span class="fc" id="L821">            return prepareInternal(metadata,</span>
+                                   boundNames,
+                                   preparedConditions,
+                                   preparedAttributes);
+        }
+
+        /**
+         * Returns the column conditions.
+         *
+         * @param metadata the column family meta data
+         * @param boundNames the bound names
+         * @return the column conditions.
+         */
+        private Conditions prepareConditions(CFMetaData metadata, VariableSpecifications boundNames)
+        {
+            // To have both 'IF EXISTS'/'IF NOT EXISTS' and some other conditions doesn't make sense.
+            // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
+<span class="pc bpc" id="L838" title="1 of 2 branches missed.">            if (ifExists)</span>
+            {
+<span class="nc bnc" id="L840" title="All 4 branches missed.">                assert conditions.isEmpty();</span>
+<span class="nc bnc" id="L841" title="All 4 branches missed.">                assert !ifNotExists;</span>
+<span class="nc" id="L842">                return Conditions.IF_EXISTS_CONDITION;</span>
+            }
+
+<span class="pc bpc" id="L845" title="1 of 2 branches missed.">            if (ifNotExists)</span>
+            {
+<span class="nc bnc" id="L847" title="All 4 branches missed.">                assert conditions.isEmpty();</span>
+<span class="nc bnc" id="L848" title="All 4 branches missed.">                assert !ifExists;</span>
+<span class="nc" id="L849">                return Conditions.IF_NOT_EXISTS_CONDITION;</span>
+            }
+
+<span class="pc bpc" id="L852" title="1 of 2 branches missed.">            if (conditions.isEmpty())</span>
+<span class="fc" id="L853">                return Conditions.EMPTY_CONDITION;</span>
+
+<span class="nc" id="L855">            return prepareColumnConditions(metadata, boundNames);</span>
+        }
+
+        /**
+         * Returns the column conditions.
+         *
+         * @param metadata the column family meta data
+         * @param boundNames the bound names
+         * @return the column conditions.
+         */
+        private ColumnConditions prepareColumnConditions(CFMetaData metadata, VariableSpecifications boundNames)
+        {
+<span class="nc" id="L867">            checkNull(attrs.timestamp, &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+
+<span class="nc" id="L869">            ColumnConditions.Builder builder = ColumnConditions.newBuilder();</span>
+
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            for (Pair&lt;ColumnDefinition.Raw, ColumnCondition.Raw&gt; entry : conditions)</span>
+            {
+<span class="nc" id="L873">                ColumnDefinition def = entry.left.prepare(metadata);</span>
+<span class="nc" id="L874">                ColumnCondition condition = entry.right.prepare(keyspace(), def, metadata);</span>
+<span class="nc" id="L875">                condition.collectMarkerSpecification(boundNames);</span>
+
+<span class="nc" id="L877">                checkFalse(def.isPrimaryKeyColumn(), &quot;PRIMARY KEY column '%s' cannot have IF conditions&quot;, def.name);</span>
+<span class="nc" id="L878">                builder.add(condition);</span>
+<span class="nc" id="L879">            }</span>
+<span class="nc" id="L880">            return builder.build();</span>
+        }
+
+        protected abstract ModificationStatement prepareInternal(CFMetaData cfm,
+                                                                 VariableSpecifications boundNames,
+                                                                 Conditions conditions,
+                                                                 Attributes attrs);
+
+        /**
+         * Creates the restrictions.
+         *
+         * @param cfm the column family meta data
+         * @param boundNames the bound names
+         * @param operations the column operations
+         * @param where the where clause
+         * @param conditions the conditions
+         * @return the restrictions
+         */
+        protected StatementRestrictions newRestrictions(CFMetaData cfm,
+                                                        VariableSpecifications boundNames,
+                                                        Operations operations,
+                                                        WhereClause where,
+                                                        Conditions conditions)
+        {
+<span class="pc bpc" id="L904" title="1 of 2 branches missed.">            if (where.containsCustomExpressions())</span>
+<span class="nc" id="L905">                throw new InvalidRequestException(CUSTOM_EXPRESSIONS_NOT_ALLOWED);</span>
+
+<span class="fc" id="L907">            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions);</span>
+<span class="fc" id="L908">            return new StatementRestrictions(type, cfm, where, boundNames, applyOnlyToStaticColumns, false, false, false);</span>
+        }
+
+        /**
+         * Retrieves the &lt;code&gt;ColumnDefinition&lt;/code&gt; corresponding to the specified raw &lt;code&gt;ColumnIdentifier&lt;/code&gt;.
+         *
+         * @param cfm the column family meta data
+         * @param rawId the raw &lt;code&gt;ColumnIdentifier&lt;/code&gt;
+         * @return the &lt;code&gt;ColumnDefinition&lt;/code&gt; corresponding to the specified raw &lt;code&gt;ColumnIdentifier&lt;/code&gt;
+         */
+        protected static ColumnDefinition getColumnDefinition(CFMetaData cfm, Raw rawId)
+        {
+<span class="fc" id="L920">            return rawId.prepare(cfm);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

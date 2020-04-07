@@ -1,0 +1,602 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ViewUpdateGenerator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">ViewUpdateGenerator.java</span></div><h1>ViewUpdateGenerator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.view;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CompositeType;
+
+/**
+ * Creates the updates to apply to a view given the existing rows in the base
+ * table and the updates that we're applying to them (this handles updates
+ * on a single partition only).
+ *
+ * This class is used by passing the updates made to the base table to
+ * {@link #addBaseTableUpdate} and calling {@link #generateViewUpdates} once all updates have
+ * been handled to get the resulting view mutations.
+ */
+<span class="nc bnc" id="L43" title="All 2 branches missed.">public class ViewUpdateGenerator</span>
+{
+    private final View view;
+    private final int nowInSec;
+
+    private final CFMetaData baseMetadata;
+    private final DecoratedKey baseDecoratedKey;
+    private final ByteBuffer[] basePartitionKey;
+
+    private final CFMetaData viewMetadata;
+    private final boolean baseEnforceStrictLiveness;
+
+<span class="nc" id="L55">    private final Map&lt;DecoratedKey, PartitionUpdate&gt; updates = new HashMap&lt;&gt;();</span>
+
+    // Reused internally to build a new entry
+    private final ByteBuffer[] currentViewEntryPartitionKey;
+    private final Row.Builder currentViewEntryBuilder;
+
+    /**
+     * The type of type update action to perform to the view for a given base table
+     * update.
+     */
+<span class="nc" id="L65">    private enum UpdateAction</span>
+    {
+<span class="nc" id="L67">        NONE,            // There was no view entry and none should be added</span>
+<span class="nc" id="L68">        NEW_ENTRY,       // There was no entry but there is one post-update</span>
+<span class="nc" id="L69">        DELETE_OLD,      // There was an entry but there is nothing after update</span>
+<span class="nc" id="L70">        UPDATE_EXISTING, // There was an entry and the update modifies it</span>
+<span class="nc" id="L71">        SWITCH_ENTRY     // There was an entry and there is still one after update,</span>
+                         // but they are not the same one.
+    }
+
+    /**
+     * Creates a new {@code ViewUpdateBuilder}.
+     *
+     * @param view the view for which this will be building updates for.
+     * @param basePartitionKey the partition key for the base table partition for which
+     * we'll handle updates for.
+     * @param nowInSec the current time in seconds. Used to decide if data are live or not
+     * and as base reference for new deletions.
+     */
+    public ViewUpdateGenerator(View view, DecoratedKey basePartitionKey, int nowInSec)
+<span class="nc" id="L85">    {</span>
+<span class="nc" id="L86">        this.view = view;</span>
+<span class="nc" id="L87">        this.nowInSec = nowInSec;</span>
+
+<span class="nc" id="L89">        this.baseMetadata = view.getDefinition().baseTableMetadata();</span>
+<span class="nc" id="L90">        this.baseEnforceStrictLiveness = baseMetadata.enforceStrictLiveness();</span>
+<span class="nc" id="L91">        this.baseDecoratedKey = basePartitionKey;</span>
+<span class="nc" id="L92">        this.basePartitionKey = extractKeyComponents(basePartitionKey, baseMetadata.getKeyValidator());</span>
+
+<span class="nc" id="L94">        this.viewMetadata = view.getDefinition().metadata;</span>
+
+<span class="nc" id="L96">        this.currentViewEntryPartitionKey = new ByteBuffer[viewMetadata.partitionKeyColumns().size()];</span>
+<span class="nc" id="L97">        this.currentViewEntryBuilder = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L98">    }</span>
+
+    private static ByteBuffer[] extractKeyComponents(DecoratedKey partitionKey, AbstractType&lt;?&gt; type)
+    {
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        return type instanceof CompositeType</span>
+<span class="nc" id="L103">             ? ((CompositeType)type).split(partitionKey.getKey())</span>
+<span class="nc" id="L104">             : new ByteBuffer[]{ partitionKey.getKey() };</span>
+    }
+
+    /**
+     * Adds to this generator the updates to be made to the view given a base table row
+     * before and after an update.
+     *
+     * @param existingBaseRow the base table row as it is before an update.
+     * @param mergedBaseRow the base table row after the update is applied (note that
+     * this is not just the new update, but rather the resulting row).
+     */
+    public void addBaseTableUpdate(Row existingBaseRow, Row mergedBaseRow)
+    {
+<span class="nc bnc" id="L117" title="All 6 branches missed.">        switch (updateAction(existingBaseRow, mergedBaseRow))</span>
+        {
+            case NONE:
+<span class="nc" id="L120">                return;</span>
+            case NEW_ENTRY:
+<span class="nc" id="L122">                createEntry(mergedBaseRow);</span>
+<span class="nc" id="L123">                return;</span>
+            case DELETE_OLD:
+<span class="nc" id="L125">                deleteOldEntry(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L126">                return;</span>
+            case UPDATE_EXISTING:
+<span class="nc" id="L128">                updateEntry(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L129">                return;</span>
+            case SWITCH_ENTRY:
+<span class="nc" id="L131">                createEntry(mergedBaseRow);</span>
+<span class="nc" id="L132">                deleteOldEntry(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L133">                return;</span>
+        }
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Returns the updates that needs to be done to the view given the base table updates
+     * passed to {@link #addBaseTableUpdate}.
+     *
+     * @return the updates to do to the view.
+     */
+    public Collection&lt;PartitionUpdate&gt; generateViewUpdates()
+    {
+<span class="nc" id="L145">        return updates.values();</span>
+    }
+
+    /**
+     * Clears the current state so that the generator may be reused.
+     */
+    public void clear()
+    {
+<span class="nc" id="L153">        updates.clear();</span>
+<span class="nc" id="L154">    }</span>
+
+    /**
+     * Compute which type of action needs to be performed to the view for a base table row
+     * before and after an update.
+     */
+    private UpdateAction updateAction(Row existingBaseRow, Row mergedBaseRow)
+    {
+        // Having existing empty is useful, it just means we'll insert a brand new entry for mergedBaseRow,
+        // but if we have no update at all, we shouldn't get there.
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        assert !mergedBaseRow.isEmpty();</span>
+
+        // Note that none of the base PK columns will differ since we're intrinsically dealing
+        // with the same base row. So we have to check 3 things:
+        //   1) that the clustering doesn't have a null, which can happen for compact tables. If that's the case,
+        //      there is no corresponding entries.
+        //   2) if there is a column not part of the base PK in the view PK, whether it is changed by the update.
+        //   3) whether mergedBaseRow actually match the view SELECT filter
+
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (baseMetadata.isCompactTable())</span>
+        {
+<span class="nc" id="L175">            Clustering clustering = mergedBaseRow.clustering();</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            for (int i = 0; i &lt; clustering.size(); i++)</span>
+            {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                if (clustering.get(i) == null)</span>
+<span class="nc" id="L179">                    return UpdateAction.NONE;</span>
+            }
+        }
+
+<span class="nc bnc" id="L183" title="All 4 branches missed.">        assert view.baseNonPKColumnsInViewPK.size() &lt;= 1 : &quot;We currently only support one base non-PK column in the view PK&quot;;</span>
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (view.baseNonPKColumnsInViewPK.isEmpty())</span>
+        {
+            // The view entry is necessarily the same pre and post update.
+
+            // Note that we allow existingBaseRow to be null and treat it as empty (see MultiViewUpdateBuilder.generateViewsMutations).
+<span class="nc bnc" id="L190" title="All 4 branches missed.">            boolean existingHasLiveData = existingBaseRow != null &amp;&amp; existingBaseRow.hasLiveData(nowInSec, baseEnforceStrictLiveness);</span>
+<span class="nc" id="L191">            boolean mergedHasLiveData = mergedBaseRow.hasLiveData(nowInSec, baseEnforceStrictLiveness);</span>
+<span class="nc bnc" id="L192" title="All 6 branches missed.">            return existingHasLiveData</span>
+                 ? (mergedHasLiveData ? UpdateAction.UPDATE_EXISTING : UpdateAction.DELETE_OLD)
+                 : (mergedHasLiveData ? UpdateAction.NEW_ENTRY : UpdateAction.NONE);
+        }
+
+<span class="nc" id="L197">        ColumnDefinition baseColumn = view.baseNonPKColumnsInViewPK.get(0);</span>
+<span class="nc bnc" id="L198" title="All 4 branches missed.">        assert !baseColumn.isComplex() : &quot;A complex column couldn't be part of the view PK&quot;;</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        Cell before = existingBaseRow == null ? null : existingBaseRow.getCell(baseColumn);</span>
+<span class="nc" id="L200">        Cell after = mergedBaseRow.getCell(baseColumn);</span>
+
+        // If the update didn't modified this column, the cells will be the same object so it's worth checking
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (before == after)</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            return isLive(before) ? UpdateAction.UPDATE_EXISTING : UpdateAction.NONE;</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (!isLive(before))</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            return isLive(after) ? UpdateAction.NEW_ENTRY : UpdateAction.NONE;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (!isLive(after))</span>
+        {
+<span class="nc" id="L210">            return UpdateAction.DELETE_OLD;</span>
+        }
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        return baseColumn.cellValueType().compare(before.value(), after.value()) == 0</span>
+             ? UpdateAction.UPDATE_EXISTING
+             : UpdateAction.SWITCH_ENTRY;
+    }
+
+    private boolean matchesViewFilter(Row baseRow)
+    {
+<span class="nc" id="L220">        return view.matchesViewFilter(baseDecoratedKey, baseRow, nowInSec);</span>
+    }
+
+    private boolean isLive(Cell cell)
+    {
+<span class="nc bnc" id="L225" title="All 4 branches missed.">        return cell != null &amp;&amp; cell.isLive(nowInSec);</span>
+    }
+
+    /**
+     * Creates a view entry corresponding to the provided base row.
+     * &lt;p&gt;
+     * This method checks that the base row does match the view filter before applying it.
+     */
+    private void createEntry(Row baseRow)
+    {
+        // Before create a new entry, make sure it matches the view filter
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if (!matchesViewFilter(baseRow))</span>
+<span class="nc" id="L237">            return;</span>
+
+<span class="nc" id="L239">        startNewUpdate(baseRow);</span>
+<span class="nc" id="L240">        currentViewEntryBuilder.addPrimaryKeyLivenessInfo(computeLivenessInfoForEntry(baseRow));</span>
+<span class="nc" id="L241">        currentViewEntryBuilder.addRowDeletion(baseRow.deletion());</span>
+
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        for (ColumnData data : baseRow)</span>
+        {
+<span class="nc" id="L245">            ColumnDefinition viewColumn = view.getViewColumn(data.column());</span>
+            // If that base table column is not denormalized in the view, we had nothing to do.
+            // Alose, if it's part of the view PK it's already been taken into account in the clustering.
+<span class="nc bnc" id="L248" title="All 4 branches missed.">            if (viewColumn == null || viewColumn.isPrimaryKeyColumn())</span>
+<span class="nc" id="L249">                continue;</span>
+
+<span class="nc" id="L251">            addColumnData(viewColumn, data);</span>
+<span class="nc" id="L252">        }</span>
+
+<span class="nc" id="L254">        submitUpdate();</span>
+<span class="nc" id="L255">    }</span>
+
+    /**
+     * Creates the updates to apply to the existing view entry given the base table row before
+     * and after the update, assuming that the update hasn't changed to which view entry the
+     * row correspond (that is, we know the columns composing the view PK haven't changed).
+     * &lt;p&gt;
+     * This method checks that the base row (before and after) does match the view filter before
+     * applying anything.
+     */
+    private void updateEntry(Row existingBaseRow, Row mergedBaseRow)
+    {
+        // While we know existingBaseRow and mergedBaseRow are corresponding to the same view entry,
+        // they may not match the view filter.
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (!matchesViewFilter(existingBaseRow))</span>
+        {
+<span class="nc" id="L271">            createEntry(mergedBaseRow);</span>
+<span class="nc" id="L272">            return;</span>
+        }
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (!matchesViewFilter(mergedBaseRow))</span>
+        {
+<span class="nc" id="L276">            deleteOldEntryInternal(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L277">            return;</span>
+        }
+
+<span class="nc" id="L280">        startNewUpdate(mergedBaseRow);</span>
+
+        // In theory, it may be the PK liveness and row deletion hasn't been change by the update
+        // and we could condition the 2 additions below. In practice though, it's as fast (if not
+        // faster) to compute those info than to check if they have changed so we keep it simple.
+<span class="nc" id="L285">        currentViewEntryBuilder.addPrimaryKeyLivenessInfo(computeLivenessInfoForEntry(mergedBaseRow));</span>
+<span class="nc" id="L286">        currentViewEntryBuilder.addRowDeletion(mergedBaseRow.deletion());</span>
+
+<span class="nc" id="L288">        addDifferentCells(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L289">        submitUpdate();</span>
+<span class="nc" id="L290">    }</span>
+
+    private void addDifferentCells(Row existingBaseRow, Row mergedBaseRow)
+    {
+        // We only add to the view update the cells from mergedBaseRow that differs from
+        // existingBaseRow. For that and for speed we can just cell pointer equality: if the update
+        // hasn't touched a cell, we know it will be the same object in existingBaseRow and
+        // mergedBaseRow (note that including more cells than we strictly should isn't a problem
+        // for correction, so even if the code change and pointer equality don't work anymore, it'll
+        // only a slightly inefficiency which we can fix then).
+        // Note: we could alternatively use Rows.diff() for this, but because it is a bit more generic
+        // than what we need here, it's also a bit less efficient (it allocates more in particular),
+        // and this might be called a lot of time for view updates. So, given that this is not a whole
+        // lot of code anyway, it's probably doing the diff manually.
+<span class="nc" id="L304">        PeekingIterator&lt;ColumnData&gt; existingIter = Iterators.peekingIterator(existingBaseRow.iterator());</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        for (ColumnData mergedData : mergedBaseRow)</span>
+        {
+<span class="nc" id="L307">            ColumnDefinition baseColumn = mergedData.column();</span>
+<span class="nc" id="L308">            ColumnDefinition viewColumn = view.getViewColumn(baseColumn);</span>
+            // If that base table column is not denormalized in the view, we had nothing to do.
+            // Alose, if it's part of the view PK it's already been taken into account in the clustering.
+<span class="nc bnc" id="L311" title="All 4 branches missed.">            if (viewColumn == null || viewColumn.isPrimaryKeyColumn())</span>
+<span class="nc" id="L312">                continue;</span>
+
+<span class="nc" id="L314">            ColumnData existingData = null;</span>
+            // Find if there is data for that column in the existing row
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            while (existingIter.hasNext())</span>
+            {
+<span class="nc" id="L318">                int cmp = baseColumn.compareTo(existingIter.peek().column());</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                if (cmp &lt; 0)</span>
+<span class="nc" id="L320">                    break;</span>
+
+<span class="nc" id="L322">                ColumnData next = existingIter.next();</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (cmp == 0)</span>
+                {
+<span class="nc" id="L325">                    existingData = next;</span>
+<span class="nc" id="L326">                    break;</span>
+                }
+<span class="nc" id="L328">            }</span>
+
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if (existingData == null)</span>
+            {
+<span class="nc" id="L332">                addColumnData(viewColumn, mergedData);</span>
+<span class="nc" id="L333">                continue;</span>
+            }
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            if (mergedData == existingData)</span>
+<span class="nc" id="L337">                continue;</span>
+
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (baseColumn.isComplex())</span>
+            {
+<span class="nc" id="L341">                ComplexColumnData mergedComplexData = (ComplexColumnData)mergedData;</span>
+<span class="nc" id="L342">                ComplexColumnData existingComplexData = (ComplexColumnData)existingData;</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                if (mergedComplexData.complexDeletion().supersedes(existingComplexData.complexDeletion()))</span>
+<span class="nc" id="L344">                    currentViewEntryBuilder.addComplexDeletion(viewColumn, mergedComplexData.complexDeletion());</span>
+
+<span class="nc" id="L346">                PeekingIterator&lt;Cell&gt; existingCells = Iterators.peekingIterator(existingComplexData.iterator());</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">                for (Cell mergedCell : mergedComplexData)</span>
+                {
+<span class="nc" id="L349">                    Cell existingCell = null;</span>
+                    // Find if there is corresponding cell in the existing row
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                    while (existingCells.hasNext())</span>
+                    {
+<span class="nc" id="L353">                        int cmp = baseColumn.cellPathComparator().compare(mergedCell.path(), existingCells.peek().path());</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                        if (cmp &gt; 0)</span>
+<span class="nc" id="L355">                            break;</span>
+
+<span class="nc" id="L357">                        Cell next = existingCells.next();</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                        if (cmp == 0)</span>
+                        {
+<span class="nc" id="L360">                            existingCell = next;</span>
+<span class="nc" id="L361">                            break;</span>
+                        }
+<span class="nc" id="L363">                    }</span>
+
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                    if (mergedCell != existingCell)</span>
+<span class="nc" id="L366">                        addCell(viewColumn, mergedCell);</span>
+<span class="nc" id="L367">                }</span>
+<span class="nc" id="L368">            }</span>
+            else
+            {
+                // Note that we've already eliminated the case where merged == existing
+<span class="nc" id="L372">                addCell(viewColumn, (Cell)mergedData);</span>
+            }
+<span class="nc" id="L374">        }</span>
+<span class="nc" id="L375">    }</span>
+
+    /**
+     * Deletes the view entry corresponding to the provided base row.
+     * &lt;p&gt;
+     * This method checks that the base row does match the view filter before bothering.
+     */
+    private void deleteOldEntry(Row existingBaseRow, Row mergedBaseRow)
+    {
+        // Before deleting an old entry, make sure it was matching the view filter (otherwise there is nothing to delete)
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (!matchesViewFilter(existingBaseRow))</span>
+<span class="nc" id="L386">            return;</span>
+
+<span class="nc" id="L388">        deleteOldEntryInternal(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L389">    }</span>
+
+    private void deleteOldEntryInternal(Row existingBaseRow, Row mergedBaseRow)
+    {
+<span class="nc" id="L393">        startNewUpdate(existingBaseRow);</span>
+<span class="nc" id="L394">        long timestamp = computeTimestampForEntryDeletion(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L395">        long rowDeletion = mergedBaseRow.deletion().time().markedForDeleteAt();</span>
+<span class="nc bnc" id="L396" title="All 4 branches missed.">        assert timestamp &gt;= rowDeletion;</span>
+
+        // If computed deletion timestamp greater than row deletion, it must be coming from
+        //  1. non-pk base column used in view pk, or
+        //  2. unselected base column
+        //  any case, we need to use it as expired livenessInfo
+        // If computed deletion timestamp is from row deletion, we only need row deletion itself
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (timestamp &gt; rowDeletion)</span>
+        {
+            /**
+              * We use an expired liveness instead of a row tombstone to allow a shadowed MV
+              * entry to co-exist with a row tombstone, see ViewComplexTest#testCommutativeRowDeletion.
+              *
+              * TODO This is a dirty overload of LivenessInfo and we should modify
+              * the storage engine to properly support this on CASSANDRA-13826.
+              */
+<span class="nc" id="L412">            LivenessInfo info = LivenessInfo.withExpirationTime(timestamp, LivenessInfo.EXPIRED_LIVENESS_TTL, nowInSec);</span>
+<span class="nc" id="L413">            currentViewEntryBuilder.addPrimaryKeyLivenessInfo(info);</span>
+        }
+<span class="nc" id="L415">        currentViewEntryBuilder.addRowDeletion(mergedBaseRow.deletion());</span>
+
+<span class="nc" id="L417">        addDifferentCells(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L418">        submitUpdate();</span>
+<span class="nc" id="L419">    }</span>
+
+    /**
+     * Computes the partition key and clustering for a new view entry, and setup the internal
+     * row builder for the new row.
+     *
+     * This assumes that there is corresponding entry, i.e. no values for the partition key and
+     * clustering are null (since we have eliminated that case through updateAction).
+     */
+    private void startNewUpdate(Row baseRow)
+    {
+<span class="nc" id="L430">        ByteBuffer[] clusteringValues = new ByteBuffer[viewMetadata.clusteringColumns().size()];</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        for (ColumnDefinition viewColumn : viewMetadata.primaryKeyColumns())</span>
+        {
+<span class="nc" id="L433">            ColumnDefinition baseColumn = view.getBaseColumn(viewColumn);</span>
+<span class="nc" id="L434">            ByteBuffer value = getValueForPK(baseColumn, baseRow);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            if (viewColumn.isPartitionKey())</span>
+<span class="nc" id="L436">                currentViewEntryPartitionKey[viewColumn.position()] = value;</span>
+            else
+<span class="nc" id="L438">                clusteringValues[viewColumn.position()] = value;</span>
+<span class="nc" id="L439">        }</span>
+
+<span class="nc" id="L441">        currentViewEntryBuilder.newRow(Clustering.make(clusteringValues));</span>
+<span class="nc" id="L442">    }</span>
+
+    private LivenessInfo computeLivenessInfoForEntry(Row baseRow)
+    {
+        /**
+         * There 3 cases:
+         *  1. No extra primary key in view and all base columns are selected in MV. all base row's components(livenessInfo,
+         *     deletion, cells) are same as view row. Simply map base components to view row.
+         *  2. There is a base non-key column used in view pk. This base non-key column determines the liveness of view row. view's row level
+         *     info should based on this column.
+         *  3. Most tricky case is no extra primary key in view and some base columns are not selected in MV. We cannot use 1 livenessInfo or
+         *     row deletion to represent the liveness of unselected column properly, see CASSANDRA-11500.
+         *     We could make some simplification: the unselected columns will be used only when it affects view row liveness. eg. if view row
+         *     already exists and not expiring, there is no need to use unselected columns.
+         *     Note: if the view row is removed due to unselected column removal(ttl or cell tombstone), we will have problem keeping view
+         *     row alive with a smaller or equal timestamp than the max unselected column timestamp.
+         *
+         */
+<span class="nc bnc" id="L460" title="All 4 branches missed.">        assert view.baseNonPKColumnsInViewPK.size() &lt;= 1; // This may change, but is currently an enforced limitation</span>
+
+<span class="nc" id="L462">        LivenessInfo baseLiveness = baseRow.primaryKeyLivenessInfo();</span>
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (view.hasSamePrimaryKeyColumnsAsBaseTable())</span>
+        {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (view.getDefinition().includeAllColumns)</span>
+<span class="nc" id="L467">                return baseLiveness;</span>
+
+<span class="nc" id="L469">            long timestamp = baseLiveness.timestamp();</span>
+<span class="nc" id="L470">            boolean hasNonExpiringLiveCell = false;</span>
+<span class="nc" id="L471">            Cell biggestExpirationCell = null;</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">            for (Cell cell : baseRow.cells())</span>
+            {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                if (view.getViewColumn(cell.column()) != null)</span>
+<span class="nc" id="L475">                    continue;</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">                if (!isLive(cell))</span>
+<span class="nc" id="L477">                    continue;</span>
+<span class="nc" id="L478">                timestamp = Math.max(timestamp, cell.maxTimestamp());</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">                if (!cell.isExpiring())</span>
+<span class="nc" id="L480">                    hasNonExpiringLiveCell = true;</span>
+                else
+                {
+<span class="nc bnc" id="L483" title="All 2 branches missed.">                    if (biggestExpirationCell == null)</span>
+<span class="nc" id="L484">                        biggestExpirationCell = cell;</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                    else if (cell.localDeletionTime() &gt; biggestExpirationCell.localDeletionTime())</span>
+<span class="nc" id="L486">                        biggestExpirationCell = cell;</span>
+                }
+<span class="nc" id="L488">            }</span>
+<span class="nc bnc" id="L489" title="All 4 branches missed.">            if (baseLiveness.isLive(nowInSec) &amp;&amp; !baseLiveness.isExpiring())</span>
+<span class="nc" id="L490">                return LivenessInfo.create(timestamp, nowInSec);</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">            if (hasNonExpiringLiveCell)</span>
+<span class="nc" id="L492">                return LivenessInfo.create(timestamp, nowInSec);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            if (biggestExpirationCell == null)</span>
+<span class="nc" id="L494">                return baseLiveness;</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            if (biggestExpirationCell.localDeletionTime() &gt; baseLiveness.localExpirationTime()</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                    || !baseLiveness.isLive(nowInSec))</span>
+<span class="nc" id="L497">                return LivenessInfo.withExpirationTime(timestamp,</span>
+<span class="nc" id="L498">                                                       biggestExpirationCell.ttl(),</span>
+<span class="nc" id="L499">                                                       biggestExpirationCell.localDeletionTime());</span>
+<span class="nc" id="L500">            return baseLiveness;</span>
+        }
+
+<span class="nc" id="L503">        Cell cell = baseRow.getCell(view.baseNonPKColumnsInViewPK.get(0));</span>
+<span class="nc bnc" id="L504" title="All 4 branches missed.">        assert isLive(cell) : &quot;We shouldn't have got there if the base row had no associated entry&quot;;</span>
+
+<span class="nc" id="L506">        return LivenessInfo.withExpirationTime(cell.timestamp(), cell.ttl(), cell.localDeletionTime());</span>
+    }
+
+    private long computeTimestampForEntryDeletion(Row existingBaseRow, Row mergedBaseRow)
+    {
+<span class="nc" id="L511">        DeletionTime deletion = mergedBaseRow.deletion().time();</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        if (view.hasSamePrimaryKeyColumnsAsBaseTable())</span>
+        {
+<span class="nc" id="L514">            long timestamp = Math.max(deletion.markedForDeleteAt(), existingBaseRow.primaryKeyLivenessInfo().timestamp());</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">            if (view.getDefinition().includeAllColumns)</span>
+<span class="nc" id="L516">                return timestamp;</span>
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">            for (Cell cell : existingBaseRow.cells())</span>
+            {
+                // selected column should not contribute to view deletion, itself is already included in view row
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                if (view.getViewColumn(cell.column()) != null)</span>
+<span class="nc" id="L522">                    continue;</span>
+                // unselected column is used regardless live or dead, because we don't know if it was used for liveness.
+<span class="nc" id="L524">                timestamp = Math.max(timestamp, cell.maxTimestamp());</span>
+<span class="nc" id="L525">            }</span>
+<span class="nc" id="L526">            return timestamp;</span>
+        }
+        // has base non-pk column in view pk
+<span class="nc" id="L529">        Cell before = existingBaseRow.getCell(view.baseNonPKColumnsInViewPK.get(0));</span>
+<span class="nc bnc" id="L530" title="All 4 branches missed.">        assert isLive(before) : &quot;We shouldn't have got there if the base row had no associated entry&quot;;</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">        return deletion.deletes(before) ? deletion.markedForDeleteAt() : before.timestamp();</span>
+    }
+
+    private void addColumnData(ColumnDefinition viewColumn, ColumnData baseTableData)
+    {
+<span class="nc bnc" id="L536" title="All 4 branches missed.">        assert viewColumn.isComplex() == baseTableData.column().isComplex();</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">        if (!viewColumn.isComplex())</span>
+        {
+<span class="nc" id="L539">            addCell(viewColumn, (Cell)baseTableData);</span>
+<span class="nc" id="L540">            return;</span>
+        }
+
+<span class="nc" id="L543">        ComplexColumnData complexData = (ComplexColumnData)baseTableData;</span>
+<span class="nc" id="L544">        currentViewEntryBuilder.addComplexDeletion(viewColumn, complexData.complexDeletion());</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        for (Cell cell : complexData)</span>
+<span class="nc" id="L546">            addCell(viewColumn, cell);</span>
+<span class="nc" id="L547">    }</span>
+
+    private void addCell(ColumnDefinition viewColumn, Cell baseTableCell)
+    {
+<span class="nc bnc" id="L551" title="All 4 branches missed.">        assert !viewColumn.isPrimaryKeyColumn();</span>
+<span class="nc" id="L552">        currentViewEntryBuilder.addCell(baseTableCell.withUpdatedColumn(viewColumn));</span>
+<span class="nc" id="L553">    }</span>
+
+    /**
+     * Finish building the currently updated view entry and add it to the other built
+     * updates.
+     */
+    private void submitUpdate()
+    {
+<span class="nc" id="L561">        Row row = currentViewEntryBuilder.build();</span>
+        // I'm not sure we can reach there is there is nothing is updated, but adding an empty row breaks things
+        // and it costs us nothing to be prudent here.
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if (row.isEmpty())</span>
+<span class="nc" id="L565">            return;</span>
+
+<span class="nc" id="L567">        DecoratedKey partitionKey = makeCurrentPartitionKey();</span>
+<span class="nc" id="L568">        PartitionUpdate update = updates.get(partitionKey);</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (update == null)</span>
+        {
+            // We can't really know which columns of the view will be updated nor how many row will be updated for this key
+            // so we rely on hopefully sane defaults.
+<span class="nc" id="L573">            update = new PartitionUpdate(viewMetadata, partitionKey, viewMetadata.partitionColumns(), 4);</span>
+<span class="nc" id="L574">            updates.put(partitionKey, update);</span>
+        }
+<span class="nc" id="L576">        update.add(row);</span>
+<span class="nc" id="L577">    }</span>
+
+    private DecoratedKey makeCurrentPartitionKey()
+    {
+<span class="nc bnc" id="L581" title="All 2 branches missed.">        ByteBuffer rawKey = viewMetadata.partitionKeyColumns().size() == 1</span>
+                          ? currentViewEntryPartitionKey[0]
+<span class="nc" id="L583">                          : CompositeType.build(currentViewEntryPartitionKey);</span>
+
+<span class="nc" id="L585">        return viewMetadata.decorateKey(rawKey);</span>
+    }
+
+    private ByteBuffer getValueForPK(ColumnDefinition column, Row row)
+    {
+<span class="nc bnc" id="L590" title="All 3 branches missed.">        switch (column.kind)</span>
+        {
+            case PARTITION_KEY:
+<span class="nc" id="L593">                return basePartitionKey[column.position()];</span>
+            case CLUSTERING:
+<span class="nc" id="L595">                return row.clustering().get(column.position());</span>
+            default:
+                // This shouldn't NPE as we shouldn't get there if the value can be null (or there is a bug in updateAction())
+<span class="nc" id="L598">                return row.getCell(column).value();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

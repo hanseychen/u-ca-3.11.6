@@ -1,0 +1,1289 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BTree.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.btree</a> &gt; <span class="el_source">BTree.java</span></div><h1>BTree.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.utils.btree;
+
+import java.util.*;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Ordering;
+
+import org.apache.cassandra.utils.ObjectSizes;
+
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.filter;
+import static com.google.common.collect.Iterables.transform;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+
+<span class="pc bpc" id="L38" title="1 of 2 branches missed.">public class BTree</span>
+{
+    /**
+     * Leaf Nodes are a raw array of values: Object[V1, V1, ...,].
+     *
+     * Branch Nodes: Object[V1, V2, ..., child[&amp;lt;V1.key], child[&amp;lt;V2.key], ..., child[&amp;lt; Inf], size], where
+     * each child is another node, i.e., an Object[].  Thus, the value elements in a branch node are the
+     * first half of the array (minus one).  In our implementation, each value must include its own key;
+     * we access these via Comparator, rather than directly. 
+     *
+     * So we can quickly distinguish between leaves and branches, we require that leaf nodes are always an odd number
+     * of elements (padded with a null, if necessary), and branches are always an even number of elements.
+     *
+     * BTrees are immutable; updating one returns a new tree that reuses unmodified nodes.
+     *
+     * There are no references back to a parent node from its children.  (This would make it impossible to re-use
+     * subtrees when modifying the tree, since the modified tree would need new parent references.)
+     * Instead, we store these references in a Path as needed when navigating the tree.
+     */
+
+    // The maximum fan factor used for B-Trees
+    static final int FAN_SHIFT;
+    static
+    {
+<span class="fc" id="L62">        int fanfactor = 32;</span>
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">        if (System.getProperty(&quot;cassandra.btree.fanfactor&quot;) != null)</span>
+<span class="nc" id="L64">            fanfactor = Integer.parseInt(System.getProperty(&quot;cassandra.btree.fanfactor&quot;));</span>
+<span class="fc" id="L65">        int shift = 1;</span>
+<span class="fc bfc" id="L66" title="All 2 branches covered.">        while (1 &lt;&lt; shift &lt; fanfactor)</span>
+<span class="fc" id="L67">            shift += 1;</span>
+<span class="fc" id="L68">        FAN_SHIFT = shift;</span>
+    }
+    // NB we encode Path indexes as Bytes, so this needs to be less than Byte.MAX_VALUE / 2
+<span class="fc" id="L71">    static final int FAN_FACTOR = 1 &lt;&lt; FAN_SHIFT;</span>
+
+<span class="fc" id="L73">    static final int MINIMAL_NODE_SIZE = FAN_FACTOR &gt;&gt; 1;</span>
+
+    // An empty BTree Leaf - which is the same as an empty BTree
+<span class="fc" id="L76">    static final Object[] EMPTY_LEAF = new Object[1];</span>
+
+    // An empty BTree branch - used only for internal purposes in Modifier
+<span class="fc" id="L79">    static final Object[] EMPTY_BRANCH = new Object[] { null, new int[0] };</span>
+
+    // direction of iteration
+<span class="fc" id="L82">    public static enum Dir</span>
+    {
+<span class="fc" id="L84">        ASC, DESC;</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        public Dir invert() { return this == ASC ? DESC : ASC; }</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">        public static Dir asc(boolean asc) { return asc ? ASC : DESC; }</span>
+<span class="pc bpc" id="L87" title="1 of 2 branches missed.">        public static Dir desc(boolean desc) { return desc ? DESC : ASC; }</span>
+    }
+
+    public static Object[] empty()
+    {
+<span class="fc" id="L92">        return EMPTY_LEAF;</span>
+    }
+
+    public static Object[] singleton(Object value)
+    {
+<span class="fc" id="L97">        return new Object[] { value };</span>
+    }
+
+    public static &lt;C, K extends C, V extends C&gt; Object[] build(Collection&lt;K&gt; source, UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="fc" id="L102">        return buildInternal(source, source.size(), updateF);</span>
+    }
+
+    public static &lt;C, K extends C, V extends C&gt; Object[] build(Iterable&lt;K&gt; source, UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="nc" id="L107">        return buildInternal(source, -1, updateF);</span>
+    }
+
+    /**
+     * Creates a BTree containing all of the objects in the provided collection
+     *
+     * @param source  the items to build the tree with. MUST BE IN STRICTLY ASCENDING ORDER.
+     * @param size    the size of the source iterable
+     * @return        a btree representing the contents of the provided iterable
+     */
+    public static &lt;C, K extends C, V extends C&gt; Object[] build(Iterable&lt;K&gt; source, int size, UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">        if (size &lt; 0)</span>
+<span class="nc" id="L120">            throw new IllegalArgumentException(Integer.toString(size));</span>
+<span class="fc" id="L121">        return buildInternal(source, size, updateF);</span>
+    }
+
+    /**
+     * As build(), except:
+     * @param size    &lt; 0 if size is unknown
+     */
+    private static &lt;C, K extends C, V extends C&gt; Object[] buildInternal(Iterable&lt;K&gt; source, int size, UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="fc bfc" id="L130" title="All 6 branches covered.">        if ((size &gt;= 0) &amp; (size &lt; FAN_FACTOR))</span>
+        {
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            if (size == 0)</span>
+<span class="fc" id="L133">                return EMPTY_LEAF;</span>
+            // pad to odd length to match contract that all leaf nodes are odd
+<span class="fc" id="L135">            V[] values = (V[]) new Object[size | 1];</span>
+            {
+<span class="fc" id="L137">                int i = 0;</span>
+<span class="fc bfc" id="L138" title="All 2 branches covered.">                for (K k : source)</span>
+<span class="fc" id="L139">                    values[i++] = updateF.apply(k);</span>
+            }
+<span class="fc bfc" id="L141" title="All 2 branches covered.">            if (updateF != UpdateFunction.noOp())</span>
+<span class="fc" id="L142">                updateF.allocated(ObjectSizes.sizeOfArray(values));</span>
+<span class="fc" id="L143">            return values;</span>
+        }
+
+<span class="fc" id="L146">        TreeBuilder builder = TreeBuilder.newInstance();</span>
+<span class="fc" id="L147">        Object[] btree = builder.build(source, updateF, size);</span>
+
+<span class="fc" id="L149">        return btree;</span>
+    }
+
+    public static &lt;C, K extends C, V extends C&gt; Object[] update(Object[] btree,
+                                                                Comparator&lt;C&gt; comparator,
+                                                                Collection&lt;K&gt; updateWith,
+                                                                UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="fc" id="L157">        return update(btree, comparator, updateWith, updateWith.size(), updateF);</span>
+    }
+
+    /**
+     * Returns a new BTree with the provided collection inserting/replacing as necessary any equal items
+     *
+     * @param btree              the tree to update
+     * @param comparator         the comparator that defines the ordering over the items in the tree
+     * @param updateWith         the items to either insert / update. MUST BE IN STRICTLY ASCENDING ORDER.
+     * @param updateWithLength   then number of elements in updateWith
+     * @param updateF            the update function to apply to any pairs we are swapping, and maybe abort early
+     * @param &lt;V&gt;
+     * @return
+     */
+    public static &lt;C, K extends C, V extends C&gt; Object[] update(Object[] btree,
+                                                                Comparator&lt;C&gt; comparator,
+                                                                Iterable&lt;K&gt; updateWith,
+                                                                int updateWithLength,
+                                                                UpdateFunction&lt;K, V&gt; updateF)
+    {
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if (isEmpty(btree))</span>
+<span class="fc" id="L178">            return build(updateWith, updateWithLength, updateF);</span>
+
+
+<span class="fc" id="L181">        TreeBuilder builder = TreeBuilder.newInstance();</span>
+<span class="fc" id="L182">        btree = builder.update(btree, comparator, updateWith, updateF);</span>
+<span class="fc" id="L183">        return btree;</span>
+    }
+
+    public static &lt;K&gt; Object[] merge(Object[] tree1, Object[] tree2, Comparator&lt;? super K&gt; comparator, UpdateFunction&lt;K, K&gt; updateF)
+    {
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        if (size(tree1) &lt; size(tree2))</span>
+        {
+<span class="fc" id="L190">            Object[] tmp = tree1;</span>
+<span class="fc" id="L191">            tree1 = tree2;</span>
+<span class="fc" id="L192">            tree2 = tmp;</span>
+        }
+<span class="fc" id="L194">        return update(tree1, comparator, new BTreeSet&lt;&gt;(tree2, comparator), updateF);</span>
+    }
+
+    public static &lt;V&gt; Iterator&lt;V&gt; iterator(Object[] btree)
+    {
+<span class="fc" id="L199">        return iterator(btree, Dir.ASC);</span>
+    }
+
+    public static &lt;V&gt; Iterator&lt;V&gt; iterator(Object[] btree, Dir dir)
+    {
+<span class="fc" id="L204">        return new BTreeSearchIterator&lt;&gt;(btree, null, dir);</span>
+    }
+
+    public static &lt;V&gt; Iterator&lt;V&gt; iterator(Object[] btree, int lb, int ub, Dir dir)
+    {
+<span class="fc" id="L209">        return new BTreeSearchIterator&lt;&gt;(btree, null, dir, lb, ub);</span>
+    }
+
+    public static &lt;V&gt; Iterable&lt;V&gt; iterable(Object[] btree)
+    {
+<span class="fc" id="L214">        return iterable(btree, Dir.ASC);</span>
+    }
+
+    public static &lt;V&gt; Iterable&lt;V&gt; iterable(Object[] btree, Dir dir)
+    {
+<span class="fc" id="L219">        return () -&gt; iterator(btree, dir);</span>
+    }
+
+    public static &lt;V&gt; Iterable&lt;V&gt; iterable(Object[] btree, int lb, int ub, Dir dir)
+    {
+<span class="fc" id="L224">        return () -&gt; iterator(btree, lb, ub, dir);</span>
+    }
+
+    /**
+     * Returns an Iterator over the entire tree
+     *
+     * @param btree  the tree to iterate over
+     * @param dir    direction of iteration
+     * @param &lt;V&gt;
+     * @return
+     */
+    public static &lt;K, V&gt; BTreeSearchIterator&lt;K, V&gt; slice(Object[] btree, Comparator&lt;? super K&gt; comparator, Dir dir)
+    {
+<span class="fc" id="L237">        return new BTreeSearchIterator&lt;&gt;(btree, comparator, dir);</span>
+    }
+
+    /**
+     * @param btree      the tree to iterate over
+     * @param comparator the comparator that defines the ordering over the items in the tree
+     * @param start      the beginning of the range to return, inclusive (in ascending order)
+     * @param end        the end of the range to return, exclusive (in ascending order)
+     * @param dir   if false, the iterator will start at the last item and move backwards
+     * @return           an Iterator over the defined sub-range of the tree
+     */
+    public static &lt;K, V extends K&gt; BTreeSearchIterator&lt;K, V&gt; slice(Object[] btree, Comparator&lt;? super K&gt; comparator, K start, K end, Dir dir)
+    {
+<span class="nc" id="L250">        return slice(btree, comparator, start, true, end, false, dir);</span>
+    }
+
+    /**
+     * @param btree          the tree to iterate over
+     * @param comparator     the comparator that defines the ordering over the items in the tree
+     * @param start          low bound of the range
+     * @param startInclusive inclusivity of lower bound
+     * @param end            high bound of the range
+     * @param endInclusive   inclusivity of higher bound
+     * @param dir            direction of iteration
+     * @return               an Iterator over the defined sub-range of the tree
+     */
+    public static &lt;K, V extends K&gt; BTreeSearchIterator&lt;K, V&gt; slice(Object[] btree, Comparator&lt;? super K&gt; comparator, K start, boolean startInclusive, K end, boolean endInclusive, Dir dir)
+    {
+<span class="pc bpc" id="L265" title="3 of 4 branches missed.">        int inclusiveLowerBound = max(0,</span>
+                                      start == null ? Integer.MIN_VALUE
+<span class="nc" id="L267">                                                    : startInclusive ? ceilIndex(btree, comparator, start)</span>
+<span class="nc" id="L268">                                                                     : higherIndex(btree, comparator, start));</span>
+<span class="pc bpc" id="L269" title="3 of 4 branches missed.">        int inclusiveUpperBound = min(size(btree) - 1,</span>
+                                      end == null ? Integer.MAX_VALUE
+<span class="nc" id="L271">                                                  : endInclusive ? floorIndex(btree, comparator, end)</span>
+<span class="nc" id="L272">                                                                 : lowerIndex(btree, comparator, end));</span>
+<span class="fc" id="L273">        return new BTreeSearchIterator&lt;&gt;(btree, comparator, dir, inclusiveLowerBound, inclusiveUpperBound);</span>
+    }
+
+    /**
+     * @return the item in the tree that sorts as equal to the search argument, or null if no such item
+     */
+    public static &lt;V&gt; V find(Object[] node, Comparator&lt;? super V&gt; comparator, V find)
+    {
+        while (true)
+        {
+<span class="fc" id="L283">            int keyEnd = getKeyEnd(node);</span>
+<span class="fc" id="L284">            int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);</span>
+
+<span class="fc bfc" id="L286" title="All 2 branches covered.">            if (i &gt;= 0)</span>
+<span class="fc" id="L287">                return (V) node[i];</span>
+
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">            if (isLeaf(node))</span>
+<span class="fc" id="L290">                return null;</span>
+
+<span class="nc" id="L292">            i = -1 - i;</span>
+<span class="nc" id="L293">            node = (Object[]) node[keyEnd + i];</span>
+<span class="nc" id="L294">        }</span>
+    }
+
+    /**
+     * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+     * Finds and replaces the item provided by index in the tree.
+     */
+    public static &lt;V&gt; void replaceInSitu(Object[] tree, int index, V replace)
+    {
+        // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+<span class="nc bnc" id="L304" title="All 6 branches missed.">        if ((index &lt; 0) | (index &gt;= size(tree)))</span>
+<span class="nc" id="L305">            throw new IndexOutOfBoundsException(index + &quot; not in range [0..&quot; + size(tree) + &quot;)&quot;);</span>
+
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        while (!isLeaf(tree))</span>
+        {
+<span class="nc" id="L309">            final int[] sizeMap = getSizeMap(tree);</span>
+<span class="nc" id="L310">            int boundary = Arrays.binarySearch(sizeMap, index);</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (boundary &gt;= 0)</span>
+            {
+                // exact match, in this branch node
+<span class="nc bnc" id="L314" title="All 4 branches missed.">                assert boundary &lt; sizeMap.length - 1;</span>
+<span class="nc" id="L315">                tree[boundary] = replace;</span>
+<span class="nc" id="L316">                return;</span>
+            }
+
+<span class="nc" id="L319">            boundary = -1 -boundary;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            if (boundary &gt; 0)</span>
+            {
+<span class="nc bnc" id="L322" title="All 4 branches missed.">                assert boundary &lt; sizeMap.length;</span>
+<span class="nc" id="L323">                index -= (1 + sizeMap[boundary - 1]);</span>
+            }
+<span class="nc" id="L325">            tree = (Object[]) tree[getChildStart(tree) + boundary];</span>
+<span class="nc" id="L326">        }</span>
+<span class="nc bnc" id="L327" title="All 4 branches missed.">        assert index &lt; getLeafKeyEnd(tree);</span>
+<span class="nc" id="L328">        tree[index] = replace;</span>
+<span class="nc" id="L329">    }</span>
+
+    /**
+     * Modifies the provided btree directly. THIS SHOULD NOT BE USED WITHOUT EXTREME CARE as BTrees are meant to be immutable.
+     * Finds and replaces the provided item in the tree. Both should sort as equal to each other (although this is not enforced)
+     */
+    public static &lt;V&gt; void replaceInSitu(Object[] node, Comparator&lt;? super V&gt; comparator, V find, V replace)
+    {
+        while (true)
+        {
+<span class="nc" id="L339">            int keyEnd = getKeyEnd(node);</span>
+<span class="nc" id="L340">            int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);</span>
+
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (i &gt;= 0)</span>
+            {
+<span class="nc bnc" id="L344" title="All 4 branches missed.">                assert find == node[i];</span>
+<span class="nc" id="L345">                node[i] = replace;</span>
+<span class="nc" id="L346">                return;</span>
+            }
+
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            if (isLeaf(node))</span>
+<span class="nc" id="L350">                throw new NoSuchElementException();</span>
+
+<span class="nc" id="L352">            i = -1 - i;</span>
+<span class="nc" id="L353">            node = (Object[]) node[keyEnd + i];</span>
+<span class="nc" id="L354">        }</span>
+    }
+
+    /**
+     * Honours result semantics of {@link Arrays#binarySearch}, as though it were performed on the tree flattened into an array
+     * @return index of item in tree, or &lt;tt&gt;(-(&lt;i&gt;insertion point&lt;/i&gt;) - 1)&lt;/tt&gt; if not present
+     */
+    public static &lt;V&gt; int findIndex(Object[] node, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="fc" id="L363">        int lb = 0;</span>
+        while (true)
+        {
+<span class="fc" id="L366">            int keyEnd = getKeyEnd(node);</span>
+<span class="fc" id="L367">            int i = Arrays.binarySearch((V[]) node, 0, keyEnd, find, comparator);</span>
+<span class="fc bfc" id="L368" title="All 2 branches covered.">            boolean exact = i &gt;= 0;</span>
+
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">            if (isLeaf(node))</span>
+<span class="fc bfc" id="L371" title="All 2 branches covered.">                return exact ? lb + i : i - lb;</span>
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            if (!exact)</span>
+<span class="nc" id="L374">                i = -1 - i;</span>
+
+<span class="nc" id="L376">            int[] sizeMap = getSizeMap(node);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (exact)</span>
+<span class="nc" id="L378">                return lb + sizeMap[i];</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            else if (i &gt; 0)</span>
+<span class="nc" id="L380">                lb += sizeMap[i - 1] + 1;</span>
+
+<span class="nc" id="L382">            node = (Object[]) node[keyEnd + i];</span>
+<span class="nc" id="L383">        }</span>
+    }
+
+    /**
+     * @return the value at the index'th position in the tree, in tree order
+     */
+    public static &lt;V&gt; V findByIndex(Object[] tree, int index)
+    {
+        // WARNING: if semantics change, see also InternalCursor.seekTo, which mirrors this implementation
+<span class="pc bpc" id="L392" title="3 of 6 branches missed.">        if ((index &lt; 0) | (index &gt;= size(tree)))</span>
+<span class="nc" id="L393">            throw new IndexOutOfBoundsException(index + &quot; not in range [0..&quot; + size(tree) + &quot;)&quot;);</span>
+
+<span class="fc" id="L395">        Object[] node = tree;</span>
+        while (true)
+        {
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">            if (isLeaf(node))</span>
+            {
+<span class="fc" id="L400">                int keyEnd = getLeafKeyEnd(node);</span>
+<span class="pc bpc" id="L401" title="2 of 4 branches missed.">                assert index &lt; keyEnd;</span>
+<span class="fc" id="L402">                return (V) node[index];</span>
+            }
+
+<span class="nc" id="L405">            int[] sizeMap = getSizeMap(node);</span>
+<span class="nc" id="L406">            int boundary = Arrays.binarySearch(sizeMap, index);</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if (boundary &gt;= 0)</span>
+            {
+                // exact match, in this branch node
+<span class="nc bnc" id="L410" title="All 4 branches missed.">                assert boundary &lt; sizeMap.length - 1;</span>
+<span class="nc" id="L411">                return (V) node[boundary];</span>
+            }
+
+<span class="nc" id="L414">            boundary = -1 -boundary;</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (boundary &gt; 0)</span>
+            {
+<span class="nc bnc" id="L417" title="All 4 branches missed.">                assert boundary &lt; sizeMap.length;</span>
+<span class="nc" id="L418">                index -= (1 + sizeMap[boundary - 1]);</span>
+            }
+<span class="nc" id="L420">            node = (Object[]) node[getChildStart(node) + boundary];</span>
+<span class="nc" id="L421">        }</span>
+    }
+
+    /* since we have access to binarySearch semantics within indexOf(), we can use this to implement
+     * lower/upper/floor/higher very trivially
+     *
+     * this implementation is *not* optimal; it requires two logarithmic traversals, although the second is much cheaper
+     * (having less height, and operating over only primitive arrays), and the clarity is compelling
+     */
+
+    public static &lt;V&gt; int lowerIndex(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L433">        int i = findIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        if (i &lt; 0)</span>
+<span class="nc" id="L435">            i = -1 -i;</span>
+<span class="nc" id="L436">        return i - 1;</span>
+    }
+
+    public static &lt;V&gt; V lower(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L441">        int i = lowerIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        return i &gt;= 0 ? findByIndex(btree, i) : null;</span>
+    }
+
+    public static &lt;V&gt; int floorIndex(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L447">        int i = findIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (i &lt; 0)</span>
+<span class="nc" id="L449">            i = -2 -i;</span>
+<span class="nc" id="L450">        return i;</span>
+    }
+
+    public static &lt;V&gt; V floor(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L455">        int i = floorIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        return i &gt;= 0 ? findByIndex(btree, i) : null;</span>
+    }
+
+    public static &lt;V&gt; int higherIndex(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L461">        int i = findIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (i &lt; 0) i = -1 -i;</span>
+<span class="nc" id="L463">        else i++;</span>
+<span class="nc" id="L464">        return i;</span>
+    }
+
+    public static &lt;V&gt; V higher(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L469">        int i = higherIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        return i &lt; size(btree) ? findByIndex(btree, i) : null;</span>
+    }
+
+    public static &lt;V&gt; int ceilIndex(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="fc" id="L475">        int i = findIndex(btree, comparator, find);</span>
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">        if (i &lt; 0)</span>
+<span class="fc" id="L477">            i = -1 -i;</span>
+<span class="fc" id="L478">        return i;</span>
+    }
+
+    public static &lt;V&gt; V ceil(Object[] btree, Comparator&lt;? super V&gt; comparator, V find)
+    {
+<span class="nc" id="L483">        int i = ceilIndex(btree, comparator, find);</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        return i &lt; size(btree) ? findByIndex(btree, i) : null;</span>
+    }
+
+    // UTILITY METHODS
+
+    // get the upper bound we should search in for keys in the node
+    static int getKeyEnd(Object[] node)
+    {
+<span class="fc bfc" id="L492" title="All 2 branches covered.">        if (isLeaf(node))</span>
+<span class="fc" id="L493">            return getLeafKeyEnd(node);</span>
+        else
+<span class="fc" id="L495">            return getBranchKeyEnd(node);</span>
+    }
+
+    // get the last index that is non-null in the leaf node
+    static int getLeafKeyEnd(Object[] node)
+    {
+<span class="fc" id="L501">        int len = node.length;</span>
+<span class="fc bfc" id="L502" title="All 2 branches covered.">        return node[len - 1] == null ? len - 1 : len;</span>
+    }
+
+    // return the boundary position between keys/children for the branch node
+    // == number of keys, as they are indexed from zero
+    static int getBranchKeyEnd(Object[] branchNode)
+    {
+<span class="fc" id="L509">        return (branchNode.length / 2) - 1;</span>
+    }
+
+    /**
+     * @return first index in a branch node containing child nodes
+     */
+    static int getChildStart(Object[] branchNode)
+    {
+<span class="fc" id="L517">        return getBranchKeyEnd(branchNode);</span>
+    }
+
+    /**
+     * @return last index + 1 in a branch node containing child nodes
+     */
+    static int getChildEnd(Object[] branchNode)
+    {
+<span class="fc" id="L525">        return branchNode.length - 1;</span>
+    }
+
+    /**
+     * @return number of children in a branch node
+     */
+    static int getChildCount(Object[] branchNode)
+    {
+<span class="nc" id="L533">        return branchNode.length / 2;</span>
+    }
+
+    /**
+     * @return the size map for the branch node
+     */
+    static int[] getSizeMap(Object[] branchNode)
+    {
+<span class="fc" id="L541">        return (int[]) branchNode[getChildEnd(branchNode)];</span>
+    }
+
+    /**
+     * @return the size map for the branch node
+     */
+    static int lookupSizeMap(Object[] branchNode, int index)
+    {
+<span class="fc" id="L549">        return getSizeMap(branchNode)[index];</span>
+    }
+
+    // get the size from the btree's index (fails if not present)
+    public static int size(Object[] tree)
+    {
+<span class="fc bfc" id="L555" title="All 2 branches covered.">        if (isLeaf(tree))</span>
+<span class="fc" id="L556">            return getLeafKeyEnd(tree);</span>
+<span class="fc" id="L557">        int length = tree.length;</span>
+        // length - 1 == getChildEnd == getPositionOfSizeMap
+        // (length / 2) - 1 == getChildCount - 1 == position of full tree size
+        // hard code this, as will be used often;
+<span class="fc" id="L561">        return ((int[]) tree[length - 1])[(length / 2) - 1];</span>
+    }
+
+    public static long sizeOfStructureOnHeap(Object[] tree)
+    {
+<span class="fc" id="L566">        long size = ObjectSizes.sizeOfArray(tree);</span>
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">        if (isLeaf(tree))</span>
+<span class="fc" id="L568">            return size;</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        for (int i = getChildStart(tree) ; i &lt; getChildEnd(tree) ; i++)</span>
+<span class="nc" id="L570">            size += sizeOfStructureOnHeap((Object[]) tree[i]);</span>
+<span class="nc" id="L571">        return size;</span>
+    }
+
+    // returns true if the provided node is a leaf, false if it is a branch
+    static boolean isLeaf(Object[] node)
+    {
+<span class="fc bfc" id="L577" title="All 2 branches covered.">        return (node.length &amp; 1) == 1;</span>
+    }
+
+    public static boolean isEmpty(Object[] tree)
+    {
+<span class="fc bfc" id="L582" title="All 2 branches covered.">        return tree == EMPTY_LEAF;</span>
+    }
+
+    public static int depth(Object[] tree)
+    {
+<span class="nc" id="L587">        int depth = 1;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        while (!isLeaf(tree))</span>
+        {
+<span class="nc" id="L590">            depth++;</span>
+<span class="nc" id="L591">            tree = (Object[]) tree[getKeyEnd(tree)];</span>
+        }
+<span class="nc" id="L593">        return depth;</span>
+    }
+
+    /**
+     * Fill the target array with the contents of the provided subtree, in ascending order, starting at targetOffset
+     * @param tree source
+     * @param target array
+     * @param targetOffset offset in target array
+     * @return number of items copied (size of tree)
+     */
+    public static int toArray(Object[] tree, Object[] target, int targetOffset)
+    {
+<span class="fc" id="L605">        return toArray(tree, 0, size(tree), target, targetOffset);</span>
+    }
+    public static int toArray(Object[] tree, int treeStart, int treeEnd, Object[] target, int targetOffset)
+    {
+<span class="pc bpc" id="L609" title="1 of 2 branches missed.">        if (isLeaf(tree))</span>
+        {
+<span class="fc" id="L611">            int count = treeEnd - treeStart;</span>
+<span class="fc" id="L612">            System.arraycopy(tree, treeStart, target, targetOffset, count);</span>
+<span class="fc" id="L613">            return count;</span>
+        }
+
+<span class="nc" id="L616">        int newTargetOffset = targetOffset;</span>
+<span class="nc" id="L617">        int childCount = getChildCount(tree);</span>
+<span class="nc" id="L618">        int childOffset = getChildStart(tree);</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        for (int i = 0 ; i &lt; childCount ; i++)</span>
+        {
+<span class="nc" id="L621">            int childStart = treeIndexOffsetOfChild(tree, i);</span>
+<span class="nc" id="L622">            int childEnd = treeIndexOfBranchKey(tree, i);</span>
+<span class="nc bnc" id="L623" title="All 4 branches missed.">            if (childStart &lt;= treeEnd &amp;&amp; childEnd &gt;= treeStart)</span>
+            {
+<span class="nc" id="L625">                newTargetOffset += toArray((Object[]) tree[childOffset + i], max(0, treeStart - childStart), min(childEnd, treeEnd) - childStart,</span>
+                                           target, newTargetOffset);
+<span class="nc bnc" id="L627" title="All 4 branches missed.">                if (treeStart &lt;= childEnd &amp;&amp; treeEnd &gt; childEnd) // this check will always fail for the non-existent key</span>
+<span class="nc" id="L628">                    target[newTargetOffset++] = tree[i];</span>
+            }
+        }
+<span class="nc" id="L631">        return newTargetOffset - targetOffset;</span>
+    }
+
+    // simple class for avoiding duplicate transformation work
+    private static class FiltrationTracker&lt;V&gt; implements Function&lt;V, V&gt;
+    {
+        final Function&lt;? super V, ? extends V&gt; wrapped;
+        int index;
+        boolean failed;
+
+        private FiltrationTracker(Function&lt;? super V, ? extends V&gt; wrapped)
+<span class="fc" id="L642">        {</span>
+<span class="fc" id="L643">            this.wrapped = wrapped;</span>
+<span class="fc" id="L644">        }</span>
+
+        public V apply(V i)
+        {
+<span class="fc" id="L648">            V o = wrapped.apply(i);</span>
+<span class="fc bfc" id="L649" title="All 2 branches covered.">            if (o != null) index++;</span>
+<span class="fc" id="L650">            else failed = true;</span>
+<span class="fc" id="L651">            return o;</span>
+        }
+    }
+
+    /**
+     * Takes a btree and transforms it using the provided function, filtering out any null results.
+     * The result of any transformation must sort identically wrt the other results as their originals
+     */
+    public static &lt;V&gt; Object[] transformAndFilter(Object[] btree, Function&lt;? super V, ? extends V&gt; function)
+    {
+<span class="pc bpc" id="L661" title="1 of 2 branches missed.">        if (isEmpty(btree))</span>
+<span class="nc" id="L662">            return btree;</span>
+
+        // TODO: can be made more efficient
+<span class="fc" id="L665">        FiltrationTracker&lt;V&gt; wrapped = new FiltrationTracker&lt;&gt;(function);</span>
+<span class="fc" id="L666">        Object[] result = transformAndFilter(btree, wrapped);</span>
+<span class="fc bfc" id="L667" title="All 2 branches covered.">        if (!wrapped.failed)</span>
+<span class="fc" id="L668">            return result;</span>
+
+        // take the already transformed bits from the head of the partial result
+<span class="fc" id="L671">        Iterable&lt;V&gt; head = iterable(result, 0, wrapped.index - 1, Dir.ASC);</span>
+        // and concatenate with remainder of original tree, with transformation applied
+<span class="fc" id="L673">        Iterable&lt;V&gt; remainder = iterable(btree, wrapped.index + 1, size(btree) - 1, Dir.ASC);</span>
+<span class="fc bfc" id="L674" title="All 2 branches covered.">        remainder = filter(transform(remainder, function), (x) -&gt; x != null);</span>
+<span class="fc" id="L675">        Iterable&lt;V&gt; build = concat(head, remainder);</span>
+
+<span class="fc" id="L677">        return buildInternal(build, -1, UpdateFunction.&lt;V&gt;noOp());</span>
+    }
+
+    private static &lt;V&gt; Object[] transformAndFilter(Object[] btree, FiltrationTracker&lt;V&gt; function)
+    {
+<span class="fc" id="L682">        Object[] result = btree;</span>
+<span class="fc" id="L683">        boolean isLeaf = isLeaf(btree);</span>
+<span class="pc bpc" id="L684" title="1 of 2 branches missed.">        int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);</span>
+<span class="pc bpc" id="L685" title="1 of 2 branches missed.">        int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;</span>
+<span class="fc bfc" id="L686" title="All 2 branches covered.">        for (int i = 0 ; i &lt; limit ; i++)</span>
+        {
+            // we want to visit in iteration order, so we visit our key nodes inbetween our children
+<span class="pc bpc" id="L689" title="3 of 4 branches missed.">            int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);</span>
+<span class="fc" id="L690">            Object current = btree[idx];</span>
+<span class="pc bpc" id="L691" title="1 of 2 branches missed.">            Object updated = idx &lt; childOffset ? function.apply((V) current) : transformAndFilter((Object[]) current, function);</span>
+<span class="fc bfc" id="L692" title="All 2 branches covered.">            if (updated != current)</span>
+            {
+<span class="fc bfc" id="L694" title="All 2 branches covered.">                if (result == btree)</span>
+<span class="fc" id="L695">                    result = btree.clone();</span>
+<span class="fc" id="L696">                result[idx] = updated;</span>
+            }
+<span class="fc bfc" id="L698" title="All 2 branches covered.">            if (function.failed)</span>
+<span class="fc" id="L699">                return result;</span>
+        }
+<span class="fc" id="L701">        return result;</span>
+    }
+
+    public static boolean equals(Object[] a, Object[] b)
+    {
+<span class="nc bnc" id="L706" title="All 4 branches missed.">        return size(a) == size(b) &amp;&amp; Iterators.elementsEqual(iterator(a), iterator(b));</span>
+    }
+
+    public static int hashCode(Object[] btree)
+    {
+        // we can't just delegate to Arrays.deepHashCode(),
+        // because two equivalent trees may be represented by differently shaped trees
+<span class="fc" id="L713">        int result = 1;</span>
+<span class="fc bfc" id="L714" title="All 2 branches covered.">        for (Object v : iterable(btree))</span>
+<span class="fc" id="L715">            result = 31 * result + Objects.hashCode(v);</span>
+<span class="fc" id="L716">        return result;</span>
+
+    }
+
+    /**
+     * tree index =&gt; index of key wrt all items in the tree laid out serially
+     *
+     * This version of the method permits requesting out-of-bounds indexes, -1 and size
+     * @param root to calculate tree index within
+     * @param keyIndex root-local index of key to calculate tree-index
+     * @return the number of items preceding the key in the whole tree of root
+     */
+    public static int treeIndexOfKey(Object[] root, int keyIndex)
+    {
+<span class="fc bfc" id="L730" title="All 2 branches covered.">        if (isLeaf(root))</span>
+<span class="fc" id="L731">            return keyIndex;</span>
+<span class="fc" id="L732">        int[] sizeMap = getSizeMap(root);</span>
+<span class="pc bpc" id="L733" title="3 of 6 branches missed.">        if ((keyIndex &gt;= 0) &amp; (keyIndex &lt; sizeMap.length))</span>
+<span class="fc" id="L734">            return sizeMap[keyIndex];</span>
+        // we support asking for -1 or size, so that we can easily use this for iterator bounds checking
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        if (keyIndex &lt; 0)</span>
+<span class="nc" id="L737">            return -1;</span>
+<span class="nc" id="L738">        return sizeMap[keyIndex - 1] + 1;</span>
+    }
+
+    /**
+     * @param keyIndex node-local index of the key to calculate index of
+     * @return keyIndex; this method is here only for symmetry and clarity
+     */
+    public static int treeIndexOfLeafKey(int keyIndex)
+    {
+<span class="fc" id="L747">        return keyIndex;</span>
+    }
+
+    /**
+     * @param root to calculate tree-index within
+     * @param keyIndex root-local index of key to calculate tree-index of
+     * @return the number of items preceding the key in the whole tree of root
+     */
+    public static int treeIndexOfBranchKey(Object[] root, int keyIndex)
+    {
+<span class="nc" id="L757">        return lookupSizeMap(root, keyIndex);</span>
+    }
+
+    /**
+     * @param root to calculate tree-index within
+     * @param childIndex root-local index of *child* to calculate tree-index of
+     * @return the number of items preceding the child in the whole tree of root
+     */
+    public static int treeIndexOffsetOfChild(Object[] root, int childIndex)
+    {
+<span class="fc bfc" id="L767" title="All 2 branches covered.">        if (childIndex == 0)</span>
+<span class="fc" id="L768">            return 0;</span>
+<span class="fc" id="L769">        return 1 + lookupSizeMap(root, childIndex - 1);</span>
+    }
+
+    public static &lt;V&gt; Builder&lt;V&gt; builder(Comparator&lt;? super V&gt; comparator)
+    {
+<span class="fc" id="L774">        return new Builder&lt;&gt;(comparator);</span>
+    }
+
+    public static &lt;V&gt; Builder&lt;V&gt; builder(Comparator&lt;? super V&gt; comparator, int initialCapacity)
+    {
+<span class="fc" id="L779">        return new Builder&lt;&gt;(comparator, initialCapacity);</span>
+    }
+
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">    public static class Builder&lt;V&gt;</span>
+    {
+        // a user-defined bulk resolution, to be applied manually via resolve()
+        public static interface Resolver
+        {
+            // can return a different output type to input, so long as sort order is maintained
+            // if a resolver is present, this method will be called for every sequence of equal inputs
+            // even those with only one item
+            Object resolve(Object[] array, int lb, int ub);
+        }
+
+        // a user-defined resolver that is applied automatically on encountering two duplicate values
+        public static interface QuickResolver&lt;V&gt;
+        {
+            // can return a different output type to input, so long as sort order is maintained
+            // if a resolver is present, this method will be called for every sequence of equal inputs
+            // even those with only one item
+            V resolve(V a, V b);
+        }
+
+        Comparator&lt;? super V&gt; comparator;
+        Object[] values;
+        int count;
+<span class="pc" id="L805">        boolean detected = true; // true if we have managed to cheaply ensure sorted (+ filtered, if resolver == null) as we have added</span>
+<span class="pc" id="L806">        boolean auto = true; // false if the user has promised to enforce the sort order and resolve any duplicates</span>
+        QuickResolver&lt;V&gt; quickResolver;
+
+        protected Builder(Comparator&lt;? super V&gt; comparator)
+        {
+<span class="fc" id="L811">            this(comparator, 16);</span>
+<span class="fc" id="L812">        }</span>
+
+        protected Builder(Comparator&lt;? super V&gt; comparator, int initialCapacity)
+<span class="fc" id="L815">        {</span>
+<span class="pc bpc" id="L816" title="1 of 2 branches missed.">            if (initialCapacity == 0)</span>
+<span class="nc" id="L817">                initialCapacity = 16;</span>
+<span class="fc" id="L818">            this.comparator = comparator;</span>
+<span class="fc" id="L819">            this.values = new Object[initialCapacity];</span>
+<span class="fc" id="L820">        }</span>
+
+        @VisibleForTesting
+        public Builder()
+<span class="nc" id="L824">        {</span>
+<span class="nc" id="L825">            this.values = new Object[16];</span>
+<span class="nc" id="L826">        }</span>
+
+        private Builder(Builder&lt;V&gt; builder)
+<span class="nc" id="L829">        {</span>
+<span class="nc" id="L830">            this.comparator = builder.comparator;</span>
+<span class="nc" id="L831">            this.values = Arrays.copyOf(builder.values, builder.values.length);</span>
+<span class="nc" id="L832">            this.count = builder.count;</span>
+<span class="nc" id="L833">            this.detected = builder.detected;</span>
+<span class="nc" id="L834">            this.auto = builder.auto;</span>
+<span class="nc" id="L835">            this.quickResolver = builder.quickResolver;</span>
+<span class="nc" id="L836">        }</span>
+
+        /**
+         * Creates a copy of this {@code Builder}.
+         * @return a copy of this {@code Builder}.
+         */
+        public Builder&lt;V&gt; copy()
+        {
+<span class="nc" id="L844">            return new Builder&lt;&gt;(this);</span>
+        }
+
+        public Builder&lt;V&gt; setQuickResolver(QuickResolver&lt;V&gt; quickResolver)
+        {
+<span class="fc" id="L849">            this.quickResolver = quickResolver;</span>
+<span class="fc" id="L850">            return this;</span>
+        }
+
+        public void reuse()
+        {
+<span class="fc" id="L855">            reuse(comparator);</span>
+<span class="fc" id="L856">        }</span>
+
+        public void reuse(Comparator&lt;? super V&gt; comparator)
+        {
+<span class="fc" id="L860">            this.comparator = comparator;</span>
+<span class="fc" id="L861">            Arrays.fill(values, null);</span>
+<span class="fc" id="L862">            count = 0;</span>
+<span class="fc" id="L863">            detected = true;</span>
+<span class="fc" id="L864">        }</span>
+
+        public Builder&lt;V&gt; auto(boolean auto)
+        {
+<span class="fc" id="L868">            this.auto = auto;</span>
+<span class="fc" id="L869">            return this;</span>
+        }
+
+        public Builder&lt;V&gt; add(V v)
+        {
+<span class="fc bfc" id="L874" title="All 2 branches covered.">            if (count == values.length)</span>
+<span class="fc" id="L875">                values = Arrays.copyOf(values, count * 2);</span>
+
+<span class="fc" id="L877">            Object[] values = this.values;</span>
+<span class="fc" id="L878">            int prevCount = this.count++;</span>
+<span class="fc" id="L879">            values[prevCount] = v;</span>
+
+<span class="fc bfc" id="L881" title="All 6 branches covered.">            if (auto &amp;&amp; detected &amp;&amp; prevCount &gt; 0)</span>
+            {
+<span class="fc" id="L883">                V prev = (V) values[prevCount - 1];</span>
+<span class="fc" id="L884">                int c = comparator.compare(prev, v);</span>
+<span class="pc bpc" id="L885" title="1 of 4 branches missed.">                if (c == 0 &amp;&amp; auto)</span>
+                {
+<span class="fc" id="L887">                    count = prevCount;</span>
+<span class="pc bpc" id="L888" title="1 of 2 branches missed.">                    if (quickResolver != null)</span>
+<span class="nc" id="L889">                        values[prevCount - 1] = quickResolver.resolve(prev, v);</span>
+                }
+<span class="fc bfc" id="L891" title="All 2 branches covered.">                else if (c &gt; 0)</span>
+                {
+<span class="fc" id="L893">                    detected = false;</span>
+                }
+            }
+
+<span class="fc" id="L897">            return this;</span>
+        }
+
+        public Builder&lt;V&gt; addAll(Collection&lt;V&gt; add)
+        {
+<span class="pc bpc" id="L902" title="3 of 6 branches missed.">            if (auto &amp;&amp; add instanceof SortedSet &amp;&amp; equalComparators(comparator, ((SortedSet) add).comparator()))</span>
+            {
+                // if we're a SortedSet, permit quick order-preserving addition of items
+                // if we collect all duplicates, don't bother as merge will necessarily be more expensive than sorting at end
+<span class="fc" id="L906">                return mergeAll(add, add.size());</span>
+            }
+<span class="nc" id="L908">            detected = false;</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if (values.length &lt; count + add.size())</span>
+<span class="nc" id="L910">                values = Arrays.copyOf(values, max(count + add.size(), count * 2));</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">            for (V v : add)</span>
+<span class="nc" id="L912">                values[count++] = v;</span>
+<span class="nc" id="L913">            return this;</span>
+        }
+
+        private static boolean equalComparators(Comparator&lt;?&gt; a, Comparator&lt;?&gt; b)
+        {
+<span class="pc bpc" id="L918" title="5 of 6 branches missed.">            return a == b || (isNaturalComparator(a) &amp;&amp; isNaturalComparator(b));</span>
+        }
+
+        private static boolean isNaturalComparator(Comparator&lt;?&gt; a)
+        {
+<span class="nc bnc" id="L923" title="All 6 branches missed.">            return a == null || a == Comparator.naturalOrder() || a == Ordering.natural();</span>
+        }
+
+        // iter must be in sorted order!
+        private Builder&lt;V&gt; mergeAll(Iterable&lt;V&gt; add, int addCount)
+        {
+<span class="pc bpc" id="L929" title="2 of 4 branches missed.">            assert auto;</span>
+            // ensure the existing contents are in order
+<span class="fc" id="L931">            autoEnforce();</span>
+
+<span class="fc" id="L933">            int curCount = count;</span>
+            // we make room for curCount * 2 + addCount, so that we can copy the current values to the end
+            // if necessary for continuing the merge, and have the new values directly after the current value range
+<span class="fc bfc" id="L936" title="All 2 branches covered.">            if (values.length &lt; curCount * 2 + addCount)</span>
+<span class="fc" id="L937">                values = Arrays.copyOf(values, max(curCount * 2 + addCount, curCount * 3));</span>
+
+<span class="pc bpc" id="L939" title="1 of 2 branches missed.">            if (add instanceof BTreeSet)</span>
+            {
+                // use btree set's fast toArray method, to append directly
+<span class="fc" id="L942">                ((BTreeSet) add).toArray(values, curCount);</span>
+            }
+            else
+            {
+                // consider calling toArray() and System.arraycopy
+<span class="nc" id="L947">                int i = curCount;</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                for (V v : add)</span>
+<span class="nc" id="L949">                    values[i++] = v;</span>
+            }
+<span class="fc" id="L951">            return mergeAll(addCount);</span>
+        }
+
+        private Builder&lt;V&gt; mergeAll(int addCount)
+        {
+<span class="fc" id="L956">            Object[] a = values;</span>
+<span class="fc" id="L957">            int addOffset = count;</span>
+
+<span class="fc" id="L959">            int i = 0, j = addOffset;</span>
+<span class="fc" id="L960">            int curEnd = addOffset, addEnd = addOffset + addCount;</span>
+
+            // save time in cases where we already have a subset, by skipping dir
+<span class="pc bpc" id="L963" title="3 of 4 branches missed.">            while (i &lt; curEnd &amp;&amp; j &lt; addEnd)</span>
+            {
+<span class="nc" id="L965">                V ai = (V) a[i], aj = (V) a[j];</span>
+                // in some cases, such as Columns, we may have identity supersets, so perform a cheap object-identity check
+<span class="nc bnc" id="L967" title="All 2 branches missed.">                int c = ai == aj ? 0 : comparator.compare(ai, aj);</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">                if (c &gt; 0)</span>
+<span class="nc" id="L969">                    break;</span>
+<span class="nc bnc" id="L970" title="All 2 branches missed.">                else if (c == 0)</span>
+                {
+<span class="nc bnc" id="L972" title="All 2 branches missed.">                    if (quickResolver != null)</span>
+<span class="nc" id="L973">                        a[i] = quickResolver.resolve(ai, aj);</span>
+<span class="nc" id="L974">                    j++;</span>
+                }
+<span class="nc" id="L976">                i++;</span>
+<span class="nc" id="L977">            }</span>
+
+<span class="pc bpc" id="L979" title="1 of 2 branches missed.">            if (j == addEnd)</span>
+<span class="nc" id="L980">                return this; // already a superset of the new values</span>
+
+            // otherwise, copy the remaining existing values to the very end, freeing up space for merge result
+<span class="fc" id="L983">            int newCount = i;</span>
+<span class="fc" id="L984">            System.arraycopy(a, i, a, addEnd, count - i);</span>
+<span class="fc" id="L985">            curEnd = addEnd + (count - i);</span>
+<span class="fc" id="L986">            i = addEnd;</span>
+
+<span class="pc bpc" id="L988" title="3 of 4 branches missed.">            while (i &lt; curEnd &amp;&amp; j &lt; addEnd)</span>
+            {
+<span class="nc" id="L990">                V ai = (V) a[i];</span>
+<span class="nc" id="L991">                V aj = (V) a[j];</span>
+                // could avoid one comparison if we cared, but would make this ugly
+<span class="nc" id="L993">                int c = comparator.compare(ai, aj);</span>
+<span class="nc bnc" id="L994" title="All 2 branches missed.">                if (c == 0)</span>
+                {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">                    Object newValue = quickResolver == null ? ai : quickResolver.resolve(ai, aj);</span>
+<span class="nc" id="L997">                    a[newCount++] = newValue;</span>
+<span class="nc" id="L998">                    i++;</span>
+<span class="nc" id="L999">                    j++;</span>
+<span class="nc" id="L1000">                }</span>
+                else
+                {
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">                    a[newCount++] =  c &lt; 0 ? a[i++] : a[j++];</span>
+                }
+<span class="nc" id="L1005">            }</span>
+
+            // exhausted one of the inputs; fill in remainder of the other
+<span class="pc bpc" id="L1008" title="1 of 2 branches missed.">            if (i &lt; curEnd)</span>
+            {
+<span class="nc" id="L1010">                System.arraycopy(a, i, a, newCount, curEnd - i);</span>
+<span class="nc" id="L1011">                newCount += curEnd - i;</span>
+            }
+<span class="pc bpc" id="L1013" title="1 of 2 branches missed.">            else if (j &lt; addEnd)</span>
+            {
+<span class="pc bpc" id="L1015" title="1 of 2 branches missed.">                if (j != newCount)</span>
+<span class="nc" id="L1016">                    System.arraycopy(a, j, a, newCount, addEnd - j);</span>
+<span class="fc" id="L1017">                newCount += addEnd - j;</span>
+            }
+<span class="fc" id="L1019">            count = newCount;</span>
+<span class="fc" id="L1020">            return this;</span>
+        }
+
+        public boolean isEmpty()
+        {
+<span class="pc bpc" id="L1025" title="1 of 2 branches missed.">            return count == 0;</span>
+        }
+
+        public Builder&lt;V&gt; reverse()
+        {
+<span class="nc bnc" id="L1030" title="All 4 branches missed.">            assert !auto;</span>
+<span class="nc" id="L1031">            int mid = count / 2;</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            for (int i = 0 ; i &lt; mid ; i++)</span>
+            {
+<span class="nc" id="L1034">                Object t = values[i];</span>
+<span class="nc" id="L1035">                values[i] = values[count - (1 + i)];</span>
+<span class="nc" id="L1036">                values[count - (1 + i)] = t;</span>
+            }
+<span class="nc" id="L1038">            return this;</span>
+        }
+
+        public Builder&lt;V&gt; sort()
+        {
+<span class="fc" id="L1043">            Arrays.sort((V[]) values, 0, count, comparator);</span>
+<span class="fc" id="L1044">            return this;</span>
+        }
+
+        // automatically enforce sorted+filtered
+        private void autoEnforce()
+        {
+<span class="pc bpc" id="L1050" title="1 of 4 branches missed.">            if (!detected &amp;&amp; count &gt; 1)</span>
+            {
+<span class="fc" id="L1052">                sort();</span>
+<span class="fc" id="L1053">                int prevIdx = 0;</span>
+<span class="fc" id="L1054">                V prev = (V) values[0];</span>
+<span class="fc bfc" id="L1055" title="All 2 branches covered.">                for (int i = 1 ; i &lt; count ; i++)</span>
+                {
+<span class="fc" id="L1057">                    V next = (V) values[i];</span>
+<span class="fc bfc" id="L1058" title="All 2 branches covered.">                    if (comparator.compare(prev, next) != 0)</span>
+<span class="fc" id="L1059">                        values[++prevIdx] = prev = next;</span>
+<span class="pc bpc" id="L1060" title="1 of 2 branches missed.">                    else if (quickResolver != null)</span>
+<span class="nc" id="L1061">                        values[prevIdx] = prev = quickResolver.resolve(prev, next);</span>
+                }
+<span class="fc" id="L1063">                count = prevIdx + 1;</span>
+            }
+<span class="fc" id="L1065">            detected = true;</span>
+<span class="fc" id="L1066">        }</span>
+
+        public Builder&lt;V&gt; resolve(Resolver resolver)
+        {
+<span class="pc bpc" id="L1070" title="1 of 2 branches missed.">            if (count &gt; 0)</span>
+            {
+<span class="fc" id="L1072">                int c = 0;</span>
+<span class="fc" id="L1073">                int prev = 0;</span>
+<span class="fc bfc" id="L1074" title="All 2 branches covered.">                for (int i = 1 ; i &lt; count ; i++)</span>
+                {
+<span class="fc bfc" id="L1076" title="All 2 branches covered.">                    if (comparator.compare((V) values[i], (V) values[prev]) != 0)</span>
+                    {
+<span class="fc" id="L1078">                        values[c++] = resolver.resolve((V[]) values, prev, i);</span>
+<span class="fc" id="L1079">                        prev = i;</span>
+                    }
+                }
+<span class="fc" id="L1082">                values[c++] = resolver.resolve((V[]) values, prev, count);</span>
+<span class="fc" id="L1083">                count = c;</span>
+            }
+<span class="fc" id="L1085">            return this;</span>
+        }
+
+        public Object[] build()
+        {
+<span class="fc bfc" id="L1090" title="All 2 branches covered.">            if (auto)</span>
+<span class="fc" id="L1091">                autoEnforce();</span>
+<span class="fc" id="L1092">            return BTree.build(Arrays.asList(values).subList(0, count), UpdateFunction.noOp());</span>
+        }
+    }
+
+    /** simple static wrapper to calls to cmp.compare() which checks if either a or b are Special (i.e. represent an infinity) */
+    static &lt;V&gt; int compare(Comparator&lt;V&gt; cmp, Object a, Object b)
+    {
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        if (a == b)</span>
+<span class="nc" id="L1100">            return 0;</span>
+<span class="nc bnc" id="L1101" title="All 6 branches missed.">        if (a == NEGATIVE_INFINITY | b == POSITIVE_INFINITY)</span>
+<span class="nc" id="L1102">            return -1;</span>
+<span class="nc bnc" id="L1103" title="All 6 branches missed.">        if (b == NEGATIVE_INFINITY | a == POSITIVE_INFINITY)</span>
+<span class="nc" id="L1104">            return 1;</span>
+<span class="nc" id="L1105">        return cmp.compare((V) a, (V) b);</span>
+    }
+
+<span class="fc" id="L1108">    static Object POSITIVE_INFINITY = new Object();</span>
+<span class="fc" id="L1109">    static Object NEGATIVE_INFINITY = new Object();</span>
+
+    public static boolean isWellFormed(Object[] btree, Comparator&lt;? extends Object&gt; cmp)
+    {
+<span class="nc" id="L1113">        return isWellFormed(cmp, btree, true, NEGATIVE_INFINITY, POSITIVE_INFINITY);</span>
+    }
+
+    private static boolean isWellFormed(Comparator&lt;?&gt; cmp, Object[] node, boolean isRoot, Object min, Object max)
+    {
+<span class="nc bnc" id="L1118" title="All 4 branches missed.">        if (cmp != null &amp;&amp; !isNodeWellFormed(cmp, node, min, max))</span>
+<span class="nc" id="L1119">            return false;</span>
+
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">        if (isLeaf(node))</span>
+        {
+<span class="nc bnc" id="L1123" title="All 2 branches missed.">            if (isRoot)</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">                return node.length &lt;= FAN_FACTOR + 1;</span>
+<span class="nc bnc" id="L1125" title="All 4 branches missed.">            return node.length &gt;= FAN_FACTOR / 2 &amp;&amp; node.length &lt;= FAN_FACTOR + 1;</span>
+        }
+
+<span class="nc" id="L1128">        final int keyCount = getBranchKeyEnd(node);</span>
+<span class="nc bnc" id="L1129" title="All 6 branches missed.">        if ((!isRoot &amp;&amp; keyCount &lt; FAN_FACTOR / 2) || keyCount &gt; FAN_FACTOR + 1)</span>
+<span class="nc" id="L1130">            return false;</span>
+
+<span class="nc" id="L1132">        int type = 0;</span>
+<span class="nc" id="L1133">        int size = -1;</span>
+<span class="nc" id="L1134">        int[] sizeMap = getSizeMap(node);</span>
+        // compare each child node with the branch element at the head of this node it corresponds with
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        for (int i = getChildStart(node); i &lt; getChildEnd(node) ; i++)</span>
+        {
+<span class="nc" id="L1138">            Object[] child = (Object[]) node[i];</span>
+<span class="nc" id="L1139">            size += size(child) + 1;</span>
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">            if (sizeMap[i - getChildStart(node)] != size)</span>
+<span class="nc" id="L1141">                return false;</span>
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">            Object localmax = i &lt; node.length - 2 ? node[i - getChildStart(node)] : max;</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">            if (!isWellFormed(cmp, child, false, min, localmax))</span>
+<span class="nc" id="L1144">                return false;</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">            type |= isLeaf(child) ? 1 : 2;</span>
+<span class="nc" id="L1146">            min = localmax;</span>
+        }
+<span class="nc bnc" id="L1148" title="All 2 branches missed.">        return type &lt; 3; // either all leaves or all branches but not a mix</span>
+    }
+
+    private static boolean isNodeWellFormed(Comparator&lt;?&gt; cmp, Object[] node, Object min, Object max)
+    {
+<span class="nc" id="L1153">        Object previous = min;</span>
+<span class="nc" id="L1154">        int end = getKeyEnd(node);</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">        for (int i = 0; i &lt; end; i++)</span>
+        {
+<span class="nc" id="L1157">            Object current = node[i];</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">            if (compare(cmp, previous, current) &gt;= 0)</span>
+<span class="nc" id="L1159">                return false;</span>
+<span class="nc" id="L1160">            previous = current;</span>
+        }
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">        return compare(cmp, previous, max) &lt; 0;</span>
+    }
+
+    /**
+     * Simple method to walk the btree forwards or reversed and apply a function to each element
+     *
+     * Public method
+     *
+     */
+    public static &lt;V&gt; void apply(Object[] btree, Consumer&lt;V&gt; function, boolean reversed)
+    {
+<span class="pc bpc" id="L1173" title="1 of 2 branches missed.">        if (reversed)</span>
+<span class="nc" id="L1174">            applyReverse(btree, function, null);</span>
+        else
+<span class="fc" id="L1176">            applyForwards(btree, function, null);</span>
+<span class="fc" id="L1177">    }</span>
+
+    /**
+     * Simple method to walk the btree forwards or reversed and apply a function till a stop condition is reached
+     *
+     * Public method
+     *
+     */
+    public static &lt;V&gt; void apply(Object[] btree, Consumer&lt;V&gt; function, Predicate&lt;V&gt; stopCondition, boolean reversed)
+    {
+<span class="fc bfc" id="L1187" title="All 2 branches covered.">        if (reversed)</span>
+<span class="fc" id="L1188">            applyReverse(btree, function, stopCondition);</span>
+        else
+<span class="fc" id="L1190">            applyForwards(btree, function, stopCondition);</span>
+<span class="fc" id="L1191">    }</span>
+
+
+
+
+    /**
+     * Simple method to walk the btree forwards and apply a function till a stop condition is reached
+     *
+     * Private method
+     *
+     * @param btree
+     * @param function
+     * @param stopCondition
+     */
+    private static &lt;V&gt; boolean applyForwards(Object[] btree, Consumer&lt;V&gt; function, Predicate&lt;V&gt; stopCondition)
+    {
+<span class="fc" id="L1207">        boolean isLeaf = isLeaf(btree);</span>
+<span class="pc bpc" id="L1208" title="1 of 2 branches missed.">        int childOffset = isLeaf ? Integer.MAX_VALUE : getChildStart(btree);</span>
+<span class="pc bpc" id="L1209" title="1 of 2 branches missed.">        int limit = isLeaf ? getLeafKeyEnd(btree) : btree.length - 1;</span>
+<span class="fc bfc" id="L1210" title="All 2 branches covered.">        for (int i = 0 ; i &lt; limit ; i++)</span>
+        {
+            // we want to visit in iteration order, so we visit our key nodes inbetween our children
+<span class="pc bpc" id="L1213" title="3 of 4 branches missed.">            int idx = isLeaf ? i : (i / 2) + (i % 2 == 0 ? childOffset : 0);</span>
+<span class="fc" id="L1214">            Object current = btree[idx];</span>
+<span class="pc bpc" id="L1215" title="1 of 2 branches missed.">            if (idx &lt; childOffset)</span>
+            {
+<span class="fc" id="L1217">                V castedCurrent = (V) current;</span>
+<span class="pc bpc" id="L1218" title="1 of 4 branches missed.">                if (stopCondition != null &amp;&amp; stopCondition.apply(castedCurrent))</span>
+<span class="nc" id="L1219">                    return true;</span>
+
+<span class="fc" id="L1221">                function.accept(castedCurrent);</span>
+<span class="fc" id="L1222">            }</span>
+            else
+            {
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">                if (applyForwards((Object[]) current, function, stopCondition))</span>
+<span class="nc" id="L1226">                    return true;</span>
+            }
+        }
+
+<span class="fc" id="L1230">        return false;</span>
+    }
+
+    /**
+     * Simple method to walk the btree in reverse and apply a function till a stop condition is reached
+     *
+     * Private method
+     *
+     * @param btree
+     * @param function
+     * @param stopCondition
+     */
+    private static &lt;V&gt; boolean applyReverse(Object[] btree, Consumer&lt;V&gt; function, Predicate&lt;V&gt; stopCondition)
+    {
+<span class="fc" id="L1244">        boolean isLeaf = isLeaf(btree);</span>
+<span class="pc bpc" id="L1245" title="1 of 2 branches missed.">        int childOffset = isLeaf ? 0 : getChildStart(btree);</span>
+<span class="pc bpc" id="L1246" title="1 of 2 branches missed.">        int limit = isLeaf ? getLeafKeyEnd(btree)  : btree.length - 1;</span>
+<span class="fc bfc" id="L1247" title="All 2 branches covered.">        for (int i = limit - 1, visited = 0; i &gt;= 0 ; i--, visited++)</span>
+        {
+<span class="fc" id="L1249">            int idx = i;</span>
+
+            // we want to visit in reverse iteration order, so we visit our children nodes inbetween our keys
+<span class="pc bpc" id="L1252" title="1 of 2 branches missed.">            if (!isLeaf)</span>
+            {
+<span class="nc" id="L1254">                int typeOffset = visited / 2;</span>
+
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">                if (i % 2 == 0)</span>
+                {
+                    // This is a child branch. Since children are in the second half of the array, we must
+                    // adjust for the key's we've visited along the way
+<span class="nc" id="L1260">                    idx += typeOffset;</span>
+                }
+                else
+                {
+                    // This is a key. Since the keys are in the first half of the array and we are iterating
+                    // in reverse we subtract the childOffset and adjust for children we've walked so far
+<span class="nc" id="L1266">                    idx = i - childOffset + typeOffset;</span>
+                }
+            }
+
+<span class="fc" id="L1270">            Object current = btree[idx];</span>
+<span class="pc bpc" id="L1271" title="3 of 4 branches missed.">            if (isLeaf || idx &lt; childOffset)</span>
+            {
+<span class="fc" id="L1273">                V castedCurrent = (V) current;</span>
+<span class="pc bpc" id="L1274" title="1 of 4 branches missed.">                if (stopCondition != null &amp;&amp; stopCondition.apply(castedCurrent))</span>
+<span class="fc" id="L1275">                    return true;</span>
+
+<span class="fc" id="L1277">                function.accept(castedCurrent);</span>
+<span class="fc" id="L1278">            }</span>
+            else
+            {
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">                if (applyReverse((Object[]) current, function, stopCondition))</span>
+<span class="nc" id="L1282">                    return true;</span>
+            }
+        }
+
+<span class="fc" id="L1286">        return false;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

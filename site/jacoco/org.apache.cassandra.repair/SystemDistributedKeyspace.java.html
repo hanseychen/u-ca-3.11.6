@@ -1,0 +1,344 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SystemDistributedKeyspace.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">SystemDistributedKeyspace.java</span></div><h1>SystemDistributedKeyspace.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.repair;
+
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.concurrent.TimeUnit;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+import com.google.common.base.Joiner;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.repair.messages.RepairOption;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+
+public final class SystemDistributedKeyspace
+{
+    private SystemDistributedKeyspace()
+    {
+    }
+
+<span class="fc" id="L64">    private static final Logger logger = LoggerFactory.getLogger(SystemDistributedKeyspace.class);</span>
+
+    /**
+     * Generation is used as a timestamp for automatic table creation on startup.
+     * If you make any changes to the tables below, make sure to increment the
+     * generation and document your change here.
+     *
+     * gen 0: original definition in 2.2
+     * gen 1: (pre-)add options column to parent_repair_history in 3.0, 3.11
+     * gen 2: (pre-)add coordinator_port and participants_v2 columns to repair_history in 3.0, 3.11, 4.0
+     * gen 3: gc_grace_seconds raised from 0 to 10 days in CASSANDRA-12954 in 3.11.0
+     */
+    public static final long GENERATION = 3;
+
+    public static final String REPAIR_HISTORY = &quot;repair_history&quot;;
+
+    public static final String PARENT_REPAIR_HISTORY = &quot;parent_repair_history&quot;;
+
+    public static final String VIEW_BUILD_STATUS = &quot;view_build_status&quot;;
+
+<span class="fc" id="L84">    private static final CFMetaData RepairHistory =</span>
+<span class="fc" id="L85">        compile(REPAIR_HISTORY,</span>
+                &quot;Repair history&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                     + &quot;keyspace_name text,&quot;
+                     + &quot;columnfamily_name text,&quot;
+                     + &quot;id timeuuid,&quot;
+                     + &quot;parent_id timeuuid,&quot;
+                     + &quot;range_begin text,&quot;
+                     + &quot;range_end text,&quot;
+                     + &quot;coordinator inet,&quot;
+                     + &quot;coordinator_port int,&quot;
+                     + &quot;participants set&lt;inet&gt;,&quot;
+                     + &quot;participants_v2 set&lt;text&gt;,&quot;
+                     + &quot;exception_message text,&quot;
+                     + &quot;exception_stacktrace text,&quot;
+                     + &quot;status text,&quot;
+                     + &quot;started_at timestamp,&quot;
+                     + &quot;finished_at timestamp,&quot;
+                     + &quot;PRIMARY KEY ((keyspace_name, columnfamily_name), id))&quot;);
+
+<span class="fc" id="L105">    private static final CFMetaData ParentRepairHistory =</span>
+<span class="fc" id="L106">        compile(PARENT_REPAIR_HISTORY,</span>
+                &quot;Repair history&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                     + &quot;parent_id timeuuid,&quot;
+                     + &quot;keyspace_name text,&quot;
+                     + &quot;columnfamily_names set&lt;text&gt;,&quot;
+                     + &quot;started_at timestamp,&quot;
+                     + &quot;finished_at timestamp,&quot;
+                     + &quot;exception_message text,&quot;
+                     + &quot;exception_stacktrace text,&quot;
+                     + &quot;requested_ranges set&lt;text&gt;,&quot;
+                     + &quot;successful_ranges set&lt;text&gt;,&quot;
+                     + &quot;options map&lt;text, text&gt;,&quot;
+                     + &quot;PRIMARY KEY (parent_id))&quot;);
+
+<span class="fc" id="L121">    private static final CFMetaData ViewBuildStatus =</span>
+<span class="fc" id="L122">    compile(VIEW_BUILD_STATUS,</span>
+            &quot;Materialized View build status&quot;,
+            &quot;CREATE TABLE %s (&quot;
+                     + &quot;keyspace_name text,&quot;
+                     + &quot;view_name text,&quot;
+                     + &quot;host_id uuid,&quot;
+                     + &quot;status text,&quot;
+                     + &quot;PRIMARY KEY ((keyspace_name, view_name), host_id))&quot;);
+
+    private static CFMetaData compile(String name, String description, String schema)
+    {
+<span class="fc" id="L133">        return CFMetaData.compile(String.format(schema, name), SchemaConstants.DISTRIBUTED_KEYSPACE_NAME)</span>
+<span class="fc" id="L134">                         .comment(description)</span>
+<span class="fc" id="L135">                         .gcGraceSeconds((int) TimeUnit.DAYS.toSeconds(10));</span>
+    }
+
+    public static KeyspaceMetadata metadata()
+    {
+<span class="fc" id="L140">        return KeyspaceMetadata.create(SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, KeyspaceParams.simple(3), Tables.of(RepairHistory, ParentRepairHistory, ViewBuildStatus));</span>
+    }
+
+    public static void startParentRepair(UUID parent_id, String keyspaceName, String[] cfnames, RepairOption options)
+    {
+<span class="nc" id="L145">        Collection&lt;Range&lt;Token&gt;&gt; ranges = options.getRanges();</span>
+<span class="nc" id="L146">        String query = &quot;INSERT INTO %s.%s (parent_id, keyspace_name, columnfamily_names, requested_ranges, started_at,          options)&quot;+</span>
+                                 &quot; VALUES (%s,        '%s',          { '%s' },           { '%s' },          toTimestamp(now()), { %s })&quot;;
+<span class="nc" id="L148">        String fmtQry = String.format(query,</span>
+                                      SchemaConstants.DISTRIBUTED_KEYSPACE_NAME,
+                                      PARENT_REPAIR_HISTORY,
+<span class="nc" id="L151">                                      parent_id.toString(),</span>
+                                      keyspaceName,
+<span class="nc" id="L153">                                      Joiner.on(&quot;','&quot;).join(cfnames),</span>
+<span class="nc" id="L154">                                      Joiner.on(&quot;','&quot;).join(ranges),</span>
+<span class="nc" id="L155">                                      toCQLMap(options.asMap(), RepairOption.RANGES_KEY, RepairOption.COLUMNFAMILIES_KEY));</span>
+<span class="nc" id="L156">        processSilent(fmtQry);</span>
+<span class="nc" id="L157">    }</span>
+
+    private static String toCQLMap(Map&lt;String, String&gt; options, String ... ignore)
+    {
+<span class="nc" id="L161">        Set&lt;String&gt; toIgnore = Sets.newHashSet(ignore);</span>
+<span class="nc" id="L162">        StringBuilder map = new StringBuilder();</span>
+<span class="nc" id="L163">        boolean first = true;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (Map.Entry&lt;String, String&gt; entry : options.entrySet())</span>
+        {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">            if (!toIgnore.contains(entry.getKey()))</span>
+            {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                if (!first)</span>
+<span class="nc" id="L169">                    map.append(',');</span>
+<span class="nc" id="L170">                first = false;</span>
+<span class="nc" id="L171">                map.append(String.format(&quot;'%s': '%s'&quot;, entry.getKey(), entry.getValue()));</span>
+            }
+<span class="nc" id="L173">        }</span>
+<span class="nc" id="L174">        return map.toString();</span>
+    }
+
+    public static void failParentRepair(UUID parent_id, Throwable t)
+    {
+<span class="nc" id="L179">        String query = &quot;UPDATE %s.%s SET finished_at = toTimestamp(now()), exception_message=?, exception_stacktrace=? WHERE parent_id=%s&quot;;</span>
+
+<span class="nc" id="L181">        StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L182">        PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L183">        t.printStackTrace(pw);</span>
+<span class="nc" id="L184">        String fmtQuery = String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, PARENT_REPAIR_HISTORY, parent_id.toString());</span>
+<span class="nc" id="L185">        processSilent(fmtQuery, t.getMessage(), sw.toString());</span>
+<span class="nc" id="L186">    }</span>
+
+    public static void successfulParentRepair(UUID parent_id, Collection&lt;Range&lt;Token&gt;&gt; successfulRanges)
+    {
+<span class="nc" id="L190">        String query = &quot;UPDATE %s.%s SET finished_at = toTimestamp(now()), successful_ranges = {'%s'} WHERE parent_id=%s&quot;;</span>
+<span class="nc" id="L191">        String fmtQuery = String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, PARENT_REPAIR_HISTORY, Joiner.on(&quot;','&quot;).join(successfulRanges), parent_id.toString());</span>
+<span class="nc" id="L192">        processSilent(fmtQuery);</span>
+<span class="nc" id="L193">    }</span>
+
+    public static void startRepairs(UUID id, UUID parent_id, String keyspaceName, String[] cfnames, Collection&lt;Range&lt;Token&gt;&gt; ranges, Iterable&lt;InetAddress&gt; endpoints)
+    {
+<span class="nc" id="L197">        String coordinator = FBUtilities.getBroadcastAddress().getHostAddress();</span>
+<span class="nc" id="L198">        Set&lt;String&gt; participants = Sets.newHashSet(coordinator);</span>
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        for (InetAddress endpoint : endpoints)</span>
+<span class="nc" id="L201">            participants.add(endpoint.getHostAddress());</span>
+
+<span class="nc" id="L203">        String query =</span>
+                &quot;INSERT INTO %s.%s (keyspace_name, columnfamily_name, id, parent_id, range_begin, range_end, coordinator, participants, status, started_at) &quot; +
+                        &quot;VALUES (   '%s',          '%s',              %s, %s,        '%s',        '%s',      '%s',        { '%s' },     '%s',   toTimestamp(now()))&quot;;
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        for (String cfname : cfnames)</span>
+        {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : ranges)</span>
+            {
+<span class="nc" id="L211">                String fmtQry = String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, REPAIR_HISTORY,</span>
+                                              keyspaceName,
+                                              cfname,
+<span class="nc" id="L214">                                              id.toString(),</span>
+<span class="nc" id="L215">                                              parent_id.toString(),</span>
+<span class="nc" id="L216">                                              range.left.toString(),</span>
+<span class="nc" id="L217">                                              range.right.toString(),</span>
+                                              coordinator,
+<span class="nc" id="L219">                                              Joiner.on(&quot;', '&quot;).join(participants),</span>
+<span class="nc" id="L220">                                              RepairState.STARTED.toString());</span>
+<span class="nc" id="L221">                processSilent(fmtQry);</span>
+<span class="nc" id="L222">            }</span>
+        }
+<span class="nc" id="L224">    }</span>
+
+    public static void failRepairs(UUID id, String keyspaceName, String[] cfnames, Throwable t)
+    {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        for (String cfname : cfnames)</span>
+<span class="nc" id="L229">            failedRepairJob(id, keyspaceName, cfname, t);</span>
+<span class="nc" id="L230">    }</span>
+
+    public static void successfulRepairJob(UUID id, String keyspaceName, String cfname)
+    {
+<span class="nc" id="L234">        String query = &quot;UPDATE %s.%s SET status = '%s', finished_at = toTimestamp(now()) WHERE keyspace_name = '%s' AND columnfamily_name = '%s' AND id = %s&quot;;</span>
+<span class="nc" id="L235">        String fmtQuery = String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, REPAIR_HISTORY,</span>
+<span class="nc" id="L236">                                        RepairState.SUCCESS.toString(),</span>
+                                        keyspaceName,
+                                        cfname,
+<span class="nc" id="L239">                                        id.toString());</span>
+<span class="nc" id="L240">        processSilent(fmtQuery);</span>
+<span class="nc" id="L241">    }</span>
+
+    public static void failedRepairJob(UUID id, String keyspaceName, String cfname, Throwable t)
+    {
+<span class="nc" id="L245">        String query = &quot;UPDATE %s.%s SET status = '%s', finished_at = toTimestamp(now()), exception_message=?, exception_stacktrace=? WHERE keyspace_name = '%s' AND columnfamily_name = '%s' AND id = %s&quot;;</span>
+<span class="nc" id="L246">        StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L247">        PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L248">        t.printStackTrace(pw);</span>
+<span class="nc" id="L249">        String fmtQry = String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, REPAIR_HISTORY,</span>
+<span class="nc" id="L250">                                      RepairState.FAILED.toString(),</span>
+                                      keyspaceName,
+                                      cfname,
+<span class="nc" id="L253">                                      id.toString());</span>
+<span class="nc" id="L254">        processSilent(fmtQry, t.getMessage(), sw.toString());</span>
+<span class="nc" id="L255">    }</span>
+
+    public static void startViewBuild(String keyspace, String view, UUID hostId)
+    {
+<span class="nc" id="L259">        String query = &quot;INSERT INTO %s.%s (keyspace_name, view_name, host_id, status) VALUES (?, ?, ?, ?)&quot;;</span>
+<span class="nc" id="L260">        QueryProcessor.process(String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, VIEW_BUILD_STATUS),</span>
+                               ConsistencyLevel.ONE,
+<span class="nc" id="L262">                               Lists.newArrayList(bytes(keyspace),</span>
+<span class="nc" id="L263">                                                  bytes(view),</span>
+<span class="nc" id="L264">                                                  bytes(hostId),</span>
+<span class="nc" id="L265">                                                  bytes(BuildStatus.STARTED.toString())));</span>
+<span class="nc" id="L266">    }</span>
+
+    public static void successfulViewBuild(String keyspace, String view, UUID hostId)
+    {
+<span class="nc" id="L270">        String query = &quot;UPDATE %s.%s SET status = ? WHERE keyspace_name = ? AND view_name = ? AND host_id = ?&quot;;</span>
+<span class="nc" id="L271">        QueryProcessor.process(String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, VIEW_BUILD_STATUS),</span>
+                               ConsistencyLevel.ONE,
+<span class="nc" id="L273">                               Lists.newArrayList(bytes(BuildStatus.SUCCESS.toString()),</span>
+<span class="nc" id="L274">                                                  bytes(keyspace),</span>
+<span class="nc" id="L275">                                                  bytes(view),</span>
+<span class="nc" id="L276">                                                  bytes(hostId)));</span>
+<span class="nc" id="L277">    }</span>
+
+    public static Map&lt;UUID, String&gt; viewStatus(String keyspace, String view)
+    {
+<span class="nc" id="L281">        String query = &quot;SELECT host_id, status FROM %s.%s WHERE keyspace_name = ? AND view_name = ?&quot;;</span>
+        UntypedResultSet results;
+        try
+        {
+<span class="nc" id="L285">            results = QueryProcessor.execute(String.format(query, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, VIEW_BUILD_STATUS),</span>
+                                             ConsistencyLevel.ONE,
+                                             keyspace,
+                                             view);
+        }
+<span class="nc" id="L290">        catch (Exception e)</span>
+        {
+<span class="nc" id="L292">            return Collections.emptyMap();</span>
+<span class="nc" id="L293">        }</span>
+
+
+<span class="nc" id="L296">        Map&lt;UUID, String&gt; status = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        for (UntypedResultSet.Row row : results)</span>
+        {
+<span class="nc" id="L299">            status.put(row.getUUID(&quot;host_id&quot;), row.getString(&quot;status&quot;));</span>
+<span class="nc" id="L300">        }</span>
+<span class="nc" id="L301">        return status;</span>
+    }
+
+    public static void setViewRemoved(String keyspaceName, String viewName)
+    {
+<span class="nc" id="L306">        String buildReq = &quot;DELETE FROM %s.%s WHERE keyspace_name = ? AND view_name = ?&quot;;</span>
+<span class="nc" id="L307">        QueryProcessor.executeInternal(String.format(buildReq, SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, VIEW_BUILD_STATUS), keyspaceName, viewName);</span>
+<span class="nc" id="L308">        forceBlockingFlush(VIEW_BUILD_STATUS);</span>
+<span class="nc" id="L309">    }</span>
+
+    private static void processSilent(String fmtQry, String... values)
+    {
+        try
+        {
+<span class="nc" id="L315">            List&lt;ByteBuffer&gt; valueList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            for (String v : values)</span>
+            {
+<span class="nc" id="L318">                valueList.add(bytes(v));</span>
+            }
+<span class="nc" id="L320">            QueryProcessor.process(fmtQry, ConsistencyLevel.ONE, valueList);</span>
+        }
+<span class="nc" id="L322">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L324">            logger.error(&quot;Error executing query &quot;+fmtQry, t);</span>
+<span class="nc" id="L325">        }</span>
+<span class="nc" id="L326">    }</span>
+
+    public static void forceBlockingFlush(String table)
+    {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if (!DatabaseDescriptor.isUnsafeSystem())</span>
+<span class="nc" id="L331">            FBUtilities.waitOnFuture(Keyspace.open(SchemaConstants.DISTRIBUTED_KEYSPACE_NAME).getColumnFamilyStore(table).forceFlush());</span>
+<span class="nc" id="L332">    }</span>
+
+<span class="nc" id="L334">    private enum RepairState</span>
+    {
+<span class="nc" id="L336">        STARTED, SUCCESS, FAILED</span>
+    }
+
+<span class="nc" id="L339">    private enum BuildStatus</span>
+    {
+<span class="nc" id="L341">        UNKNOWN, STARTED, SUCCESS</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

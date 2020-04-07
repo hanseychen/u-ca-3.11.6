@@ -1,0 +1,549 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableReversedIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.columniterator</a> &gt; <span class="el_source">SSTableReversedIterator.java</span></div><h1>SSTableReversedIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.columniterator;
+
+import java.io.IOException;
+import java.util.*;
+
+import com.google.common.base.Verify;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.btree.BTree;
+
+/**
+ *  A Cell Iterator in reversed clustering order over SSTable
+ */
+public class SSTableReversedIterator extends AbstractSSTableIterator
+{
+    /**
+     * The index of the slice being processed.
+     */
+    private int slice;
+
+    public SSTableReversedIterator(SSTableReader sstable,
+                                   FileDataInput file,
+                                   DecoratedKey key,
+                                   RowIndexEntry indexEntry,
+                                   Slices slices,
+                                   ColumnFilter columns,
+                                   boolean isForThrift,
+                                   FileHandle ifile)
+    {
+<span class="nc" id="L55">        super(sstable, file, key, indexEntry, slices, columns, isForThrift, ifile);</span>
+<span class="nc" id="L56">    }</span>
+
+    protected Reader createReaderInternal(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
+    {
+<span class="nc bnc" id="L60" title="All 2 branches missed.">        return indexEntry.isIndexed()</span>
+             ? new ReverseIndexedReader(indexEntry, file, shouldCloseFile)
+             : new ReverseReader(file, shouldCloseFile);
+    }
+
+    public boolean isReverseOrder()
+    {
+<span class="nc" id="L67">        return true;</span>
+    }
+
+    protected int nextSliceIndex()
+    {
+<span class="nc" id="L72">        int next = slice;</span>
+<span class="nc" id="L73">        slice++;</span>
+<span class="nc" id="L74">        return slices.size() - (next + 1);</span>
+    }
+
+    protected boolean hasMoreSlices()
+    {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        return slice &lt; slices.size();</span>
+    }
+
+<span class="nc bnc" id="L82" title="All 2 branches missed.">    private class ReverseReader extends Reader</span>
+    {
+        protected ReusablePartitionData buffer;
+        protected Iterator&lt;Unfiltered&gt; iterator;
+
+        // Set in loadFromDisk () and used in setIterator to handle range tombstone extending on multiple index block. See
+        // loadFromDisk for details. Note that those are always false for non-indexed readers.
+        protected boolean skipFirstIteratedItem;
+        protected boolean skipLastIteratedItem;
+
+<span class="nc" id="L92">        protected Unfiltered mostRecentlyEmitted = null;</span>
+
+        private ReverseReader(FileDataInput file, boolean shouldCloseFile)
+<span class="nc" id="L95">        {</span>
+<span class="nc" id="L96">            super(file, shouldCloseFile);</span>
+<span class="nc" id="L97">        }</span>
+
+        protected ReusablePartitionData createBuffer(int blocksCount)
+        {
+<span class="nc" id="L101">            int estimatedRowCount = 16;</span>
+<span class="nc" id="L102">            int columnCount = metadata().partitionColumns().regulars.size();</span>
+<span class="nc bnc" id="L103" title="All 4 branches missed.">            if (columnCount == 0 || metadata().clusteringColumns().isEmpty())</span>
+            {
+<span class="nc" id="L105">                estimatedRowCount = 1;</span>
+            }
+            else
+            {
+                try
+                {
+                    // To avoid wasted resizing we guess-estimate the number of rows we're likely to read. For that
+                    // we use the stats on the number of rows per partition for that sstable.
+                    // FIXME: so far we only keep stats on cells, so to get a rough estimate on the number of rows,
+                    // we divide by the number of regular columns the table has. We should fix once we collect the
+                    // stats on rows
+<span class="nc" id="L116">                    int estimatedRowsPerPartition = (int)(sstable.getEstimatedColumnCount().percentile(0.75) / columnCount);</span>
+<span class="nc" id="L117">                    estimatedRowCount = Math.max(estimatedRowsPerPartition / blocksCount, 1);</span>
+                }
+<span class="nc" id="L119">                catch (IllegalStateException e)</span>
+                {
+                    // The EstimatedHistogram mean() method can throw this (if it overflows). While such overflow
+                    // shouldn't happen, it's not worth taking the risk of letting the exception bubble up.
+<span class="nc" id="L123">                }</span>
+            }
+<span class="nc" id="L125">            return new ReusablePartitionData(metadata(), partitionKey(), columns(), estimatedRowCount);</span>
+        }
+
+        public void setForSlice(Slice slice) throws IOException
+        {
+            // If we have read the data, just create the iterator for the slice. Otherwise, read the data.
+<span class="nc bnc" id="L131" title="All 2 branches missed.">            if (buffer == null)</span>
+            {
+<span class="nc" id="L133">                buffer = createBuffer(1);</span>
+                // Note that we can reuse that buffer between slices (we could alternatively re-read from disk
+                // every time, but that feels more wasteful) so we want to include everything from the beginning.
+                // We can stop at the slice end however since any following slice will be before that.
+<span class="nc" id="L137">                loadFromDisk(null, slice.end(), false, false, null, null);</span>
+            }
+<span class="nc" id="L139">            setIterator(slice);</span>
+<span class="nc" id="L140">        }</span>
+
+        protected void setIterator(Slice slice)
+        {
+<span class="nc bnc" id="L144" title="All 4 branches missed.">            assert buffer != null;</span>
+<span class="nc" id="L145">            iterator = buffer.built.unfilteredIterator(columns, Slices.with(metadata().comparator, slice), true);</span>
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if (!iterator.hasNext())</span>
+<span class="nc" id="L148">                return;</span>
+
+<span class="nc bnc" id="L150" title="All 2 branches missed.">            if (skipFirstIteratedItem)</span>
+<span class="nc" id="L151">                iterator.next();</span>
+
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (skipLastIteratedItem)</span>
+<span class="nc" id="L154">                iterator = new SkipLastIterator(iterator);</span>
+<span class="nc" id="L155">        }</span>
+
+        protected boolean hasNextInternal() throws IOException
+        {
+            // If we've never called setForSlice, we're reading everything
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (iterator == null)</span>
+<span class="nc" id="L161">                setForSlice(Slice.ALL);</span>
+
+<span class="nc" id="L163">            return iterator.hasNext();</span>
+        }
+
+        protected Unfiltered nextInternal() throws IOException
+        {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            if (!hasNext())</span>
+<span class="nc" id="L169">                throw new NoSuchElementException();</span>
+<span class="nc" id="L170">            Unfiltered next = iterator.next();</span>
+<span class="nc" id="L171">            mostRecentlyEmitted = next;</span>
+<span class="nc" id="L172">            return next;</span>
+        }
+
+        protected boolean stopReadingDisk() throws IOException
+        {
+<span class="nc" id="L177">            return false;</span>
+        }
+
+        // checks if left prefix precedes right prefix
+        private boolean precedes(ClusteringPrefix left, ClusteringPrefix right)
+        {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            return metadata().comparator.compare(left, right) &lt; 0;</span>
+        }
+
+        // Reads the unfiltered from disk and load them into the reader buffer. It stops reading when either the partition
+        // is fully read, or when stopReadingDisk() returns true.
+        protected void loadFromDisk(ClusteringBound start,
+                                    ClusteringBound end,
+                                    boolean hasPreviousBlock,
+                                    boolean hasNextBlock,
+                                    ClusteringPrefix currentFirstName,
+                                    ClusteringPrefix nextLastName) throws IOException
+        {
+            // start != null means it's the block covering the beginning of the slice, so it has to be the last block for this slice.
+<span class="nc bnc" id="L196" title="All 6 branches missed.">            assert start == null || !hasNextBlock;</span>
+
+<span class="nc" id="L198">            buffer.reset();</span>
+<span class="nc" id="L199">            skipFirstIteratedItem = false;</span>
+<span class="nc" id="L200">            skipLastIteratedItem = false;</span>
+
+<span class="nc" id="L202">            boolean isFirst = true;</span>
+
+            // If the start might be in this block, skip everything that comes before it.
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (start != null)</span>
+            {
+<span class="nc bnc" id="L207" title="All 6 branches missed.">                while (deserializer.hasNext() &amp;&amp; deserializer.compareNextTo(start) &lt;= 0 &amp;&amp; !stopReadingDisk())</span>
+                {
+<span class="nc" id="L209">                    isFirst = false;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                    if (deserializer.nextIsRow())</span>
+<span class="nc" id="L211">                        deserializer.skipNext();</span>
+                    else
+<span class="nc" id="L213">                        updateOpenMarker((RangeTombstoneMarker)deserializer.readNext());</span>
+                }
+            }
+
+            // If we have an open marker, it's either one from what we just skipped or it's one that open in the next (or
+            // one of the next) index block (if openMarker == openMarkerAtStartOfBlock).
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (openMarker != null)</span>
+            {
+                // We have to feed a marker to the buffer, because that marker is likely to be close later and ImmtableBTreePartition
+                // doesn't take kindly to marker that comes without their counterpart. If that's the last block we're gonna read (for
+                // the current slice at least) it's easy because we'll want to return that open marker at the end of the data in this
+                // block anyway, so we have nothing more to do than adding it to the buffer.
+                // If it's not the last block however, in which case we know we'll have start == null, it means this marker is really
+                // open in a next block and so while we do need to add it the buffer for the reason mentioned above, we don't
+                // want to &quot;return&quot; it just yet, we'll wait until we reach it in the next blocks. That's why we trigger
+                // skipLastIteratedItem in that case (this is first item of the block, but we're iterating in reverse order
+                // so it will be last returned by the iterator).
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                ClusteringBound markerStart = start == null ? ClusteringBound.BOTTOM : start;</span>
+<span class="nc" id="L231">                buffer.add(new RangeTombstoneBoundMarker(markerStart, openMarker));</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                if (hasNextBlock)</span>
+<span class="nc" id="L233">                    skipLastIteratedItem = true;</span>
+            }
+
+            // Now deserialize everything until we reach our requested end (if we have one)
+            // See SSTableIterator.ForwardRead.computeNext() for why this is a strict inequality below: this is the same
+            // reasoning here.
+<span class="nc bnc" id="L239" title="All 4 branches missed.">            while (deserializer.hasNext()</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                   &amp;&amp; (end == null || deserializer.compareNextTo(end) &lt; 0)</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                   &amp;&amp; !stopReadingDisk())</span>
+            {
+<span class="nc" id="L243">                Unfiltered unfiltered = deserializer.readNext();</span>
+
+<span class="nc bnc" id="L245" title="All 8 branches missed.">                if (isFirst &amp;&amp; openMarker == null</span>
+                    &amp;&amp; currentFirstName != null &amp;&amp; nextLastName != null
+<span class="nc bnc" id="L247" title="All 4 branches missed.">                    &amp;&amp; (precedes(currentFirstName, nextLastName) || precedes(unfiltered.clustering(), currentFirstName)))</span>
+                {
+                    // Range tombstones spanning multiple index blocks when reading legacy sstables need special handling.
+                    // Pre-3.0, the column index didn't encode open markers. Instead, open range tombstones were rewritten
+                    // at the start of index blocks they at least partially covered. These rewritten RTs found at the
+                    // beginning of index blocks need to be handled as though they were an open marker, otherwise iterator
+                    // validation will fail and/or some rows will be excluded from the result. These rewritten RTs can be
+                    // detected based on their relation to the current index block and the next one depending on what wrote
+                    // the sstable. For sstables coming from a memtable flush, a rewritten RT will have a clustering value
+                    // less than the first name of its index block. For sstables coming from compaction, the index block
+                    // first name will be the RT open bound, which will be less than the last name of the next block. So,
+                    // here we compare the first name of this block to the last name of the next block to detect the
+                    // compaction case, and clustering value of the unfiltered we just read to the index block's first name
+                    // to detect the flush case.
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                    Verify.verify(!sstable.descriptor.version.storeRows());</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                    Verify.verify(openMarker == null);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">                    Verify.verify(!skipLastIteratedItem);</span>
+<span class="nc" id="L264">                    Verify.verify(unfiltered.isRangeTombstoneMarker());</span>
+<span class="nc" id="L265">                    buffer.add(unfiltered);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                    if (hasNextBlock)</span>
+<span class="nc" id="L267">                        skipLastIteratedItem = true;</span>
+                }
+<span class="nc bnc" id="L269" title="All 6 branches missed.">                else if (isFirst &amp;&amp; nextLastName != null &amp;&amp; !precedes(nextLastName, unfiltered.clustering()))</span>
+                {
+                    // When dealing with old format sstable, we have the problem that a row can span 2 index block, i.e. it can
+                    // start at the end of a block and end at the beginning of the next one. That's not a problem per se for
+                    // UnfilteredDeserializer.OldFormatSerializer, since it always read rows entirely, even if they span index
+                    // blocks, but as we reading index block in reverse we must be careful to not read the end of the row at
+                    // beginning of a block before we're reading the beginning of that row. So what we do is that if we detect
+                    // that the row starting this block is also the row ending the next one we're read (previous on disk), then
+                    // we'll skip that first result and  let it be read with the next block.
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                    Verify.verify(!sstable.descriptor.version.storeRows());</span>
+<span class="nc" id="L279">                    isFirst = false;</span>
+                }
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                else if (unfiltered.isEmpty())</span>
+                {
+<span class="nc" id="L283">                    isFirst = false;</span>
+                }
+                else
+                {
+<span class="nc" id="L287">                    buffer.add(unfiltered);</span>
+<span class="nc" id="L288">                    isFirst = false;</span>
+                }
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                if (unfiltered.isRangeTombstoneMarker())</span>
+<span class="nc" id="L292">                    updateOpenMarker((RangeTombstoneMarker)unfiltered);</span>
+<span class="nc" id="L293">            }</span>
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (!sstable.descriptor.version.storeRows()</span>
+<span class="nc bnc" id="L296" title="All 4 branches missed.">                &amp;&amp; deserializer.hasNext()</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">                &amp;&amp; (end == null || deserializer.compareNextTo(end) &lt; 0))</span>
+            {
+                // Range tombstone start and end bounds are stored together in legacy sstables. When we read one, we
+                // stash the closing bound until we reach the appropriate place to emit it, which is immediately before
+                // the next unfiltered with a greater clustering.
+                // If SSTRI considers the block exhausted before encountering such a clustering though, this end marker
+                // will never be emitted. So here we just check if there's a closing bound left in the deserializer.
+                // If there is, we compare it against the most recently emitted unfiltered (i.e.: the last unfiltered
+                // that this RT would enclose. And we have to do THAT comparison because the last name field on the
+                // current index block will be whatever was written at the end of the index block (i.e. the last name
+                // physically in the block), not the closing bound of the range tombstone (i.e. the last name logically
+                // in the block). If all this indicates that there is indeed a range tombstone we're missing, we add it
+                // to the buffer and update the open marker field.
+<span class="nc" id="L310">                Unfiltered unfiltered = deserializer.readNext();</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">                RangeTombstoneMarker marker = unfiltered.isRangeTombstoneMarker() ? (RangeTombstoneMarker) unfiltered : null;</span>
+<span class="nc bnc" id="L312" title="All 6 branches missed.">                if (marker != null &amp;&amp; marker.isClose(false)</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                    &amp;&amp; (mostRecentlyEmitted == null || precedes(marker.clustering(), mostRecentlyEmitted.clustering())))</span>
+                {
+<span class="nc" id="L315">                    buffer.add(marker);</span>
+<span class="nc" id="L316">                    updateOpenMarker(marker);</span>
+                }
+            }
+
+            // If we have an open marker, we should close it before finishing
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (openMarker != null)</span>
+            {
+                // This is the reverse problem than the one at the start of the block. Namely, if it's the first block
+                // we deserialize for the slice (the one covering the slice end basically), then it's easy, we just want
+                // to add the close marker to the buffer and return it normally.
+                // If it's note our first block (for the slice) however, it means that marker closed in a previously read
+                // block and we have already returned it. So while we should still add it to the buffer for the sake of
+                // not breaking ImmutableBTreePartition, we should skip it when returning from the iterator, hence the
+                // skipFirstIteratedItem (this is the last item of the block, but we're iterating in reverse order so it will
+                // be the first returned by the iterator).
+<span class="nc bnc" id="L331" title="All 2 branches missed.">                ClusteringBound markerEnd = end == null ? ClusteringBound.TOP : end;</span>
+<span class="nc" id="L332">                buffer.add(new RangeTombstoneBoundMarker(markerEnd, openMarker));</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                if (hasPreviousBlock)</span>
+<span class="nc" id="L334">                    skipFirstIteratedItem = true;</span>
+            }
+
+<span class="nc" id="L337">            buffer.build();</span>
+<span class="nc" id="L338">        }</span>
+    }
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">    private class ReverseIndexedReader extends ReverseReader</span>
+    {
+        private final IndexState indexState;
+
+        // The slice we're currently iterating over
+        private Slice slice;
+        // The last index block to consider for the slice
+        private int lastBlockIdx;
+
+        private ReverseIndexedReader(RowIndexEntry indexEntry, FileDataInput file, boolean shouldCloseFile)
+<span class="nc" id="L351">        {</span>
+<span class="nc" id="L352">            super(file, shouldCloseFile);</span>
+<span class="nc" id="L353">            this.indexState = new IndexState(this, sstable.metadata.comparator, indexEntry, true, ifile);</span>
+<span class="nc" id="L354">        }</span>
+
+        @Override
+        public void close() throws IOException
+        {
+<span class="nc" id="L359">            super.close();</span>
+<span class="nc" id="L360">            this.indexState.close();</span>
+<span class="nc" id="L361">        }</span>
+
+        @Override
+        public void setForSlice(Slice slice) throws IOException
+        {
+<span class="nc" id="L366">            this.slice = slice;</span>
+
+            // if our previous slicing already got us past the beginning of the sstable, we're done
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (indexState.isDone())</span>
+            {
+<span class="nc" id="L371">                iterator = Collections.emptyIterator();</span>
+<span class="nc" id="L372">                return;</span>
+            }
+
+            // Find the first index block we'll need to read for the slice.
+<span class="nc" id="L376">            int startIdx = indexState.findBlockIndex(slice.end(), indexState.currentBlockIdx());</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (startIdx &lt; 0)</span>
+            {
+<span class="nc" id="L379">                iterator = Collections.emptyIterator();</span>
+<span class="nc" id="L380">                indexState.setToBlock(startIdx);</span>
+<span class="nc" id="L381">                return;</span>
+            }
+
+<span class="nc" id="L384">            lastBlockIdx = indexState.findBlockIndex(slice.start(), startIdx);</span>
+
+            // If the last block to look (in reverse order) is after the very last block, we have nothing for that slice
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (lastBlockIdx &gt;= indexState.blocksCount())</span>
+            {
+<span class="nc bnc" id="L389" title="All 4 branches missed.">                assert startIdx &gt;= indexState.blocksCount();</span>
+<span class="nc" id="L390">                iterator = Collections.emptyIterator();</span>
+<span class="nc" id="L391">                return;</span>
+            }
+
+            // If we start (in reverse order) after the very last block, just read from the last one.
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            if (startIdx &gt;= indexState.blocksCount())</span>
+<span class="nc" id="L396">                startIdx = indexState.blocksCount() - 1;</span>
+
+            // Note that even if we were already set on the proper block (which would happen if the previous slice
+            // requested ended on the same block this one start), we can't reuse it because when reading the previous
+            // slice we've only read that block from the previous slice start. Re-reading also handles
+            // skipFirstIteratedItem/skipLastIteratedItem that we would need to handle otherwise.
+<span class="nc" id="L402">            indexState.setToBlock(startIdx);</span>
+
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            readCurrentBlock(false, startIdx != lastBlockIdx);</span>
+<span class="nc" id="L405">        }</span>
+
+        @Override
+        protected boolean hasNextInternal() throws IOException
+        {
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (super.hasNextInternal())</span>
+<span class="nc" id="L411">                return true;</span>
+
+            while (true)
+            {
+                // We have nothing more for our current block, move the next one (so the one before on disk).
+<span class="nc" id="L416">                int nextBlockIdx = indexState.currentBlockIdx() - 1;</span>
+<span class="nc bnc" id="L417" title="All 4 branches missed.">                if (nextBlockIdx &lt; 0 || nextBlockIdx &lt; lastBlockIdx)</span>
+<span class="nc" id="L418">                    return false;</span>
+
+                // The slice start can be in
+<span class="nc" id="L421">                indexState.setToBlock(nextBlockIdx);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                readCurrentBlock(true, nextBlockIdx != lastBlockIdx);</span>
+
+                // If an indexed block only contains data for a dropped column, the iterator will be empty, even
+                // though we may still have data to read in subsequent blocks
+
+                // also, for pre-3.0 storage formats, index blocks that only contain a single row and that row crosses
+                // index boundaries, the iterator will be empty even though we haven't read everything we're intending
+                // to read. In that case, we want to read the next index block. This shouldn't be possible in 3.0+
+                // formats (see next comment)
+<span class="nc bnc" id="L431" title="All 4 branches missed.">                if (!iterator.hasNext() &amp;&amp; nextBlockIdx &gt; lastBlockIdx)</span>
+                {
+<span class="nc" id="L433">                    continue;</span>
+                }
+
+<span class="nc" id="L436">                return iterator.hasNext();</span>
+            }
+        }
+
+        /**
+         * Reads the current block, the last one we've set.
+         *
+         * @param hasPreviousBlock is whether we have already read a previous block for the current slice.
+         * @param hasNextBlock is whether we have more blocks to read for the current slice.
+         */
+        private void readCurrentBlock(boolean hasPreviousBlock, boolean hasNextBlock) throws IOException
+        {
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (buffer == null)</span>
+<span class="nc" id="L449">                buffer = createBuffer(indexState.blocksCount());</span>
+
+<span class="nc" id="L451">            int currentBlock = indexState.currentBlockIdx();</span>
+
+            // The slice start (resp. slice end) is only meaningful on the last (resp. first) block read (since again,
+            // we read blocks in reverse order).
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            boolean canIncludeSliceStart = !hasNextBlock;</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">            boolean canIncludeSliceEnd = !hasPreviousBlock;</span>
+
+<span class="nc" id="L458">            ClusteringPrefix currentFirstName = null;</span>
+<span class="nc" id="L459">            ClusteringPrefix nextLastName = null;</span>
+<span class="nc bnc" id="L460" title="All 4 branches missed.">            if (!sstable.descriptor.version.storeRows() &amp;&amp; currentBlock &gt; 0)</span>
+            {
+<span class="nc" id="L462">                currentFirstName = indexState.index(currentBlock).firstName;</span>
+<span class="nc" id="L463">                nextLastName = indexState.index(currentBlock - 1).lastName;</span>
+            }
+
+<span class="nc bnc" id="L466" title="All 4 branches missed.">            loadFromDisk(canIncludeSliceStart ? slice.start() : null,</span>
+<span class="nc" id="L467">                         canIncludeSliceEnd ? slice.end() : null,</span>
+                         hasPreviousBlock,
+                         hasNextBlock,
+                         currentFirstName,
+                         nextLastName
+            );
+<span class="nc" id="L473">            setIterator(slice);</span>
+<span class="nc" id="L474">        }</span>
+
+        @Override
+        protected boolean stopReadingDisk() throws IOException
+        {
+<span class="nc" id="L479">            return indexState.isPastCurrentBlock();</span>
+        }
+    }
+
+    private class ReusablePartitionData
+    {
+        private final CFMetaData metadata;
+        private final DecoratedKey partitionKey;
+        private final PartitionColumns columns;
+
+        private MutableDeletionInfo.Builder deletionBuilder;
+        private MutableDeletionInfo deletionInfo;
+        private BTree.Builder&lt;Row&gt; rowBuilder;
+        private ImmutableBTreePartition built;
+
+        private ReusablePartitionData(CFMetaData metadata,
+                                      DecoratedKey partitionKey,
+                                      PartitionColumns columns,
+                                      int initialRowCapacity)
+<span class="nc" id="L498">        {</span>
+<span class="nc" id="L499">            this.metadata = metadata;</span>
+<span class="nc" id="L500">            this.partitionKey = partitionKey;</span>
+<span class="nc" id="L501">            this.columns = columns;</span>
+<span class="nc" id="L502">            this.rowBuilder = BTree.builder(metadata.comparator, initialRowCapacity);</span>
+<span class="nc" id="L503">        }</span>
+
+
+        public void add(Unfiltered unfiltered)
+        {
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (unfiltered.isRow())</span>
+<span class="nc" id="L509">                rowBuilder.add((Row)unfiltered);</span>
+            else
+<span class="nc" id="L511">                deletionBuilder.add((RangeTombstoneMarker)unfiltered);</span>
+<span class="nc" id="L512">        }</span>
+
+        public void reset()
+        {
+<span class="nc" id="L516">            built = null;</span>
+<span class="nc" id="L517">            rowBuilder.reuse();</span>
+<span class="nc" id="L518">            deletionBuilder = MutableDeletionInfo.builder(partitionLevelDeletion, metadata().comparator, false);</span>
+<span class="nc" id="L519">        }</span>
+
+        public void build()
+        {
+<span class="nc" id="L523">            deletionInfo = deletionBuilder.build();</span>
+<span class="nc" id="L524">            built = new ImmutableBTreePartition(metadata, partitionKey, columns, Rows.EMPTY_STATIC_ROW, rowBuilder.build(),</span>
+                                                deletionInfo, EncodingStats.NO_STATS);
+<span class="nc" id="L526">            deletionBuilder = null;</span>
+<span class="nc" id="L527">        }</span>
+    }
+
+    private static class SkipLastIterator extends AbstractIterator&lt;Unfiltered&gt;
+    {
+        private final Iterator&lt;Unfiltered&gt; iterator;
+
+        private SkipLastIterator(Iterator&lt;Unfiltered&gt; iterator)
+<span class="nc" id="L535">        {</span>
+<span class="nc" id="L536">            this.iterator = iterator;</span>
+<span class="nc" id="L537">        }</span>
+
+        protected Unfiltered computeNext()
+        {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            if (!iterator.hasNext())</span>
+<span class="nc" id="L542">                return endOfData();</span>
+
+<span class="nc" id="L544">            Unfiltered next = iterator.next();</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">            return iterator.hasNext() ? next : endOfData();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

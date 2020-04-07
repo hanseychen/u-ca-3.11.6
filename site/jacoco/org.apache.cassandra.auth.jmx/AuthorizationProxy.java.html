@@ -1,0 +1,495 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AuthorizationProxy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth.jmx</a> &gt; <span class="el_source">AuthorizationProxy.java</span></div><h1>AuthorizationProxy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.auth.jmx;
+
+import java.lang.reflect.*;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.security.Principal;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+import javax.security.auth.Subject;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.*;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.service.StorageService;
+
+/**
+ * Provides a proxy interface to the platform's MBeanServer instance to perform
+ * role-based authorization on method invocation.
+ *
+ * When used in conjunction with a suitable JMXAuthenticator, which attaches a CassandraPrincipal
+ * to authenticated Subjects, this class uses the configured IAuthorizer to verify that the
+ * subject has the required permissions to execute methods on the MBeanServer and the MBeans it
+ * manages.
+ *
+ * Because an ObjectName may contain wildcards, meaning it represents a set of individual MBeans,
+ * JMX resources don't fit well with the hierarchical approach modelled by other IResource
+ * implementations and utilised by ClientState::ensureHasPermission etc. To enable grants to use
+ * pattern-type ObjectNames, this class performs its own custom matching and filtering of resources
+ * rather than pushing that down to the configured IAuthorizer. To that end, during authorization
+ * it pulls back all permissions for the active subject, filtering them to retain only grants on
+ * JMXResources. It then uses ObjectName::apply to assert whether the target MBeans are wholly
+ * represented by the resources with permissions. This means that it cannot use the PermissionsCache
+ * as IAuthorizer can, so it manages its own cache locally.
+ *
+ * Methods are split into 2 categories; those which are to be invoked on the MBeanServer itself
+ * and those which apply to MBean instances. Actually, this is somewhat of a construct as in fact
+ * *all* invocations are performed on the MBeanServer instance, the distinction is made here on
+ * those methods which take an ObjectName as their first argument and those which do not.
+ * Invoking a method of the former type, e.g. MBeanServer::getAttribute(ObjectName name, String attribute),
+ * implies that the caller is concerned with a specific MBean. Conversely, invoking a method such as
+ * MBeanServer::getDomains is primarily a function of the MBeanServer itself. This class makes
+ * such a distinction in order to identify which JMXResource the subject requires permissions on.
+ *
+ * Certain operations are never allowed for users and these are recorded in a blacklist so that we
+ * can short circuit authorization process if one is attempted by a remote subject.
+ *
+ */
+<span class="nc" id="L76">public class AuthorizationProxy implements InvocationHandler</span>
+{
+<span class="nc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(AuthorizationProxy.class);</span>
+
+    /*
+     A whitelist of permitted methods on the MBeanServer interface which *do not* take an ObjectName
+     as their first argument. These methods can be thought of as relating to the MBeanServer itself,
+     rather than to the MBeans it manages. All of the whitelisted methods are essentially descriptive,
+     hence they require the Subject to have the DESCRIBE permission on the root JMX resource.
+     */
+<span class="nc" id="L86">    private static final Set&lt;String&gt; MBEAN_SERVER_METHOD_WHITELIST = ImmutableSet.of(&quot;getDefaultDomain&quot;,</span>
+                                                                                     &quot;getDomains&quot;,
+                                                                                     &quot;getMBeanCount&quot;,
+                                                                                     &quot;hashCode&quot;,
+                                                                                     &quot;queryMBeans&quot;,
+                                                                                     &quot;queryNames&quot;,
+                                                                                     &quot;toString&quot;);
+
+    /*
+     A blacklist of method names which are never permitted to be executed by a remote user,
+     regardless of privileges they may be granted.
+     */
+<span class="nc" id="L98">    private static final Set&lt;String&gt; METHOD_BLACKLIST = ImmutableSet.of(&quot;createMBean&quot;,</span>
+                                                                        &quot;deserialize&quot;,
+                                                                        &quot;getClassLoader&quot;,
+                                                                        &quot;getClassLoaderFor&quot;,
+                                                                        &quot;instantiate&quot;,
+                                                                        &quot;registerMBean&quot;,
+                                                                        &quot;unregisterMBean&quot;);
+
+<span class="nc" id="L106">    private static final JMXPermissionsCache permissionsCache = new JMXPermissionsCache();</span>
+    private MBeanServer mbs;
+
+    /*
+     Used to check whether the Role associated with the authenticated Subject has superuser
+     status. By default, just delegates to Roles::hasSuperuserStatus, but can be overridden for testing.
+     */
+<span class="nc" id="L113">    protected Function&lt;RoleResource, Boolean&gt; isSuperuser = Roles::hasSuperuserStatus;</span>
+
+    /*
+     Used to retrieve the set of all permissions granted to a given role. By default, this fetches
+     the permissions from the local cache, which in turn loads them from the configured IAuthorizer
+     but can be overridden for testing.
+     */
+<span class="nc" id="L120">    protected Function&lt;RoleResource, Set&lt;PermissionDetails&gt;&gt; getPermissions = permissionsCache::get;</span>
+
+    /*
+     Used to decide whether authorization is enabled or not, usually this depends on the configured
+     IAuthorizer, but can be overridden for testing.
+     */
+<span class="nc" id="L126">    protected Supplier&lt;Boolean&gt; isAuthzRequired = () -&gt; DatabaseDescriptor.getAuthorizer().requireAuthorization();</span>
+
+    /*
+     Used to find matching MBeans when the invocation target is a pattern type ObjectName.
+     Defaults to querying the MBeanServer but can be overridden for testing. See checkPattern for usage.
+     */
+<span class="nc" id="L132">    protected Function&lt;ObjectName, Set&lt;ObjectName&gt;&gt; queryNames = (name) -&gt; mbs.queryNames(name, null);</span>
+
+    /*
+     Used to determine whether auth setup has completed so we know whether the expect the IAuthorizer
+     to be ready. Can be overridden for testing.
+     */
+<span class="nc" id="L138">    protected Supplier&lt;Boolean&gt; isAuthSetupComplete = () -&gt; StorageService.instance.isAuthSetupComplete();</span>
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args)
+            throws Throwable
+    {
+<span class="nc" id="L144">        String methodName = method.getName();</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (&quot;getMBeanServer&quot;.equals(methodName))</span>
+<span class="nc" id="L147">            throw new SecurityException(&quot;Access denied&quot;);</span>
+
+        // Retrieve Subject from current AccessControlContext
+<span class="nc" id="L150">        AccessControlContext acc = AccessController.getContext();</span>
+<span class="nc" id="L151">        Subject subject = Subject.getSubject(acc);</span>
+
+        // Allow setMBeanServer iff performed on behalf of the connector server itself
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if ((&quot;setMBeanServer&quot;).equals(methodName))</span>
+        {
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (subject != null)</span>
+<span class="nc" id="L157">                throw new SecurityException(&quot;Access denied&quot;);</span>
+
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (args[0] == null)</span>
+<span class="nc" id="L160">                throw new IllegalArgumentException(&quot;Null MBeanServer&quot;);</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (mbs != null)</span>
+<span class="nc" id="L163">                throw new IllegalArgumentException(&quot;MBeanServer already initialized&quot;);</span>
+
+<span class="nc" id="L165">            mbs = (MBeanServer) args[0];</span>
+<span class="nc" id="L166">            return null;</span>
+        }
+
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (authorize(subject, methodName, args))</span>
+<span class="nc" id="L170">            return invoke(method, args);</span>
+
+<span class="nc" id="L172">        throw new SecurityException(&quot;Access Denied&quot;);</span>
+    }
+
+    /**
+     * Performs the actual authorization of an identified subject to execute a remote method invocation.
+     * @param subject The principal making the execution request. A null value represents a local invocation
+     *                from the JMX connector itself
+     * @param methodName Name of the method being invoked
+     * @param args Array containing invocation argument. If the first element is an ObjectName instance, for
+     *             authz purposes we consider this an invocation of an MBean method, otherwise it is treated
+     *             as an invocation of a method on the MBeanServer.
+     */
+    @VisibleForTesting
+    boolean authorize(Subject subject, String methodName, Object[] args)
+    {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        logger.trace(&quot;Authorizing JMX method invocation {} for {}&quot;,</span>
+                     methodName,
+<span class="nc" id="L189">                     subject == null ? &quot;&quot; :subject.toString().replaceAll(&quot;\\n&quot;, &quot; &quot;));</span>
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (!isAuthSetupComplete.get())</span>
+        {
+<span class="nc" id="L193">            logger.trace(&quot;Auth setup is not complete, refusing access&quot;);</span>
+<span class="nc" id="L194">            return false;</span>
+        }
+
+        // Permissive authorization is enabled
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (!isAuthzRequired.get())</span>
+<span class="nc" id="L199">            return true;</span>
+
+        // Allow operations performed locally on behalf of the connector server itself
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (subject == null)</span>
+<span class="nc" id="L203">            return true;</span>
+
+        // Restrict access to certain methods by any remote user
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (METHOD_BLACKLIST.contains(methodName))</span>
+        {
+<span class="nc" id="L208">            logger.trace(&quot;Access denied to blacklisted method {}&quot;, methodName);</span>
+<span class="nc" id="L209">            return false;</span>
+        }
+
+        // Reject if the user has not authenticated
+<span class="nc" id="L213">        Set&lt;Principal&gt; principals = subject.getPrincipals();</span>
+<span class="nc bnc" id="L214" title="All 4 branches missed.">        if (principals == null || principals.isEmpty())</span>
+<span class="nc" id="L215">            return false;</span>
+
+        // Currently, we assume that the first Principal returned from the Subject
+        // is the one to use for authorization. It would be good to make this more
+        // robust, but we have no control over which Principals a given LoginModule
+        // might choose to associate with the Subject following successful authentication
+<span class="nc" id="L221">        RoleResource userResource = RoleResource.role(principals.iterator().next().getName());</span>
+        // A role with superuser status can do anything
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (isSuperuser.apply(userResource))</span>
+<span class="nc" id="L224">            return true;</span>
+
+        // The method being invoked may be a method on an MBean, or it could belong
+        // to the MBeanServer itself
+<span class="nc bnc" id="L228" title="All 4 branches missed.">        if (args != null &amp;&amp; args[0] instanceof ObjectName)</span>
+<span class="nc" id="L229">            return authorizeMBeanMethod(userResource, methodName, args);</span>
+        else
+<span class="nc" id="L231">            return authorizeMBeanServerMethod(userResource, methodName);</span>
+    }
+
+    /**
+     * Authorize execution of a method on the MBeanServer which does not take an MBean ObjectName
+     * as its first argument. The whitelisted methods that match this criteria are generally
+     * descriptive methods concerned with the MBeanServer itself, rather than with any particular
+     * set of MBeans managed by the server and so we check the DESCRIBE permission on the root
+     * JMXResource (representing the MBeanServer)
+     *
+     * @param subject
+     * @param methodName
+     * @return the result of the method invocation, if authorized
+     * @throws Throwable
+     * @throws SecurityException if authorization fails
+     */
+    private boolean authorizeMBeanServerMethod(RoleResource subject, String methodName)
+    {
+<span class="nc" id="L249">        logger.trace(&quot;JMX invocation of {} on MBeanServer requires permission {}&quot;, methodName, Permission.DESCRIBE);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        return (MBEAN_SERVER_METHOD_WHITELIST.contains(methodName) &amp;&amp;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            hasPermission(subject, Permission.DESCRIBE, JMXResource.root()));</span>
+    }
+
+    /**
+     * Authorize execution of a method on an MBean (or set of MBeans) which may be
+     * managed by the MBeanServer. Note that this also includes the queryMBeans and queryNames
+     * methods of MBeanServer as those both take an ObjectName (possibly a pattern containing
+     * wildcards) as their first argument. They both of those methods also accept null arguments,
+     * in which case they will be handled by authorizedMBeanServerMethod
+     *
+     * @param role
+     * @param methodName
+     * @param args
+     * @return the result of the method invocation, if authorized
+     * @throws Throwable
+     * @throws SecurityException if authorization fails
+     */
+    private boolean authorizeMBeanMethod(RoleResource role, String methodName, Object[] args)
+    {
+<span class="nc" id="L270">        ObjectName targetBean = (ObjectName)args[0];</span>
+
+        // work out which permission we need to execute the method being called on the mbean
+<span class="nc" id="L273">        Permission requiredPermission = getRequiredPermission(methodName);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (null == requiredPermission)</span>
+<span class="nc" id="L275">            return false;</span>
+
+<span class="nc" id="L277">        logger.trace(&quot;JMX invocation of {} on {} requires permission {}&quot;, methodName, targetBean, requiredPermission);</span>
+
+        // find any JMXResources upon which the authenticated subject has been granted the
+        // reqired permission. We'll do ObjectName-specific filtering &amp; matching of resources later
+<span class="nc" id="L281">        Set&lt;JMXResource&gt; permittedResources = getPermittedResources(role, requiredPermission);</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (permittedResources.isEmpty())</span>
+<span class="nc" id="L284">            return false;</span>
+
+        // finally, check the JMXResource from the grants to see if we have either
+        // an exact match or a wildcard match for the target resource, whichever is
+        // applicable
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        return targetBean.isPattern()</span>
+<span class="nc" id="L290">                ? checkPattern(targetBean, permittedResources)</span>
+<span class="nc" id="L291">                : checkExact(targetBean, permittedResources);</span>
+    }
+
+    /**
+     * Get any grants of the required permission for the authenticated subject, regardless
+     * of the resource the permission applies to as we'll do the filtering &amp; matching in
+     * the calling method
+     * @param subject
+     * @param required
+     * @return the set of JMXResources upon which the subject has been granted the required permission
+     */
+    private Set&lt;JMXResource&gt; getPermittedResources(RoleResource subject, Permission required)
+    {
+<span class="nc" id="L304">        return getPermissions.apply(subject)</span>
+<span class="nc" id="L305">               .stream()</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">               .filter(details -&gt; details.permission == required)</span>
+<span class="nc" id="L307">               .map(details -&gt; (JMXResource)details.resource)</span>
+<span class="nc" id="L308">               .collect(Collectors.toSet());</span>
+    }
+
+    /**
+     * Check whether a required permission has been granted to the authenticated subject on a specific resource
+     * @param subject
+     * @param permission
+     * @param resource
+     * @return true if the Subject has been granted the required permission on the specified resource; false otherwise
+     */
+    private boolean hasPermission(RoleResource subject, Permission permission, JMXResource resource)
+    {
+<span class="nc" id="L320">        return getPermissions.apply(subject)</span>
+<span class="nc" id="L321">               .stream()</span>
+<span class="nc bnc" id="L322" title="All 4 branches missed.">               .anyMatch(details -&gt; details.permission == permission &amp;&amp; details.resource.equals(resource));</span>
+    }
+
+    /**
+     * Given a set of JMXResources upon which the Subject has been granted a particular permission,
+     * check whether any match the pattern-type ObjectName representing the target of the method
+     * invocation. At this point, we are sure that whatever the required permission, the Subject
+     * has definitely been granted it against this set of JMXResources. The job of this method is
+     * only to verify that the target of the invocation is covered by the members of the set.
+     *
+     * @param target
+     * @param permittedResources
+     * @return true if all registered beans which match the target can also be matched by the
+     *         JMXResources the subject has been granted permissions on; false otherwise
+     */
+    private boolean checkPattern(ObjectName target, Set&lt;JMXResource&gt; permittedResources)
+    {
+        // if the required permission was granted on the root JMX resource, then we're done
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (permittedResources.contains(JMXResource.root()))</span>
+<span class="nc" id="L341">            return true;</span>
+
+        // Get the full set of beans which match the target pattern
+<span class="nc" id="L344">        Set&lt;ObjectName&gt; targetNames = queryNames.apply(target);</span>
+
+        // Iterate over the resources the permission has been granted on. Some of these may
+        // be patterns, so query the server to retrieve the full list of matching names and
+        // remove those from the target set. Once the target set is empty (i.e. all required
+        // matches have been satisfied), the requirement is met.
+        // If there are still unsatisfied targets after all the JMXResources have been processed,
+        // there are insufficient grants to permit the operation.
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        for (JMXResource resource : permittedResources)</span>
+        {
+            try
+            {
+<span class="nc" id="L356">                Set&lt;ObjectName&gt; matchingNames = queryNames.apply(ObjectName.getInstance(resource.getObjectName()));</span>
+<span class="nc" id="L357">                targetNames.removeAll(matchingNames);</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (targetNames.isEmpty())</span>
+<span class="nc" id="L359">                    return true;</span>
+            }
+<span class="nc" id="L361">            catch (MalformedObjectNameException e)</span>
+            {
+<span class="nc" id="L363">                logger.warn(&quot;Permissions for JMX resource contains invalid ObjectName {}&quot;, resource.getObjectName());</span>
+<span class="nc" id="L364">            }</span>
+<span class="nc" id="L365">        }</span>
+
+<span class="nc" id="L367">        logger.trace(&quot;Subject does not have sufficient permissions on all MBeans matching the target pattern {}&quot;, target);</span>
+<span class="nc" id="L368">        return false;</span>
+    }
+
+    /**
+     * Given a set of JMXResources upon which the Subject has been granted a particular permission,
+     * check whether any match the ObjectName representing the target of the method invocation.
+     * At this point, we are sure that whatever the required permission, the Subject has definitely
+     * been granted it against this set of JMXResources. The job of this method is only to verify
+     * that the target of the invocation is matched by a member of the set.
+     *
+     * @param target
+     * @param permittedResources
+     * @return true if at least one of the permitted resources matches the target; false otherwise
+     */
+    private boolean checkExact(ObjectName target, Set&lt;JMXResource&gt; permittedResources)
+    {
+        // if the required permission was granted on the root JMX resource, then we're done
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (permittedResources.contains(JMXResource.root()))</span>
+<span class="nc" id="L386">            return true;</span>
+
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        for (JMXResource resource : permittedResources)</span>
+        {
+            try
+            {
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                if (ObjectName.getInstance(resource.getObjectName()).apply(target))</span>
+<span class="nc" id="L393">                    return true;</span>
+            }
+<span class="nc" id="L395">            catch (MalformedObjectNameException e)</span>
+            {
+<span class="nc" id="L397">                logger.warn(&quot;Permissions for JMX resource contains invalid ObjectName {}&quot;, resource.getObjectName());</span>
+<span class="nc" id="L398">            }</span>
+<span class="nc" id="L399">        }</span>
+
+<span class="nc" id="L401">        logger.trace(&quot;Subject does not have sufficient permissions on target MBean {}&quot;, target);</span>
+<span class="nc" id="L402">        return false;</span>
+    }
+
+    /**
+     * Mapping between method names and the permission required to invoke them. Note, these
+     * names refer to methods on MBean instances invoked via the MBeanServer.
+     * @param methodName
+     * @return
+     */
+    private static Permission getRequiredPermission(String methodName)
+    {
+<span class="nc bnc" id="L413" title="All 5 branches missed.">        switch (methodName)</span>
+        {
+            case &quot;getAttribute&quot;:
+            case &quot;getAttributes&quot;:
+<span class="nc" id="L417">                return Permission.SELECT;</span>
+            case &quot;setAttribute&quot;:
+            case &quot;setAttributes&quot;:
+<span class="nc" id="L420">                return Permission.MODIFY;</span>
+            case &quot;invoke&quot;:
+<span class="nc" id="L422">                return Permission.EXECUTE;</span>
+            case &quot;getInstanceOf&quot;:
+            case &quot;getMBeanInfo&quot;:
+            case &quot;hashCode&quot;:
+            case &quot;isInstanceOf&quot;:
+            case &quot;isRegistered&quot;:
+            case &quot;queryMBeans&quot;:
+            case &quot;queryNames&quot;:
+<span class="nc" id="L430">                return Permission.DESCRIBE;</span>
+            default:
+<span class="nc" id="L432">                logger.debug(&quot;Access denied, method name {} does not map to any defined permission&quot;, methodName);</span>
+<span class="nc" id="L433">                return null;</span>
+        }
+    }
+
+    /**
+     * Invoke a method on the MBeanServer instance. This is called when authorization is not required (because
+     * AllowAllAuthorizer is configured, or because the invocation is being performed by the JMXConnector
+     * itself rather than by a connected client), and also when a call from an authenticated subject
+     * has been successfully authorized
+     *
+     * @param method
+     * @param args
+     * @return
+     * @throws Throwable
+     */
+    private Object invoke(Method method, Object[] args) throws Throwable
+    {
+        try
+        {
+<span class="nc" id="L452">            return method.invoke(mbs, args);</span>
+        }
+<span class="nc" id="L454">        catch (InvocationTargetException e) //Catch any exception that might have been thrown by the mbeans</span>
+        {
+<span class="nc" id="L456">            Throwable t = e.getCause(); //Throw the exception that nodetool etc expects</span>
+<span class="nc" id="L457">            throw t;</span>
+        }
+    }
+
+    /**
+     * Query the configured IAuthorizer for the set of all permissions granted on JMXResources to a specific subject
+     * @param subject
+     * @return All permissions granted to the specfied subject (including those transitively inherited from
+     *         any roles the subject has been granted), filtered to include only permissions granted on
+     *         JMXResources
+     */
+    private static Set&lt;PermissionDetails&gt; loadPermissions(RoleResource subject)
+    {
+        // get all permissions for the specified subject. We'll cache them as it's likely
+        // we'll receive multiple lookups for the same subject (but for different resources
+        // and permissions) in quick succession
+<span class="nc" id="L473">        return DatabaseDescriptor.getAuthorizer().list(AuthenticatedUser.SYSTEM_USER, Permission.ALL, null, subject)</span>
+<span class="nc" id="L474">                                                 .stream()</span>
+<span class="nc" id="L475">                                                 .filter(details -&gt; details.resource instanceof JMXResource)</span>
+<span class="nc" id="L476">                                                 .collect(Collectors.toSet());</span>
+    }
+
+    private static final class JMXPermissionsCache extends AuthCache&lt;RoleResource, Set&lt;PermissionDetails&gt;&gt;
+    {
+        protected JMXPermissionsCache()
+        {
+<span class="nc" id="L483">            super(&quot;JMXPermissionsCache&quot;,</span>
+                  DatabaseDescriptor::setPermissionsValidity,
+                  DatabaseDescriptor::getPermissionsValidity,
+                  DatabaseDescriptor::setPermissionsUpdateInterval,
+                  DatabaseDescriptor::getPermissionsUpdateInterval,
+                  DatabaseDescriptor::setPermissionsCacheMaxEntries,
+                  DatabaseDescriptor::getPermissionsCacheMaxEntries,
+<span class="nc" id="L490">                  AuthorizationProxy::loadPermissions,</span>
+<span class="nc" id="L491">                  () -&gt; true);</span>
+<span class="nc" id="L492">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

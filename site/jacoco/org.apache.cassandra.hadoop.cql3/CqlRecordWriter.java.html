@@ -1,0 +1,536 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CqlRecordWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hadoop.cql3</a> &gt; <span class="el_source">CqlRecordWriter.java</span></div><h1>CqlRecordWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hadoop.cql3;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.datastax.driver.core.*;
+import com.datastax.driver.core.exceptions.*;
+
+import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.hadoop.ConfigHelper;
+import org.apache.cassandra.hadoop.HadoopCompat;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapreduce.RecordWriter;
+import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.util.Progressable;
+
+import static java.util.stream.Collectors.toMap;
+
+/**
+ * The &lt;code&gt;CqlRecordWriter&lt;/code&gt; maps the output &amp;lt;key, value&amp;gt;
+ * pairs to a Cassandra table. In particular, it applies the binded variables
+ * in the value to the prepared statement, which it associates with the key, and in
+ * turn the responsible endpoint.
+ *
+ * &lt;p&gt;
+ * Furthermore, this writer groups the cql queries by the endpoint responsible for
+ * the rows being affected. This allows the cql queries to be executed in parallel,
+ * directly to a responsible endpoint.
+ * &lt;/p&gt;
+ *
+ * @see CqlOutputFormat
+ */
+class CqlRecordWriter extends RecordWriter&lt;Map&lt;String, ByteBuffer&gt;, List&lt;ByteBuffer&gt;&gt; implements
+        org.apache.hadoop.mapred.RecordWriter&lt;Map&lt;String, ByteBuffer&gt;, List&lt;ByteBuffer&gt;&gt;, AutoCloseable
+{
+<span class="nc" id="L62">    private static final Logger logger = LoggerFactory.getLogger(CqlRecordWriter.class);</span>
+
+    // The configuration this writer is associated with.
+    protected final Configuration conf;
+    // The number of mutations to buffer per endpoint
+    protected final int queueSize;
+
+    protected final long batchThreshold;
+
+    protected Progressable progressable;
+    protected TaskAttemptContext context;
+
+    // The ring cache that describes the token ranges each node in the ring is
+    // responsible for. This is what allows us to group the mutations by
+    // the endpoints they should be targeted at. The targeted endpoint
+    // essentially
+    // acts as the primary replica for the rows being affected by the mutations.
+    private final NativeRingCache ringCache;
+
+    // handles for clients for each range running in the threadpool
+    protected final Map&lt;InetAddress, RangeClient&gt; clients;
+
+    // host to prepared statement id mappings
+<span class="nc" id="L85">    protected final ConcurrentHashMap&lt;Session, PreparedStatement&gt; preparedStatements = new ConcurrentHashMap&lt;Session, PreparedStatement&gt;();</span>
+
+    protected final String cql;
+
+    protected List&lt;ColumnMetadata&gt; partitionKeyColumns;
+    protected List&lt;ColumnMetadata&gt; clusterColumns;
+
+    /**
+     * Upon construction, obtain the map that this writer will use to collect
+     * mutations, and the ring cache for the given keyspace.
+     *
+     * @param context the task attempt context
+     * @throws IOException
+     */
+    CqlRecordWriter(TaskAttemptContext context) throws IOException
+    {
+<span class="nc" id="L101">        this(HadoopCompat.getConfiguration(context));</span>
+<span class="nc" id="L102">        this.context = context;</span>
+<span class="nc" id="L103">    }</span>
+
+    CqlRecordWriter(Configuration conf, Progressable progressable)
+    {
+<span class="nc" id="L107">        this(conf);</span>
+<span class="nc" id="L108">        this.progressable = progressable;</span>
+<span class="nc" id="L109">    }</span>
+
+    CqlRecordWriter(Configuration conf)
+<span class="nc" id="L112">    {</span>
+<span class="nc" id="L113">        this.conf = conf;</span>
+<span class="nc" id="L114">        this.queueSize = conf.getInt(CqlOutputFormat.QUEUE_SIZE, 32 * FBUtilities.getAvailableProcessors());</span>
+<span class="nc" id="L115">        batchThreshold = conf.getLong(CqlOutputFormat.BATCH_THRESHOLD, 32);</span>
+<span class="nc" id="L116">        this.clients = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L117">        String keyspace = ConfigHelper.getOutputKeyspace(conf);</span>
+
+<span class="nc" id="L119">        try (Cluster cluster = CqlConfigHelper.getOutputCluster(ConfigHelper.getOutputInitialAddress(conf), conf))</span>
+        {
+<span class="nc" id="L121">            Metadata metadata = cluster.getMetadata();</span>
+<span class="nc" id="L122">            ringCache = new NativeRingCache(conf, metadata);</span>
+<span class="nc" id="L123">            TableMetadata tableMetadata = metadata.getKeyspace(Metadata.quote(keyspace)).getTable(ConfigHelper.getOutputColumnFamily(conf));</span>
+<span class="nc" id="L124">            clusterColumns = tableMetadata.getClusteringColumns();</span>
+<span class="nc" id="L125">            partitionKeyColumns = tableMetadata.getPartitionKey();</span>
+
+<span class="nc" id="L127">            String cqlQuery = CqlConfigHelper.getOutputCql(conf).trim();</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (cqlQuery.toLowerCase(Locale.ENGLISH).startsWith(&quot;insert&quot;))</span>
+<span class="nc" id="L129">                throw new UnsupportedOperationException(&quot;INSERT with CqlRecordWriter is not supported, please use UPDATE/DELETE statement&quot;);</span>
+<span class="nc" id="L130">            cql = appendKeyWhereClauses(cqlQuery);</span>
+        }
+<span class="nc" id="L132">        catch (Exception e)</span>
+        {
+<span class="nc" id="L134">            throw new RuntimeException(e);</span>
+<span class="nc" id="L135">        }</span>
+<span class="nc" id="L136">    }</span>
+
+    /**
+     * Close this &lt;code&gt;RecordWriter&lt;/code&gt; to future operations, but not before
+     * flushing out the batched mutations.
+     *
+     * @param context the context of the task
+     * @throws IOException
+     */
+    public void close(TaskAttemptContext context) throws IOException, InterruptedException
+    {
+<span class="nc" id="L147">        close();</span>
+<span class="nc" id="L148">    }</span>
+
+    /** Fills the deprecated RecordWriter interface for streaming. */
+    @Deprecated
+    public void close(org.apache.hadoop.mapred.Reporter reporter) throws IOException
+    {
+<span class="nc" id="L154">        close();</span>
+<span class="nc" id="L155">    }</span>
+
+    @Override
+    public void close() throws IOException
+    {
+        // close all the clients before throwing anything
+<span class="nc" id="L161">        IOException clientException = null;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        for (RangeClient client : clients.values())</span>
+        {
+            try
+            {
+<span class="nc" id="L166">                client.close();</span>
+            }
+<span class="nc" id="L168">            catch (IOException e)</span>
+            {
+<span class="nc" id="L170">                clientException = e;</span>
+<span class="nc" id="L171">            }</span>
+<span class="nc" id="L172">        }</span>
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (clientException != null)</span>
+<span class="nc" id="L175">            throw clientException;</span>
+<span class="nc" id="L176">    }</span>
+
+    /**
+     * If the key is to be associated with a valid value, a mutation is created
+     * for it with the given table and columns. In the event the value
+     * in the column is missing (i.e., null), then it is marked for
+     * {@link Deletion}. Similarly, if the entire value for a key is missing
+     * (i.e., null), then the entire key is marked for {@link Deletion}.
+     * &lt;/p&gt;
+     *
+     * @param keyColumns
+     *            the key to write.
+     * @param values
+     *            the values to write.
+     * @throws IOException
+     */
+    @Override
+    public void write(Map&lt;String, ByteBuffer&gt; keyColumns, List&lt;ByteBuffer&gt; values) throws IOException
+    {
+<span class="nc" id="L195">        TokenRange range = ringCache.getRange(getPartitionKey(keyColumns));</span>
+
+        // get the client for the given range, or create a new one
+<span class="nc" id="L198">        final InetAddress address = ringCache.getEndpoints(range).get(0);</span>
+<span class="nc" id="L199">        RangeClient client = clients.get(address);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (client == null)</span>
+        {
+            // haven't seen keys for this range: create new client
+<span class="nc" id="L203">            client = new RangeClient(ringCache.getEndpoints(range));</span>
+<span class="nc" id="L204">            client.start();</span>
+<span class="nc" id="L205">            clients.put(address, client);</span>
+        }
+
+        // add primary key columns to the bind variables
+<span class="nc" id="L209">        List&lt;ByteBuffer&gt; allValues = new ArrayList&lt;ByteBuffer&gt;(values);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        for (ColumnMetadata column : partitionKeyColumns)</span>
+<span class="nc" id="L211">            allValues.add(keyColumns.get(column.getName()));</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        for (ColumnMetadata column : clusterColumns)</span>
+<span class="nc" id="L213">            allValues.add(keyColumns.get(column.getName()));</span>
+
+<span class="nc" id="L215">        client.put(allValues);</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if (progressable != null)</span>
+<span class="nc" id="L218">            progressable.progress();</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (context != null)</span>
+<span class="nc" id="L220">            HadoopCompat.progress(context);</span>
+<span class="nc" id="L221">    }</span>
+
+    private static void closeSession(Session session)
+    {
+        //Close the session to satisfy to avoid warnings for the resource not being closed
+        try
+        {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            if (session != null)</span>
+<span class="nc" id="L229">                session.getCluster().closeAsync();</span>
+        }
+<span class="nc" id="L231">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L233">            logger.warn(&quot;Error closing connection&quot;, t);</span>
+<span class="nc" id="L234">        }</span>
+<span class="nc" id="L235">    }</span>
+
+    /**
+     * A client that runs in a threadpool and connects to the list of endpoints for a particular
+     * range. Bound variables for keys in that range are sent to this client via a queue.
+     */
+    public class RangeClient extends Thread
+    {
+        // The list of endpoints for this range
+        protected final List&lt;InetAddress&gt; endpoints;
+<span class="nc" id="L245">        protected Cluster cluster = null;</span>
+        // A bounded queue of incoming mutations for this range
+<span class="nc" id="L247">        protected final BlockingQueue&lt;List&lt;ByteBuffer&gt;&gt; queue = new ArrayBlockingQueue&lt;List&lt;ByteBuffer&gt;&gt;(queueSize);</span>
+
+<span class="nc" id="L249">        protected volatile boolean run = true;</span>
+        // we want the caller to know if something went wrong, so we record any unrecoverable exception while writing
+        // so we can throw it on the caller's stack when he calls put() again, or if there are no more put calls,
+        // when the client is closed.
+        protected volatile IOException lastException;
+
+        /**
+         * Constructs an {@link RangeClient} for the given endpoints.
+         * @param endpoints the possible endpoints to execute the mutations on
+         */
+        public RangeClient(List&lt;InetAddress&gt; endpoints)
+<span class="nc" id="L260">        {</span>
+<span class="nc" id="L261">            super(&quot;client-&quot; + endpoints);</span>
+<span class="nc" id="L262">            this.endpoints = endpoints;</span>
+<span class="nc" id="L263">        }</span>
+
+        /**
+         * enqueues the given value to Cassandra
+         */
+        public void put(List&lt;ByteBuffer&gt; value) throws IOException
+        {
+            while (true)
+            {
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                if (lastException != null)</span>
+<span class="nc" id="L273">                    throw lastException;</span>
+                try
+                {
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                    if (queue.offer(value, 100, TimeUnit.MILLISECONDS))</span>
+<span class="nc" id="L277">                        break;</span>
+                }
+<span class="nc" id="L279">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L281">                    throw new AssertionError(e);</span>
+<span class="nc" id="L282">                }</span>
+            }
+<span class="nc" id="L284">        }</span>
+
+        /**
+         * Loops collecting cql binded variable values from the queue and sending to Cassandra
+         */
+        @SuppressWarnings(&quot;resource&quot;)
+        public void run()
+        {
+<span class="nc" id="L292">            Session session = null;</span>
+
+            try
+            {
+                outer:
+<span class="nc bnc" id="L297" title="All 4 branches missed.">                while (run || !queue.isEmpty())</span>
+                {
+                    List&lt;ByteBuffer&gt; bindVariables;
+                    try
+                    {
+<span class="nc" id="L302">                        bindVariables = queue.take();</span>
+                    }
+<span class="nc" id="L304">                    catch (InterruptedException e)</span>
+                    {
+                        // re-check loop condition after interrupt
+<span class="nc" id="L307">                        continue;</span>
+<span class="nc" id="L308">                    }</span>
+
+<span class="nc" id="L310">                    ListIterator&lt;InetAddress&gt; iter = endpoints.listIterator();</span>
+                    while (true)
+                    {
+                        // send the mutation to the last-used endpoint.  first time through, this will NPE harmlessly.
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                        if (session != null)</span>
+                        {
+                            try
+                            {
+<span class="nc" id="L318">                                int i = 0;</span>
+<span class="nc" id="L319">                                PreparedStatement statement = preparedStatement(session);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                                while (bindVariables != null)</span>
+                                {
+<span class="nc" id="L322">                                    BoundStatement boundStatement = new BoundStatement(statement);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                                    for (int columnPosition = 0; columnPosition &lt; bindVariables.size(); columnPosition++)</span>
+                                    {
+<span class="nc" id="L325">                                        boundStatement.setBytesUnsafe(columnPosition, bindVariables.get(columnPosition));</span>
+                                    }
+<span class="nc" id="L327">                                    session.execute(boundStatement);</span>
+<span class="nc" id="L328">                                    i++;</span>
+
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                                    if (i &gt;= batchThreshold)</span>
+<span class="nc" id="L331">                                        break;</span>
+<span class="nc" id="L332">                                    bindVariables = queue.poll();</span>
+<span class="nc" id="L333">                                }</span>
+<span class="nc" id="L334">                                break;</span>
+                            }
+<span class="nc" id="L336">                            catch (Exception e)</span>
+                            {
+<span class="nc" id="L338">                                closeInternal();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                                if (!iter.hasNext())</span>
+                                {
+<span class="nc" id="L341">                                    lastException = new IOException(e);</span>
+<span class="nc" id="L342">                                    break outer;</span>
+                                }
+                            }
+                        }
+
+                        // attempt to connect to a different endpoint
+                        try
+                        {
+<span class="nc" id="L350">                            InetAddress address = iter.next();</span>
+<span class="nc" id="L351">                            String host = address.getHostName();</span>
+<span class="nc" id="L352">                            cluster = CqlConfigHelper.getOutputCluster(host, conf);</span>
+<span class="nc" id="L353">                            closeSession(session);</span>
+<span class="nc" id="L354">                            session = cluster.connect();</span>
+                        }
+<span class="nc" id="L356">                        catch (Exception e)</span>
+                        {
+                            //If connection died due to Interrupt, just try connecting to the endpoint again.
+                            //There are too many ways for the Thread.interrupted() state to be cleared, so
+                            //we can't rely on that here. Until the java driver gives us a better way of knowing
+                            //that this exception came from an InterruptedException, this is the best solution.
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                            if (canRetryDriverConnection(e))</span>
+                            {
+<span class="nc" id="L364">                                iter.previous();</span>
+                            }
+<span class="nc" id="L366">                            closeInternal();</span>
+
+                            // Most exceptions mean something unexpected went wrong to that endpoint, so
+                            // we should try again to another.  Other exceptions (auth or invalid request) are fatal.
+<span class="nc bnc" id="L370" title="All 6 branches missed.">                            if ((e instanceof AuthenticationException || e instanceof InvalidQueryException) || !iter.hasNext())</span>
+                            {
+<span class="nc" id="L372">                                lastException = new IOException(e);</span>
+<span class="nc" id="L373">                                break outer;</span>
+                            }
+<span class="nc" id="L375">                        }</span>
+                    }
+<span class="nc" id="L377">                }</span>
+            }
+            finally
+            {
+<span class="nc" id="L381">                closeSession(session);</span>
+                // close all our connections once we are done.
+<span class="nc" id="L383">                closeInternal();</span>
+            }
+<span class="nc" id="L385">        }</span>
+
+        /** get prepared statement id from cache, otherwise prepare it from Cassandra server*/
+        private PreparedStatement preparedStatement(Session client)
+        {
+<span class="nc" id="L390">            PreparedStatement statement = preparedStatements.get(client);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            if (statement == null)</span>
+            {
+                PreparedStatement result;
+                try
+                {
+<span class="nc" id="L396">                    result = client.prepare(cql);</span>
+                }
+<span class="nc" id="L398">                catch (NoHostAvailableException e)</span>
+                {
+<span class="nc" id="L400">                    throw new RuntimeException(&quot;failed to prepare cql query &quot; + cql, e);</span>
+<span class="nc" id="L401">                }</span>
+
+<span class="nc" id="L403">                PreparedStatement previousId = preparedStatements.putIfAbsent(client, result);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                statement = previousId == null ? result : previousId;</span>
+            }
+<span class="nc" id="L406">            return statement;</span>
+        }
+
+        public void close() throws IOException
+        {
+            // stop the run loop.  this will result in closeInternal being called by the time join() finishes.
+<span class="nc" id="L412">            run = false;</span>
+<span class="nc" id="L413">            interrupt();</span>
+            try
+            {
+<span class="nc" id="L416">                this.join();</span>
+            }
+<span class="nc" id="L418">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L420">                throw new AssertionError(e);</span>
+<span class="nc" id="L421">            }</span>
+
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (lastException != null)</span>
+<span class="nc" id="L424">                throw lastException;</span>
+<span class="nc" id="L425">        }</span>
+
+        protected void closeInternal()
+        {
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (cluster != null)</span>
+            {
+<span class="nc" id="L431">                cluster.close();</span>
+            }
+<span class="nc" id="L433">        }</span>
+
+        private boolean canRetryDriverConnection(Exception e)
+        {
+<span class="nc bnc" id="L437" title="All 4 branches missed.">            if (e instanceof DriverException &amp;&amp; e.getMessage().contains(&quot;Connection thread interrupted&quot;))</span>
+<span class="nc" id="L438">                return true;</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            if (e instanceof NoHostAvailableException)</span>
+            {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                if (((NoHostAvailableException) e).getErrors().values().size() == 1)</span>
+                {
+<span class="nc" id="L443">                    Throwable cause = ((NoHostAvailableException) e).getErrors().values().iterator().next();</span>
+<span class="nc bnc" id="L444" title="All 4 branches missed.">                    if (cause != null &amp;&amp; cause.getCause() instanceof java.nio.channels.ClosedByInterruptException)</span>
+                    {
+<span class="nc" id="L446">                        return true;</span>
+                    }
+                }
+            }
+<span class="nc" id="L450">            return false;</span>
+        }
+    }
+
+    private ByteBuffer getPartitionKey(Map&lt;String, ByteBuffer&gt; keyColumns)
+    {
+        ByteBuffer partitionKey;
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (partitionKeyColumns.size() &gt; 1)</span>
+        {
+<span class="nc" id="L459">            ByteBuffer[] keys = new ByteBuffer[partitionKeyColumns.size()];</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            for (int i = 0; i&lt; keys.length; i++)</span>
+<span class="nc" id="L461">                keys[i] = keyColumns.get(partitionKeyColumns.get(i).getName());</span>
+
+<span class="nc" id="L463">            partitionKey = CompositeType.build(keys);</span>
+<span class="nc" id="L464">        }</span>
+        else
+        {
+<span class="nc" id="L467">            partitionKey = keyColumns.get(partitionKeyColumns.get(0).getName());</span>
+        }
+<span class="nc" id="L469">        return partitionKey;</span>
+    }
+
+    /**
+     * add where clauses for partition keys and cluster columns
+     */
+    private String appendKeyWhereClauses(String cqlQuery)
+    {
+<span class="nc" id="L477">        String keyWhereClause = &quot;&quot;;</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        for (ColumnMetadata partitionKey : partitionKeyColumns)</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">            keyWhereClause += String.format(&quot;%s = ?&quot;, keyWhereClause.isEmpty() ? quote(partitionKey.getName()) : (&quot; AND &quot; + quote(partitionKey.getName())));</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        for (ColumnMetadata clusterColumn : clusterColumns)</span>
+<span class="nc" id="L482">            keyWhereClause += &quot; AND &quot; + quote(clusterColumn.getName()) + &quot; = ?&quot;;</span>
+
+<span class="nc" id="L484">        return cqlQuery + &quot; WHERE &quot; + keyWhereClause;</span>
+    }
+
+    /** Quoting for working with uppercase */
+    private String quote(String identifier)
+    {
+<span class="nc" id="L490">        return &quot;\&quot;&quot; + identifier.replaceAll(&quot;\&quot;&quot;, &quot;\&quot;\&quot;&quot;) + &quot;\&quot;&quot;;</span>
+    }
+
+    static class NativeRingCache
+    {
+        private final Map&lt;TokenRange, Set&lt;Host&gt;&gt; rangeMap;
+        private final Metadata metadata;
+        private final IPartitioner partitioner;
+
+        public NativeRingCache(Configuration conf, Metadata metadata)
+<span class="nc" id="L500">        {</span>
+<span class="nc" id="L501">            this.partitioner = ConfigHelper.getOutputPartitioner(conf);</span>
+<span class="nc" id="L502">            this.metadata = metadata;</span>
+<span class="nc" id="L503">            String keyspace = ConfigHelper.getOutputKeyspace(conf);</span>
+<span class="nc" id="L504">            this.rangeMap = metadata.getTokenRanges()</span>
+<span class="nc" id="L505">                                    .stream()</span>
+<span class="nc" id="L506">                                    .collect(toMap(p -&gt; p, p -&gt; metadata.getReplicas('&quot;' + keyspace + '&quot;', p)));</span>
+<span class="nc" id="L507">        }</span>
+
+        public TokenRange getRange(ByteBuffer key)
+        {
+<span class="nc" id="L511">            Token t = partitioner.getToken(key);</span>
+<span class="nc" id="L512">            com.datastax.driver.core.Token driverToken = metadata.newToken(partitioner.getTokenFactory().toString(t));</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">            for (TokenRange range : rangeMap.keySet())</span>
+            {
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                if (range.contains(driverToken))</span>
+                {
+<span class="nc" id="L517">                    return range;</span>
+                }
+<span class="nc" id="L519">            }</span>
+
+<span class="nc" id="L521">            throw new RuntimeException(&quot;Invalid token information returned by describe_ring: &quot; + rangeMap);</span>
+        }
+
+        public List&lt;InetAddress&gt; getEndpoints(TokenRange range)
+        {
+<span class="nc" id="L526">            Set&lt;Host&gt; hostSet = rangeMap.get(range);</span>
+<span class="nc" id="L527">            List&lt;InetAddress&gt; addresses = new ArrayList&lt;&gt;(hostSet.size());</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            for (Host host: hostSet)</span>
+            {
+<span class="nc" id="L530">                addresses.add(host.getAddress());</span>
+<span class="nc" id="L531">            }</span>
+<span class="nc" id="L532">            return addresses;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

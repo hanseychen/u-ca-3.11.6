@@ -1,0 +1,287 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Validator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">Validator.java</span></div><h1>Validator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.repair;
+
+import java.net.InetAddress;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.repair.messages.ValidationComplete;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MerkleTree;
+import org.apache.cassandra.utils.MerkleTree.RowHash;
+import org.apache.cassandra.utils.MerkleTrees;
+
+/**
+ * Handles the building of a merkle tree for a column family.
+ *
+ * Lifecycle:
+ * 1. prepare() - Initialize tree with samples.
+ * 2. add() - 0 or more times, to add hashes to the tree.
+ * 3. complete() - Enqueues any operations that were blocked waiting for a valid tree.
+ */
+<span class="nc bnc" id="L54" title="All 2 branches missed.">public class Validator implements Runnable</span>
+{
+<span class="nc" id="L56">    private static final Logger logger = LoggerFactory.getLogger(Validator.class);</span>
+
+    public final RepairJobDesc desc;
+    public final InetAddress initiator;
+    public final int gcBefore;
+    private final boolean evenTreeDistribution;
+
+    // null when all rows with the min token have been consumed
+    private long validated;
+    private MerkleTrees trees;
+    // current range being updated
+    private MerkleTree.TreeRange range;
+    // iterator for iterating sub ranges (MT's leaves)
+    private MerkleTrees.TreeRangeIterator ranges;
+    // last key seen
+    private DecoratedKey lastKey;
+
+    public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore)
+    {
+<span class="nc" id="L75">        this(desc, initiator, gcBefore, false);</span>
+<span class="nc" id="L76">    }</span>
+
+    public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore, boolean evenTreeDistribution)
+<span class="nc" id="L79">    {</span>
+<span class="nc" id="L80">        this.desc = desc;</span>
+<span class="nc" id="L81">        this.initiator = initiator;</span>
+<span class="nc" id="L82">        this.gcBefore = gcBefore;</span>
+<span class="nc" id="L83">        validated = 0;</span>
+<span class="nc" id="L84">        range = null;</span>
+<span class="nc" id="L85">        ranges = null;</span>
+<span class="nc" id="L86">        this.evenTreeDistribution = evenTreeDistribution;</span>
+<span class="nc" id="L87">    }</span>
+
+    public void prepare(ColumnFamilyStore cfs, MerkleTrees tree)
+    {
+<span class="nc" id="L91">        this.trees = tree;</span>
+
+<span class="nc bnc" id="L93" title="All 4 branches missed.">        if (!tree.partitioner().preservesOrder() || evenTreeDistribution)</span>
+        {
+            // You can't beat an even tree distribution for md5
+<span class="nc" id="L96">            tree.init();</span>
+        }
+        else
+        {
+<span class="nc" id="L100">            List&lt;DecoratedKey&gt; keys = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L101">            Random random = new Random();</span>
+
+<span class="nc bnc" id="L103" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : tree.ranges())</span>
+            {
+<span class="nc bnc" id="L105" title="All 2 branches missed.">                for (DecoratedKey sample : cfs.keySamples(range))</span>
+                {
+<span class="nc bnc" id="L107" title="All 4 branches missed.">                    assert range.contains(sample.getToken()) : &quot;Token &quot; + sample.getToken() + &quot; is not within range &quot; + desc.ranges;</span>
+<span class="nc" id="L108">                    keys.add(sample);</span>
+<span class="nc" id="L109">                }</span>
+
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                if (keys.isEmpty())</span>
+                {
+                    // use an even tree distribution
+<span class="nc" id="L114">                    tree.init(range);</span>
+                }
+                else
+                {
+<span class="nc" id="L118">                    int numKeys = keys.size();</span>
+                    // sample the column family using random keys from the index
+                    while (true)
+                    {
+<span class="nc" id="L122">                        DecoratedKey dk = keys.get(random.nextInt(numKeys));</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">                        if (!tree.split(dk.getToken()))</span>
+<span class="nc" id="L124">                            break;</span>
+<span class="nc" id="L125">                    }</span>
+<span class="nc" id="L126">                    keys.clear();</span>
+                }
+<span class="nc" id="L128">            }</span>
+        }
+<span class="nc" id="L130">        logger.debug(&quot;Prepared AEService trees of size {} for {}&quot;, trees.size(), desc);</span>
+<span class="nc" id="L131">        ranges = tree.invalids();</span>
+<span class="nc" id="L132">    }</span>
+
+    /**
+     * Called (in order) for every row present in the CF.
+     * Hashes the row, and adds it to the tree being built.
+     *
+     * @param partition Partition to add hash
+     */
+    public void add(UnfilteredRowIterator partition)
+    {
+<span class="nc bnc" id="L142" title="All 4 branches missed.">        assert Range.isInRanges(partition.partitionKey().getToken(), desc.ranges) : partition.partitionKey().getToken() + &quot; is not contained in &quot; + desc.ranges;</span>
+<span class="nc bnc" id="L143" title="All 6 branches missed.">        assert lastKey == null || lastKey.compareTo(partition.partitionKey()) &lt; 0</span>
+<span class="nc" id="L144">               : &quot;partition &quot; + partition.partitionKey() + &quot; received out of order wrt &quot; + lastKey;</span>
+<span class="nc" id="L145">        lastKey = partition.partitionKey();</span>
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (range == null)</span>
+<span class="nc" id="L148">            range = ranges.next();</span>
+
+        // generate new ranges as long as case 1 is true
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (!findCorrectRange(lastKey.getToken()))</span>
+        {
+            // add the empty hash, and move to the next range
+<span class="nc" id="L154">            ranges = trees.invalids();</span>
+<span class="nc" id="L155">            findCorrectRange(lastKey.getToken());</span>
+        }
+
+<span class="nc bnc" id="L158" title="All 4 branches missed.">        assert range.contains(lastKey.getToken()) : &quot;Token not in MerkleTree: &quot; + lastKey.getToken();</span>
+        // case 3 must be true: mix in the hashed row
+<span class="nc" id="L160">        RowHash rowHash = rowHash(partition);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (rowHash != null)</span>
+        {
+<span class="nc" id="L163">            range.addHash(rowHash);</span>
+        }
+<span class="nc" id="L165">    }</span>
+
+    public boolean findCorrectRange(Token t)
+    {
+<span class="nc bnc" id="L169" title="All 4 branches missed.">        while (!range.contains(t) &amp;&amp; ranges.hasNext())</span>
+        {
+<span class="nc" id="L171">            range = ranges.next();</span>
+        }
+
+<span class="nc" id="L174">        return range.contains(t);</span>
+    }
+
+    static class CountingDigest extends MessageDigest
+    {
+        private long count;
+        private MessageDigest underlying;
+
+        public CountingDigest(MessageDigest underlying)
+        {
+<span class="nc" id="L184">            super(underlying.getAlgorithm());</span>
+<span class="nc" id="L185">            this.underlying = underlying;</span>
+<span class="nc" id="L186">        }</span>
+
+        @Override
+        protected void engineUpdate(byte input)
+        {
+<span class="nc" id="L191">            underlying.update(input);</span>
+<span class="nc" id="L192">            count += 1;</span>
+<span class="nc" id="L193">        }</span>
+
+        @Override
+        protected void engineUpdate(byte[] input, int offset, int len)
+        {
+<span class="nc" id="L198">            underlying.update(input, offset, len);</span>
+<span class="nc" id="L199">            count += len;</span>
+<span class="nc" id="L200">        }</span>
+
+        @Override
+        protected byte[] engineDigest()
+        {
+<span class="nc" id="L205">            return underlying.digest();</span>
+        }
+
+        @Override
+        protected void engineReset()
+        {
+<span class="nc" id="L211">            underlying.reset();</span>
+<span class="nc" id="L212">        }</span>
+
+    }
+
+    private MerkleTree.RowHash rowHash(UnfilteredRowIterator partition)
+    {
+<span class="nc" id="L218">        validated++;</span>
+        // MerkleTree uses XOR internally, so we want lots of output bits here
+<span class="nc" id="L220">        CountingDigest digest = new CountingDigest(FBUtilities.newMessageDigest(&quot;SHA-256&quot;));</span>
+<span class="nc" id="L221">        UnfilteredRowIterators.digest(null, partition, digest, MessagingService.current_version);</span>
+        // only return new hash for merkle tree in case digest was updated - see CASSANDRA-8979
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        return digest.count &gt; 0</span>
+<span class="nc" id="L224">             ? new MerkleTree.RowHash(partition.partitionKey().getToken(), digest.digest(), digest.count)</span>
+             : null;
+    }
+
+    /**
+     * Registers the newly created tree for rendezvous in Stage.ANTIENTROPY.
+     */
+    public void complete()
+    {
+<span class="nc" id="L233">        completeTree();</span>
+
+<span class="nc" id="L235">        StageManager.getStage(Stage.ANTI_ENTROPY).execute(this);</span>
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (logger.isDebugEnabled())</span>
+        {
+            // log distribution of rows in tree
+<span class="nc" id="L240">            logger.debug(&quot;Validated {} partitions for {}.  Partitions per leaf are:&quot;, validated, desc.sessionId);</span>
+<span class="nc" id="L241">            trees.logRowCountPerLeaf(logger);</span>
+<span class="nc" id="L242">            logger.debug(&quot;Validated {} partitions for {}.  Partition sizes are:&quot;, validated, desc.sessionId);</span>
+<span class="nc" id="L243">            trees.logRowSizePerLeaf(logger);</span>
+        }
+<span class="nc" id="L245">    }</span>
+
+    @VisibleForTesting
+    public void completeTree()
+    {
+<span class="nc bnc" id="L250" title="All 4 branches missed.">        assert ranges != null : &quot;Validator was not prepared()&quot;;</span>
+
+<span class="nc" id="L252">        ranges = trees.invalids();</span>
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        while (ranges.hasNext())</span>
+        {
+<span class="nc" id="L256">            range = ranges.next();</span>
+<span class="nc" id="L257">            range.ensureHashInitialised();</span>
+        }
+<span class="nc" id="L259">    }</span>
+
+    /**
+     * Called when some error during the validation happened.
+     * This sends RepairStatus to inform the initiator that the validation has failed.
+     * The actual reason for failure should be looked up in the log of the host calling this function.
+     */
+    public void fail()
+    {
+<span class="nc" id="L268">        logger.error(&quot;Failed creating a merkle tree for {}, {} (see log for details)&quot;, desc, initiator);</span>
+        // send fail message only to nodes &gt;= version 2.0
+<span class="nc" id="L270">        MessagingService.instance().sendOneWay(new ValidationComplete(desc).createMessage(), initiator);</span>
+<span class="nc" id="L271">    }</span>
+
+    /**
+     * Called after the validation lifecycle to respond with the now valid tree. Runs in Stage.ANTIENTROPY.
+     */
+    public void run()
+    {
+        // respond to the request that triggered this validation
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (!initiator.equals(FBUtilities.getBroadcastAddress()))</span>
+        {
+<span class="nc" id="L281">            logger.info(&quot;[repair #{}] Sending completed merkle tree to {} for {}.{}&quot;, desc.sessionId, initiator, desc.keyspace, desc.columnFamily);</span>
+<span class="nc" id="L282">            Tracing.traceRepair(&quot;Sending completed merkle tree to {} for {}.{}&quot;, initiator, desc.keyspace, desc.columnFamily);</span>
+        }
+<span class="nc" id="L284">        MessagingService.instance().sendOneWay(new ValidationComplete(desc, trees).createMessage(), initiator);</span>
+<span class="nc" id="L285">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,696 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JavaBasedUDFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.functions</a> &gt; <span class="el_source">JavaBasedUDFunction.java</span></div><h1>JavaBasedUDFunction.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.cql3.functions;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.security.*;
+import java.security.cert.Certificate;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.io.ByteStreams;
+import com.google.common.reflect.TypeToken;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.datastax.driver.core.TypeCodec;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.security.SecurityThreadGroup;
+import org.apache.cassandra.security.ThreadAwareSecurityManager;
+import org.eclipse.jdt.core.compiler.IProblem;
+import org.eclipse.jdt.internal.compiler.*;
+import org.eclipse.jdt.internal.compiler.Compiler;
+import org.eclipse.jdt.internal.compiler.classfmt.ClassFileReader;
+import org.eclipse.jdt.internal.compiler.classfmt.ClassFormatException;
+import org.eclipse.jdt.internal.compiler.env.ICompilationUnit;
+import org.eclipse.jdt.internal.compiler.env.INameEnvironment;
+import org.eclipse.jdt.internal.compiler.env.NameEnvironmentAnswer;
+import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
+import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+
+public final class JavaBasedUDFunction extends UDFunction
+{
+    private static final String BASE_PACKAGE = &quot;org.apache.cassandra.cql3.udf.gen&quot;;
+
+<span class="nc" id="L71">    private static final Pattern JAVA_LANG_PREFIX = Pattern.compile(&quot;\\bjava\\.lang\\.&quot;);</span>
+
+<span class="nc" id="L73">    static final Logger logger = LoggerFactory.getLogger(JavaBasedUDFunction.class);</span>
+
+<span class="nc" id="L75">    private static final AtomicInteger classSequence = new AtomicInteger();</span>
+
+    // use a JVM standard ExecutorService as DebuggableThreadPoolExecutor references internal
+    // classes, which triggers AccessControlException from the UDF sandbox
+<span class="nc" id="L79">    private static final UDFExecutorService executor =</span>
+        new UDFExecutorService(new NamedThreadFactory(&quot;UserDefinedFunctions&quot;,
+                                                      Thread.MIN_PRIORITY,
+                                                      udfClassLoader,
+                                                      new SecurityThreadGroup(&quot;UserDefinedFunctions&quot;, null, UDFunction::initializeThread)),
+                               &quot;userfunction&quot;);
+
+<span class="nc" id="L86">    private static final EcjTargetClassLoader targetClassLoader = new EcjTargetClassLoader();</span>
+
+<span class="nc" id="L88">    private static final UDFByteCodeVerifier udfByteCodeVerifier = new UDFByteCodeVerifier();</span>
+
+    private static final ProtectionDomain protectionDomain;
+
+<span class="nc" id="L92">    private static final IErrorHandlingPolicy errorHandlingPolicy = DefaultErrorHandlingPolicies.proceedWithAllProblems();</span>
+<span class="nc" id="L93">    private static final IProblemFactory problemFactory = new DefaultProblemFactory(Locale.ENGLISH);</span>
+    private static final CompilerOptions compilerOptions;
+
+    /**
+     * Poor man's template - just a text file splitted at '#' chars.
+     * Each string at an even index is a constant string (just copied),
+     * each string at an odd index is an 'instruction'.
+     */
+    private static final String[] javaSourceTemplate;
+
+    static
+    {
+<span class="nc" id="L105">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/Class&quot;, &quot;forName&quot;);</span>
+<span class="nc" id="L106">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/Class&quot;, &quot;getClassLoader&quot;);</span>
+<span class="nc" id="L107">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/Class&quot;, &quot;getResource&quot;);</span>
+<span class="nc" id="L108">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/Class&quot;, &quot;getResourceAsStream&quot;);</span>
+<span class="nc" id="L109">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;clearAssertionStatus&quot;);</span>
+<span class="nc" id="L110">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getResource&quot;);</span>
+<span class="nc" id="L111">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getResourceAsStream&quot;);</span>
+<span class="nc" id="L112">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getResources&quot;);</span>
+<span class="nc" id="L113">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getSystemClassLoader&quot;);</span>
+<span class="nc" id="L114">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getSystemResource&quot;);</span>
+<span class="nc" id="L115">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getSystemResourceAsStream&quot;);</span>
+<span class="nc" id="L116">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;getSystemResources&quot;);</span>
+<span class="nc" id="L117">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;loadClass&quot;);</span>
+<span class="nc" id="L118">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;setClassAssertionStatus&quot;);</span>
+<span class="nc" id="L119">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;setDefaultAssertionStatus&quot;);</span>
+<span class="nc" id="L120">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/lang/ClassLoader&quot;, &quot;setPackageAssertionStatus&quot;);</span>
+<span class="nc" id="L121">        udfByteCodeVerifier.addDisallowedMethodCall(&quot;java/nio/ByteBuffer&quot;, &quot;allocateDirect&quot;);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        for (String ia : new String[]{&quot;java/net/InetAddress&quot;, &quot;java/net/Inet4Address&quot;, &quot;java/net/Inet6Address&quot;})</span>
+        {
+            // static method, probably performing DNS lookups (despite SecurityManager)
+<span class="nc" id="L125">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getByAddress&quot;);</span>
+<span class="nc" id="L126">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getAllByName&quot;);</span>
+<span class="nc" id="L127">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getByName&quot;);</span>
+<span class="nc" id="L128">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getLocalHost&quot;);</span>
+            // instance methods, probably performing DNS lookups (despite SecurityManager)
+<span class="nc" id="L130">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getHostName&quot;);</span>
+<span class="nc" id="L131">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;getCanonicalHostName&quot;);</span>
+            // ICMP PING
+<span class="nc" id="L133">            udfByteCodeVerifier.addDisallowedMethodCall(ia, &quot;isReachable&quot;);</span>
+        }
+<span class="nc" id="L135">        udfByteCodeVerifier.addDisallowedClass(&quot;java/net/NetworkInterface&quot;);</span>
+<span class="nc" id="L136">        udfByteCodeVerifier.addDisallowedClass(&quot;java/net/SocketException&quot;);</span>
+
+<span class="nc" id="L138">        Map&lt;String, String&gt; settings = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L139">        settings.put(CompilerOptions.OPTION_LineNumberAttribute,</span>
+                     CompilerOptions.GENERATE);
+<span class="nc" id="L141">        settings.put(CompilerOptions.OPTION_SourceFileAttribute,</span>
+                     CompilerOptions.DISABLED);
+<span class="nc" id="L143">        settings.put(CompilerOptions.OPTION_ReportDeprecation,</span>
+                     CompilerOptions.IGNORE);
+<span class="nc" id="L145">        settings.put(CompilerOptions.OPTION_Source,</span>
+                     CompilerOptions.VERSION_1_8);
+<span class="nc" id="L147">        settings.put(CompilerOptions.OPTION_TargetPlatform,</span>
+                     CompilerOptions.VERSION_1_8);
+
+<span class="nc" id="L150">        compilerOptions = new CompilerOptions(settings);</span>
+<span class="nc" id="L151">        compilerOptions.parseLiteralExpressionsAsConstants = true;</span>
+
+<span class="nc" id="L153">        try (InputStream input = JavaBasedUDFunction.class.getResource(&quot;JavaSourceUDF.txt&quot;).openConnection().getInputStream())</span>
+        {
+<span class="nc" id="L155">            ByteArrayOutputStream output = new ByteArrayOutputStream();</span>
+<span class="nc" id="L156">            FBUtilities.copy(input, output, Long.MAX_VALUE);</span>
+<span class="nc" id="L157">            String template = output.toString();</span>
+
+<span class="nc" id="L159">            StringTokenizer st = new StringTokenizer(template, &quot;#&quot;);</span>
+<span class="nc" id="L160">            javaSourceTemplate = new String[st.countTokens()];</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            for (int i = 0; st.hasMoreElements(); i++)</span>
+<span class="nc" id="L162">                javaSourceTemplate[i] = st.nextToken();</span>
+        }
+<span class="nc" id="L164">        catch (IOException e)</span>
+        {
+<span class="nc" id="L166">            throw new RuntimeException(e);</span>
+<span class="nc" id="L167">        }</span>
+
+        CodeSource codeSource;
+        try
+        {
+<span class="nc" id="L172">            codeSource = new CodeSource(new URL(&quot;udf&quot;, &quot;localhost&quot;, 0, &quot;/java&quot;, new URLStreamHandler()</span>
+<span class="nc" id="L173">            {</span>
+                protected URLConnection openConnection(URL u)
+                {
+<span class="nc" id="L176">                    return null;</span>
+                }
+            }), (Certificate[])null);
+        }
+<span class="nc" id="L180">        catch (MalformedURLException e)</span>
+        {
+<span class="nc" id="L182">            throw new RuntimeException(e);</span>
+<span class="nc" id="L183">        }</span>
+
+<span class="nc" id="L185">        protectionDomain = new ProtectionDomain(codeSource, ThreadAwareSecurityManager.noPermissions, targetClassLoader, null);</span>
+<span class="nc" id="L186">    }</span>
+
+    private final JavaUDF javaUDF;
+
+    JavaBasedUDFunction(FunctionName name, List&lt;ColumnIdentifier&gt; argNames, List&lt;AbstractType&lt;?&gt;&gt; argTypes,
+                        AbstractType&lt;?&gt; returnType, boolean calledOnNullInput, String body)
+    {
+<span class="nc" id="L193">        super(name, argNames, argTypes, UDHelper.driverTypes(argTypes),</span>
+<span class="nc" id="L194">              returnType, UDHelper.driverType(returnType), calledOnNullInput, &quot;java&quot;, body);</span>
+
+        // javaParamTypes is just the Java representation for argTypes resp. argDataTypes
+<span class="nc" id="L197">        TypeToken&lt;?&gt;[] javaParamTypes = UDHelper.typeTokens(argCodecs, calledOnNullInput);</span>
+        // javaReturnType is just the Java representation for returnType resp. returnTypeCodec
+<span class="nc" id="L199">        TypeToken&lt;?&gt; javaReturnType = returnCodec.getJavaType();</span>
+
+        // put each UDF in a separate package to prevent cross-UDF code access
+<span class="nc" id="L202">        String pkgName = BASE_PACKAGE + '.' + generateClassName(name, 'p');</span>
+<span class="nc" id="L203">        String clsName = generateClassName(name, 'C');</span>
+
+<span class="nc" id="L205">        String executeInternalName = generateClassName(name, 'x');</span>
+
+<span class="nc" id="L207">        StringBuilder javaSourceBuilder = new StringBuilder();</span>
+<span class="nc" id="L208">        int lineOffset = 1;</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        for (int i = 0; i &lt; javaSourceTemplate.length; i++)</span>
+        {
+<span class="nc" id="L211">            String s = javaSourceTemplate[i];</span>
+
+            // strings at odd indexes are 'instructions'
+<span class="nc bnc" id="L214" title="All 2 branches missed.">            if ((i &amp; 1) == 1)</span>
+            {
+<span class="nc bnc" id="L216" title="All 9 branches missed.">                switch (s)</span>
+                {
+                    case &quot;package_name&quot;:
+<span class="nc" id="L219">                        s = pkgName;</span>
+<span class="nc" id="L220">                        break;</span>
+                    case &quot;class_name&quot;:
+<span class="nc" id="L222">                        s = clsName;</span>
+<span class="nc" id="L223">                        break;</span>
+                    case &quot;body&quot;:
+<span class="nc" id="L225">                        lineOffset = countNewlines(javaSourceBuilder);</span>
+<span class="nc" id="L226">                        s = body;</span>
+<span class="nc" id="L227">                        break;</span>
+                    case &quot;arguments&quot;:
+<span class="nc" id="L229">                        s = generateArguments(javaParamTypes, argNames, false);</span>
+<span class="nc" id="L230">                        break;</span>
+                    case &quot;arguments_aggregate&quot;:
+<span class="nc" id="L232">                        s = generateArguments(javaParamTypes, argNames, true);</span>
+<span class="nc" id="L233">                        break;</span>
+                    case &quot;argument_list&quot;:
+<span class="nc" id="L235">                        s = generateArgumentList(javaParamTypes, argNames);</span>
+<span class="nc" id="L236">                        break;</span>
+                    case &quot;return_type&quot;:
+<span class="nc" id="L238">                        s = javaSourceName(javaReturnType);</span>
+<span class="nc" id="L239">                        break;</span>
+                    case &quot;execute_internal_name&quot;:
+<span class="nc" id="L241">                        s = executeInternalName;</span>
+                        break;
+                }
+            }
+
+<span class="nc" id="L246">            javaSourceBuilder.append(s);</span>
+        }
+
+<span class="nc" id="L249">        String targetClassName = pkgName + '.' + clsName;</span>
+
+<span class="nc" id="L251">        String javaSource = javaSourceBuilder.toString();</span>
+
+<span class="nc" id="L253">        logger.trace(&quot;Compiling Java source UDF '{}' as class '{}' using source:\n{}&quot;, name, targetClassName, javaSource);</span>
+
+        try
+        {
+<span class="nc" id="L257">            EcjCompilationUnit compilationUnit = new EcjCompilationUnit(javaSource, targetClassName);</span>
+
+<span class="nc" id="L259">            Compiler compiler = new Compiler(compilationUnit,</span>
+                                                                               errorHandlingPolicy,
+                                                                               compilerOptions,
+                                                                               compilationUnit,
+                                                                               problemFactory);
+<span class="nc" id="L264">            compiler.compile(new ICompilationUnit[]{ compilationUnit });</span>
+
+<span class="nc bnc" id="L266" title="All 4 branches missed.">            if (compilationUnit.problemList != null &amp;&amp; !compilationUnit.problemList.isEmpty())</span>
+            {
+<span class="nc" id="L268">                boolean fullSource = false;</span>
+<span class="nc" id="L269">                StringBuilder problems = new StringBuilder();</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                for (IProblem problem : compilationUnit.problemList)</span>
+                {
+<span class="nc" id="L272">                    long ln = problem.getSourceLineNumber() - lineOffset;</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                    if (ln &lt; 1L)</span>
+                    {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">                        if (problem.isError())</span>
+                        {
+                            // if generated source around UDF source provided by the user is buggy,
+                            // this code is appended.
+<span class="nc" id="L279">                            problems.append(&quot;GENERATED SOURCE ERROR: line &quot;)</span>
+<span class="nc" id="L280">                                    .append(problem.getSourceLineNumber())</span>
+<span class="nc" id="L281">                                    .append(&quot; (in generated source): &quot;)</span>
+<span class="nc" id="L282">                                    .append(problem.getMessage())</span>
+<span class="nc" id="L283">                                    .append('\n');</span>
+<span class="nc" id="L284">                            fullSource = true;</span>
+                        }
+                    }
+                    else
+                    {
+<span class="nc" id="L289">                        problems.append(&quot;Line &quot;)</span>
+<span class="nc" id="L290">                                .append(Long.toString(ln))</span>
+<span class="nc" id="L291">                                .append(&quot;: &quot;)</span>
+<span class="nc" id="L292">                                .append(problem.getMessage())</span>
+<span class="nc" id="L293">                                .append('\n');</span>
+                    }
+<span class="nc" id="L295">                }</span>
+
+<span class="nc bnc" id="L297" title="All 2 branches missed.">                if (fullSource)</span>
+<span class="nc" id="L298">                    throw new InvalidRequestException(&quot;Java source compilation failed:\n&quot; + problems + &quot;\n generated source:\n&quot; + javaSource);</span>
+                else
+<span class="nc" id="L300">                    throw new InvalidRequestException(&quot;Java source compilation failed:\n&quot; + problems);</span>
+            }
+
+            // Verify the UDF bytecode against use of probably dangerous code
+<span class="nc" id="L304">            Set&lt;String&gt; errors = udfByteCodeVerifier.verify(targetClassName, targetClassLoader.classData(targetClassName));</span>
+<span class="nc" id="L305">            String validDeclare = &quot;not allowed method declared: &quot; + executeInternalName + '(';</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            for (Iterator&lt;String&gt; i = errors.iterator(); i.hasNext();)</span>
+            {
+<span class="nc" id="L308">                String error = i.next();</span>
+                // we generate a random name of the private, internal execute method, which is detected by the byte-code verifier
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                if (error.startsWith(validDeclare))</span>
+<span class="nc" id="L311">                    i.remove();</span>
+<span class="nc" id="L312">            }</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (!errors.isEmpty())</span>
+<span class="nc" id="L314">                throw new InvalidRequestException(&quot;Java UDF validation failed: &quot; + errors);</span>
+
+            // Load the class and create a new instance of it
+<span class="nc" id="L317">            Thread thread = Thread.currentThread();</span>
+<span class="nc" id="L318">            ClassLoader orig = thread.getContextClassLoader();</span>
+            try
+            {
+<span class="nc" id="L321">                thread.setContextClassLoader(UDFunction.udfClassLoader);</span>
+                // Execute UDF intiialization from UDF class loader
+
+<span class="nc" id="L324">                Class cls = Class.forName(targetClassName, false, targetClassLoader);</span>
+
+                // Count only non-synthetic methods, so code coverage instrumentation doesn't cause a miscount
+<span class="nc" id="L327">                int nonSyntheticMethodCount = 0;</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                for (Method m : cls.getDeclaredMethods())</span>
+                {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    if (!m.isSynthetic())</span>
+                    {
+<span class="nc" id="L332">                        nonSyntheticMethodCount += 1;</span>
+                    }
+                }
+
+<span class="nc bnc" id="L336" title="All 4 branches missed.">                if (nonSyntheticMethodCount != 3 || cls.getDeclaredConstructors().length != 1)</span>
+<span class="nc" id="L337">                    throw new InvalidRequestException(&quot;Check your source to not define additional Java methods or constructors&quot;);</span>
+<span class="nc" id="L338">                MethodType methodType = MethodType.methodType(void.class)</span>
+<span class="nc" id="L339">                                                  .appendParameterTypes(TypeCodec.class, TypeCodec[].class, UDFContext.class);</span>
+<span class="nc" id="L340">                MethodHandle ctor = MethodHandles.lookup().findConstructor(cls, methodType);</span>
+<span class="nc" id="L341">                this.javaUDF = (JavaUDF) ctor.invokeWithArguments(returnCodec, argCodecs, udfContext);</span>
+            }
+            finally
+            {
+<span class="nc" id="L345">                thread.setContextClassLoader(orig);</span>
+            }
+        }
+<span class="nc" id="L348">        catch (InvocationTargetException e)</span>
+        {
+            // in case of an ITE, use the cause
+<span class="nc" id="L351">            throw new InvalidRequestException(String.format(&quot;Could not compile function '%s' from Java source: %s&quot;, name, e.getCause()));</span>
+        }
+<span class="nc" id="L353">        catch (InvalidRequestException | VirtualMachineError e)</span>
+        {
+<span class="nc" id="L355">            throw e;</span>
+        }
+<span class="nc" id="L357">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L359">            logger.error(String.format(&quot;Could not compile function '%s' from Java source:%n%s&quot;, name, javaSource), e);</span>
+<span class="nc" id="L360">            throw new InvalidRequestException(String.format(&quot;Could not compile function '%s' from Java source: %s&quot;, name, e));</span>
+<span class="nc" id="L361">        }</span>
+<span class="nc" id="L362">    }</span>
+
+    protected ExecutorService executor()
+    {
+<span class="nc" id="L366">        return executor;</span>
+    }
+
+    protected ByteBuffer executeUserDefined(ProtocolVersion protocolVersion, List&lt;ByteBuffer&gt; params)
+    {
+<span class="nc" id="L371">        return javaUDF.executeImpl(protocolVersion, params);</span>
+    }
+
+    protected Object executeAggregateUserDefined(ProtocolVersion protocolVersion, Object firstParam, List&lt;ByteBuffer&gt; params)
+    {
+<span class="nc" id="L376">        return javaUDF.executeAggregateImpl(protocolVersion, firstParam, params);</span>
+    }
+
+    private static int countNewlines(StringBuilder javaSource)
+    {
+<span class="nc" id="L381">        int ln = 0;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        for (int i = 0; i &lt; javaSource.length(); i++)</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">            if (javaSource.charAt(i) == '\n')</span>
+<span class="nc" id="L384">                ln++;</span>
+<span class="nc" id="L385">        return ln;</span>
+    }
+
+    private static String generateClassName(FunctionName name, char prefix)
+    {
+<span class="nc" id="L390">        String qualifiedName = name.toString();</span>
+
+<span class="nc" id="L392">        StringBuilder sb = new StringBuilder(qualifiedName.length() + 10);</span>
+<span class="nc" id="L393">        sb.append(prefix);</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        for (int i = 0; i &lt; qualifiedName.length(); i++)</span>
+        {
+<span class="nc" id="L396">            char c = qualifiedName.charAt(i);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (Character.isJavaIdentifierPart(c))</span>
+<span class="nc" id="L398">                sb.append(c);</span>
+            else
+<span class="nc" id="L400">                sb.append(Integer.toHexString(((short)c)&amp;0xffff));</span>
+        }
+<span class="nc" id="L402">        sb.append('_')</span>
+<span class="nc" id="L403">          .append(ThreadLocalRandom.current().nextInt() &amp; 0xffffff)</span>
+<span class="nc" id="L404">          .append('_')</span>
+<span class="nc" id="L405">          .append(classSequence.incrementAndGet());</span>
+<span class="nc" id="L406">        return sb.toString();</span>
+    }
+
+    @VisibleForTesting
+    public static String javaSourceName(TypeToken&lt;?&gt; type)
+    {
+<span class="nc" id="L412">        String n = type.toString();</span>
+<span class="nc" id="L413">        return JAVA_LANG_PREFIX.matcher(n).replaceAll(&quot;&quot;);</span>
+    }
+
+    private static String generateArgumentList(TypeToken&lt;?&gt;[] paramTypes, List&lt;ColumnIdentifier&gt; argNames)
+    {
+        // initial builder size can just be a guess (prevent temp object allocations)
+<span class="nc" id="L419">        StringBuilder code = new StringBuilder(32 * paramTypes.length);</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        for (int i = 0; i &lt; paramTypes.length; i++)</span>
+        {
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (i &gt; 0)</span>
+<span class="nc" id="L423">                code.append(&quot;, &quot;);</span>
+<span class="nc" id="L424">            code.append(javaSourceName(paramTypes[i]))</span>
+<span class="nc" id="L425">                .append(' ')</span>
+<span class="nc" id="L426">                .append(argNames.get(i));</span>
+        }
+<span class="nc" id="L428">        return code.toString();</span>
+    }
+
+    /**
+     * Generate Java source code snippet for the arguments part to call the UDF implementation function -
+     * i.e. the {@code private #return_type# #execute_internal_name#(#argument_list#)} function
+     * (see {@code JavaSourceUDF.txt} template file for details).
+     * &lt;p&gt;
+     * This method generates the arguments code snippet for both {@code executeImpl} and
+     * {@code executeAggregateImpl}. General signature for both is the {@code protocolVersion} and
+     * then all UDF arguments. For aggregation UDF calls the first argument is always unserialized as
+     * that is the state variable.
+     * &lt;/p&gt;
+     * &lt;p&gt;
+     * An example output for {@code executeImpl}:
+     * {@code (double) super.compose_double(protocolVersion, 0, params.get(0)), (double) super.compose_double(protocolVersion, 1, params.get(1))}
+     * &lt;/p&gt;
+     * &lt;p&gt;
+     * Similar output for {@code executeAggregateImpl}:
+     * {@code firstParam, (double) super.compose_double(protocolVersion, 1, params.get(1))}
+     * &lt;/p&gt;
+     */
+    private static String generateArguments(TypeToken&lt;?&gt;[] paramTypes, List&lt;ColumnIdentifier&gt; argNames, boolean forAggregate)
+    {
+<span class="nc" id="L452">        StringBuilder code = new StringBuilder(64 * paramTypes.length);</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        for (int i = 0; i &lt; paramTypes.length; i++)</span>
+        {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            if (i &gt; 0)</span>
+                // add separator, if not the first argument
+<span class="nc" id="L457">                code.append(&quot;,\n&quot;);</span>
+
+            // add comment only if trace is enabled
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L461">                code.append(&quot;            /* parameter '&quot;).append(argNames.get(i)).append(&quot;' */\n&quot;);</span>
+
+            // cast to Java type
+<span class="nc" id="L464">            code.append(&quot;            (&quot;).append(javaSourceName(paramTypes[i])).append(&quot;) &quot;);</span>
+
+<span class="nc bnc" id="L466" title="All 4 branches missed.">            if (forAggregate &amp;&amp; i == 0)</span>
+                // special case for aggregations where the state variable (1st arg to state + final function and
+                // return value from state function) is not re-serialized
+<span class="nc" id="L469">                code.append(&quot;firstParam&quot;);</span>
+            else
+                // generate object representation of input parameter (call UDFunction.compose)
+<span class="nc bnc" id="L472" title="All 2 branches missed.">                code.append(composeMethod(paramTypes[i])).append(&quot;(protocolVersion, &quot;).append(i).append(&quot;, params.get(&quot;).append(forAggregate ? i - 1 : i).append(&quot;))&quot;);</span>
+        }
+<span class="nc" id="L474">        return code.toString();</span>
+    }
+
+    private static String composeMethod(TypeToken&lt;?&gt; type)
+    {
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        return (type.isPrimitive()) ? (&quot;super.compose_&quot; + type.getRawType().getName()) : &quot;super.compose&quot;;</span>
+    }
+
+    // Java source UDFs are a very simple compilation task, which allows us to let one class implement
+    // all interfaces required by ECJ.
+    static final class EcjCompilationUnit implements ICompilationUnit, ICompilerRequestor, INameEnvironment
+    {
+        List&lt;IProblem&gt; problemList;
+        private final String className;
+        private final char[] sourceCode;
+
+        EcjCompilationUnit(String sourceCode, String className)
+<span class="nc" id="L491">        {</span>
+<span class="nc" id="L492">            this.className = className;</span>
+<span class="nc" id="L493">            this.sourceCode = sourceCode.toCharArray();</span>
+<span class="nc" id="L494">        }</span>
+
+        // ICompilationUnit
+
+        @Override
+        public char[] getFileName()
+        {
+<span class="nc" id="L501">            return sourceCode;</span>
+        }
+
+        @Override
+        public char[] getContents()
+        {
+<span class="nc" id="L507">            return sourceCode;</span>
+        }
+
+        @Override
+        public char[] getMainTypeName()
+        {
+<span class="nc" id="L513">            int dot = className.lastIndexOf('.');</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">            return ((dot &gt; 0) ? className.substring(dot + 1) : className).toCharArray();</span>
+        }
+
+        @Override
+        public char[][] getPackageName()
+        {
+<span class="nc" id="L520">            StringTokenizer izer = new StringTokenizer(className, &quot;.&quot;);</span>
+<span class="nc" id="L521">            char[][] result = new char[izer.countTokens() - 1][];</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">            for (int i = 0; i &lt; result.length; i++)</span>
+<span class="nc" id="L523">                result[i] = izer.nextToken().toCharArray();</span>
+<span class="nc" id="L524">            return result;</span>
+        }
+
+        @Override
+        public boolean ignoreOptionalProblems()
+        {
+<span class="nc" id="L530">            return false;</span>
+        }
+
+        // ICompilerRequestor
+
+        @Override
+        public void acceptResult(CompilationResult result)
+        {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">            if (result.hasErrors())</span>
+            {
+<span class="nc" id="L540">                IProblem[] problems = result.getProblems();</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (problemList == null)</span>
+<span class="nc" id="L542">                    problemList = new ArrayList&lt;&gt;(problems.length);</span>
+<span class="nc" id="L543">                Collections.addAll(problemList, problems);</span>
+<span class="nc" id="L544">            }</span>
+            else
+            {
+<span class="nc" id="L547">                ClassFile[] classFiles = result.getClassFiles();</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                for (ClassFile classFile : classFiles)</span>
+<span class="nc" id="L549">                    targetClassLoader.addClass(className, classFile.getBytes());</span>
+            }
+<span class="nc" id="L551">        }</span>
+
+        // INameEnvironment
+
+        @Override
+        public NameEnvironmentAnswer findType(char[][] compoundTypeName)
+        {
+<span class="nc" id="L558">            StringBuilder result = new StringBuilder();</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            for (int i = 0; i &lt; compoundTypeName.length; i++)</span>
+            {
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if (i &gt; 0)</span>
+<span class="nc" id="L562">                    result.append('.');</span>
+<span class="nc" id="L563">                result.append(compoundTypeName[i]);</span>
+            }
+<span class="nc" id="L565">            return findType(result.toString());</span>
+        }
+
+        @Override
+        public NameEnvironmentAnswer findType(char[] typeName, char[][] packageName)
+        {
+<span class="nc" id="L571">            StringBuilder result = new StringBuilder();</span>
+<span class="nc" id="L572">            int i = 0;</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            for (; i &lt; packageName.length; i++)</span>
+            {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                if (i &gt; 0)</span>
+<span class="nc" id="L576">                    result.append('.');</span>
+<span class="nc" id="L577">                result.append(packageName[i]);</span>
+            }
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (i &gt; 0)</span>
+<span class="nc" id="L580">                result.append('.');</span>
+<span class="nc" id="L581">            result.append(typeName);</span>
+<span class="nc" id="L582">            return findType(result.toString());</span>
+        }
+
+        private NameEnvironmentAnswer findType(String className)
+        {
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            if (className.equals(this.className))</span>
+            {
+<span class="nc" id="L589">                return new NameEnvironmentAnswer(this, null);</span>
+            }
+
+<span class="nc" id="L592">            String resourceName = className.replace('.', '/') + &quot;.class&quot;;</span>
+
+<span class="nc" id="L594">            try (InputStream is = UDFunction.udfClassLoader.getResourceAsStream(resourceName))</span>
+            {
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                if (is != null)</span>
+                {
+<span class="nc" id="L598">                    byte[] classBytes = ByteStreams.toByteArray(is);</span>
+<span class="nc" id="L599">                    char[] fileName = className.toCharArray();</span>
+<span class="nc" id="L600">                    ClassFileReader classFileReader = new ClassFileReader(classBytes, fileName, true);</span>
+<span class="nc" id="L601">                    return new NameEnvironmentAnswer(classFileReader, null);</span>
+                }
+            }
+<span class="nc" id="L604">            catch (IOException | ClassFormatException exc)</span>
+            {
+<span class="nc" id="L606">                throw new RuntimeException(exc);</span>
+<span class="nc" id="L607">            }</span>
+<span class="nc" id="L608">            return null;</span>
+        }
+
+        private boolean isPackage(String result)
+        {
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if (result.equals(this.className))</span>
+<span class="nc" id="L614">                return false;</span>
+<span class="nc" id="L615">            String resourceName = result.replace('.', '/') + &quot;.class&quot;;</span>
+<span class="nc" id="L616">            try (InputStream is = UDFunction.udfClassLoader.getResourceAsStream(resourceName))</span>
+            {
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                return is == null;</span>
+            }
+<span class="nc" id="L620">            catch (IOException e)</span>
+            {
+                // we are here, since close on is failed. That means it was not null
+<span class="nc" id="L623">                return false;</span>
+            }
+        }
+
+        @Override
+        public boolean isPackage(char[][] parentPackageName, char[] packageName)
+        {
+<span class="nc" id="L630">            StringBuilder result = new StringBuilder();</span>
+<span class="nc" id="L631">            int i = 0;</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (parentPackageName != null)</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">                for (; i &lt; parentPackageName.length; i++)</span>
+                {
+<span class="nc bnc" id="L635" title="All 2 branches missed.">                    if (i &gt; 0)</span>
+<span class="nc" id="L636">                        result.append('.');</span>
+<span class="nc" id="L637">                    result.append(parentPackageName[i]);</span>
+                }
+
+<span class="nc bnc" id="L640" title="All 4 branches missed.">            if (Character.isUpperCase(packageName[0]) &amp;&amp; !isPackage(result.toString()))</span>
+<span class="nc" id="L641">                return false;</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">            if (i &gt; 0)</span>
+<span class="nc" id="L643">                result.append('.');</span>
+<span class="nc" id="L644">            result.append(packageName);</span>
+
+<span class="nc" id="L646">            return isPackage(result.toString());</span>
+        }
+
+        @Override
+        public void cleanup()
+        {
+<span class="nc" id="L652">        }</span>
+    }
+
+    static final class EcjTargetClassLoader extends SecureClassLoader
+    {
+        EcjTargetClassLoader()
+        {
+<span class="nc" id="L659">            super(UDFunction.udfClassLoader);</span>
+<span class="nc" id="L660">        }</span>
+
+        // This map is usually empty.
+        // It only contains data *during* UDF compilation but not during runtime.
+        //
+        // addClass() is invoked by ECJ after successful compilation of the generated Java source.
+        // loadClass(targetClassName) is invoked by buildUDF() after ECJ returned from successful compilation.
+        //
+<span class="nc" id="L668">        private final Map&lt;String, byte[]&gt; classes = new ConcurrentHashMap&lt;&gt;();</span>
+
+        void addClass(String className, byte[] classData)
+        {
+<span class="nc" id="L672">            classes.put(className, classData);</span>
+<span class="nc" id="L673">        }</span>
+
+        byte[] classData(String className)
+        {
+<span class="nc" id="L677">            return classes.get(className);</span>
+        }
+
+        protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException
+        {
+            // remove the class binary - it's only used once - so it's wasting heap
+<span class="nc" id="L683">            byte[] classData = classes.remove(name);</span>
+
+<span class="nc bnc" id="L685" title="All 2 branches missed.">            if (classData != null)</span>
+<span class="nc" id="L686">                return defineClass(name, classData, 0, classData.length, protectionDomain);</span>
+
+<span class="nc" id="L688">            return getParent().loadClass(name);</span>
+        }
+
+        protected PermissionCollection getPermissions(CodeSource codesource)
+        {
+<span class="nc" id="L693">            return ThreadAwareSecurityManager.noPermissions;</span>
+        }
+    }}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

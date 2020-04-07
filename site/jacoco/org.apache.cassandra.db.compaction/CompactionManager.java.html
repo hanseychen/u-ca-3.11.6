@@ -1,0 +1,2161 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionManager.java</span></div><h1>CompactionManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+import com.google.common.util.concurrent.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.cache.AutoSavingCache;
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionInfo.Holder;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.lifecycle.WrappedLifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.view.ViewBuilder;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.IndexSummaryRedistribution;
+import org.apache.cassandra.io.sstable.SSTableRewriter;
+import org.apache.cassandra.io.sstable.SnapshotDeletingTask;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.metrics.CompactionMetrics;
+import org.apache.cassandra.repair.Validator;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static java.util.Collections.singleton;
+
+/**
+ * &lt;p&gt;
+ * A singleton which manages a private executor of ongoing compactions.
+ * &lt;/p&gt;
+ * Scheduling for compaction is accomplished by swapping sstables to be compacted into
+ * a set via Tracker. New scheduling attempts will ignore currently compacting
+ * sstables.
+ */
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">public class CompactionManager implements CompactionManagerMBean</span>
+{
+    public static final String MBEAN_OBJECT_NAME = &quot;org.apache.cassandra.db:type=CompactionManager&quot;;
+<span class="fc" id="L89">    private static final Logger logger = LoggerFactory.getLogger(CompactionManager.class);</span>
+    public static final CompactionManager instance;
+
+    public static final int NO_GC = Integer.MIN_VALUE;
+    public static final int GC_ALL = Integer.MAX_VALUE;
+
+    // A thread local that tells us if the current thread is owned by the compaction manager. Used
+    // by CounterContext to figure out if it should log a warning for invalid counter shards.
+<span class="fc" id="L97">    public static final FastThreadLocal&lt;Boolean&gt; isCompactionManager = new FastThreadLocal&lt;Boolean&gt;()</span>
+<span class="fc" id="L98">    {</span>
+        @Override
+        protected Boolean initialValue()
+        {
+<span class="nc" id="L102">            return false;</span>
+        }
+    };
+
+    static
+    {
+<span class="fc" id="L108">        instance = new CompactionManager();</span>
+
+<span class="fc" id="L110">        MBeanWrapper.instance.registerMBean(instance, MBEAN_OBJECT_NAME);</span>
+<span class="fc" id="L111">    }</span>
+
+<span class="fc" id="L113">    private final CompactionExecutor executor = new CompactionExecutor();</span>
+<span class="fc" id="L114">    private final CompactionExecutor validationExecutor = new ValidationExecutor();</span>
+<span class="fc" id="L115">    private final CompactionExecutor cacheCleanupExecutor = new CacheCleanupExecutor();</span>
+
+<span class="fc" id="L117">    private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor);</span>
+<span class="fc" id="L118">    @VisibleForTesting</span>
+<span class="fc" id="L119">    final Multiset&lt;ColumnFamilyStore&gt; compactingCF = ConcurrentHashMultiset.create();</span>
+
+    // used to temporarily pause non-strategy managed compactions (like index summary redistribution)
+<span class="fc" id="L122">    private final AtomicInteger globalCompactionPauseCount = new AtomicInteger(0);</span>
+
+<span class="fc" id="L124">    private final RateLimiter compactionRateLimiter = RateLimiter.create(Double.MAX_VALUE);</span>
+
+    /**
+     * Gets compaction rate limiter.
+     * Rate unit is bytes per sec.
+     *
+     * @return RateLimiter with rate limit set
+     */
+    public RateLimiter getRateLimiter()
+    {
+<span class="fc" id="L134">        setRate(DatabaseDescriptor.getCompactionThroughputMbPerSec());</span>
+<span class="fc" id="L135">        return compactionRateLimiter;</span>
+    }
+
+    /**
+     * Sets the rate for the rate limiter. When compaction_throughput_mb_per_sec is 0 or node is bootstrapping,
+     * this sets the rate to Double.MAX_VALUE bytes per second.
+     * @param throughPutMbPerSec throughput to set in mb per second
+     */
+    public void setRate(final double throughPutMbPerSec)
+    {
+<span class="fc" id="L145">        double throughput = throughPutMbPerSec * 1024.0 * 1024.0;</span>
+        // if throughput is set to 0, throttling is disabled
+<span class="pc bpc" id="L147" title="2 of 4 branches missed.">        if (throughput == 0 || StorageService.instance.isBootstrapMode())</span>
+<span class="nc" id="L148">            throughput = Double.MAX_VALUE;</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">        if (compactionRateLimiter.getRate() != throughput)</span>
+<span class="fc" id="L150">            compactionRateLimiter.setRate(throughput);</span>
+<span class="fc" id="L151">    }</span>
+
+    /**
+     * Call this whenever a compaction might be needed on the given columnfamily.
+     * It's okay to over-call (within reason) if a call is unnecessary, it will
+     * turn into a no-op in the bucketing/candidate-scan phase.
+     */
+    public List&lt;Future&lt;?&gt;&gt; submitBackground(final ColumnFamilyStore cfs)
+    {
+<span class="fc bfc" id="L160" title="All 2 branches covered.">        if (cfs.isAutoCompactionDisabled())</span>
+        {
+<span class="fc" id="L162">            logger.trace(&quot;Autocompaction is disabled&quot;);</span>
+<span class="fc" id="L163">            return Collections.emptyList();</span>
+        }
+
+        /**
+         * If a CF is currently being compacted, and there are no idle threads, submitBackground should be a no-op;
+         * we can wait for the current compaction to finish and re-submit when more information is available.
+         * Otherwise, we should submit at least one task to prevent starvation by busier CFs, and more if there
+         * are idle threads stil. (CASSANDRA-4310)
+         */
+<span class="fc" id="L172">        int count = compactingCF.count(cfs);</span>
+<span class="pc bpc" id="L173" title="1 of 4 branches missed.">        if (count &gt; 0 &amp;&amp; executor.getActiveCount() &gt;= executor.getMaximumPoolSize())</span>
+        {
+<span class="nc" id="L175">            logger.trace(&quot;Background compaction is still running for {}.{} ({} remaining). Skipping&quot;,</span>
+<span class="nc" id="L176">                         cfs.keyspace.getName(), cfs.name, count);</span>
+<span class="nc" id="L177">            return Collections.emptyList();</span>
+        }
+
+<span class="fc" id="L180">        logger.trace(&quot;Scheduling a background task check for {}.{} with {}&quot;,</span>
+<span class="fc" id="L181">                     cfs.keyspace.getName(),</span>
+                     cfs.name,
+<span class="fc" id="L183">                     cfs.getCompactionStrategyManager().getName());</span>
+
+<span class="fc" id="L185">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;(1);</span>
+<span class="fc" id="L186">        Future&lt;?&gt; fut = executor.submitIfRunning(new BackgroundCompactionCandidate(cfs), &quot;background task&quot;);</span>
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">        if (!fut.isCancelled())</span>
+<span class="fc" id="L188">            futures.add(fut);</span>
+        else
+<span class="nc" id="L190">            compactingCF.remove(cfs);</span>
+<span class="fc" id="L191">        return futures;</span>
+    }
+
+    public boolean isCompacting(Iterable&lt;ColumnFamilyStore&gt; cfses)
+    {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : cfses)</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (!cfs.getTracker().getCompacting().isEmpty())</span>
+<span class="nc" id="L198">                return true;</span>
+<span class="nc" id="L199">        return false;</span>
+    }
+
+    /**
+     * Shutdowns both compaction and validation executors, cancels running compaction / validation,
+     * and waits for tasks to complete if tasks were not cancelable.
+     */
+    public void forceShutdown()
+    {
+        // shutdown executors to prevent further submission
+<span class="nc" id="L209">        executor.shutdown();</span>
+<span class="nc" id="L210">        validationExecutor.shutdown();</span>
+<span class="nc" id="L211">        cacheCleanupExecutor.shutdown();</span>
+
+        // interrupt compactions and validations
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        for (Holder compactionHolder : CompactionMetrics.getCompactions())</span>
+        {
+<span class="nc" id="L216">            compactionHolder.stop();</span>
+<span class="nc" id="L217">        }</span>
+
+        // wait for tasks to terminate
+        // compaction tasks are interrupted above, so it shuold be fairy quick
+        // until not interrupted tasks to complete.
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        for (ExecutorService exec : Arrays.asList(executor, validationExecutor, cacheCleanupExecutor))</span>
+        {
+            try
+            {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                if (!exec.awaitTermination(1, TimeUnit.MINUTES))</span>
+<span class="nc" id="L227">                    logger.warn(&quot;Failed to wait for compaction executors shutdown&quot;);</span>
+            }
+<span class="nc" id="L229">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L231">                logger.error(&quot;Interrupted while waiting for tasks to be terminated&quot;, e);</span>
+<span class="nc" id="L232">            }</span>
+<span class="nc" id="L233">        }</span>
+<span class="nc" id="L234">    }</span>
+
+    public void finishCompactionsAndShutdown(long timeout, TimeUnit unit) throws InterruptedException
+    {
+<span class="nc" id="L238">        executor.shutdown();</span>
+<span class="nc" id="L239">        executor.awaitTermination(timeout, unit);</span>
+<span class="nc" id="L240">    }</span>
+
+    // the actual sstables to compact are not determined until we run the BCT; that way, if new sstables
+    // are created between task submission and execution, we execute against the most up-to-date information
+    class BackgroundCompactionCandidate implements Runnable
+    {
+        private final ColumnFamilyStore cfs;
+
+        BackgroundCompactionCandidate(ColumnFamilyStore cfs)
+<span class="fc" id="L249">        {</span>
+<span class="fc" id="L250">            compactingCF.add(cfs);</span>
+<span class="fc" id="L251">            this.cfs = cfs;</span>
+<span class="fc" id="L252">        }</span>
+
+        public void run()
+        {
+            try
+            {
+<span class="fc" id="L258">                logger.trace(&quot;Checking {}.{}&quot;, cfs.keyspace.getName(), cfs.name);</span>
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">                if (!cfs.isValid())</span>
+                {
+<span class="nc" id="L261">                    logger.trace(&quot;Aborting compaction for dropped CF&quot;);</span>
+<span class="nc" id="L262">                    return;</span>
+                }
+
+<span class="fc" id="L265">                CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();</span>
+<span class="fc" id="L266">                AbstractCompactionTask task = strategy.getNextBackgroundTask(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()));</span>
+<span class="fc bfc" id="L267" title="All 2 branches covered.">                if (task == null)</span>
+                {
+<span class="fc" id="L269">                    logger.trace(&quot;No tasks available&quot;);</span>
+<span class="fc" id="L270">                    return;</span>
+                }
+<span class="fc" id="L272">                task.execute(metrics);</span>
+            }
+            finally
+            {
+<span class="fc" id="L276">                compactingCF.remove(cfs);</span>
+            }
+<span class="fc" id="L278">            submitBackground(cfs);</span>
+<span class="fc" id="L279">        }</span>
+    }
+
+    /**
+     * Run an operation over all sstables using jobs threads
+     *
+     * @param cfs the column family store to run the operation on
+     * @param operation the operation to run
+     * @param jobs the number of threads to use - 0 means use all available. It never uses more than concurrent_compactors threads
+     * @return status of the operation
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    private AllSSTableOpStatus parallelAllSSTableOperation(final ColumnFamilyStore cfs, final OneSSTableOperation operation, int jobs, OperationType operationType) throws ExecutionException, InterruptedException
+    {
+<span class="nc" id="L295">        logger.info(&quot;Starting {} for {}.{}&quot;, operationType, cfs.keyspace.getName(), cfs.getTableName());</span>
+<span class="nc" id="L296">        List&lt;LifecycleTransaction&gt; transactions = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L297">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L298">        try (LifecycleTransaction compacting = cfs.markAllCompacting(operationType))</span>
+        {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (compacting == null)</span>
+<span class="nc" id="L301">                return AllSSTableOpStatus.UNABLE_TO_CANCEL;</span>
+
+<span class="nc" id="L303">            Iterable&lt;SSTableReader&gt; sstables = Lists.newArrayList(operation.filterSSTables(compacting));</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            if (Iterables.isEmpty(sstables))</span>
+            {
+<span class="nc" id="L306">                logger.info(&quot;No sstables to {} for {}.{}&quot;, operationType.name(), cfs.keyspace.getName(), cfs.name);</span>
+<span class="nc" id="L307">                return AllSSTableOpStatus.SUCCESSFUL;</span>
+            }
+
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            for (final SSTableReader sstable : sstables)</span>
+            {
+<span class="nc" id="L312">                final LifecycleTransaction txn = compacting.split(singleton(sstable));</span>
+<span class="nc" id="L313">                transactions.add(txn);</span>
+<span class="nc" id="L314">                Callable&lt;Object&gt; callable = new Callable&lt;Object&gt;()</span>
+<span class="nc" id="L315">                {</span>
+                    @Override
+                    public Object call() throws Exception
+                    {
+<span class="nc" id="L319">                        operation.execute(txn);</span>
+<span class="nc" id="L320">                        return this;</span>
+                    }
+                };
+<span class="nc" id="L323">                Future&lt;?&gt; fut = executor.submitIfRunning(callable, &quot;paralell sstable operation&quot;);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">                if (!fut.isCancelled())</span>
+<span class="nc" id="L325">                    futures.add(fut);</span>
+                else
+<span class="nc" id="L327">                    return AllSSTableOpStatus.ABORTED;</span>
+
+<span class="nc bnc" id="L329" title="All 4 branches missed.">                if (jobs &gt; 0 &amp;&amp; futures.size() == jobs)</span>
+                {
+<span class="nc" id="L331">                    Future&lt;?&gt; f = FBUtilities.waitOnFirstFuture(futures);</span>
+<span class="nc" id="L332">                    futures.remove(f);</span>
+                }
+<span class="nc" id="L334">            }</span>
+<span class="nc" id="L335">            FBUtilities.waitOnFutures(futures);</span>
+<span class="nc bnc" id="L336" title="All 4 branches missed.">            assert compacting.originals().isEmpty();</span>
+<span class="nc" id="L337">            logger.info(&quot;Finished {} for {}.{} successfully&quot;, operationType, cfs.keyspace.getName(), cfs.getTableName());</span>
+<span class="nc" id="L338">            return AllSSTableOpStatus.SUCCESSFUL;</span>
+        }
+        finally
+        {
+            // wait on any unfinished futures to make sure we don't close an ongoing transaction
+            try
+            {
+<span class="nc" id="L345">                FBUtilities.waitOnFutures(futures);</span>
+            }
+<span class="nc" id="L347">            catch (Throwable t)</span>
+            {
+               // these are handled/logged in CompactionExecutor#afterExecute
+<span class="nc" id="L350">            }</span>
+<span class="nc" id="L351">            Throwable fail = Throwables.close(null, transactions);</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if (fail != null)</span>
+<span class="nc" id="L353">                logger.error(&quot;Failed to cleanup lifecycle transactions ({} for {}.{})&quot;, operationType, cfs.keyspace.getName(), cfs.getTableName(), fail);</span>
+        }
+    }
+
+    private static interface OneSSTableOperation
+    {
+        Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction transaction);
+        void execute(LifecycleTransaction input) throws IOException;
+    }
+
+<span class="nc" id="L363">    public enum AllSSTableOpStatus</span>
+    {
+<span class="nc" id="L365">        SUCCESSFUL(0),</span>
+<span class="nc" id="L366">        ABORTED(1),</span>
+<span class="nc" id="L367">        UNABLE_TO_CANCEL(2);</span>
+
+        public final int statusCode;
+
+        AllSSTableOpStatus(int statusCode)
+<span class="nc" id="L372">        {</span>
+<span class="nc" id="L373">            this.statusCode = statusCode;</span>
+<span class="nc" id="L374">        }</span>
+    }
+
+    public AllSSTableOpStatus performScrub(final ColumnFamilyStore cfs, final boolean skipCorrupted, final boolean checkData,
+                                           int jobs)
+    throws InterruptedException, ExecutionException
+    {
+<span class="nc" id="L381">        return performScrub(cfs, skipCorrupted, checkData, false, jobs);</span>
+    }
+
+    public AllSSTableOpStatus performScrub(final ColumnFamilyStore cfs, final boolean skipCorrupted, final boolean checkData,
+                                           final boolean reinsertOverflowedTTL, int jobs)
+    throws InterruptedException, ExecutionException
+    {
+<span class="nc" id="L388">        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()</span>
+<span class="nc" id="L389">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction input)
+            {
+<span class="nc" id="L393">                return input.originals();</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction input) throws IOException
+            {
+<span class="nc" id="L399">                scrubOne(cfs, input, skipCorrupted, checkData, reinsertOverflowedTTL);</span>
+<span class="nc" id="L400">            }</span>
+        }, jobs, OperationType.SCRUB);
+    }
+
+    public AllSSTableOpStatus performVerify(final ColumnFamilyStore cfs, final boolean extendedVerify) throws InterruptedException, ExecutionException
+    {
+<span class="nc bnc" id="L406" title="All 4 branches missed.">        assert !cfs.isIndex();</span>
+<span class="nc" id="L407">        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()</span>
+<span class="nc" id="L408">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction input)
+            {
+<span class="nc" id="L412">                return input.originals();</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction input) throws IOException
+            {
+<span class="nc" id="L418">                verifyOne(cfs, input.onlyOne(), extendedVerify);</span>
+<span class="nc" id="L419">            }</span>
+        }, 0, OperationType.VERIFY);
+    }
+
+    public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs, final boolean excludeCurrentVersion, int jobs) throws InterruptedException, ExecutionException
+    {
+<span class="nc" id="L425">        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()</span>
+<span class="nc" id="L426">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction transaction)
+            {
+<span class="nc" id="L430">                List&lt;SSTableReader&gt; sortedSSTables = Lists.newArrayList(transaction.originals());</span>
+<span class="nc" id="L431">                Collections.sort(sortedSSTables, SSTableReader.sizeComparator.reversed());</span>
+<span class="nc" id="L432">                Iterator&lt;SSTableReader&gt; iter = sortedSSTables.iterator();</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                while (iter.hasNext())</span>
+                {
+<span class="nc" id="L435">                    SSTableReader sstable = iter.next();</span>
+<span class="nc bnc" id="L436" title="All 4 branches missed.">                    if (excludeCurrentVersion &amp;&amp; sstable.descriptor.version.equals(sstable.descriptor.getFormat().getLatestVersion()))</span>
+                    {
+<span class="nc" id="L438">                        transaction.cancel(sstable);</span>
+<span class="nc" id="L439">                        iter.remove();</span>
+                    }
+<span class="nc" id="L441">                }</span>
+<span class="nc" id="L442">                return sortedSSTables;</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn)
+            {
+<span class="nc" id="L448">                AbstractCompactionTask task = cfs.getCompactionStrategyManager().getCompactionTask(txn, NO_GC, Long.MAX_VALUE);</span>
+<span class="nc" id="L449">                task.setUserDefined(true);</span>
+<span class="nc" id="L450">                task.setCompactionType(OperationType.UPGRADE_SSTABLES);</span>
+<span class="nc" id="L451">                task.execute(metrics);</span>
+<span class="nc" id="L452">            }</span>
+        }, jobs, OperationType.UPGRADE_SSTABLES);
+    }
+
+    public AllSSTableOpStatus performCleanup(final ColumnFamilyStore cfStore, int jobs) throws InterruptedException, ExecutionException
+    {
+<span class="nc bnc" id="L458" title="All 4 branches missed.">        assert !cfStore.isIndex();</span>
+<span class="nc" id="L459">        Keyspace keyspace = cfStore.keyspace;</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (!StorageService.instance.isJoined())</span>
+        {
+<span class="nc" id="L462">            logger.info(&quot;Cleanup cannot run before a node has joined the ring&quot;);</span>
+<span class="nc" id="L463">            return AllSSTableOpStatus.ABORTED;</span>
+        }
+        // if local ranges is empty, it means no data should remain
+<span class="nc" id="L466">        final Collection&lt;Range&lt;Token&gt;&gt; ranges = StorageService.instance.getLocalRanges(keyspace.getName());</span>
+<span class="nc" id="L467">        final boolean hasIndexes = cfStore.indexManager.hasIndexes();</span>
+
+<span class="nc" id="L469">        return parallelAllSSTableOperation(cfStore, new OneSSTableOperation()</span>
+<span class="nc" id="L470">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction transaction)
+            {
+<span class="nc" id="L474">                List&lt;SSTableReader&gt; sortedSSTables = Lists.newArrayList(transaction.originals());</span>
+<span class="nc" id="L475">                Iterator&lt;SSTableReader&gt; sstableIter = sortedSSTables.iterator();</span>
+<span class="nc" id="L476">                int totalSSTables = 0;</span>
+<span class="nc" id="L477">                int skippedSStables = 0;</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                while (sstableIter.hasNext())</span>
+                {
+<span class="nc" id="L480">                    SSTableReader sstable = sstableIter.next();</span>
+<span class="nc" id="L481">                    totalSSTables++;</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">                    if (!needsCleanup(sstable, ranges))</span>
+                    {
+<span class="nc" id="L484">                        logger.debug(&quot;Not cleaning up {} ([{}, {}]) - no tokens outside owned ranges {}&quot;,</span>
+<span class="nc" id="L485">                                     sstable, sstable.first.getToken(), sstable.last.getToken(), ranges);</span>
+<span class="nc" id="L486">                        sstableIter.remove();</span>
+<span class="nc" id="L487">                        transaction.cancel(sstable);</span>
+<span class="nc" id="L488">                        skippedSStables++;</span>
+                    }
+<span class="nc" id="L490">                }</span>
+<span class="nc" id="L491">                logger.info(&quot;Skipping cleanup for {}/{} sstables for {}.{} since they are fully contained in owned ranges ({})&quot;,</span>
+<span class="nc" id="L492">                            skippedSStables, totalSSTables, cfStore.keyspace.getName(), cfStore.getTableName(), ranges);</span>
+<span class="nc" id="L493">                sortedSSTables.sort(SSTableReader.sizeComparator);</span>
+<span class="nc" id="L494">                return sortedSSTables;</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn) throws IOException
+            {
+<span class="nc" id="L500">                CleanupStrategy cleanupStrategy = CleanupStrategy.get(cfStore, ranges, FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L501">                doCleanupOne(cfStore, txn, cleanupStrategy, ranges, hasIndexes);</span>
+<span class="nc" id="L502">            }</span>
+        }, jobs, OperationType.CLEANUP);
+    }
+
+    public AllSSTableOpStatus performGarbageCollection(final ColumnFamilyStore cfStore, TombstoneOption tombstoneOption, int jobs) throws InterruptedException, ExecutionException
+    {
+<span class="nc bnc" id="L508" title="All 4 branches missed.">        assert !cfStore.isIndex();</span>
+
+<span class="nc" id="L510">        return parallelAllSSTableOperation(cfStore, new OneSSTableOperation()</span>
+<span class="nc" id="L511">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction transaction)
+            {
+<span class="nc" id="L515">                Iterable&lt;SSTableReader&gt; originals = transaction.originals();</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                if (cfStore.getCompactionStrategyManager().onlyPurgeRepairedTombstones())</span>
+<span class="nc" id="L517">                    originals = Iterables.filter(originals, SSTableReader::isRepaired);</span>
+<span class="nc" id="L518">                List&lt;SSTableReader&gt; sortedSSTables = Lists.newArrayList(originals);</span>
+<span class="nc" id="L519">                Collections.sort(sortedSSTables, SSTableReader.maxTimestampAscending);</span>
+<span class="nc" id="L520">                return sortedSSTables;</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn) throws IOException
+            {
+<span class="nc" id="L526">                logger.debug(&quot;Garbage collecting {}&quot;, txn.originals());</span>
+<span class="nc" id="L527">                CompactionTask task = new CompactionTask(cfStore, txn, getDefaultGcBefore(cfStore, FBUtilities.nowInSeconds()))</span>
+<span class="nc" id="L528">                {</span>
+                    @Override
+                    protected CompactionController getCompactionController(Set&lt;SSTableReader&gt; toCompact)
+                    {
+<span class="nc" id="L532">                        return new CompactionController(cfStore, toCompact, gcBefore, null, tombstoneOption);</span>
+                    }
+                };
+<span class="nc" id="L535">                task.setUserDefined(true);</span>
+<span class="nc" id="L536">                task.setCompactionType(OperationType.GARBAGE_COLLECT);</span>
+<span class="nc" id="L537">                task.execute(metrics);</span>
+<span class="nc" id="L538">            }</span>
+        }, jobs, OperationType.GARBAGE_COLLECT);
+    }
+
+    public AllSSTableOpStatus relocateSSTables(final ColumnFamilyStore cfs, int jobs) throws ExecutionException, InterruptedException
+    {
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        if (!cfs.getPartitioner().splitter().isPresent())</span>
+        {
+<span class="nc" id="L546">            logger.info(&quot;Partitioner does not support splitting&quot;);</span>
+<span class="nc" id="L547">            return AllSSTableOpStatus.ABORTED;</span>
+        }
+<span class="nc" id="L549">        final Collection&lt;Range&lt;Token&gt;&gt; r = StorageService.instance.getLocalRanges(cfs.keyspace.getName());</span>
+
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        if (r.isEmpty())</span>
+        {
+<span class="nc" id="L553">            logger.info(&quot;Relocate cannot run before a node has joined the ring&quot;);</span>
+<span class="nc" id="L554">            return AllSSTableOpStatus.ABORTED;</span>
+        }
+
+<span class="nc" id="L557">        final DiskBoundaries diskBoundaries = cfs.getDiskBoundaries();</span>
+
+<span class="nc" id="L559">        return parallelAllSSTableOperation(cfs, new OneSSTableOperation()</span>
+<span class="nc" id="L560">        {</span>
+            @Override
+            public Iterable&lt;SSTableReader&gt; filterSSTables(LifecycleTransaction transaction)
+            {
+<span class="nc" id="L564">                Set&lt;SSTableReader&gt; originals = Sets.newHashSet(transaction.originals());</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                Set&lt;SSTableReader&gt; needsRelocation = originals.stream().filter(s -&gt; !inCorrectLocation(s)).collect(Collectors.toSet());</span>
+<span class="nc" id="L566">                transaction.cancel(Sets.difference(originals, needsRelocation));</span>
+
+<span class="nc" id="L568">                Map&lt;Integer, List&lt;SSTableReader&gt;&gt; groupedByDisk = groupByDiskIndex(needsRelocation);</span>
+
+<span class="nc" id="L570">                int maxSize = 0;</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">                for (List&lt;SSTableReader&gt; diskSSTables : groupedByDisk.values())</span>
+<span class="nc" id="L572">                    maxSize = Math.max(maxSize, diskSSTables.size());</span>
+
+<span class="nc" id="L574">                List&lt;SSTableReader&gt; mixedSSTables = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                for (int i = 0; i &lt; maxSize; i++)</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    for (List&lt;SSTableReader&gt; diskSSTables : groupedByDisk.values())</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">                        if (i &lt; diskSSTables.size())</span>
+<span class="nc" id="L579">                            mixedSSTables.add(diskSSTables.get(i));</span>
+
+<span class="nc" id="L581">                return mixedSSTables;</span>
+            }
+
+            public Map&lt;Integer, List&lt;SSTableReader&gt;&gt; groupByDiskIndex(Set&lt;SSTableReader&gt; needsRelocation)
+            {
+<span class="nc" id="L586">                return needsRelocation.stream().collect(Collectors.groupingBy((s) -&gt; diskBoundaries.getDiskIndex(s)));</span>
+            }
+
+            private boolean inCorrectLocation(SSTableReader sstable)
+            {
+<span class="nc bnc" id="L591" title="All 2 branches missed.">                if (!cfs.getPartitioner().splitter().isPresent())</span>
+<span class="nc" id="L592">                    return true;</span>
+
+<span class="nc" id="L594">                int diskIndex = diskBoundaries.getDiskIndex(sstable);</span>
+<span class="nc" id="L595">                PartitionPosition diskLast = diskBoundaries.positions.get(diskIndex);</span>
+
+                // the location we get from directoryIndex is based on the first key in the sstable
+                // now we need to make sure the last key is less than the boundary as well:
+<span class="nc" id="L599">                Directories.DataDirectory dataDirectory = cfs.getDirectories().getDataDirectoryForFile(sstable.descriptor);</span>
+<span class="nc bnc" id="L600" title="All 4 branches missed.">                return diskBoundaries.directories.get(diskIndex).equals(dataDirectory) &amp;&amp; sstable.last.compareTo(diskLast) &lt;= 0;</span>
+            }
+
+            @Override
+            public void execute(LifecycleTransaction txn)
+            {
+<span class="nc" id="L606">                logger.debug(&quot;Relocating {}&quot;, txn.originals());</span>
+<span class="nc" id="L607">                AbstractCompactionTask task = cfs.getCompactionStrategyManager().getCompactionTask(txn, NO_GC, Long.MAX_VALUE);</span>
+<span class="nc" id="L608">                task.setUserDefined(true);</span>
+<span class="nc" id="L609">                task.setCompactionType(OperationType.RELOCATE);</span>
+<span class="nc" id="L610">                task.execute(metrics);</span>
+<span class="nc" id="L611">            }</span>
+        }, jobs, OperationType.RELOCATE);
+    }
+
+    /**
+     * Submit anti-compactions for a collection of SSTables over a set of repaired ranges and marks corresponding SSTables
+     * as repaired.
+     *
+     * @param cfs Column family for anti-compaction
+     * @param ranges Repaired ranges to be anti-compacted into separate SSTables.
+     * @param sstables {@link Refs} of SSTables within CF to anti-compact.
+     * @param repairedAt Unix timestamp of when repair was completed.
+     * @param parentRepairSession Corresponding repair session
+     * @return Futures executing anti-compaction.
+     */
+    public ListenableFuture&lt;?&gt; submitAntiCompaction(final ColumnFamilyStore cfs,
+                                          final Collection&lt;Range&lt;Token&gt;&gt; ranges,
+                                          final Refs&lt;SSTableReader&gt; sstables,
+                                          final long repairedAt,
+                                          final UUID parentRepairSession)
+    {
+<span class="nc" id="L632">        Runnable runnable = new WrappedRunnable()</span>
+<span class="nc" id="L633">        {</span>
+            @Override
+            @SuppressWarnings(&quot;resource&quot;)
+            public void runMayThrow() throws Exception
+            {
+<span class="nc" id="L638">                LifecycleTransaction modifier = null;</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">                while (modifier == null)</span>
+                {
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                    for (SSTableReader compactingSSTable : cfs.getTracker().getCompacting())</span>
+<span class="nc" id="L642">                        sstables.releaseIfHolds(compactingSSTable);</span>
+                    // We don't anti-compact any SSTable that has been compacted during repair as it may have been compacted
+                    // with unrepaired data.
+<span class="nc" id="L645">                    Set&lt;SSTableReader&gt; compactedSSTables = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">                    for (SSTableReader sstable : sstables)</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                        if (sstable.isMarkedCompacted())</span>
+<span class="nc" id="L648">                            compactedSSTables.add(sstable);</span>
+<span class="nc" id="L649">                    sstables.release(compactedSSTables);</span>
+<span class="nc" id="L650">                    modifier = cfs.getTracker().tryModify(sstables, OperationType.ANTICOMPACTION);</span>
+<span class="nc" id="L651">                }</span>
+<span class="nc" id="L652">                performAnticompaction(cfs, ranges, sstables, modifier, repairedAt, parentRepairSession);</span>
+<span class="nc" id="L653">            }</span>
+        };
+
+<span class="nc" id="L656">        ListenableFuture&lt;?&gt; ret = null;</span>
+        try
+        {
+<span class="nc" id="L659">            ret = executor.submitIfRunning(runnable, &quot;anticompaction&quot;);</span>
+<span class="nc" id="L660">            return ret;</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L664" title="All 4 branches missed.">            if (ret == null || ret.isCancelled())</span>
+<span class="nc" id="L665">                sstables.release();</span>
+        }
+    }
+
+    /**
+     * Make sure the {validatedForRepair} are marked for compaction before calling this.
+     *
+     * Caller must reference the validatedForRepair sstables (via ParentRepairSession.getActiveRepairedSSTableRefs(..)).
+     *
+     * NOTE: Repairs can take place on both unrepaired (incremental + full) and repaired (full) data.
+     * Although anti-compaction could work on repaired sstables as well and would result in having more accurate
+     * repairedAt values for these, we avoid anti-compacting already repaired sstables, as we currently don't
+     * make use of any actual repairedAt value and splitting up sstables just for that is not worth it. However, we will
+     * still update repairedAt if the SSTable is fully contained within the repaired ranges, as this does not require
+     * anticompaction.
+     *
+     * @param cfs
+     * @param ranges Ranges that the repair was carried out on
+     * @param validatedForRepair SSTables containing the repaired ranges. Should be referenced before passing them.
+     * @param txn Transaction across all SSTables that were repaired.
+     * @param parentRepairSession parent repair session ID
+     * @throws InterruptedException
+     * @throws IOException
+     */
+    public void performAnticompaction(ColumnFamilyStore cfs,
+                                      Collection&lt;Range&lt;Token&gt;&gt; ranges,
+                                      Refs&lt;SSTableReader&gt; validatedForRepair,
+                                      LifecycleTransaction txn,
+                                      long repairedAt,
+                                      UUID parentRepairSession) throws InterruptedException, IOException
+    {
+<span class="nc" id="L696">        logger.info(&quot;[repair #{}] Starting anticompaction for {}.{} on {}/{} sstables&quot;, parentRepairSession, cfs.keyspace.getName(), cfs.getTableName(), validatedForRepair.size(), cfs.getLiveSSTables());</span>
+<span class="nc" id="L697">        logger.trace(&quot;[repair #{}] Starting anticompaction for ranges {}&quot;, parentRepairSession, ranges);</span>
+<span class="nc" id="L698">        Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;(validatedForRepair);</span>
+<span class="nc" id="L699">        Set&lt;SSTableReader&gt; mutatedRepairStatuses = new HashSet&lt;&gt;(); // SSTables that were completely repaired only</span>
+<span class="nc" id="L700">        Set&lt;SSTableReader&gt; nonAnticompacting = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L702">        Iterator&lt;SSTableReader&gt; sstableIterator = sstables.iterator();</span>
+        try
+        {
+<span class="nc" id="L705">            List&lt;Range&lt;Token&gt;&gt; normalizedRanges = Range.normalize(ranges);</span>
+
+<span class="nc bnc" id="L707" title="All 2 branches missed.">            while (sstableIterator.hasNext())</span>
+            {
+<span class="nc" id="L709">                SSTableReader sstable = sstableIterator.next();</span>
+<span class="nc" id="L710">                List&lt;String&gt; anticompactRanges = new ArrayList&lt;&gt;();</span>
+                // We don't anti-compact SSTables already marked repaired. See CASSANDRA-13153
+                // and CASSANDRA-14423.
+<span class="nc bnc" id="L713" title="All 2 branches missed.">                if (sstable.isRepaired()) // We never anti-compact already repaired SSTables</span>
+<span class="nc" id="L714">                    nonAnticompacting.add(sstable);</span>
+
+<span class="nc" id="L716">                Bounds&lt;Token&gt; sstableBounds = new Bounds&lt;&gt;(sstable.first.getToken(), sstable.last.getToken());</span>
+
+<span class="nc" id="L718">                boolean shouldAnticompact = false;</span>
+
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                for (Range&lt;Token&gt; r : normalizedRanges)</span>
+                {
+<span class="nc bnc" id="L722" title="All 4 branches missed.">                    if (r.contains(sstableBounds.left) &amp;&amp; r.contains(sstableBounds.right))</span>
+                    {
+<span class="nc" id="L724">                        logger.info(&quot;[repair #{}] SSTable {} fully contained in range {}, mutating repairedAt instead of anticompacting&quot;, parentRepairSession, sstable, r);</span>
+<span class="nc" id="L725">                        sstable.descriptor.getMetadataSerializer().mutateRepairedAt(sstable.descriptor, repairedAt);</span>
+<span class="nc" id="L726">                        sstable.reloadSSTableMetadata();</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">                        if (!nonAnticompacting.contains(sstable)) // don't notify if the SSTable was already repaired</span>
+<span class="nc" id="L728">                            mutatedRepairStatuses.add(sstable);</span>
+<span class="nc" id="L729">                        sstableIterator.remove();</span>
+<span class="nc" id="L730">                        shouldAnticompact = true;</span>
+<span class="nc" id="L731">                        break;</span>
+                    }
+<span class="nc bnc" id="L733" title="All 4 branches missed.">                    else if (r.intersects(sstableBounds) &amp;&amp; !nonAnticompacting.contains(sstable))</span>
+                    {
+<span class="nc" id="L735">                        anticompactRanges.add(r.toString());</span>
+<span class="nc" id="L736">                        shouldAnticompact = true;</span>
+                    }
+<span class="nc" id="L738">                }</span>
+
+<span class="nc bnc" id="L740" title="All 2 branches missed.">                if (!anticompactRanges.isEmpty())</span>
+<span class="nc" id="L741">                    logger.info(&quot;[repair #{}] SSTable {} ({}) will be anticompacted on range {}&quot;, parentRepairSession, sstable, sstableBounds, String.join(&quot;, &quot;, anticompactRanges));</span>
+
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (!shouldAnticompact)</span>
+                {
+<span class="nc" id="L745">                    logger.info(&quot;[repair #{}] SSTable {} ({}) not subject to anticompaction of repaired ranges {}, not touching repairedAt.&quot;, parentRepairSession, sstable, sstableBounds, normalizedRanges);</span>
+<span class="nc" id="L746">                    nonAnticompacting.add(sstable);</span>
+<span class="nc" id="L747">                    sstableIterator.remove();</span>
+                }
+<span class="nc" id="L749">            }</span>
+<span class="nc" id="L750">            cfs.getTracker().notifySSTableRepairedStatusChanged(mutatedRepairStatuses);</span>
+<span class="nc" id="L751">            txn.cancel(Sets.union(nonAnticompacting, mutatedRepairStatuses));</span>
+<span class="nc" id="L752">            validatedForRepair.release(Sets.union(nonAnticompacting, mutatedRepairStatuses));</span>
+<span class="nc bnc" id="L753" title="All 4 branches missed.">            assert txn.originals().equals(sstables);</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">            if (!sstables.isEmpty())</span>
+<span class="nc" id="L755">                doAntiCompaction(cfs, ranges, txn, repairedAt);</span>
+<span class="nc" id="L756">            txn.finish();</span>
+        }
+        finally
+        {
+<span class="nc" id="L760">            validatedForRepair.release();</span>
+<span class="nc" id="L761">            txn.close();</span>
+        }
+
+<span class="nc" id="L764">        logger.info(&quot;[repair #{}] Completed anticompaction successfully&quot;, parentRepairSession);</span>
+<span class="nc" id="L765">    }</span>
+
+    public void performMaximal(final ColumnFamilyStore cfStore, boolean splitOutput)
+    {
+<span class="nc" id="L769">        FBUtilities.waitOnFutures(submitMaximal(cfStore, getDefaultGcBefore(cfStore, FBUtilities.nowInSeconds()), splitOutput));</span>
+<span class="nc" id="L770">    }</span>
+
+    public List&lt;Future&lt;?&gt;&gt; submitMaximal(final ColumnFamilyStore cfStore, final int gcBefore, boolean splitOutput)
+    {
+        // here we compute the task off the compaction executor, so having that present doesn't
+        // confuse runWithCompactionsDisabled -- i.e., we don't want to deadlock ourselves, waiting
+        // for ourselves to finish/acknowledge cancellation before continuing.
+<span class="nc" id="L777">        final Collection&lt;AbstractCompactionTask&gt; tasks = cfStore.getCompactionStrategyManager().getMaximalTasks(gcBefore, splitOutput);</span>
+
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        if (tasks == null)</span>
+<span class="nc" id="L780">            return Collections.emptyList();</span>
+
+<span class="nc" id="L782">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L784">        int nonEmptyTasks = 0;</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">        for (final AbstractCompactionTask task : tasks)</span>
+        {
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (task.transaction.originals().size() &gt; 0)</span>
+<span class="nc" id="L788">                nonEmptyTasks++;</span>
+
+<span class="nc" id="L790">            Runnable runnable = new WrappedRunnable()</span>
+<span class="nc" id="L791">            {</span>
+                protected void runMayThrow()
+                {
+<span class="nc" id="L794">                    task.execute(metrics);</span>
+<span class="nc" id="L795">                }</span>
+            };
+
+<span class="nc" id="L798">            Future&lt;?&gt; fut = executor.submitIfRunning(runnable, &quot;maximal task&quot;);</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">            if (!fut.isCancelled())</span>
+<span class="nc" id="L800">                futures.add(fut);</span>
+<span class="nc" id="L801">        }</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">        if (nonEmptyTasks &gt; 1)</span>
+<span class="nc" id="L803">            logger.info(&quot;Major compaction will not result in a single sstable - repaired and unrepaired data is kept separate and compaction runs per data_file_directory.&quot;);</span>
+
+
+<span class="nc" id="L806">        return futures;</span>
+    }
+
+    public void forceCompactionForTokenRange(ColumnFamilyStore cfStore, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L811">        Callable&lt;Collection&lt;AbstractCompactionTask&gt;&gt; taskCreator = () -&gt; {</span>
+<span class="nc" id="L812">            Collection&lt;SSTableReader&gt; sstables = sstablesInBounds(cfStore, ranges);</span>
+<span class="nc bnc" id="L813" title="All 4 branches missed.">            if (sstables == null || sstables.isEmpty())</span>
+            {
+<span class="nc" id="L815">                logger.debug(&quot;No sstables found for the provided token range&quot;);</span>
+<span class="nc" id="L816">                return null;</span>
+            }
+<span class="nc" id="L818">            return cfStore.getCompactionStrategyManager().getUserDefinedTasks(sstables, getDefaultGcBefore(cfStore, FBUtilities.nowInSeconds()));</span>
+        };
+
+<span class="nc" id="L821">        final Collection&lt;AbstractCompactionTask&gt; tasks = cfStore.runWithCompactionsDisabled(taskCreator, false, false);</span>
+
+<span class="nc bnc" id="L823" title="All 2 branches missed.">        if (tasks == null)</span>
+<span class="nc" id="L824">            return;</span>
+
+<span class="nc" id="L826">        Runnable runnable = new WrappedRunnable()</span>
+<span class="nc" id="L827">        {</span>
+            protected void runMayThrow() throws Exception
+            {
+                try
+                {
+<span class="nc bnc" id="L832" title="All 2 branches missed.">                    for (AbstractCompactionTask task : tasks)</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">                        if (task != null)</span>
+<span class="nc" id="L834">                            task.execute(metrics);</span>
+                }
+                finally
+                {
+<span class="nc" id="L838">                    FBUtilities.closeAll(tasks.stream().map(task -&gt; task.transaction).collect(Collectors.toList()));</span>
+                }
+<span class="nc" id="L840">            }</span>
+        };
+
+<span class="nc" id="L843">        FBUtilities.waitOnFuture(executor.submitIfRunning(runnable, &quot;force compaction for token range&quot;));</span>
+<span class="nc" id="L844">    }</span>
+
+    private static Collection&lt;SSTableReader&gt; sstablesInBounds(ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; tokenRangeCollection)
+    {
+<span class="nc" id="L848">        final Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L849">        Iterable&lt;SSTableReader&gt; liveTables = cfs.getTracker().getView().select(SSTableSet.LIVE);</span>
+<span class="nc" id="L850">        SSTableIntervalTree tree = SSTableIntervalTree.build(liveTables);</span>
+
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        for (Range&lt;Token&gt; tokenRange : tokenRangeCollection)</span>
+        {
+<span class="nc" id="L854">            Iterable&lt;SSTableReader&gt; ssTableReaders = View.sstablesInBounds(tokenRange.left.minKeyBound(), tokenRange.right.maxKeyBound(), tree);</span>
+<span class="nc" id="L855">            Iterables.addAll(sstables, ssTableReaders);</span>
+<span class="nc" id="L856">        }</span>
+<span class="nc" id="L857">        return sstables;</span>
+    }
+
+    public void forceUserDefinedCompaction(String dataFiles)
+    {
+<span class="nc" id="L862">        String[] filenames = dataFiles.split(&quot;,&quot;);</span>
+<span class="nc" id="L863">        Multimap&lt;ColumnFamilyStore, Descriptor&gt; descriptors = ArrayListMultimap.create();</span>
+
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        for (String filename : filenames)</span>
+        {
+            // extract keyspace and columnfamily name from filename
+<span class="nc" id="L868">            Descriptor desc = Descriptor.fromFilename(filename.trim());</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (Schema.instance.getCFMetaData(desc) == null)</span>
+            {
+<span class="nc" id="L871">                logger.warn(&quot;Schema does not exist for file {}. Skipping.&quot;, filename);</span>
+<span class="nc" id="L872">                continue;</span>
+            }
+            // group by keyspace/columnfamily
+<span class="nc" id="L875">            ColumnFamilyStore cfs = Keyspace.open(desc.ksname).getColumnFamilyStore(desc.cfname);</span>
+<span class="nc" id="L876">            descriptors.put(cfs, cfs.getDirectories().find(new File(filename.trim()).getName()));</span>
+        }
+
+<span class="nc" id="L879">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L880">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : descriptors.keySet())</span>
+<span class="nc" id="L882">            futures.add(submitUserDefined(cfs, descriptors.get(cfs), getDefaultGcBefore(cfs, nowInSec)));</span>
+<span class="nc" id="L883">        FBUtilities.waitOnFutures(futures);</span>
+<span class="nc" id="L884">    }</span>
+
+    public void forceUserDefinedCleanup(String dataFiles)
+    {
+<span class="nc" id="L888">        String[] filenames = dataFiles.split(&quot;,&quot;);</span>
+<span class="nc" id="L889">        HashMap&lt;ColumnFamilyStore, Descriptor&gt; descriptors = Maps.newHashMap();</span>
+
+<span class="nc bnc" id="L891" title="All 2 branches missed.">        for (String filename : filenames)</span>
+        {
+            // extract keyspace and columnfamily name from filename
+<span class="nc" id="L894">            Descriptor desc = Descriptor.fromFilename(filename.trim());</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">            if (Schema.instance.getCFMetaData(desc) == null)</span>
+            {
+<span class="nc" id="L897">                logger.warn(&quot;Schema does not exist for file {}. Skipping.&quot;, filename);</span>
+<span class="nc" id="L898">                continue;</span>
+            }
+            // group by keyspace/columnfamily
+<span class="nc" id="L901">            ColumnFamilyStore cfs = Keyspace.open(desc.ksname).getColumnFamilyStore(desc.cfname);</span>
+<span class="nc" id="L902">            desc = cfs.getDirectories().find(new File(filename.trim()).getName());</span>
+<span class="nc bnc" id="L903" title="All 2 branches missed.">            if (desc != null)</span>
+<span class="nc" id="L904">                descriptors.put(cfs, desc);</span>
+        }
+
+<span class="nc bnc" id="L907" title="All 2 branches missed.">        if (!StorageService.instance.isJoined())</span>
+        {
+<span class="nc" id="L909">            logger.error(&quot;Cleanup cannot run before a node has joined the ring&quot;);</span>
+<span class="nc" id="L910">            return;</span>
+        }
+
+<span class="nc bnc" id="L913" title="All 2 branches missed.">        for (Map.Entry&lt;ColumnFamilyStore,Descriptor&gt; entry : descriptors.entrySet())</span>
+        {
+<span class="nc" id="L915">            ColumnFamilyStore cfs = entry.getKey();</span>
+<span class="nc" id="L916">            Keyspace keyspace = cfs.keyspace;</span>
+<span class="nc" id="L917">            Collection&lt;Range&lt;Token&gt;&gt; ranges = StorageService.instance.getLocalRanges(keyspace.getName());</span>
+<span class="nc" id="L918">            boolean hasIndexes = cfs.indexManager.hasIndexes();</span>
+<span class="nc" id="L919">            SSTableReader sstable = lookupSSTable(cfs, entry.getValue());</span>
+
+<span class="nc bnc" id="L921" title="All 2 branches missed.">            if (sstable == null)</span>
+            {
+<span class="nc" id="L923">                logger.warn(&quot;Will not clean {}, it is not an active sstable&quot;, entry.getValue());</span>
+            }
+            else
+            {
+<span class="nc" id="L927">                CleanupStrategy cleanupStrategy = CleanupStrategy.get(cfs, ranges, FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L928">                try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstable, OperationType.CLEANUP))</span>
+                {
+<span class="nc" id="L930">                    doCleanupOne(cfs, txn, cleanupStrategy, ranges, hasIndexes);</span>
+                }
+<span class="nc" id="L932">                catch (IOException e)</span>
+                {
+<span class="nc" id="L934">                    logger.error(&quot;forceUserDefinedCleanup failed: {}&quot;, e.getLocalizedMessage());</span>
+<span class="nc" id="L935">                }</span>
+            }
+<span class="nc" id="L937">        }</span>
+<span class="nc" id="L938">    }</span>
+
+
+    public Future&lt;?&gt; submitUserDefined(final ColumnFamilyStore cfs, final Collection&lt;Descriptor&gt; dataFiles, final int gcBefore)
+    {
+<span class="nc" id="L943">        Runnable runnable = new WrappedRunnable()</span>
+<span class="nc" id="L944">        {</span>
+            protected void runMayThrow() throws Exception
+            {
+                // look up the sstables now that we're on the compaction executor, so we don't try to re-compact
+                // something that was already being compacted earlier.
+<span class="nc" id="L949">                Collection&lt;SSTableReader&gt; sstables = new ArrayList&lt;&gt;(dataFiles.size());</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">                for (Descriptor desc : dataFiles)</span>
+                {
+                    // inefficient but not in a performance sensitive path
+<span class="nc" id="L953">                    SSTableReader sstable = lookupSSTable(cfs, desc);</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">                    if (sstable == null)</span>
+                    {
+<span class="nc" id="L956">                        logger.info(&quot;Will not compact {}: it is not an active sstable&quot;, desc);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L960">                        sstables.add(sstable);</span>
+                    }
+<span class="nc" id="L962">                }</span>
+
+<span class="nc bnc" id="L964" title="All 2 branches missed.">                if (sstables.isEmpty())</span>
+                {
+<span class="nc" id="L966">                    logger.info(&quot;No files to compact for user defined compaction&quot;);</span>
+                }
+                else
+                {
+<span class="nc" id="L970">                    List&lt;AbstractCompactionTask&gt; tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);</span>
+                    try
+                    {
+<span class="nc bnc" id="L973" title="All 2 branches missed.">                        for (AbstractCompactionTask task : tasks)</span>
+                        {
+<span class="nc bnc" id="L975" title="All 2 branches missed.">                            if (task != null)</span>
+<span class="nc" id="L976">                                task.execute(metrics);</span>
+<span class="nc" id="L977">                        }</span>
+                    }
+                    finally
+                    {
+<span class="nc" id="L981">                        FBUtilities.closeAll(tasks.stream().map(task -&gt; task.transaction).collect(Collectors.toList()));</span>
+                    }
+                }
+<span class="nc" id="L984">            }</span>
+        };
+
+<span class="nc" id="L987">        return executor.submitIfRunning(runnable, &quot;user defined task&quot;);</span>
+    }
+
+    // This acquire a reference on the sstable
+    // This is not efficient, do not use in any critical path
+    private SSTableReader lookupSSTable(final ColumnFamilyStore cfs, Descriptor descriptor)
+    {
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))</span>
+        {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">            if (sstable.descriptor.equals(descriptor))</span>
+<span class="nc" id="L997">                return sstable;</span>
+<span class="nc" id="L998">        }</span>
+<span class="nc" id="L999">        return null;</span>
+    }
+
+    /**
+     * Does not mutate data, so is not scheduled.
+     */
+    public Future&lt;?&gt; submitValidation(final ColumnFamilyStore cfStore, final Validator validator)
+    {
+<span class="nc" id="L1007">        Callable&lt;Object&gt; callable = new Callable&lt;Object&gt;()</span>
+<span class="nc" id="L1008">        {</span>
+            public Object call() throws IOException
+            {
+                try
+                {
+<span class="nc" id="L1013">                    doValidationCompaction(cfStore, validator);</span>
+                }
+<span class="nc" id="L1015">                catch (Throwable e)</span>
+                {
+                    // we need to inform the remote end of our failure, otherwise it will hang on repair forever
+<span class="nc" id="L1018">                    validator.fail();</span>
+<span class="nc" id="L1019">                    throw e;</span>
+<span class="nc" id="L1020">                }</span>
+<span class="nc" id="L1021">                return this;</span>
+            }
+        };
+
+<span class="nc" id="L1025">        return validationExecutor.submitIfRunning(callable, &quot;validation&quot;);</span>
+    }
+
+    /* Used in tests. */
+    public void disableAutoCompaction()
+    {
+<span class="nc bnc" id="L1031" title="All 2 branches missed.">        for (String ksname : Schema.instance.getNonSystemKeyspaces())</span>
+        {
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">            for (ColumnFamilyStore cfs : Keyspace.open(ksname).getColumnFamilyStores())</span>
+<span class="nc" id="L1034">                cfs.disableAutoCompaction();</span>
+<span class="nc" id="L1035">        }</span>
+<span class="nc" id="L1036">    }</span>
+
+    private void scrubOne(ColumnFamilyStore cfs, LifecycleTransaction modifier, boolean skipCorrupted, boolean checkData, boolean reinsertOverflowedTTL) throws IOException
+    {
+<span class="nc" id="L1040">        CompactionInfo.Holder scrubInfo = null;</span>
+
+<span class="nc" id="L1042">        try (Scrubber scrubber = new Scrubber(cfs, modifier, skipCorrupted, checkData, reinsertOverflowedTTL))</span>
+        {
+<span class="nc" id="L1044">            scrubInfo = scrubber.getScrubInfo();</span>
+<span class="nc" id="L1045">            metrics.beginCompaction(scrubInfo);</span>
+<span class="nc" id="L1046">            scrubber.scrub();</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">            if (scrubInfo != null)</span>
+<span class="nc" id="L1051">                metrics.finishCompaction(scrubInfo);</span>
+        }
+<span class="nc" id="L1053">    }</span>
+
+    private void verifyOne(ColumnFamilyStore cfs, SSTableReader sstable, boolean extendedVerify) throws IOException
+    {
+<span class="nc" id="L1057">        CompactionInfo.Holder verifyInfo = null;</span>
+
+<span class="nc" id="L1059">        try (Verifier verifier = new Verifier(cfs, sstable, false))</span>
+        {
+<span class="nc" id="L1061">            verifyInfo = verifier.getVerifyInfo();</span>
+<span class="nc" id="L1062">            metrics.beginCompaction(verifyInfo);</span>
+<span class="nc" id="L1063">            verifier.verify(extendedVerify);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">            if (verifyInfo != null)</span>
+<span class="nc" id="L1068">                metrics.finishCompaction(verifyInfo);</span>
+        }
+<span class="nc" id="L1070">    }</span>
+
+    /**
+     * Determines if a cleanup would actually remove any data in this SSTable based
+     * on a set of owned ranges.
+     */
+    @VisibleForTesting
+    public static boolean needsCleanup(SSTableReader sstable, Collection&lt;Range&lt;Token&gt;&gt; ownedRanges)
+    {
+<span class="nc bnc" id="L1079" title="All 2 branches missed.">        if (ownedRanges.isEmpty())</span>
+        {
+<span class="nc" id="L1081">            return true; // all data will be cleaned</span>
+        }
+
+        // unwrap and sort the ranges by LHS token
+<span class="nc" id="L1085">        List&lt;Range&lt;Token&gt;&gt; sortedRanges = Range.normalize(ownedRanges);</span>
+
+        // see if there are any keys LTE the token for the start of the first range
+        // (token range ownership is exclusive on the LHS.)
+<span class="nc" id="L1089">        Range&lt;Token&gt; firstRange = sortedRanges.get(0);</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">        if (sstable.first.getToken().compareTo(firstRange.left) &lt;= 0)</span>
+<span class="nc" id="L1091">            return true;</span>
+
+        // then, iterate over all owned ranges and see if the next key beyond the end of the owned
+        // range falls before the start of the next range
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        for (int i = 0; i &lt; sortedRanges.size(); i++)</span>
+        {
+<span class="nc" id="L1097">            Range&lt;Token&gt; range = sortedRanges.get(i);</span>
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">            if (range.right.isMinimum())</span>
+            {
+                // we split a wrapping range and this is the second half.
+                // there can't be any keys beyond this (and this is the last range)
+<span class="nc" id="L1102">                return false;</span>
+            }
+
+<span class="nc" id="L1105">            DecoratedKey firstBeyondRange = sstable.firstKeyBeyond(range.right.maxKeyBound());</span>
+<span class="nc bnc" id="L1106" title="All 2 branches missed.">            if (firstBeyondRange == null)</span>
+            {
+                // we ran off the end of the sstable looking for the next key; we don't need to check any more ranges
+<span class="nc" id="L1109">                return false;</span>
+            }
+
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">            if (i == (sortedRanges.size() - 1))</span>
+            {
+                // we're at the last range and we found a key beyond the end of the range
+<span class="nc" id="L1115">                return true;</span>
+            }
+
+<span class="nc" id="L1118">            Range&lt;Token&gt; nextRange = sortedRanges.get(i + 1);</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">            if (firstBeyondRange.getToken().compareTo(nextRange.left) &lt;= 0)</span>
+            {
+                // we found a key in between the owned ranges
+<span class="nc" id="L1122">                return true;</span>
+            }
+        }
+
+<span class="nc" id="L1126">        return false;</span>
+    }
+
+    /**
+     * This function goes over a file and removes the keys that the node is not responsible for
+     * and only keeps keys that this node is responsible for.
+     *
+     * @throws IOException
+     */
+    private void doCleanupOne(final ColumnFamilyStore cfs, LifecycleTransaction txn, CleanupStrategy cleanupStrategy, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean hasIndexes) throws IOException
+    {
+<span class="nc bnc" id="L1137" title="All 4 branches missed.">        assert !cfs.isIndex();</span>
+
+<span class="nc" id="L1139">        SSTableReader sstable = txn.onlyOne();</span>
+
+        // if ranges is empty and no index, entire sstable is discarded
+<span class="nc bnc" id="L1142" title="All 4 branches missed.">        if (!hasIndexes &amp;&amp; !new Bounds&lt;&gt;(sstable.first.getToken(), sstable.last.getToken()).intersects(ranges))</span>
+        {
+<span class="nc" id="L1144">            txn.obsoleteOriginals();</span>
+<span class="nc" id="L1145">            txn.finish();</span>
+<span class="nc" id="L1146">            logger.info(&quot;SSTable {} ([{}, {}]) does not intersect the owned ranges ({}), dropping it&quot;, sstable, sstable.first.getToken(), sstable.last.getToken(), ranges);</span>
+<span class="nc" id="L1147">            return;</span>
+        }
+
+<span class="nc" id="L1150">        long start = System.nanoTime();</span>
+
+<span class="nc" id="L1152">        long totalkeysWritten = 0;</span>
+
+<span class="nc" id="L1154">        long expectedBloomFilterSize = Math.max(cfs.metadata.params.minIndexInterval,</span>
+<span class="nc" id="L1155">                                               SSTableReader.getApproximateKeyCount(txn.originals()));</span>
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1157">            logger.trace(&quot;Expected bloom filter size : {}&quot;, expectedBloomFilterSize);</span>
+
+<span class="nc" id="L1159">        logger.info(&quot;Cleaning up {}&quot;, sstable);</span>
+
+<span class="nc" id="L1161">        File compactionFileLocation = sstable.descriptor.directory;</span>
+<span class="nc" id="L1162">        RateLimiter limiter = getRateLimiter();</span>
+<span class="nc" id="L1163">        double compressionRatio = sstable.getCompressionRatio();</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">        if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)</span>
+<span class="nc" id="L1165">            compressionRatio = 1.0;</span>
+
+        List&lt;SSTableReader&gt; finished;
+
+<span class="nc" id="L1169">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L1170">        try (SSTableRewriter writer = SSTableRewriter.construct(cfs, txn, false, sstable.maxDataAge);</span>
+<span class="nc" id="L1171">             ISSTableScanner scanner = cleanupStrategy.getScanner(sstable, null);</span>
+<span class="nc" id="L1172">             CompactionController controller = new CompactionController(cfs, txn.originals(), getDefaultGcBefore(cfs, nowInSec));</span>
+<span class="nc" id="L1173">             Refs&lt;SSTableReader&gt; refs = Refs.ref(Collections.singleton(sstable));</span>
+<span class="nc" id="L1174">             CompactionIterator ci = new CompactionIterator(OperationType.CLEANUP, Collections.singletonList(scanner), controller, nowInSec, UUIDGen.getTimeUUID(), metrics))</span>
+        {
+<span class="nc" id="L1176">            writer.switchWriter(createWriter(cfs, compactionFileLocation, expectedBloomFilterSize, sstable.getSSTableMetadata().repairedAt, sstable, txn));</span>
+<span class="nc" id="L1177">            long lastBytesScanned = 0;</span>
+
+
+<span class="nc bnc" id="L1180" title="All 2 branches missed.">            while (ci.hasNext())</span>
+            {
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">                if (ci.isStopRequested())</span>
+<span class="nc" id="L1183">                    throw new CompactionInterruptedException(ci.getCompactionInfo());</span>
+
+<span class="nc" id="L1185">                try (UnfilteredRowIterator partition = ci.next();</span>
+<span class="nc" id="L1186">                     UnfilteredRowIterator notCleaned = cleanupStrategy.cleanup(partition))</span>
+                {
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">                    if (notCleaned == null)</span>
+                        continue;
+
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">                    if (writer.append(notCleaned) != null)</span>
+<span class="nc" id="L1192">                        totalkeysWritten++;</span>
+
+<span class="nc" id="L1194">                    long bytesScanned = scanner.getBytesScanned();</span>
+
+<span class="nc" id="L1196">                    compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);</span>
+
+<span class="nc" id="L1198">                    lastBytesScanned = bytesScanned;</span>
+<span class="nc" id="L1199">                }</span>
+            }
+
+            // flush to ensure we don't lose the tombstones on a restart, since they are not commitlog'd
+<span class="nc" id="L1203">            cfs.indexManager.flushAllIndexesBlocking();</span>
+
+<span class="nc" id="L1205">            finished = writer.finish();</span>
+        }
+
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">        if (!finished.isEmpty())</span>
+        {
+<span class="nc" id="L1210">            String format = &quot;Cleaned up to %s.  %s to %s (~%d%% of original) for %,d keys.  Time: %,dms.&quot;;</span>
+<span class="nc" id="L1211">            long dTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);</span>
+<span class="nc" id="L1212">            long startsize = sstable.onDiskLength();</span>
+<span class="nc" id="L1213">            long endsize = 0;</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">            for (SSTableReader newSstable : finished)</span>
+<span class="nc" id="L1215">                endsize += newSstable.onDiskLength();</span>
+<span class="nc" id="L1216">            double ratio = (double) endsize / (double) startsize;</span>
+<span class="nc" id="L1217">            logger.info(String.format(format, finished.get(0).getFilename(), FBUtilities.prettyPrintMemory(startsize),</span>
+<span class="nc" id="L1218">                                      FBUtilities.prettyPrintMemory(endsize), (int) (ratio * 100), totalkeysWritten, dTime));</span>
+        }
+
+<span class="nc" id="L1221">    }</span>
+
+    static void compactionRateLimiterAcquire(RateLimiter limiter, long bytesScanned, long lastBytesScanned, double compressionRatio)
+    {
+<span class="fc" id="L1225">        long lengthRead = (long) ((bytesScanned - lastBytesScanned) * compressionRatio) + 1;</span>
+<span class="pc bpc" id="L1226" title="1 of 2 branches missed.">        while (lengthRead &gt;= Integer.MAX_VALUE)</span>
+        {
+<span class="nc" id="L1228">            limiter.acquire(Integer.MAX_VALUE);</span>
+<span class="nc" id="L1229">            lengthRead -= Integer.MAX_VALUE;</span>
+        }
+<span class="pc bpc" id="L1231" title="1 of 2 branches missed.">        if (lengthRead &gt; 0)</span>
+        {
+<span class="fc" id="L1233">            limiter.acquire((int) lengthRead);</span>
+        }
+<span class="fc" id="L1235">    }</span>
+
+    private static abstract class CleanupStrategy
+    {
+        protected final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+        protected final int nowInSec;
+
+        protected CleanupStrategy(Collection&lt;Range&lt;Token&gt;&gt; ranges, int nowInSec)
+<span class="nc" id="L1243">        {</span>
+<span class="nc" id="L1244">            this.ranges = ranges;</span>
+<span class="nc" id="L1245">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L1246">        }</span>
+
+        public static CleanupStrategy get(ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; ranges, int nowInSec)
+        {
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">            return cfs.indexManager.hasIndexes()</span>
+                 ? new Full(cfs, ranges, nowInSec)
+                 : new Bounded(cfs, ranges, nowInSec);
+        }
+
+        public abstract ISSTableScanner getScanner(SSTableReader sstable, RateLimiter limiter);
+        public abstract UnfilteredRowIterator cleanup(UnfilteredRowIterator partition);
+
+        private static final class Bounded extends CleanupStrategy
+        {
+            public Bounded(final ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; ranges, int nowInSec)
+            {
+<span class="nc" id="L1262">                super(ranges, nowInSec);</span>
+<span class="nc" id="L1263">                instance.cacheCleanupExecutor.submit(new Runnable()</span>
+<span class="nc" id="L1264">                {</span>
+                    @Override
+                    public void run()
+                    {
+<span class="nc" id="L1268">                        cfs.cleanupCache();</span>
+<span class="nc" id="L1269">                    }</span>
+                });
+<span class="nc" id="L1271">            }</span>
+
+            @Override
+            public ISSTableScanner getScanner(SSTableReader sstable, RateLimiter limiter)
+            {
+<span class="nc" id="L1276">                return sstable.getScanner(ranges, limiter);</span>
+            }
+
+            @Override
+            public UnfilteredRowIterator cleanup(UnfilteredRowIterator partition)
+            {
+<span class="nc" id="L1282">                return partition;</span>
+            }
+        }
+
+        private static final class Full extends CleanupStrategy
+        {
+            private final ColumnFamilyStore cfs;
+
+            public Full(ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; ranges, int nowInSec)
+            {
+<span class="nc" id="L1292">                super(ranges, nowInSec);</span>
+<span class="nc" id="L1293">                this.cfs = cfs;</span>
+<span class="nc" id="L1294">            }</span>
+
+            @Override
+            public ISSTableScanner getScanner(SSTableReader sstable, RateLimiter limiter)
+            {
+<span class="nc" id="L1299">                return sstable.getScanner(limiter);</span>
+            }
+
+            @Override
+            public UnfilteredRowIterator cleanup(UnfilteredRowIterator partition)
+            {
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">                if (Range.isInRanges(partition.partitionKey().getToken(), ranges))</span>
+<span class="nc" id="L1306">                    return partition;</span>
+
+<span class="nc" id="L1308">                cfs.invalidateCachedPartition(partition.partitionKey());</span>
+
+<span class="nc" id="L1310">                cfs.indexManager.deletePartition(partition, nowInSec);</span>
+<span class="nc" id="L1311">                return null;</span>
+            }
+        }
+    }
+
+    public static SSTableWriter createWriter(ColumnFamilyStore cfs,
+                                             File compactionFileLocation,
+                                             long expectedBloomFilterSize,
+                                             long repairedAt,
+                                             SSTableReader sstable,
+                                             LifecycleTransaction txn)
+    {
+<span class="nc" id="L1323">        FileUtils.createDirectory(compactionFileLocation);</span>
+<span class="nc" id="L1324">        SerializationHeader header = sstable.header;</span>
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">        if (header == null)</span>
+<span class="nc" id="L1326">            header = SerializationHeader.make(sstable.metadata, Collections.singleton(sstable));</span>
+
+<span class="nc" id="L1328">        return SSTableWriter.create(cfs.metadata,</span>
+<span class="nc" id="L1329">                                    Descriptor.fromFilename(cfs.getSSTablePath(compactionFileLocation)),</span>
+                                    expectedBloomFilterSize,
+                                    repairedAt,
+<span class="nc" id="L1332">                                    sstable.getSSTableLevel(),</span>
+                                    header,
+<span class="nc" id="L1334">                                    cfs.indexManager.listIndexes(),</span>
+                                    txn);
+    }
+
+    public static SSTableWriter createWriterForAntiCompaction(ColumnFamilyStore cfs,
+                                                              File compactionFileLocation,
+                                                              int expectedBloomFilterSize,
+                                                              long repairedAt,
+                                                              Collection&lt;SSTableReader&gt; sstables,
+                                                              ILifecycleTransaction txn)
+    {
+<span class="nc" id="L1345">        FileUtils.createDirectory(compactionFileLocation);</span>
+<span class="nc" id="L1346">        int minLevel = Integer.MAX_VALUE;</span>
+        // if all sstables have the same level, we can compact them together without creating overlap during anticompaction
+        // note that we only anticompact from unrepaired sstables, which is not leveled, but we still keep original level
+        // after first migration to be able to drop the sstables back in their original place in the repaired sstable manifest
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">            if (minLevel == Integer.MAX_VALUE)</span>
+<span class="nc" id="L1353">                minLevel = sstable.getSSTableLevel();</span>
+
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">            if (minLevel != sstable.getSSTableLevel())</span>
+            {
+<span class="nc" id="L1357">                minLevel = 0;</span>
+<span class="nc" id="L1358">                break;</span>
+            }
+<span class="nc" id="L1360">        }</span>
+<span class="nc" id="L1361">        return SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(compactionFileLocation)),</span>
+<span class="nc" id="L1362">                                    (long) expectedBloomFilterSize,</span>
+<span class="nc" id="L1363">                                    repairedAt,</span>
+                                    cfs.metadata,
+                                    new MetadataCollector(sstables, cfs.metadata.comparator, minLevel),
+<span class="nc" id="L1366">                                    SerializationHeader.make(cfs.metadata, sstables),</span>
+<span class="nc" id="L1367">                                    cfs.indexManager.listIndexes(),</span>
+                                    txn);
+    }
+
+
+    /**
+     * Performs a readonly &quot;compaction&quot; of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    private void doValidationCompaction(ColumnFamilyStore cfs, Validator validator) throws IOException
+    {
+        // this isn't meant to be race-proof, because it's not -- it won't cause bugs for a CFS to be dropped
+        // mid-validation, or to attempt to validate a droped CFS.  this is just a best effort to avoid useless work,
+        // particularly in the scenario where a validation is submitted before the drop, and there are compactions
+        // started prior to the drop keeping some sstables alive.  Since validationCompaction can run
+        // concurrently with other compactions, it would otherwise go ahead and scan those again.
+<span class="nc bnc" id="L1384" title="All 2 branches missed.">        if (!cfs.isValid())</span>
+<span class="nc" id="L1385">            return;</span>
+
+<span class="nc" id="L1387">        Refs&lt;SSTableReader&gt; sstables = null;</span>
+        try
+        {
+
+            int gcBefore;
+<span class="nc" id="L1392">            int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L1393">            UUID parentRepairSessionId = validator.desc.parentSessionId;</span>
+            String snapshotName;
+<span class="nc" id="L1395">            boolean isGlobalSnapshotValidation = cfs.snapshotExists(parentRepairSessionId.toString());</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">            if (isGlobalSnapshotValidation)</span>
+<span class="nc" id="L1397">                snapshotName = parentRepairSessionId.toString();</span>
+            else
+<span class="nc" id="L1399">                snapshotName = validator.desc.sessionId.toString();</span>
+<span class="nc" id="L1400">            boolean isSnapshotValidation = cfs.snapshotExists(snapshotName);</span>
+
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">            if (isSnapshotValidation)</span>
+            {
+                // If there is a snapshot created for the session then read from there.
+                // note that we populate the parent repair session when creating the snapshot, meaning the sstables in the snapshot are the ones we
+                // are supposed to validate.
+<span class="nc" id="L1407">                sstables = cfs.getSnapshotSSTableReader(snapshotName);</span>
+
+
+                // Computing gcbefore based on the current time wouldn't be very good because we know each replica will execute
+                // this at a different time (that's the whole purpose of repair with snaphsot). So instead we take the creation
+                // time of the snapshot, which should give us roughtly the same time on each replica (roughtly being in that case
+                // 'as good as in the non-snapshot' case)
+<span class="nc" id="L1414">                gcBefore = cfs.gcBefore((int)(cfs.getSnapshotCreationTime(snapshotName) / 1000));</span>
+            }
+            else
+            {
+                // flush first so everyone is validating data that is as similar as possible
+<span class="nc" id="L1419">                StorageService.instance.forceKeyspaceFlush(cfs.keyspace.getName(), cfs.name);</span>
+<span class="nc" id="L1420">                sstables = getSSTablesToValidate(cfs, validator);</span>
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">                if (sstables == null)</span>
+<span class="nc" id="L1422">                    return; // this means the parent repair session was removed - the repair session failed on another node and we removed it</span>
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">                if (validator.gcBefore &gt; 0)</span>
+<span class="nc" id="L1424">                    gcBefore = validator.gcBefore;</span>
+                else
+<span class="nc" id="L1426">                    gcBefore = getDefaultGcBefore(cfs, nowInSec);</span>
+            }
+
+            // Create Merkle trees suitable to hold estimated partitions for the given ranges.
+            // We blindly assume that a partition is evenly distributed on all sstables for now.
+<span class="nc" id="L1431">            MerkleTrees tree = createMerkleTrees(sstables, validator.desc.ranges, cfs);</span>
+<span class="nc" id="L1432">            long start = System.nanoTime();</span>
+<span class="nc" id="L1433">            try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables, validator.desc.ranges);</span>
+<span class="nc" id="L1434">                 ValidationCompactionController controller = new ValidationCompactionController(cfs, gcBefore);</span>
+<span class="nc" id="L1435">                 CompactionIterator ci = new ValidationCompactionIterator(scanners.scanners, controller, nowInSec, metrics))</span>
+            {
+                // validate the CF as we iterate over it
+<span class="nc" id="L1438">                validator.prepare(cfs, tree);</span>
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">                while (ci.hasNext())</span>
+                {
+<span class="nc bnc" id="L1441" title="All 2 branches missed.">                    if (ci.isStopRequested())</span>
+<span class="nc" id="L1442">                        throw new CompactionInterruptedException(ci.getCompactionInfo());</span>
+<span class="nc" id="L1443">                    try (UnfilteredRowIterator partition = ci.next())</span>
+                    {
+<span class="nc" id="L1445">                        validator.add(partition);</span>
+<span class="nc" id="L1446">                    }</span>
+                }
+<span class="nc" id="L1448">                validator.complete();</span>
+            }
+            finally
+            {
+<span class="nc bnc" id="L1452" title="All 4 branches missed.">                if (isSnapshotValidation &amp;&amp; !isGlobalSnapshotValidation)</span>
+                {
+                    // we can only clear the snapshot if we are not doing a global snapshot validation (we then clear it once anticompaction
+                    // is done).
+<span class="nc" id="L1456">                    cfs.clearSnapshot(snapshotName);</span>
+                }
+            }
+
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+            {
+<span class="nc" id="L1462">                long duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);</span>
+<span class="nc" id="L1463">                logger.debug(&quot;Validation finished in {} msec, for {}&quot;,</span>
+<span class="nc" id="L1464">                             duration,</span>
+                             validator.desc);
+            }
+        }
+        finally
+        {
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">            if (sstables != null)</span>
+<span class="nc" id="L1471">                sstables.release();</span>
+        }
+<span class="nc" id="L1473">    }</span>
+
+    private static MerkleTrees createMerkleTrees(Iterable&lt;SSTableReader&gt; sstables, Collection&lt;Range&lt;Token&gt;&gt; ranges, ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L1477">        MerkleTrees tree = new MerkleTrees(cfs.getPartitioner());</span>
+<span class="nc" id="L1478">        long allPartitions = 0;</span>
+<span class="nc" id="L1479">        Map&lt;Range&lt;Token&gt;, Long&gt; rangePartitionCounts = Maps.newHashMapWithExpectedSize(ranges.size());</span>
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : ranges)</span>
+        {
+<span class="nc" id="L1482">            long numPartitions = 0;</span>
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L1484">                numPartitions += sstable.estimatedKeysForRanges(Collections.singleton(range));</span>
+<span class="nc" id="L1485">            rangePartitionCounts.put(range, numPartitions);</span>
+<span class="nc" id="L1486">            allPartitions += numPartitions;</span>
+<span class="nc" id="L1487">        }</span>
+
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : ranges)</span>
+        {
+<span class="nc" id="L1491">            long numPartitions = rangePartitionCounts.get(range);</span>
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">            double rangeOwningRatio = allPartitions &gt; 0 ? (double)numPartitions / allPartitions : 0;</span>
+            // determine max tree depth proportional to range size to avoid blowing up memory with multiple tress,
+            // capping at a configurable depth (default 18) to prevent large tree (CASSANDRA-11390, CASSANDRA-14096)
+<span class="nc bnc" id="L1495" title="All 2 branches missed.">            int maxDepth = rangeOwningRatio &gt; 0</span>
+<span class="nc" id="L1496">                           ? (int) Math.floor(Math.max(0.0, DatabaseDescriptor.getRepairSessionMaxTreeDepth() -</span>
+<span class="nc" id="L1497">                                                            Math.log(1 / rangeOwningRatio) / Math.log(2)))</span>
+                           : 0;
+
+            // determine tree depth from number of partitions, capping at max tree depth (CASSANDRA-5263)
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">            int depth = numPartitions &gt; 0 ? (int) Math.min(Math.ceil(Math.log(numPartitions) / Math.log(2)), maxDepth) : 0;</span>
+<span class="nc" id="L1502">            tree.addMerkleTree((int) Math.pow(2, depth), range);</span>
+<span class="nc" id="L1503">        }</span>
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">        if (logger.isDebugEnabled())</span>
+        {
+            // MT serialize may take time
+<span class="nc" id="L1507">            logger.debug(&quot;Created {} merkle trees with merkle trees size {}, {} partitions, {} bytes&quot;, tree.ranges().size(), tree.size(), allPartitions, MerkleTrees.serializer.serializedSize(tree, 0));</span>
+        }
+
+<span class="nc" id="L1510">        return tree;</span>
+    }
+
+    private synchronized Refs&lt;SSTableReader&gt; getSSTablesToValidate(ColumnFamilyStore cfs, Validator validator)
+    {
+        Refs&lt;SSTableReader&gt; sstables;
+
+<span class="nc" id="L1517">        ActiveRepairService.ParentRepairSession prs = ActiveRepairService.instance.getParentRepairSession(validator.desc.parentSessionId);</span>
+<span class="nc bnc" id="L1518" title="All 2 branches missed.">        if (prs == null)</span>
+<span class="nc" id="L1519">            return null;</span>
+<span class="nc" id="L1520">        Set&lt;SSTableReader&gt; sstablesToValidate = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">        if (prs.isGlobal)</span>
+<span class="nc" id="L1522">            prs.markSSTablesRepairing(cfs.metadata.cfId, validator.desc.parentSessionId);</span>
+        // note that we always grab all existing sstables for this - if we were to just grab the ones that
+        // were marked as repairing, we would miss any ranges that were compacted away and this would cause us to overstream
+<span class="nc bnc" id="L1525" title="All 4 branches missed.">        try (ColumnFamilyStore.RefViewFragment sstableCandidates = cfs.selectAndReference(View.select(SSTableSet.CANONICAL, (s) -&gt; !prs.isIncremental || !s.isRepaired())))</span>
+        {
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">            for (SSTableReader sstable : sstableCandidates.sstables)</span>
+            {
+<span class="nc bnc" id="L1529" title="All 2 branches missed.">                if (new Bounds&lt;&gt;(sstable.first.getToken(), sstable.last.getToken()).intersects(validator.desc.ranges))</span>
+                {
+<span class="nc" id="L1531">                    sstablesToValidate.add(sstable);</span>
+                }
+<span class="nc" id="L1533">            }</span>
+
+<span class="nc" id="L1535">            sstables = Refs.tryRef(sstablesToValidate);</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">            if (sstables == null)</span>
+            {
+<span class="nc" id="L1538">                logger.error(&quot;Could not reference sstables&quot;);</span>
+<span class="nc" id="L1539">                throw new RuntimeException(&quot;Could not reference sstables&quot;);</span>
+            }
+        }
+
+<span class="nc" id="L1543">        return sstables;</span>
+    }
+
+    /**
+     * Splits up an sstable into two new sstables. The first of the new tables will store repaired ranges, the second
+     * will store the non-repaired ranges. Once anticompation is completed, the original sstable is marked as compacted
+     * and subsequently deleted.
+     * @param cfs
+     * @param repaired a transaction over the repaired sstables to anticompacy
+     * @param ranges Repaired ranges to be placed into one of the new sstables. The repaired table will be tracked via
+     * the {@link org.apache.cassandra.io.sstable.metadata.StatsMetadata#repairedAt} field.
+     */
+    private void doAntiCompaction(ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; ranges, LifecycleTransaction repaired, long repairedAt)
+    {
+<span class="nc" id="L1557">        int numAnticompact = repaired.originals().size();</span>
+<span class="nc" id="L1558">        logger.info(&quot;Performing anticompaction on {} sstables&quot;, numAnticompact);</span>
+
+        //Group SSTables
+<span class="nc" id="L1561">        Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupedSSTables = cfs.getCompactionStrategyManager().groupSSTablesForAntiCompaction(repaired.originals());</span>
+        // iterate over sstables to check if the repaired / unrepaired ranges intersect them.
+<span class="nc" id="L1563">        int antiCompactedSSTableCount = 0;</span>
+<span class="nc bnc" id="L1564" title="All 2 branches missed.">        for (Collection&lt;SSTableReader&gt; sstableGroup : groupedSSTables)</span>
+        {
+<span class="nc" id="L1566">            try (LifecycleTransaction txn = repaired.split(sstableGroup))</span>
+            {
+<span class="nc" id="L1568">                int antiCompacted = antiCompactGroup(cfs, ranges, txn, repairedAt);</span>
+<span class="nc" id="L1569">                antiCompactedSSTableCount += antiCompacted;</span>
+            }
+<span class="nc" id="L1571">        }</span>
+
+<span class="nc" id="L1573">        String format = &quot;Anticompaction completed successfully, anticompacted from {} to {} sstable(s).&quot;;</span>
+<span class="nc" id="L1574">        logger.info(format, numAnticompact, antiCompactedSSTableCount);</span>
+<span class="nc" id="L1575">    }</span>
+
+
+    @VisibleForTesting
+    int antiCompactGroup(ColumnFamilyStore cfs, Collection&lt;Range&lt;Token&gt;&gt; ranges,
+                         LifecycleTransaction anticompactionGroup, long repairedAt)
+    {
+<span class="nc" id="L1582">        long groupMaxDataAge = -1;</span>
+
+<span class="nc bnc" id="L1584" title="All 2 branches missed.">        for (Iterator&lt;SSTableReader&gt; i = anticompactionGroup.originals().iterator(); i.hasNext();)</span>
+        {
+<span class="nc" id="L1586">            SSTableReader sstable = i.next();</span>
+<span class="nc bnc" id="L1587" title="All 2 branches missed.">            if (groupMaxDataAge &lt; sstable.maxDataAge)</span>
+<span class="nc" id="L1588">                groupMaxDataAge = sstable.maxDataAge;</span>
+<span class="nc" id="L1589">        }</span>
+
+<span class="nc bnc" id="L1591" title="All 2 branches missed.">        if (anticompactionGroup.originals().size() == 0)</span>
+        {
+<span class="nc" id="L1593">            logger.info(&quot;No valid anticompactions for this group, All sstables were compacted and are no longer available&quot;);</span>
+<span class="nc" id="L1594">            return 0;</span>
+        }
+
+<span class="nc" id="L1597">        logger.info(&quot;Anticompacting {}&quot;, anticompactionGroup);</span>
+<span class="nc" id="L1598">        Set&lt;SSTableReader&gt; sstableAsSet = anticompactionGroup.originals();</span>
+
+<span class="nc" id="L1600">        File destination = cfs.getDirectories().getWriteableLocationAsFile(cfs.getExpectedCompactedFileSize(sstableAsSet, OperationType.ANTICOMPACTION));</span>
+<span class="nc" id="L1601">        long repairedKeyCount = 0;</span>
+<span class="nc" id="L1602">        long unrepairedKeyCount = 0;</span>
+<span class="nc" id="L1603">        int nowInSec = FBUtilities.nowInSeconds();</span>
+
+        /**
+         * HACK WARNING
+         *
+         * We have multiple writers operating over the same Transaction, producing different sets of sstables that all
+         * logically replace the transaction's originals.  The SSTableRewriter assumes it has exclusive control over
+         * the transaction state, and this will lead to temporarily inconsistent sstable/tracker state if we do not
+         * take special measures to avoid it.
+         *
+         * Specifically, if a number of rewriter have prepareToCommit() invoked in sequence, then two problematic things happen:
+         *   1. The obsoleteOriginals() call of the first rewriter immediately remove the originals from the tracker, despite
+         *      their having been only partially replaced.  To avoid this, we must either avoid obsoleteOriginals() or checkpoint()
+         *   2. The LifecycleTransaction may only have prepareToCommit() invoked once, and this will checkpoint() also.
+         *
+         * Similarly commit() would finalise partially complete on-disk state.
+         *
+         * To avoid these problems, we introduce a SharedTxn that proxies all calls onto the underlying transaction
+         * except prepareToCommit(), checkpoint(), obsoleteOriginals(), and commit().
+         * We then invoke these methods directly once each of the rewriter has updated the transaction
+         * with their share of replacements.
+         *
+         * Note that for the same essential reason we also explicitly disable early open.
+         * By noop-ing checkpoint we avoid any of the problems with early open, but by continuing to explicitly
+         * disable it we also prevent any of the extra associated work from being performed.
+         */
+        class SharedTxn extends WrappedLifecycleTransaction
+        {
+<span class="nc" id="L1631">            public SharedTxn(ILifecycleTransaction delegate) { super(delegate); }</span>
+<span class="nc" id="L1632">            public Throwable commit(Throwable accumulate) { return accumulate; }</span>
+<span class="nc" id="L1633">            public void prepareToCommit() {}</span>
+<span class="nc" id="L1634">            public void checkpoint() {}</span>
+<span class="nc" id="L1635">            public void obsoleteOriginals() {}</span>
+<span class="nc" id="L1636">            public void close() {}</span>
+        }
+
+<span class="nc" id="L1639">        CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();</span>
+<span class="nc" id="L1640">        try (SharedTxn sharedTxn = new SharedTxn(anticompactionGroup);</span>
+<span class="nc" id="L1641">             SSTableRewriter repairedSSTableWriter = SSTableRewriter.constructWithoutEarlyOpening(sharedTxn, false, groupMaxDataAge);</span>
+<span class="nc" id="L1642">             SSTableRewriter unRepairedSSTableWriter = SSTableRewriter.constructWithoutEarlyOpening(sharedTxn, false, groupMaxDataAge);</span>
+<span class="nc" id="L1643">             AbstractCompactionStrategy.ScannerList scanners = strategy.getScanners(anticompactionGroup.originals());</span>
+<span class="nc" id="L1644">             CompactionController controller = new CompactionController(cfs, sstableAsSet, getDefaultGcBefore(cfs, nowInSec));</span>
+<span class="nc" id="L1645">             CompactionIterator ci = new CompactionIterator(OperationType.ANTICOMPACTION, scanners.scanners, controller, nowInSec, UUIDGen.getTimeUUID(), metrics))</span>
+        {
+<span class="nc" id="L1647">            int expectedBloomFilterSize = Math.max(cfs.metadata.params.minIndexInterval, (int)(SSTableReader.getApproximateKeyCount(sstableAsSet)));</span>
+
+<span class="nc" id="L1649">            repairedSSTableWriter.switchWriter(CompactionManager.createWriterForAntiCompaction(cfs, destination, expectedBloomFilterSize, repairedAt, sstableAsSet, sharedTxn));</span>
+<span class="nc" id="L1650">            unRepairedSSTableWriter.switchWriter(CompactionManager.createWriterForAntiCompaction(cfs, destination, expectedBloomFilterSize, ActiveRepairService.UNREPAIRED_SSTABLE, sstableAsSet, sharedTxn));</span>
+<span class="nc" id="L1651">            Range.OrderedRangeContainmentChecker containmentChecker = new Range.OrderedRangeContainmentChecker(ranges);</span>
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">            while (ci.hasNext())</span>
+            {
+<span class="nc" id="L1654">                try (UnfilteredRowIterator partition = ci.next())</span>
+                {
+                    // if current range from sstable is repaired, save it into the new repaired sstable
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">                    if (containmentChecker.contains(partition.partitionKey().getToken()))</span>
+                    {
+<span class="nc" id="L1659">                        repairedSSTableWriter.append(partition);</span>
+<span class="nc" id="L1660">                        repairedKeyCount++;</span>
+                    }
+                    // otherwise save into the new 'non-repaired' table
+                    else
+                    {
+<span class="nc" id="L1665">                        unRepairedSSTableWriter.append(partition);</span>
+<span class="nc" id="L1666">                        unrepairedKeyCount++;</span>
+                    }
+<span class="nc" id="L1668">                }</span>
+            }
+
+<span class="nc" id="L1671">            List&lt;SSTableReader&gt; anticompactedSSTables = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L1673">            repairedSSTableWriter.setRepairedAt(repairedAt).prepareToCommit();</span>
+<span class="nc" id="L1674">            unRepairedSSTableWriter.prepareToCommit();</span>
+<span class="nc" id="L1675">            anticompactionGroup.checkpoint();</span>
+<span class="nc" id="L1676">            anticompactionGroup.obsoleteOriginals();</span>
+<span class="nc" id="L1677">            anticompactionGroup.prepareToCommit();</span>
+<span class="nc" id="L1678">            anticompactedSSTables.addAll(repairedSSTableWriter.finished());</span>
+<span class="nc" id="L1679">            anticompactedSSTables.addAll(unRepairedSSTableWriter.finished());</span>
+<span class="nc" id="L1680">            repairedSSTableWriter.commit();</span>
+<span class="nc" id="L1681">            unRepairedSSTableWriter.commit();</span>
+<span class="nc" id="L1682">            Throwables.maybeFail(anticompactionGroup.commit(null));</span>
+
+<span class="nc" id="L1684">            logger.trace(&quot;Repaired {} keys out of {} for {}/{} in {}&quot;, repairedKeyCount,</span>
+<span class="nc" id="L1685">                                                                       repairedKeyCount + unrepairedKeyCount,</span>
+<span class="nc" id="L1686">                                                                       cfs.keyspace.getName(),</span>
+<span class="nc" id="L1687">                                                                       cfs.getColumnFamilyName(),</span>
+                                                                       anticompactionGroup);
+<span class="nc" id="L1689">            return anticompactedSSTables.size();</span>
+        }
+<span class="nc" id="L1691">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L1693">            JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L1694">            logger.error(&quot;Error anticompacting &quot; + anticompactionGroup, e);</span>
+        }
+<span class="nc" id="L1696">        return 0;</span>
+    }
+
+    /**
+     * Is not scheduled, because it is performing disjoint work from sstable compaction.
+     */
+    public Future&lt;?&gt; submitIndexBuild(final SecondaryIndexBuilder builder)
+    {
+<span class="nc" id="L1704">        Runnable runnable = new Runnable()</span>
+<span class="nc" id="L1705">        {</span>
+            public void run()
+            {
+<span class="nc" id="L1708">                metrics.beginCompaction(builder);</span>
+                try
+                {
+<span class="nc" id="L1711">                    builder.build();</span>
+                }
+                finally
+                {
+<span class="nc" id="L1715">                    metrics.finishCompaction(builder);</span>
+                }
+<span class="nc" id="L1717">            }</span>
+        };
+
+<span class="nc" id="L1720">        return executor.submitIfRunning(runnable, &quot;index build&quot;);</span>
+    }
+
+    public Future&lt;?&gt; submitCacheWrite(final AutoSavingCache.Writer writer)
+    {
+<span class="nc" id="L1725">        Runnable runnable = new Runnable()</span>
+<span class="nc" id="L1726">        {</span>
+            public void run()
+            {
+<span class="nc bnc" id="L1729" title="All 2 branches missed.">                if (!AutoSavingCache.flushInProgress.add(writer.cacheType()))</span>
+                {
+<span class="nc" id="L1731">                    logger.trace(&quot;Cache flushing was already in progress: skipping {}&quot;, writer.getCompactionInfo());</span>
+<span class="nc" id="L1732">                    return;</span>
+                }
+                try
+                {
+<span class="nc" id="L1736">                    metrics.beginCompaction(writer);</span>
+                    try
+                    {
+<span class="nc" id="L1739">                        writer.saveCache();</span>
+                    }
+                    finally
+                    {
+<span class="nc" id="L1743">                        metrics.finishCompaction(writer);</span>
+                    }
+                }
+                finally
+                {
+<span class="nc" id="L1748">                    AutoSavingCache.flushInProgress.remove(writer.cacheType());</span>
+                }
+<span class="nc" id="L1750">            }</span>
+        };
+
+<span class="nc" id="L1753">        return executor.submitIfRunning(runnable, &quot;cache write&quot;);</span>
+    }
+
+    public List&lt;SSTableReader&gt; runIndexSummaryRedistribution(IndexSummaryRedistribution redistribution) throws IOException
+    {
+<span class="nc" id="L1758">        metrics.beginCompaction(redistribution);</span>
+
+        try
+        {
+<span class="nc" id="L1762">            return redistribution.redistributeSummaries();</span>
+        }
+        finally
+        {
+<span class="nc" id="L1766">            metrics.finishCompaction(redistribution);</span>
+        }
+    }
+
+    public static int getDefaultGcBefore(ColumnFamilyStore cfs, int nowInSec)
+    {
+        // 2ndary indexes have ExpiringColumns too, so we need to purge tombstones deleted before now. We do not need to
+        // add any GcGrace however since 2ndary indexes are local to a node.
+<span class="pc bpc" id="L1774" title="1 of 2 branches missed.">        return cfs.isIndex() ? nowInSec : cfs.gcBefore(nowInSec);</span>
+    }
+
+    private static class ValidationCompactionIterator extends CompactionIterator
+    {
+        public ValidationCompactionIterator(List&lt;ISSTableScanner&gt; scanners, ValidationCompactionController controller, int nowInSec, CompactionMetrics metrics)
+        {
+<span class="nc" id="L1781">            super(OperationType.VALIDATION, scanners, controller, nowInSec, UUIDGen.getTimeUUID(), metrics);</span>
+<span class="nc" id="L1782">        }</span>
+    }
+
+    /*
+     * Controller for validation compaction that always purges.
+     * Note that we should not call cfs.getOverlappingSSTables on the provided
+     * sstables because those sstables are not guaranteed to be active sstables
+     * (since we can run repair on a snapshot).
+     */
+    private static class ValidationCompactionController extends CompactionController
+    {
+        public ValidationCompactionController(ColumnFamilyStore cfs, int gcBefore)
+        {
+<span class="nc" id="L1795">            super(cfs, gcBefore);</span>
+<span class="nc" id="L1796">        }</span>
+
+        @Override
+        public Predicate&lt;Long&gt; getPurgeEvaluator(DecoratedKey key)
+        {
+            /*
+             * The main reason we always purge is that including gcable tombstone would mean that the
+             * repair digest will depends on the scheduling of compaction on the different nodes. This
+             * is still not perfect because gcbefore is currently dependend on the current time at which
+             * the validation compaction start, which while not too bad for normal repair is broken for
+             * repair on snapshots. A better solution would be to agree on a gcbefore that all node would
+             * use, and we'll do that with CASSANDRA-4932.
+             * Note validation compaction includes all sstables, so we don't have the problem of purging
+             * a tombstone that could shadow a column in another sstable, but this is doubly not a concern
+             * since validation compaction is read-only.
+             */
+<span class="nc" id="L1812">            return time -&gt; true;</span>
+        }
+    }
+
+    public Future&lt;?&gt; submitViewBuilder(final ViewBuilder builder)
+    {
+<span class="nc" id="L1818">        Runnable runnable = new Runnable()</span>
+<span class="nc" id="L1819">        {</span>
+            public void run()
+            {
+<span class="nc" id="L1822">                metrics.beginCompaction(builder);</span>
+                try
+                {
+<span class="nc" id="L1825">                    builder.run();</span>
+                }
+                finally
+                {
+<span class="nc" id="L1829">                    metrics.finishCompaction(builder);</span>
+                }
+<span class="nc" id="L1831">            }</span>
+        };
+<span class="nc bnc" id="L1833" title="All 2 branches missed.">        if (executor.isShutdown())</span>
+        {
+<span class="nc" id="L1835">            logger.info(&quot;Compaction executor has shut down, not submitting index build&quot;);</span>
+<span class="nc" id="L1836">            return null;</span>
+        }
+
+<span class="nc" id="L1839">        return executor.submit(runnable);</span>
+    }
+    public int getActiveCompactions()
+    {
+<span class="nc" id="L1843">        return CompactionMetrics.getCompactions().size();</span>
+    }
+
+    static class CompactionExecutor extends JMXEnabledThreadPoolExecutor
+    {
+        protected CompactionExecutor(int minThreads, int maxThreads, String name, BlockingQueue&lt;Runnable&gt; queue)
+        {
+<span class="fc" id="L1850">            super(minThreads, maxThreads, 60, TimeUnit.SECONDS, queue, new NamedThreadFactory(name, Thread.MIN_PRIORITY), &quot;internal&quot;);</span>
+<span class="fc" id="L1851">        }</span>
+
+        private CompactionExecutor(int threadCount, String name)
+        {
+<span class="fc" id="L1855">            this(threadCount, threadCount, name, new LinkedBlockingQueue&lt;Runnable&gt;());</span>
+<span class="fc" id="L1856">        }</span>
+
+        public CompactionExecutor()
+        {
+<span class="fc" id="L1860">            this(Math.max(1, DatabaseDescriptor.getConcurrentCompactors()), &quot;CompactionExecutor&quot;);</span>
+<span class="fc" id="L1861">        }</span>
+
+        protected void beforeExecute(Thread t, Runnable r)
+        {
+            // can't set this in Thread factory, so we do it redundantly here
+<span class="fc" id="L1866">            isCompactionManager.set(true);</span>
+<span class="fc" id="L1867">            super.beforeExecute(t, r);</span>
+<span class="fc" id="L1868">        }</span>
+
+        // modified from DebuggableThreadPoolExecutor so that CompactionInterruptedExceptions are not logged
+        @Override
+        public void afterExecute(Runnable r, Throwable t)
+        {
+<span class="fc" id="L1874">            DebuggableThreadPoolExecutor.maybeResetTraceSessionWrapper(r);</span>
+
+<span class="pc bpc" id="L1876" title="1 of 2 branches missed.">            if (t == null)</span>
+<span class="fc" id="L1877">                t = DebuggableThreadPoolExecutor.extractThrowable(r);</span>
+
+<span class="pc bpc" id="L1879" title="1 of 2 branches missed.">            if (t != null)</span>
+            {
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">                if (t instanceof CompactionInterruptedException)</span>
+                {
+<span class="nc" id="L1883">                    logger.info(t.getMessage());</span>
+<span class="nc bnc" id="L1884" title="All 4 branches missed.">                    if (t.getSuppressed() != null &amp;&amp; t.getSuppressed().length &gt; 0)</span>
+<span class="nc" id="L1885">                        logger.warn(&quot;Interruption of compaction encountered exceptions:&quot;, t);</span>
+                    else
+<span class="nc" id="L1887">                        logger.trace(&quot;Full interruption stack trace:&quot;, t);</span>
+                }
+                else
+                {
+<span class="nc" id="L1891">                    DebuggableThreadPoolExecutor.handleOrLog(t);</span>
+                }
+            }
+
+            // Snapshots cannot be deleted on Windows while segments of the root element are mapped in NTFS. Compactions
+            // unmap those segments which could free up a snapshot for successful deletion.
+<span class="fc" id="L1897">            SnapshotDeletingTask.rescheduleFailedTasks();</span>
+<span class="fc" id="L1898">        }</span>
+
+        public ListenableFuture&lt;?&gt; submitIfRunning(Runnable task, String name)
+        {
+<span class="fc" id="L1902">            return submitIfRunning(Executors.callable(task, null), name);</span>
+        }
+
+        /**
+         * Submit the task but only if the executor has not been shutdown.If the executor has
+         * been shutdown, or in case of a rejected execution exception return a cancelled future.
+         *
+         * @param task - the task to submit
+         * @param name - the task name to use in log messages
+         *
+         * @return the future that will deliver the task result, or a future that has already been
+         *         cancelled if the task could not be submitted.
+         */
+        public ListenableFuture&lt;?&gt; submitIfRunning(Callable&lt;?&gt; task, String name)
+        {
+<span class="pc bpc" id="L1917" title="1 of 2 branches missed.">            if (isShutdown())</span>
+            {
+<span class="nc" id="L1919">                logger.info(&quot;Executor has been shut down, not submitting {}&quot;, name);</span>
+<span class="nc" id="L1920">                return Futures.immediateCancelledFuture();</span>
+            }
+
+            try
+            {
+<span class="fc" id="L1925">                ListenableFutureTask ret = ListenableFutureTask.create(task);</span>
+<span class="fc" id="L1926">                execute(ret);</span>
+<span class="fc" id="L1927">                return ret;</span>
+            }
+<span class="nc" id="L1929">            catch (RejectedExecutionException ex)</span>
+            {
+<span class="nc bnc" id="L1931" title="All 2 branches missed.">                if (isShutdown())</span>
+<span class="nc" id="L1932">                    logger.info(&quot;Executor has shut down, could not submit {}&quot;, name);</span>
+                else
+<span class="nc" id="L1934">                    logger.error(&quot;Failed to submit {}&quot;, name, ex);</span>
+
+<span class="nc" id="L1936">                return Futures.immediateCancelledFuture();</span>
+            }
+        }
+    }
+
+    private static class ValidationExecutor extends CompactionExecutor
+    {
+        public ValidationExecutor()
+        {
+<span class="fc" id="L1945">            super(1, Integer.MAX_VALUE, &quot;ValidationExecutor&quot;, new SynchronousQueue&lt;Runnable&gt;());</span>
+<span class="fc" id="L1946">        }</span>
+    }
+
+    private static class CacheCleanupExecutor extends CompactionExecutor
+    {
+        public CacheCleanupExecutor()
+        {
+<span class="fc" id="L1953">            super(1, &quot;CacheCleanupExecutor&quot;);</span>
+<span class="fc" id="L1954">        }</span>
+    }
+
+    public interface CompactionExecutorStatsCollector
+    {
+        void beginCompaction(CompactionInfo.Holder ci);
+
+        void finishCompaction(CompactionInfo.Holder ci);
+    }
+
+    public List&lt;Map&lt;String, String&gt;&gt; getCompactions()
+    {
+<span class="nc" id="L1966">        List&lt;Holder&gt; compactionHolders = CompactionMetrics.getCompactions();</span>
+<span class="nc" id="L1967">        List&lt;Map&lt;String, String&gt;&gt; out = new ArrayList&lt;Map&lt;String, String&gt;&gt;(compactionHolders.size());</span>
+<span class="nc bnc" id="L1968" title="All 2 branches missed.">        for (CompactionInfo.Holder ci : compactionHolders)</span>
+<span class="nc" id="L1969">            out.add(ci.getCompactionInfo().asMap());</span>
+<span class="nc" id="L1970">        return out;</span>
+    }
+
+    public List&lt;String&gt; getCompactionSummary()
+    {
+<span class="nc" id="L1975">        List&lt;Holder&gt; compactionHolders = CompactionMetrics.getCompactions();</span>
+<span class="nc" id="L1976">        List&lt;String&gt; out = new ArrayList&lt;String&gt;(compactionHolders.size());</span>
+<span class="nc bnc" id="L1977" title="All 2 branches missed.">        for (CompactionInfo.Holder ci : compactionHolders)</span>
+<span class="nc" id="L1978">            out.add(ci.getCompactionInfo().toString());</span>
+<span class="nc" id="L1979">        return out;</span>
+    }
+
+    public TabularData getCompactionHistory()
+    {
+        try
+        {
+<span class="nc" id="L1986">            return SystemKeyspace.getCompactionHistory();</span>
+        }
+<span class="nc" id="L1988">        catch (OpenDataException e)</span>
+        {
+<span class="nc" id="L1990">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    public long getTotalBytesCompacted()
+    {
+<span class="nc" id="L1996">        return metrics.bytesCompacted.getCount();</span>
+    }
+
+    public long getTotalCompactionsCompleted()
+    {
+<span class="nc" id="L2001">        return metrics.totalCompactionsCompleted.getCount();</span>
+    }
+
+    public int getPendingTasks()
+    {
+<span class="nc" id="L2006">        return metrics.pendingTasks.getValue();</span>
+    }
+
+    public long getCompletedTasks()
+    {
+<span class="nc" id="L2011">        return metrics.completedTasks.getValue();</span>
+    }
+
+    public void stopCompaction(String type)
+    {
+<span class="nc" id="L2016">        OperationType operation = OperationType.valueOf(type);</span>
+<span class="nc bnc" id="L2017" title="All 2 branches missed.">        for (Holder holder : CompactionMetrics.getCompactions())</span>
+        {
+<span class="nc bnc" id="L2019" title="All 2 branches missed.">            if (holder.getCompactionInfo().getTaskType() == operation)</span>
+<span class="nc" id="L2020">                holder.stop();</span>
+<span class="nc" id="L2021">        }</span>
+<span class="nc" id="L2022">    }</span>
+
+    public void stopCompactionById(String compactionId)
+    {
+<span class="nc bnc" id="L2026" title="All 2 branches missed.">        for (Holder holder : CompactionMetrics.getCompactions())</span>
+        {
+<span class="nc" id="L2028">            UUID holderId = holder.getCompactionInfo().compactionId();</span>
+<span class="nc bnc" id="L2029" title="All 4 branches missed.">            if (holderId != null &amp;&amp; holderId.equals(UUID.fromString(compactionId)))</span>
+<span class="nc" id="L2030">                holder.stop();</span>
+<span class="nc" id="L2031">        }</span>
+<span class="nc" id="L2032">    }</span>
+
+    public void setConcurrentCompactors(int value)
+    {
+<span class="nc bnc" id="L2036" title="All 2 branches missed.">        if (value &gt; executor.getCorePoolSize())</span>
+        {
+            // we are increasing the value
+<span class="nc" id="L2039">            executor.setMaximumPoolSize(value);</span>
+<span class="nc" id="L2040">            executor.setCorePoolSize(value);</span>
+        }
+<span class="nc bnc" id="L2042" title="All 2 branches missed.">        else if (value &lt; executor.getCorePoolSize())</span>
+        {
+            // we are reducing the value
+<span class="nc" id="L2045">            executor.setCorePoolSize(value);</span>
+<span class="nc" id="L2046">            executor.setMaximumPoolSize(value);</span>
+        }
+<span class="nc" id="L2048">    }</span>
+
+    public int getCoreCompactorThreads()
+    {
+<span class="nc" id="L2052">        return executor.getCorePoolSize();</span>
+    }
+
+    public void setCoreCompactorThreads(int number)
+    {
+<span class="nc" id="L2057">        executor.setCorePoolSize(number);</span>
+<span class="nc" id="L2058">    }</span>
+
+    public int getMaximumCompactorThreads()
+    {
+<span class="nc" id="L2062">        return executor.getMaximumPoolSize();</span>
+    }
+
+    public void setMaximumCompactorThreads(int number)
+    {
+<span class="nc" id="L2067">        executor.setMaximumPoolSize(number);</span>
+<span class="nc" id="L2068">    }</span>
+
+    public int getCoreValidationThreads()
+    {
+<span class="nc" id="L2072">        return validationExecutor.getCorePoolSize();</span>
+    }
+
+    public void setCoreValidationThreads(int number)
+    {
+<span class="nc" id="L2077">        validationExecutor.setCorePoolSize(number);</span>
+<span class="nc" id="L2078">    }</span>
+
+    public int getMaximumValidatorThreads()
+    {
+<span class="nc" id="L2082">        return validationExecutor.getMaximumPoolSize();</span>
+    }
+
+    public void setMaximumValidatorThreads(int number)
+    {
+<span class="nc" id="L2087">        validationExecutor.setMaximumPoolSize(number);</span>
+<span class="nc" id="L2088">    }</span>
+
+    /**
+     * Try to stop all of the compactions for given ColumnFamilies.
+     *
+     * Note that this method does not wait for all compactions to finish; you'll need to loop against
+     * isCompacting if you want that behavior.
+     *
+     * @param columnFamilies The ColumnFamilies to try to stop compaction upon.
+     * @param interruptValidation true if validation operations for repair should also be interrupted
+     *
+     */
+    public void interruptCompactionFor(Iterable&lt;CFMetaData&gt; columnFamilies, boolean interruptValidation)
+    {
+<span class="nc bnc" id="L2102" title="All 4 branches missed.">        assert columnFamilies != null;</span>
+
+        // interrupt in-progress compactions
+<span class="nc bnc" id="L2105" title="All 2 branches missed.">        for (Holder compactionHolder : CompactionMetrics.getCompactions())</span>
+        {
+<span class="nc" id="L2107">            CompactionInfo info = compactionHolder.getCompactionInfo();</span>
+<span class="nc bnc" id="L2108" title="All 4 branches missed.">            if ((info.getTaskType() == OperationType.VALIDATION) &amp;&amp; !interruptValidation)</span>
+<span class="nc" id="L2109">                continue;</span>
+
+            // cfmetadata is null for index summary redistributions which are 'global' - they involve all keyspaces/tables
+<span class="nc bnc" id="L2112" title="All 4 branches missed.">            if (info.getCFMetaData() == null || Iterables.contains(columnFamilies, info.getCFMetaData()))</span>
+<span class="nc" id="L2113">                compactionHolder.stop(); // signal compaction to stop</span>
+<span class="nc" id="L2114">        }</span>
+<span class="nc" id="L2115">    }</span>
+
+    public void interruptCompactionForCFs(Iterable&lt;ColumnFamilyStore&gt; cfss, boolean interruptValidation)
+    {
+<span class="nc" id="L2119">        List&lt;CFMetaData&gt; metadata = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L2120" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : cfss)</span>
+<span class="nc" id="L2121">            metadata.add(cfs.metadata);</span>
+
+<span class="nc" id="L2123">        interruptCompactionFor(metadata, interruptValidation);</span>
+<span class="nc" id="L2124">    }</span>
+
+    public void waitForCessation(Iterable&lt;ColumnFamilyStore&gt; cfss)
+    {
+<span class="nc" id="L2128">        long start = System.nanoTime();</span>
+<span class="nc" id="L2129">        long delay = TimeUnit.MINUTES.toNanos(1);</span>
+<span class="nc bnc" id="L2130" title="All 2 branches missed.">        while (System.nanoTime() - start &lt; delay)</span>
+        {
+<span class="nc bnc" id="L2132" title="All 2 branches missed.">            if (CompactionManager.instance.isCompacting(cfss))</span>
+<span class="nc" id="L2133">                Uninterruptibles.sleepUninterruptibly(1, TimeUnit.MILLISECONDS);</span>
+            else
+                break;
+        }
+<span class="nc" id="L2137">    }</span>
+
+    /**
+     * Return whether &quot;global&quot; compactions should be paused, used by ColumnFamilyStore#runWithCompactionsDisabled
+     *
+     * a global compaction is one that includes several/all tables, currently only IndexSummaryBuilder
+     */
+    public boolean isGlobalCompactionPaused()
+    {
+<span class="nc bnc" id="L2146" title="All 2 branches missed.">        return globalCompactionPauseCount.get() &gt; 0;</span>
+    }
+
+    public CompactionPauser pauseGlobalCompaction()
+    {
+<span class="nc" id="L2151">        CompactionPauser pauser = globalCompactionPauseCount::decrementAndGet;</span>
+<span class="nc" id="L2152">        globalCompactionPauseCount.incrementAndGet();</span>
+<span class="nc" id="L2153">        return pauser;</span>
+    }
+
+    public interface CompactionPauser extends AutoCloseable
+    {
+        public void close();
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

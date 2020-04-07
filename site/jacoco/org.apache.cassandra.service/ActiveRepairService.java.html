@@ -1,0 +1,788 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ActiveRepairService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">ActiveRepairService.java</span></div><h1>ActiveRepairService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.AbstractFuture;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
+import org.apache.cassandra.gms.IFailureDetectionEventListener;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.repair.AnticompactionTask;
+import org.apache.cassandra.repair.RepairJobDesc;
+import org.apache.cassandra.repair.RepairParallelism;
+import org.apache.cassandra.repair.RepairSession;
+import org.apache.cassandra.repair.messages.*;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+/**
+ * ActiveRepairService is the starting point for manual &quot;active&quot; repairs.
+ *
+ * Each user triggered repair will correspond to one or multiple repair session,
+ * one for each token range to repair. On repair session might repair multiple
+ * column families. For each of those column families, the repair session will
+ * request merkle trees for each replica of the range being repaired, diff those
+ * trees upon receiving them, schedule the streaming ofthe parts to repair (based on
+ * the tree diffs) and wait for all those operation. See RepairSession for more
+ * details.
+ *
+ * The creation of a repair session is done through the submitRepairSession that
+ * returns a future on the completion of that session.
+ */
+<span class="nc bnc" id="L88" title="All 2 branches missed.">public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFailureDetectionEventListener</span>
+{
+    /**
+     * @deprecated this statuses are from the previous JMX notification service,
+     * which will be deprecated on 4.0. For statuses of the new notification
+     * service, see {@link org.apache.cassandra.streaming.StreamEvent.ProgressEvent}
+     */
+<span class="nc" id="L95">    @Deprecated</span>
+    public static enum Status
+    {
+<span class="nc" id="L98">        STARTED, SESSION_SUCCESS, SESSION_FAILED, FINISHED</span>
+    }
+<span class="nc" id="L100">    private boolean registeredForEndpointChanges = false;</span>
+
+<span class="nc" id="L102">    public static CassandraVersion SUPPORTS_GLOBAL_PREPARE_FLAG_VERSION = new CassandraVersion(&quot;2.2.1&quot;);</span>
+
+<span class="nc" id="L104">    private static final Logger logger = LoggerFactory.getLogger(ActiveRepairService.class);</span>
+    // singleton enforcement
+<span class="nc" id="L106">    public static final ActiveRepairService instance = new ActiveRepairService(FailureDetector.instance, Gossiper.instance);</span>
+
+    public static final long UNREPAIRED_SSTABLE = 0;
+
+    /**
+     * A map of active coordinator session.
+     */
+<span class="nc" id="L113">    private final ConcurrentMap&lt;UUID, RepairSession&gt; sessions = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L115">    private final ConcurrentMap&lt;UUID, ParentRepairSession&gt; parentRepairSessions = new ConcurrentHashMap&lt;&gt;();</span>
+
+    private final IFailureDetector failureDetector;
+    private final Gossiper gossiper;
+
+    public ActiveRepairService(IFailureDetector failureDetector, Gossiper gossiper)
+<span class="nc" id="L121">    {</span>
+<span class="nc" id="L122">        this.failureDetector = failureDetector;</span>
+<span class="nc" id="L123">        this.gossiper = gossiper;</span>
+<span class="nc" id="L124">    }</span>
+
+    /**
+     * Requests repairs for the given keyspace and column families.
+     *
+     * @return Future for asynchronous call or null if there is no need to repair
+     */
+    public RepairSession submitRepairSession(UUID parentRepairSession,
+                                             Collection&lt;Range&lt;Token&gt;&gt; range,
+                                             String keyspace,
+                                             RepairParallelism parallelismDegree,
+                                             Set&lt;InetAddress&gt; endpoints,
+                                             long repairedAt,
+                                             boolean pullRepair,
+                                             ListeningExecutorService executor,
+                                             String... cfnames)
+    {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (endpoints.isEmpty())</span>
+<span class="nc" id="L142">            return null;</span>
+
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (cfnames.length == 0)</span>
+<span class="nc" id="L145">            return null;</span>
+
+<span class="nc" id="L147">        final RepairSession session = new RepairSession(parentRepairSession, UUIDGen.getTimeUUID(), range, keyspace, parallelismDegree, endpoints, repairedAt, pullRepair, cfnames);</span>
+
+<span class="nc" id="L149">        sessions.put(session.getId(), session);</span>
+        // register listeners
+<span class="nc" id="L151">        registerOnFdAndGossip(session);</span>
+
+        // remove session at completion
+<span class="nc" id="L154">        session.addListener(new Runnable()</span>
+<span class="nc" id="L155">        {</span>
+            /**
+             * When repair finished, do clean up
+             */
+            public void run()
+            {
+<span class="nc" id="L161">                sessions.remove(session.getId());</span>
+<span class="nc" id="L162">            }</span>
+<span class="nc" id="L163">        }, MoreExecutors.directExecutor());</span>
+<span class="nc" id="L164">        session.start(executor);</span>
+<span class="nc" id="L165">        return session;</span>
+    }
+
+    private &lt;T extends AbstractFuture &amp;
+               IEndpointStateChangeSubscriber &amp;
+               IFailureDetectionEventListener&gt; void registerOnFdAndGossip(final T task)
+    {
+<span class="nc" id="L172">        gossiper.register(task);</span>
+<span class="nc" id="L173">        failureDetector.registerFailureDetectionEventListener(task);</span>
+
+        // unregister listeners at completion
+<span class="nc" id="L176">        task.addListener(new Runnable()</span>
+<span class="nc" id="L177">        {</span>
+            /**
+             * When repair finished, do clean up
+             */
+            public void run()
+            {
+<span class="nc" id="L183">                failureDetector.unregisterFailureDetectionEventListener(task);</span>
+<span class="nc" id="L184">                gossiper.unregister(task);</span>
+<span class="nc" id="L185">            }</span>
+<span class="nc" id="L186">        }, MoreExecutors.sameThreadExecutor());</span>
+<span class="nc" id="L187">    }</span>
+
+    public synchronized void terminateSessions()
+    {
+<span class="nc" id="L191">        Throwable cause = new IOException(&quot;Terminate session is called&quot;);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        for (RepairSession session : sessions.values())</span>
+        {
+<span class="nc" id="L194">            session.forceShutdown(cause);</span>
+<span class="nc" id="L195">        }</span>
+<span class="nc" id="L196">        parentRepairSessions.clear();</span>
+<span class="nc" id="L197">    }</span>
+
+    /**
+     * Return all of the neighbors with whom we share the provided range.
+     *
+     * @param keyspaceName keyspace to repair
+     * @param keyspaceLocalRanges local-range for given keyspaceName
+     * @param toRepair token to repair
+     * @param dataCenters the data centers to involve in the repair
+     *
+     * @return neighbors with whom we share the provided range
+     */
+    public static Set&lt;InetAddress&gt; getNeighbors(String keyspaceName, Collection&lt;Range&lt;Token&gt;&gt; keyspaceLocalRanges,
+                                                Range&lt;Token&gt; toRepair, Collection&lt;String&gt; dataCenters,
+                                                Collection&lt;String&gt; hosts)
+    {
+<span class="nc" id="L213">        StorageService ss = StorageService.instance;</span>
+<span class="nc" id="L214">        Map&lt;Range&lt;Token&gt;, List&lt;InetAddress&gt;&gt; replicaSets = ss.getRangeToAddressMap(keyspaceName);</span>
+<span class="nc" id="L215">        Range&lt;Token&gt; rangeSuperSet = null;</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : keyspaceLocalRanges)</span>
+        {
+<span class="nc bnc" id="L218" title="All 2 branches missed.">            if (range.contains(toRepair))</span>
+            {
+<span class="nc" id="L220">                rangeSuperSet = range;</span>
+<span class="nc" id="L221">                break;</span>
+            }
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            else if (range.intersects(toRepair))</span>
+            {
+<span class="nc" id="L225">                throw new IllegalArgumentException(String.format(&quot;Requested range %s intersects a local range (%s) &quot; +</span>
+                                                                 &quot;but is not fully contained in one; this would lead to &quot; +
+<span class="nc" id="L227">                                                                 &quot;imprecise repair. keyspace: %s&quot;, toRepair.toString(),</span>
+<span class="nc" id="L228">                                                                 range.toString(), keyspaceName));</span>
+            }
+<span class="nc" id="L230">        }</span>
+<span class="nc bnc" id="L231" title="All 4 branches missed.">        if (rangeSuperSet == null || !replicaSets.containsKey(rangeSuperSet))</span>
+<span class="nc" id="L232">            return Collections.emptySet();</span>
+
+<span class="nc" id="L234">        Set&lt;InetAddress&gt; neighbors = new HashSet&lt;&gt;(replicaSets.get(rangeSuperSet));</span>
+<span class="nc" id="L235">        neighbors.remove(FBUtilities.getBroadcastAddress());</span>
+
+<span class="nc bnc" id="L237" title="All 4 branches missed.">        if (dataCenters != null &amp;&amp; !dataCenters.isEmpty())</span>
+        {
+<span class="nc" id="L239">            TokenMetadata.Topology topology = ss.getTokenMetadata().cloneOnlyTokenMap().getTopology();</span>
+<span class="nc" id="L240">            Set&lt;InetAddress&gt; dcEndpoints = Sets.newHashSet();</span>
+<span class="nc" id="L241">            Multimap&lt;String,InetAddress&gt; dcEndpointsMap = topology.getDatacenterEndpoints();</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            for (String dc : dataCenters)</span>
+            {
+<span class="nc" id="L244">                Collection&lt;InetAddress&gt; c = dcEndpointsMap.get(dc);</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                if (c != null)</span>
+<span class="nc" id="L246">                   dcEndpoints.addAll(c);</span>
+<span class="nc" id="L247">            }</span>
+<span class="nc" id="L248">            return Sets.intersection(neighbors, dcEndpoints);</span>
+        }
+<span class="nc bnc" id="L250" title="All 4 branches missed.">        else if (hosts != null &amp;&amp; !hosts.isEmpty())</span>
+        {
+<span class="nc" id="L252">            Set&lt;InetAddress&gt; specifiedHost = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            for (final String host : hosts)</span>
+            {
+                try
+                {
+<span class="nc" id="L257">                    final InetAddress endpoint = InetAddress.getByName(host.trim());</span>
+<span class="nc bnc" id="L258" title="All 4 branches missed.">                    if (endpoint.equals(FBUtilities.getBroadcastAddress()) || neighbors.contains(endpoint))</span>
+<span class="nc" id="L259">                        specifiedHost.add(endpoint);</span>
+                }
+<span class="nc" id="L261">                catch (UnknownHostException e)</span>
+                {
+<span class="nc" id="L263">                    throw new IllegalArgumentException(&quot;Unknown host specified &quot; + host, e);</span>
+<span class="nc" id="L264">                }</span>
+<span class="nc" id="L265">            }</span>
+
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (!specifiedHost.contains(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc" id="L268">                throw new IllegalArgumentException(&quot;The current host must be part of the repair&quot;);</span>
+
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            if (specifiedHost.size() &lt;= 1)</span>
+            {
+<span class="nc" id="L272">                String msg = &quot;Specified hosts %s do not share range %s needed for repair. Either restrict repair ranges &quot; +</span>
+                             &quot;with -st/-et options, or specify one of the neighbors that share this range with &quot; +
+                             &quot;this node: %s.&quot;;
+<span class="nc" id="L275">                throw new IllegalArgumentException(String.format(msg, hosts, toRepair, neighbors));</span>
+            }
+
+<span class="nc" id="L278">            specifiedHost.remove(FBUtilities.getBroadcastAddress());</span>
+<span class="nc" id="L279">            return specifiedHost;</span>
+
+        }
+
+<span class="nc" id="L283">        return neighbors;</span>
+    }
+
+    public UUID prepareForRepair(UUID parentRepairSession, InetAddress coordinator, Set&lt;InetAddress&gt; endpoints, RepairOption options, List&lt;ColumnFamilyStore&gt; columnFamilyStores)
+    {
+<span class="nc" id="L288">        long timestamp = Clock.instance.currentTimeMillis();</span>
+<span class="nc" id="L289">        registerParentRepairSession(parentRepairSession, coordinator, columnFamilyStores, options.getRanges(), options.isIncremental(), timestamp, options.isGlobal());</span>
+<span class="nc" id="L290">        final CountDownLatch prepareLatch = new CountDownLatch(endpoints.size());</span>
+<span class="nc" id="L291">        final AtomicBoolean status = new AtomicBoolean(true);</span>
+<span class="nc" id="L292">        final Set&lt;String&gt; failedNodes = Collections.synchronizedSet(new HashSet&lt;String&gt;());</span>
+<span class="nc" id="L293">        IAsyncCallbackWithFailure callback = new IAsyncCallbackWithFailure()</span>
+<span class="nc" id="L294">        {</span>
+            public void response(MessageIn msg)
+            {
+<span class="nc" id="L297">                prepareLatch.countDown();</span>
+<span class="nc" id="L298">            }</span>
+
+            public boolean isLatencyForSnitch()
+            {
+<span class="nc" id="L302">                return false;</span>
+            }
+
+            public void onFailure(InetAddress from, RequestFailureReason failureReason)
+            {
+<span class="nc" id="L307">                status.set(false);</span>
+<span class="nc" id="L308">                failedNodes.add(from.getHostAddress());</span>
+<span class="nc" id="L309">                prepareLatch.countDown();</span>
+<span class="nc" id="L310">            }</span>
+        };
+
+<span class="nc" id="L313">        List&lt;UUID&gt; cfIds = new ArrayList&lt;&gt;(columnFamilyStores.size());</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : columnFamilyStores)</span>
+<span class="nc" id="L315">            cfIds.add(cfs.metadata.cfId);</span>
+
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        for (InetAddress neighbour : endpoints)</span>
+        {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (FailureDetector.instance.isAlive(neighbour))</span>
+            {
+<span class="nc" id="L321">                PrepareMessage message = new PrepareMessage(parentRepairSession, cfIds, options.getRanges(), options.isIncremental(), timestamp, options.isGlobal());</span>
+<span class="nc" id="L322">                MessageOut&lt;RepairMessage&gt; msg = message.createMessage();</span>
+<span class="nc" id="L323">                MessagingService.instance().sendRR(msg, neighbour, callback, TimeUnit.HOURS.toMillis(1), true);</span>
+<span class="nc" id="L324">            }</span>
+            else
+            {
+                // bailout early to avoid potentially waiting for a long time.
+<span class="nc" id="L328">                failRepair(parentRepairSession, &quot;Endpoint not alive: &quot; + neighbour);</span>
+            }
+<span class="nc" id="L330">        }</span>
+
+        try
+        {
+            // Failed repair is expensive so we wait for longer time.
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (!prepareLatch.await(1, TimeUnit.HOURS)) {</span>
+<span class="nc" id="L336">                failRepair(parentRepairSession, &quot;Did not get replies from all endpoints.&quot;);</span>
+            }
+        }
+<span class="nc" id="L339">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L341">            failRepair(parentRepairSession, &quot;Interrupted while waiting for prepare repair response.&quot;);</span>
+<span class="nc" id="L342">        }</span>
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (!status.get())</span>
+        {
+<span class="nc" id="L346">            failRepair(parentRepairSession, &quot;Got negative replies from endpoints &quot; + failedNodes);</span>
+        }
+
+<span class="nc" id="L349">        return parentRepairSession;</span>
+    }
+
+    private void failRepair(UUID parentRepairSession, String errorMsg) {
+<span class="nc" id="L353">        removeParentRepairSession(parentRepairSession);</span>
+<span class="nc" id="L354">        throw new RuntimeException(errorMsg);</span>
+    }
+
+    public synchronized void registerParentRepairSession(UUID parentRepairSession, InetAddress coordinator, List&lt;ColumnFamilyStore&gt; columnFamilyStores, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean isIncremental, long timestamp, boolean isGlobal)
+    {
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if (!registeredForEndpointChanges)</span>
+        {
+<span class="nc" id="L361">            Gossiper.instance.register(this);</span>
+<span class="nc" id="L362">            FailureDetector.instance.registerFailureDetectionEventListener(this);</span>
+<span class="nc" id="L363">            registeredForEndpointChanges = true;</span>
+        }
+
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if (!parentRepairSessions.containsKey(parentRepairSession))</span>
+        {
+<span class="nc" id="L368">            parentRepairSessions.put(parentRepairSession, new ParentRepairSession(coordinator, columnFamilyStores, ranges, isIncremental, timestamp, isGlobal));</span>
+        }
+<span class="nc" id="L370">    }</span>
+
+    public Set&lt;SSTableReader&gt; currentlyRepairing(UUID cfId, UUID parentRepairSession)
+    {
+<span class="nc" id="L374">        Set&lt;SSTableReader&gt; repairing = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        for (Map.Entry&lt;UUID, ParentRepairSession&gt; entry : parentRepairSessions.entrySet())</span>
+        {
+<span class="nc" id="L377">            Collection&lt;SSTableReader&gt; sstables = entry.getValue().getActiveSSTables(cfId);</span>
+<span class="nc bnc" id="L378" title="All 4 branches missed.">            if (sstables != null &amp;&amp; !entry.getKey().equals(parentRepairSession))</span>
+<span class="nc" id="L379">                repairing.addAll(sstables);</span>
+<span class="nc" id="L380">        }</span>
+<span class="nc" id="L381">        return repairing;</span>
+    }
+
+    /**
+     * Run final process of repair.
+     * This removes all resources held by parent repair session, after performing anti compaction if necessary.
+     *
+     * @param parentSession Parent session ID
+     * @param neighbors Repair participants (not including self)
+     * @param successfulRanges Ranges that repaired successfully
+     */
+    public synchronized ListenableFuture finishParentSession(UUID parentSession, Set&lt;InetAddress&gt; neighbors, Collection&lt;Range&lt;Token&gt;&gt; successfulRanges)
+    {
+<span class="nc" id="L394">        List&lt;ListenableFuture&lt;?&gt;&gt; tasks = new ArrayList&lt;&gt;(neighbors.size() + 1);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        for (InetAddress neighbor : neighbors)</span>
+        {
+<span class="nc" id="L397">            AnticompactionTask task = new AnticompactionTask(parentSession, neighbor, successfulRanges);</span>
+<span class="nc" id="L398">            registerOnFdAndGossip(task);</span>
+<span class="nc" id="L399">            tasks.add(task);</span>
+<span class="nc" id="L400">            task.run(); // 'run' is just sending message</span>
+<span class="nc" id="L401">        }</span>
+<span class="nc" id="L402">        tasks.add(doAntiCompaction(parentSession, successfulRanges));</span>
+<span class="nc" id="L403">        return Futures.successfulAsList(tasks);</span>
+    }
+
+    public ParentRepairSession getParentRepairSession(UUID parentSessionId)
+    {
+<span class="nc" id="L408">        ParentRepairSession session = parentRepairSessions.get(parentSessionId);</span>
+        // this can happen if a node thinks that the coordinator was down, but that coordinator got back before noticing
+        // that it was down itself.
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (session == null)</span>
+<span class="nc" id="L412">            throw new RuntimeException(&quot;Parent repair session with id = &quot; + parentSessionId + &quot; has failed.&quot;);</span>
+
+<span class="nc" id="L414">        return session;</span>
+    }
+
+    /**
+     * called when the repair session is done - either failed or anticompaction has completed
+     *
+     * clears out any snapshots created by this repair
+     *
+     * @param parentSessionId
+     * @return
+     */
+    public synchronized ParentRepairSession removeParentRepairSession(UUID parentSessionId)
+    {
+<span class="nc" id="L427">        String snapshotName = parentSessionId.toString();</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : getParentRepairSession(parentSessionId).columnFamilyStores.values())</span>
+        {
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            if (cfs.snapshotExists(snapshotName))</span>
+<span class="nc" id="L431">                cfs.clearSnapshot(snapshotName);</span>
+<span class="nc" id="L432">        }</span>
+<span class="nc" id="L433">        return parentRepairSessions.remove(parentSessionId);</span>
+    }
+
+    /**
+     * Submit anti-compaction jobs to CompactionManager.
+     * When all jobs are done, parent repair session is removed whether those are suceeded or not.
+     *
+     * @param parentRepairSession parent repair session ID
+     * @return Future result of all anti-compaction jobs.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public ListenableFuture&lt;List&lt;Object&gt;&gt; doAntiCompaction(final UUID parentRepairSession, Collection&lt;Range&lt;Token&gt;&gt; successfulRanges)
+    {
+<span class="nc bnc" id="L446" title="All 4 branches missed.">        assert parentRepairSession != null;</span>
+<span class="nc" id="L447">        ParentRepairSession prs = getParentRepairSession(parentRepairSession);</span>
+        //A repair will be marked as not global if it is a subrange repair to avoid many small anti-compactions
+        //in addition to other scenarios such as repairs not involving all DCs or hosts
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (!prs.isGlobal)</span>
+        {
+<span class="nc" id="L452">            logger.info(&quot;[repair #{}] Not a global repair, will not do anticompaction&quot;, parentRepairSession);</span>
+<span class="nc" id="L453">            removeParentRepairSession(parentRepairSession);</span>
+<span class="nc" id="L454">            return Futures.immediateFuture(Collections.emptyList());</span>
+        }
+<span class="nc bnc" id="L456" title="All 4 branches missed.">        assert prs.ranges.containsAll(successfulRanges) : &quot;Trying to perform anticompaction on unknown ranges&quot;;</span>
+
+<span class="nc" id="L458">        List&lt;ListenableFuture&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+        // if we don't have successful repair ranges, then just skip anticompaction
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (!successfulRanges.isEmpty())</span>
+        {
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            for (Map.Entry&lt;UUID, ColumnFamilyStore&gt; columnFamilyStoreEntry : prs.columnFamilyStores.entrySet())</span>
+            {
+<span class="nc" id="L464">                Refs&lt;SSTableReader&gt; sstables = prs.getActiveRepairedSSTableRefsForAntiCompaction(columnFamilyStoreEntry.getKey(), parentRepairSession);</span>
+<span class="nc" id="L465">                ColumnFamilyStore cfs = columnFamilyStoreEntry.getValue();</span>
+<span class="nc" id="L466">                futures.add(CompactionManager.instance.submitAntiCompaction(cfs, successfulRanges, sstables, prs.repairedAt, parentRepairSession));</span>
+<span class="nc" id="L467">            }</span>
+        }
+
+<span class="nc" id="L470">        ListenableFuture&lt;List&lt;Object&gt;&gt; allAntiCompactionResults = Futures.successfulAsList(futures);</span>
+<span class="nc" id="L471">        allAntiCompactionResults.addListener(new Runnable()</span>
+<span class="nc" id="L472">        {</span>
+            @Override
+            public void run()
+            {
+<span class="nc" id="L476">                removeParentRepairSession(parentRepairSession);</span>
+<span class="nc" id="L477">            }</span>
+<span class="nc" id="L478">        }, MoreExecutors.directExecutor());</span>
+
+<span class="nc" id="L480">        return allAntiCompactionResults;</span>
+    }
+
+    public void handleMessage(InetAddress endpoint, RepairMessage message)
+    {
+<span class="nc" id="L485">        RepairJobDesc desc = message.desc;</span>
+<span class="nc" id="L486">        RepairSession session = sessions.get(desc.sessionId);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        if (session == null)</span>
+<span class="nc" id="L488">            return;</span>
+<span class="nc bnc" id="L489" title="All 3 branches missed.">        switch (message.messageType)</span>
+        {
+            case VALIDATION_COMPLETE:
+<span class="nc" id="L492">                ValidationComplete validation = (ValidationComplete) message;</span>
+<span class="nc" id="L493">                session.validationComplete(desc, endpoint, validation.trees);</span>
+<span class="nc" id="L494">                break;</span>
+            case SYNC_COMPLETE:
+                // one of replica is synced.
+<span class="nc" id="L497">                SyncComplete sync = (SyncComplete) message;</span>
+<span class="nc" id="L498">                session.syncComplete(desc, sync.nodes, sync.success);</span>
+<span class="nc" id="L499">                break;</span>
+            default:
+                break;
+        }
+<span class="nc" id="L503">    }</span>
+
+    /**
+     * We keep a ParentRepairSession around for the duration of the entire repair, for example, on a 256 token vnode rf=3 cluster
+     * we would have 768 RepairSession but only one ParentRepairSession. We use the PRS to avoid anticompacting the sstables
+     * 768 times, instead we take all repaired ranges at the end of the repair and anticompact once.
+     *
+     * We do an optimistic marking of sstables - when we start an incremental repair we mark all unrepaired sstables as
+     * repairing (@see markSSTablesRepairing), then while the repair is ongoing compactions might remove those sstables,
+     * and when it is time for anticompaction we will only anticompact the sstables that are still on disk.
+     *
+     * Note that validation and streaming do not care about which sstables we have marked as repairing - they operate on
+     * all unrepaired sstables (if it is incremental), otherwise we would not get a correct repair.
+     */
+<span class="nc bnc" id="L517" title="All 2 branches missed.">    public static class ParentRepairSession</span>
+    {
+<span class="nc" id="L519">        private final Map&lt;UUID, ColumnFamilyStore&gt; columnFamilyStores = new HashMap&lt;&gt;();</span>
+        private final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+<span class="nc" id="L521">        public final Map&lt;UUID, Set&lt;String&gt;&gt; sstableMap = new HashMap&lt;&gt;();</span>
+        public final boolean isIncremental;
+        public final boolean isGlobal;
+        public final long repairedAt;
+        public final InetAddress coordinator;
+        /**
+         * Indicates whether we have marked sstables as repairing. Can only be done once per table per ParentRepairSession
+         */
+<span class="nc" id="L529">        private final Set&lt;UUID&gt; marked = new HashSet&lt;&gt;();</span>
+
+        public ParentRepairSession(InetAddress coordinator, List&lt;ColumnFamilyStore&gt; columnFamilyStores, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean isIncremental, long repairedAt, boolean isGlobal)
+<span class="nc" id="L532">        {</span>
+<span class="nc" id="L533">            this.coordinator = coordinator;</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            for (ColumnFamilyStore cfs : columnFamilyStores)</span>
+            {
+<span class="nc" id="L536">                this.columnFamilyStores.put(cfs.metadata.cfId, cfs);</span>
+<span class="nc" id="L537">                sstableMap.put(cfs.metadata.cfId, new HashSet&lt;String&gt;());</span>
+<span class="nc" id="L538">            }</span>
+<span class="nc" id="L539">            this.ranges = ranges;</span>
+<span class="nc" id="L540">            this.repairedAt = repairedAt;</span>
+<span class="nc" id="L541">            this.isIncremental = isIncremental;</span>
+<span class="nc" id="L542">            this.isGlobal = isGlobal;</span>
+<span class="nc" id="L543">        }</span>
+
+        /**
+         * Mark sstables repairing - either all sstables or only the unrepaired ones depending on
+         *
+         * whether this is an incremental or full repair
+         *
+         * @param cfId the column family
+         * @param parentSessionId the parent repair session id, used to make sure we don't start multiple repairs over the same sstables
+         */
+        public synchronized void markSSTablesRepairing(UUID cfId, UUID parentSessionId)
+        {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">            if (!marked.contains(cfId))</span>
+            {
+<span class="nc bnc" id="L557" title="All 4 branches missed.">                List&lt;SSTableReader&gt; sstables = columnFamilyStores.get(cfId).select(View.select(SSTableSet.CANONICAL, (s) -&gt; !isIncremental || !s.isRepaired())).sstables;</span>
+<span class="nc" id="L558">                Set&lt;SSTableReader&gt; currentlyRepairing = ActiveRepairService.instance.currentlyRepairing(cfId, parentSessionId);</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">                if (!Sets.intersection(currentlyRepairing, Sets.newHashSet(sstables)).isEmpty())</span>
+                {
+<span class="nc" id="L561">                    logger.error(&quot;Cannot start multiple repair sessions over the same sstables&quot;);</span>
+<span class="nc" id="L562">                    throw new RuntimeException(&quot;Cannot start multiple repair sessions over the same sstables&quot;);</span>
+                }
+<span class="nc" id="L564">                addSSTables(cfId, sstables);</span>
+<span class="nc" id="L565">                marked.add(cfId);</span>
+            }
+<span class="nc" id="L567">        }</span>
+
+        /**
+         * Get the still active sstables we should run anticompaction on
+         *
+         * note that validation and streaming do not call this method - they have to work on the actual active sstables on the node, we only call this
+         * to know which sstables are still there that were there when we started the repair
+         *
+         * @param cfId
+         * @param parentSessionId for checking if there exists a snapshot for this repair
+         * @return
+         */
+        @SuppressWarnings(&quot;resource&quot;)
+        public synchronized Refs&lt;SSTableReader&gt; getActiveRepairedSSTableRefsForAntiCompaction(UUID cfId, UUID parentSessionId)
+        {
+<span class="nc bnc" id="L582" title="All 4 branches missed.">            assert marked.contains(cfId);</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">            if (!columnFamilyStores.containsKey(cfId))</span>
+<span class="nc" id="L584">                throw new RuntimeException(&quot;Not possible to get sstables for anticompaction for &quot; + cfId);</span>
+<span class="nc" id="L585">            boolean isSnapshotRepair = columnFamilyStores.get(cfId).snapshotExists(parentSessionId.toString());</span>
+<span class="nc" id="L586">            ImmutableMap.Builder&lt;SSTableReader, Ref&lt;SSTableReader&gt;&gt; references = ImmutableMap.builder();</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            Iterable&lt;SSTableReader&gt; sstables = isSnapshotRepair ? getSSTablesForSnapshotRepair(cfId, parentSessionId) : getActiveSSTables(cfId);</span>
+            // we check this above - if columnFamilyStores contains the cfId sstables will not be null
+<span class="nc bnc" id="L589" title="All 4 branches missed.">            assert sstables != null;</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+            {
+<span class="nc" id="L592">                Ref&lt;SSTableReader&gt; ref = sstable.tryRef();</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">                if (ref == null)</span>
+<span class="nc" id="L594">                    sstableMap.get(cfId).remove(sstable.getFilename());</span>
+                else
+<span class="nc" id="L596">                    references.put(sstable, ref);</span>
+<span class="nc" id="L597">            }</span>
+<span class="nc" id="L598">            return new Refs&lt;&gt;(references.build());</span>
+        }
+
+        /**
+         * If we are running a snapshot repair we need to find the 'real' sstables when we start anticompaction
+         *
+         * We use the generation of the sstables as identifiers instead of the file name to avoid having to parse out the
+         * actual filename.
+         *
+         * @param cfId
+         * @param parentSessionId
+         * @return
+         */
+        private Set&lt;SSTableReader&gt; getSSTablesForSnapshotRepair(UUID cfId, UUID parentSessionId)
+        {
+<span class="nc" id="L613">            Set&lt;SSTableReader&gt; activeSSTables = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L614">            ColumnFamilyStore cfs = columnFamilyStores.get(cfId);</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">            if (cfs == null)</span>
+<span class="nc" id="L616">                return null;</span>
+
+<span class="nc" id="L618">            Set&lt;Integer&gt; snapshotGenerations = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L619">            try (Refs&lt;SSTableReader&gt; snapshottedSSTables = cfs.getSnapshotSSTableReader(parentSessionId.toString()))</span>
+            {
+<span class="nc bnc" id="L621" title="All 2 branches missed.">                for (SSTableReader sstable : snapshottedSSTables)</span>
+                {
+<span class="nc" id="L623">                    snapshotGenerations.add(sstable.descriptor.generation);</span>
+<span class="nc" id="L624">                }</span>
+            }
+<span class="nc" id="L626">            catch (IOException e)</span>
+            {
+<span class="nc" id="L628">                throw new RuntimeException(e);</span>
+<span class="nc" id="L629">            }</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                if (snapshotGenerations.contains(sstable.descriptor.generation))</span>
+<span class="nc" id="L632">                    activeSSTables.add(sstable);</span>
+<span class="nc" id="L633">            return activeSSTables;</span>
+        }
+
+        public synchronized void maybeSnapshot(UUID cfId, UUID parentSessionId)
+        {
+<span class="nc" id="L638">            String snapshotName = parentSessionId.toString();</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">            if (!columnFamilyStores.get(cfId).snapshotExists(snapshotName))</span>
+            {
+<span class="nc" id="L641">                Set&lt;SSTableReader&gt; snapshottedSSTables = columnFamilyStores.get(cfId).snapshot(snapshotName, new Predicate&lt;SSTableReader&gt;()</span>
+<span class="nc" id="L642">                {</span>
+                    public boolean apply(SSTableReader sstable)
+                    {
+<span class="nc bnc" id="L645" title="All 4 branches missed.">                        return sstable != null &amp;&amp;</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">                               (!isIncremental || !sstable.isRepaired()) &amp;&amp;</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                               !(sstable.metadata.isIndex()) &amp;&amp; // exclude SSTables from 2i</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                               new Bounds&lt;&gt;(sstable.first.getToken(), sstable.last.getToken()).intersects(ranges);</span>
+                    }
+                }, true, false);
+
+<span class="nc bnc" id="L652" title="All 2 branches missed.">                if (isAlreadyRepairing(cfId, parentSessionId, snapshottedSSTables))</span>
+                {
+<span class="nc" id="L654">                    columnFamilyStores.get(cfId).clearSnapshot(parentSessionId.toString());</span>
+<span class="nc" id="L655">                    logger.error(&quot;Cannot start multiple repair sessions over the same sstables&quot;);</span>
+<span class="nc" id="L656">                    throw new RuntimeException(&quot;Cannot start multiple repair sessions over the same sstables&quot;);</span>
+                }
+<span class="nc" id="L658">                addSSTables(cfId, snapshottedSSTables);</span>
+<span class="nc" id="L659">                marked.add(cfId);</span>
+            }
+<span class="nc" id="L661">        }</span>
+
+
+        /**
+         * Compares other repairing sstables *generation* to the ones we just snapshotted
+         *
+         * we compare generations since the sstables have different paths due to snapshot names
+         *
+         * @param cfId id of the column family store
+         * @param parentSessionId parent repair session
+         * @param sstables the newly snapshotted sstables
+         * @return
+         */
+        private boolean isAlreadyRepairing(UUID cfId, UUID parentSessionId, Collection&lt;SSTableReader&gt; sstables)
+        {
+<span class="nc" id="L676">            Set&lt;SSTableReader&gt; currentlyRepairing = ActiveRepairService.instance.currentlyRepairing(cfId, parentSessionId);</span>
+<span class="nc" id="L677">            Set&lt;Integer&gt; currentlyRepairingGenerations = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L678">            Set&lt;Integer&gt; newRepairingGenerations = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">            for (SSTableReader sstable : currentlyRepairing)</span>
+<span class="nc" id="L680">                currentlyRepairingGenerations.add(sstable.descriptor.generation);</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L682">                newRepairingGenerations.add(sstable.descriptor.generation);</span>
+
+<span class="nc bnc" id="L684" title="All 2 branches missed.">            return !Sets.intersection(currentlyRepairingGenerations, newRepairingGenerations).isEmpty();</span>
+        }
+
+        private Set&lt;SSTableReader&gt; getActiveSSTables(UUID cfId)
+        {
+<span class="nc bnc" id="L689" title="All 2 branches missed.">            if (!columnFamilyStores.containsKey(cfId))</span>
+<span class="nc" id="L690">                return null;</span>
+
+<span class="nc" id="L692">            Set&lt;String&gt; repairedSSTables = sstableMap.get(cfId);</span>
+<span class="nc" id="L693">            Set&lt;SSTableReader&gt; activeSSTables = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L694">            Set&lt;String&gt; activeSSTableNames = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L695">            ColumnFamilyStore cfs = columnFamilyStores.get(cfId);</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">            for (SSTableReader sstable : cfs.getSSTables(SSTableSet.CANONICAL))</span>
+            {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                if (repairedSSTables.contains(sstable.getFilename()))</span>
+                {
+<span class="nc" id="L700">                    activeSSTables.add(sstable);</span>
+<span class="nc" id="L701">                    activeSSTableNames.add(sstable.getFilename());</span>
+                }
+<span class="nc" id="L703">            }</span>
+<span class="nc" id="L704">            sstableMap.put(cfId, activeSSTableNames);</span>
+<span class="nc" id="L705">            return activeSSTables;</span>
+        }
+
+        private void addSSTables(UUID cfId, Collection&lt;SSTableReader&gt; sstables)
+        {
+<span class="nc bnc" id="L710" title="All 2 branches missed.">            for (SSTableReader sstable : sstables)</span>
+<span class="nc" id="L711">                sstableMap.get(cfId).add(sstable.getFilename());</span>
+<span class="nc" id="L712">        }</span>
+
+
+        public long getRepairedAt()
+        {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (isGlobal)</span>
+<span class="nc" id="L718">                return repairedAt;</span>
+<span class="nc" id="L719">            return ActiveRepairService.UNREPAIRED_SSTABLE;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L725">            return &quot;ParentRepairSession{&quot; +</span>
+                    &quot;columnFamilyStores=&quot; + columnFamilyStores +
+                    &quot;, ranges=&quot; + ranges +
+                    &quot;, sstableMap=&quot; + sstableMap +
+                    &quot;, repairedAt=&quot; + repairedAt +
+                    '}';
+        }
+    }
+
+    /*
+    If the coordinator node dies we should remove the parent repair session from the other nodes.
+    This uses the same notifications as we get in RepairSession
+     */
+<span class="nc" id="L738">    public void onJoin(InetAddress endpoint, EndpointState epState) {}</span>
+<span class="nc" id="L739">    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}</span>
+<span class="nc" id="L740">    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}</span>
+<span class="nc" id="L741">    public void onAlive(InetAddress endpoint, EndpointState state) {}</span>
+<span class="nc" id="L742">    public void onDead(InetAddress endpoint, EndpointState state) {}</span>
+
+    public void onRemove(InetAddress endpoint)
+    {
+<span class="nc" id="L746">        convict(endpoint, Double.MAX_VALUE);</span>
+<span class="nc" id="L747">    }</span>
+
+    public void onRestart(InetAddress endpoint, EndpointState state)
+    {
+<span class="nc" id="L751">        convict(endpoint, Double.MAX_VALUE);</span>
+<span class="nc" id="L752">    }</span>
+
+    /**
+     * Something has happened to a remote node - if that node is a coordinator, we mark the parent repair session id as failed.
+     *
+     * The fail marker is kept in the map for 24h to make sure that if the coordinator does not agree
+     * that the repair failed, we need to fail the entire repair session
+     *
+     * @param ep  endpoint to be convicted
+     * @param phi the value of phi with with ep was convicted
+     */
+    public void convict(InetAddress ep, double phi)
+    {
+        // We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost.
+<span class="nc bnc" id="L766" title="All 4 branches missed.">        if (phi &lt; 2 * DatabaseDescriptor.getPhiConvictThreshold() || parentRepairSessions.isEmpty())</span>
+<span class="nc" id="L767">            return;</span>
+
+<span class="nc" id="L769">        Set&lt;UUID&gt; toRemove = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L771" title="All 2 branches missed.">        for (Map.Entry&lt;UUID, ParentRepairSession&gt; repairSessionEntry : parentRepairSessions.entrySet())</span>
+        {
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            if (repairSessionEntry.getValue().coordinator.equals(ep))</span>
+            {
+<span class="nc" id="L775">                toRemove.add(repairSessionEntry.getKey());</span>
+            }
+<span class="nc" id="L777">        }</span>
+
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        if (!toRemove.isEmpty())</span>
+        {
+<span class="nc" id="L781">            logger.debug(&quot;Removing {} in parent repair sessions&quot;, toRemove);</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            for (UUID id : toRemove)</span>
+<span class="nc" id="L783">                removeParentRepairSession(id);</span>
+        }
+<span class="nc" id="L785">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

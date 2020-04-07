@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Tracker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.lifecycle</a> &gt; <span class="el_source">Tracker.java</span></div><h1>Tracker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.lifecycle;
+
+import java.io.File;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.collect.*;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Memtable;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.metrics.StorageMetrics;
+import org.apache.cassandra.notifications.*;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+import static com.google.common.base.Predicates.and;
+import static com.google.common.collect.ImmutableSet.copyOf;
+import static com.google.common.collect.Iterables.filter;
+import static java.util.Collections.singleton;
+import static java.util.Collections.singletonList;
+import static org.apache.cassandra.db.lifecycle.Helpers.*;
+import static org.apache.cassandra.db.lifecycle.View.permitCompacting;
+import static org.apache.cassandra.db.lifecycle.View.updateCompacting;
+import static org.apache.cassandra.db.lifecycle.View.updateLiveSet;
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+import static org.apache.cassandra.utils.Throwables.merge;
+import static org.apache.cassandra.utils.concurrent.Refs.release;
+import static org.apache.cassandra.utils.concurrent.Refs.selfRefs;
+
+/**
+ * Tracker tracks live {@link View} of data store for a table.
+ */
+<span class="pc bpc" id="L65" title="1 of 2 branches missed.">public class Tracker</span>
+{
+<span class="fc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(Tracker.class);</span>
+
+<span class="fc" id="L69">    private final Collection&lt;INotificationConsumer&gt; subscribers = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+    public final ColumnFamilyStore cfstore;
+    final AtomicReference&lt;View&gt; view;
+    public final boolean loadsstables;
+
+    /**
+     * @param memtable Initial Memtable. Can be null.
+     * @param loadsstables true to indicate to load SSTables (TODO: remove as this is only accessed from 2i)
+     */
+    public Tracker(Memtable memtable, boolean loadsstables)
+<span class="fc" id="L80">    {</span>
+<span class="fc bfc" id="L81" title="All 2 branches covered.">        this.cfstore = memtable != null ? memtable.cfs : null;</span>
+<span class="fc" id="L82">        this.view = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L83">        this.loadsstables = loadsstables;</span>
+<span class="fc" id="L84">        this.reset(memtable);</span>
+<span class="fc" id="L85">    }</span>
+
+    public LifecycleTransaction tryModify(SSTableReader sstable, OperationType operationType)
+    {
+<span class="nc" id="L89">        return tryModify(singleton(sstable), operationType);</span>
+    }
+
+    /**
+     * @return a Transaction over the provided sstables if we are able to mark the given @param sstables as compacted, before anyone else
+     */
+    public LifecycleTransaction tryModify(Iterable&lt;SSTableReader&gt; sstables, OperationType operationType)
+    {
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        if (Iterables.isEmpty(sstables))</span>
+<span class="nc" id="L98">            return new LifecycleTransaction(this, operationType, sstables);</span>
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">        if (null == apply(permitCompacting(sstables), updateCompacting(emptySet(), sstables)))</span>
+<span class="nc" id="L100">            return null;</span>
+<span class="fc" id="L101">        return new LifecycleTransaction(this, operationType, sstables);</span>
+    }
+
+
+    // METHODS FOR ATOMICALLY MODIFYING THE VIEW
+
+    Pair&lt;View, View&gt; apply(Function&lt;View, View&gt; function)
+    {
+<span class="fc" id="L109">        return apply(Predicates.&lt;View&gt;alwaysTrue(), function);</span>
+    }
+
+    Throwable apply(Function&lt;View, View&gt; function, Throwable accumulate)
+    {
+        try
+        {
+<span class="fc" id="L116">            apply(function);</span>
+        }
+<span class="nc" id="L118">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L120">            accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L121">        }</span>
+<span class="fc" id="L122">        return accumulate;</span>
+    }
+
+    /**
+     * atomically tests permit against the view and applies function to it, if permit yields true, returning the original;
+     * otherwise the method aborts, returning null
+     */
+    Pair&lt;View, View&gt; apply(Predicate&lt;View&gt; permit, Function&lt;View, View&gt; function)
+    {
+        while (true)
+        {
+<span class="fc" id="L133">            View cur = view.get();</span>
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">            if (!permit.apply(cur))</span>
+<span class="nc" id="L135">                return null;</span>
+<span class="fc" id="L136">            View updated = function.apply(cur);</span>
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (view.compareAndSet(cur, updated))</span>
+<span class="fc" id="L138">                return Pair.create(cur, updated);</span>
+<span class="nc" id="L139">        }</span>
+    }
+
+    Throwable updateSizeTracking(Iterable&lt;SSTableReader&gt; oldSSTables, Iterable&lt;SSTableReader&gt; newSSTables, Throwable accumulate)
+    {
+<span class="fc bfc" id="L144" title="All 2 branches covered.">        if (isDummy())</span>
+<span class="fc" id="L145">            return accumulate;</span>
+
+<span class="fc" id="L147">        long add = 0;</span>
+<span class="fc bfc" id="L148" title="All 2 branches covered.">        for (SSTableReader sstable : newSSTables)</span>
+        {
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L151">                logger.trace(&quot;adding {} to list of files tracked for {}.{}&quot;, sstable.descriptor, cfstore.keyspace.getName(), cfstore.name);</span>
+            try
+            {
+<span class="fc" id="L154">                add += sstable.bytesOnDisk();</span>
+            }
+<span class="nc" id="L156">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L158">                accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L159">            }</span>
+<span class="fc" id="L160">        }</span>
+<span class="fc" id="L161">        long subtract = 0;</span>
+<span class="fc bfc" id="L162" title="All 2 branches covered.">        for (SSTableReader sstable : oldSSTables)</span>
+        {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L165">                logger.trace(&quot;removing {} from list of files tracked for {}.{}&quot;, sstable.descriptor, cfstore.keyspace.getName(), cfstore.name);</span>
+            try
+            {
+<span class="fc" id="L168">                subtract += sstable.bytesOnDisk();</span>
+            }
+<span class="nc" id="L170">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L172">                accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L173">            }</span>
+<span class="fc" id="L174">        }</span>
+
+<span class="fc" id="L176">        StorageMetrics.load.inc(add - subtract);</span>
+<span class="fc" id="L177">        cfstore.metric.liveDiskSpaceUsed.inc(add - subtract);</span>
+
+        // we don't subtract from total until the sstable is deleted, see TransactionLogs.SSTableTidier
+<span class="fc" id="L180">        cfstore.metric.totalDiskSpaceUsed.inc(add);</span>
+<span class="fc" id="L181">        return accumulate;</span>
+    }
+
+    // SETUP / CLEANUP
+
+    public void addInitialSSTables(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">        if (!isDummy())</span>
+<span class="fc" id="L189">            setupOnline(sstables);</span>
+<span class="fc" id="L190">        apply(updateLiveSet(emptySet(), sstables));</span>
+<span class="fc" id="L191">        maybeFail(updateSizeTracking(emptySet(), sstables, null));</span>
+        // no notifications or backup necessary
+<span class="fc" id="L193">    }</span>
+
+    public void addSSTables(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L197">        addInitialSSTables(sstables);</span>
+<span class="nc" id="L198">        maybeIncrementallyBackup(sstables);</span>
+<span class="nc" id="L199">        notifyAdded(sstables);</span>
+<span class="nc" id="L200">    }</span>
+
+    /** (Re)initializes the tracker, purging all references. */
+    @VisibleForTesting
+    public void reset(Memtable memtable)
+    {
+<span class="fc bfc" id="L206" title="All 2 branches covered.">        view.set(new View(memtable != null ? singletonList(memtable) : Collections.emptyList(),</span>
+<span class="fc" id="L207">                          Collections.emptyList(),</span>
+<span class="fc" id="L208">                          Collections.emptyMap(),</span>
+<span class="fc" id="L209">                          Collections.emptyMap(),</span>
+<span class="fc" id="L210">                          SSTableIntervalTree.empty()));</span>
+<span class="fc" id="L211">    }</span>
+
+    public Throwable dropSSTablesIfInvalid(Throwable accumulate)
+    {
+<span class="pc bpc" id="L215" title="1 of 4 branches missed.">        if (!isDummy() &amp;&amp; !cfstore.isValid())</span>
+<span class="nc" id="L216">            accumulate = dropSSTables(accumulate);</span>
+<span class="fc" id="L217">        return accumulate;</span>
+    }
+
+    public void dropSSTables()
+    {
+<span class="fc" id="L222">        maybeFail(dropSSTables(null));</span>
+<span class="fc" id="L223">    }</span>
+
+    public Throwable dropSSTables(Throwable accumulate)
+    {
+<span class="fc" id="L227">        return dropSSTables(Predicates.&lt;SSTableReader&gt;alwaysTrue(), OperationType.UNKNOWN, accumulate);</span>
+    }
+
+    /**
+     * removes all sstables that are not busy compacting.
+     */
+    public Throwable dropSSTables(final Predicate&lt;SSTableReader&gt; remove, OperationType operationType, Throwable accumulate)
+    {
+<span class="fc" id="L235">        try (LogTransaction txnLogs = new LogTransaction(operationType, this))</span>
+        {
+<span class="fc" id="L237">            Pair&lt;View, View&gt; result = apply(view -&gt; {</span>
+<span class="fc" id="L238">                Set&lt;SSTableReader&gt; toremove = copyOf(filter(view.sstables, and(remove, notIn(view.compacting))));</span>
+<span class="fc" id="L239">                return updateLiveSet(toremove, emptySet()).apply(view);</span>
+            });
+
+<span class="fc" id="L242">            Set&lt;SSTableReader&gt; removed = Sets.difference(result.left.sstables, result.right.sstables);</span>
+<span class="pc bpc" id="L243" title="2 of 4 branches missed.">            assert Iterables.all(removed, remove);</span>
+
+            // It is important that any method accepting/returning a Throwable never throws an exception, and does its best
+            // to complete the instructions given to it
+<span class="fc" id="L247">            List&lt;LogTransaction.Obsoletion&gt; obsoletions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L248">            accumulate = prepareForObsoletion(removed, txnLogs, obsoletions, accumulate);</span>
+            try
+            {
+<span class="fc" id="L251">                txnLogs.finish();</span>
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">                if (!removed.isEmpty())</span>
+                {
+<span class="nc" id="L254">                    accumulate = markObsolete(obsoletions, accumulate);</span>
+<span class="nc" id="L255">                    accumulate = updateSizeTracking(removed, emptySet(), accumulate);</span>
+<span class="nc" id="L256">                    accumulate = release(selfRefs(removed), accumulate);</span>
+                    // notifySSTablesChanged -&gt; LeveledManifest.promote doesn't like a no-op &quot;promotion&quot;
+<span class="nc" id="L258">                    accumulate = notifySSTablesChanged(removed, Collections.&lt;SSTableReader&gt;emptySet(), txnLogs.type(), accumulate);</span>
+                }
+            }
+<span class="nc" id="L261">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L263">                accumulate = abortObsoletion(obsoletions, accumulate);</span>
+<span class="nc" id="L264">                accumulate = Throwables.merge(accumulate, t);</span>
+<span class="fc" id="L265">            }</span>
+        }
+<span class="nc" id="L267">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L269">            accumulate = Throwables.merge(accumulate, t);</span>
+<span class="fc" id="L270">        }</span>
+
+<span class="fc" id="L272">        return accumulate;</span>
+    }
+
+
+    /**
+     * Removes every SSTable in the directory from the Tracker's view.
+     * @param directory the unreadable directory, possibly with SSTables in it, but not necessarily.
+     */
+    public void removeUnreadableSSTables(final File directory)
+    {
+<span class="nc" id="L282">        maybeFail(dropSSTables(new Predicate&lt;SSTableReader&gt;()</span>
+<span class="nc" id="L283">        {</span>
+            public boolean apply(SSTableReader reader)
+            {
+<span class="nc" id="L286">                return reader.descriptor.directory.equals(directory);</span>
+            }
+        }, OperationType.UNKNOWN, null));
+<span class="nc" id="L289">    }</span>
+
+
+
+    // FLUSHING
+
+    /**
+     * get the Memtable that the ordered writeOp should be directed to
+     */
+    public Memtable getMemtableFor(OpOrder.Group opGroup, CommitLogPosition commitLogPosition)
+    {
+        // since any new memtables appended to the list after we fetch it will be for operations started
+        // after us, we can safely assume that we will always find the memtable that 'accepts' us;
+        // if the barrier for any memtable is set whilst we are reading the list, it must accept us.
+
+        // there may be multiple memtables in the list that would 'accept' us, however we only ever choose
+        // the oldest such memtable, as accepts() only prevents us falling behind (i.e. ensures we don't
+        // assign operations to a memtable that was retired/queued before we started)
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">        for (Memtable memtable : view.get().liveMemtables)</span>
+        {
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">            if (memtable.accepts(opGroup, commitLogPosition))</span>
+<span class="fc" id="L310">                return memtable;</span>
+<span class="nc" id="L311">        }</span>
+<span class="nc" id="L312">        throw new AssertionError(view.get().liveMemtables.toString());</span>
+    }
+
+    /**
+     * Switch the current memtable. This atomically appends a new memtable to the end of the list of active memtables,
+     * returning the previously last memtable. It leaves the previous Memtable in the list of live memtables until
+     * discarding(memtable) is called. These two methods must be synchronized/paired, i.e. m = switchMemtable
+     * must be followed by discarding(m), they cannot be interleaved.
+     *
+     * @return the previously active memtable
+     */
+    public Memtable switchMemtable(boolean truncating, Memtable newMemtable)
+    {
+<span class="fc" id="L325">        Pair&lt;View, View&gt; result = apply(View.switchMemtable(newMemtable));</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">        if (truncating)</span>
+<span class="nc" id="L327">            notifyRenewed(newMemtable);</span>
+        else
+<span class="fc" id="L329">            notifySwitched(result.left.getCurrentMemtable());</span>
+
+<span class="fc" id="L331">        return result.left.getCurrentMemtable();</span>
+    }
+
+    public void markFlushing(Memtable memtable)
+    {
+<span class="fc" id="L336">        apply(View.markFlushing(memtable));</span>
+<span class="fc" id="L337">    }</span>
+
+    public void replaceFlushed(Memtable memtable, Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="pc bpc" id="L341" title="2 of 4 branches missed.">        assert !isDummy();</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        if (Iterables.isEmpty(sstables))</span>
+        {
+            // sstable may be null if we flushed batchlog and nothing needed to be retained
+            // if it's null, we don't care what state the cfstore is in, we just replace it and continue
+<span class="nc" id="L346">            apply(View.replaceFlushed(memtable, null));</span>
+<span class="nc" id="L347">            return;</span>
+        }
+
+<span class="fc" id="L350">        sstables.forEach(SSTableReader::setupOnline);</span>
+        // back up before creating a new Snapshot (which makes the new one eligible for compaction)
+<span class="fc" id="L352">        maybeIncrementallyBackup(sstables);</span>
+
+<span class="fc" id="L354">        apply(View.replaceFlushed(memtable, sstables));</span>
+
+        Throwable fail;
+<span class="fc" id="L357">        fail = updateSizeTracking(emptySet(), sstables, null);</span>
+
+<span class="fc" id="L359">        notifyDiscarded(memtable);</span>
+
+        // TODO: if we're invalidated, should we notifyadded AND removed, or just skip both?
+<span class="fc" id="L362">        fail = notifyAdded(sstables, fail);</span>
+
+<span class="pc bpc" id="L364" title="2 of 4 branches missed.">        if (!isDummy() &amp;&amp; !cfstore.isValid())</span>
+<span class="nc" id="L365">            dropSSTables();</span>
+
+<span class="fc" id="L367">        maybeFail(fail);</span>
+<span class="fc" id="L368">    }</span>
+
+
+
+    // MISCELLANEOUS public utility calls
+
+    public Set&lt;SSTableReader&gt; getCompacting()
+    {
+<span class="fc" id="L376">        return view.get().compacting;</span>
+    }
+
+    public Iterable&lt;SSTableReader&gt; getUncompacting()
+    {
+<span class="fc" id="L381">        return view.get().select(SSTableSet.NONCOMPACTING);</span>
+    }
+
+    public Iterable&lt;SSTableReader&gt; getUncompacting(Iterable&lt;SSTableReader&gt; candidates)
+    {
+<span class="nc" id="L386">        return view.get().getUncompacting(candidates);</span>
+    }
+
+    public void maybeIncrementallyBackup(final Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.isIncrementalBackupsEnabled())</span>
+<span class="fc" id="L392">            return;</span>
+
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc" id="L396">            File backupsDir = Directories.getBackupsDirectory(sstable.descriptor);</span>
+<span class="nc" id="L397">            sstable.createLinks(FileUtils.getCanonicalPath(backupsDir));</span>
+<span class="nc" id="L398">        }</span>
+<span class="nc" id="L399">    }</span>
+
+    // NOTIFICATION
+
+    Throwable notifySSTablesChanged(Collection&lt;SSTableReader&gt; removed, Collection&lt;SSTableReader&gt; added, OperationType compactionType, Throwable accumulate)
+    {
+<span class="fc" id="L405">        INotification notification = new SSTableListChangedNotification(added, removed, compactionType);</span>
+<span class="fc bfc" id="L406" title="All 2 branches covered.">        for (INotificationConsumer subscriber : subscribers)</span>
+        {
+            try
+            {
+<span class="fc" id="L410">                subscriber.handleNotification(notification, this);</span>
+            }
+<span class="nc" id="L412">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L414">                accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L415">            }</span>
+<span class="fc" id="L416">        }</span>
+<span class="fc" id="L417">        return accumulate;</span>
+    }
+
+    Throwable notifyAdded(Iterable&lt;SSTableReader&gt; added, Throwable accumulate)
+    {
+<span class="fc" id="L422">        INotification notification = new SSTableAddedNotification(added);</span>
+<span class="fc bfc" id="L423" title="All 2 branches covered.">        for (INotificationConsumer subscriber : subscribers)</span>
+        {
+            try
+            {
+<span class="fc" id="L427">                subscriber.handleNotification(notification, this);</span>
+            }
+<span class="nc" id="L429">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L431">                accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L432">            }</span>
+<span class="fc" id="L433">        }</span>
+<span class="fc" id="L434">        return accumulate;</span>
+    }
+
+    public void notifyAdded(Iterable&lt;SSTableReader&gt; added)
+    {
+<span class="nc" id="L439">        maybeFail(notifyAdded(added, null));</span>
+<span class="nc" id="L440">    }</span>
+
+    public void notifySSTableRepairedStatusChanged(Collection&lt;SSTableReader&gt; repairStatusesChanged)
+    {
+<span class="nc" id="L444">        INotification notification = new SSTableRepairStatusChanged(repairStatusesChanged);</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        for (INotificationConsumer subscriber : subscribers)</span>
+<span class="nc" id="L446">            subscriber.handleNotification(notification, this);</span>
+<span class="nc" id="L447">    }</span>
+
+    public void notifyDeleting(SSTableReader deleting)
+    {
+<span class="fc" id="L451">        INotification notification = new SSTableDeletingNotification(deleting);</span>
+<span class="fc bfc" id="L452" title="All 2 branches covered.">        for (INotificationConsumer subscriber : subscribers)</span>
+<span class="fc" id="L453">            subscriber.handleNotification(notification, this);</span>
+<span class="fc" id="L454">    }</span>
+
+    public void notifyTruncated(long truncatedAt)
+    {
+<span class="nc" id="L458">        INotification notification = new TruncationNotification(truncatedAt);</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        for (INotificationConsumer subscriber : subscribers)</span>
+<span class="nc" id="L460">            subscriber.handleNotification(notification, this);</span>
+<span class="nc" id="L461">    }</span>
+
+    public void notifyRenewed(Memtable renewed)
+    {
+<span class="nc" id="L465">        notify(new MemtableRenewedNotification(renewed));</span>
+<span class="nc" id="L466">    }</span>
+
+    public void notifySwitched(Memtable previous)
+    {
+<span class="fc" id="L470">        notify(new MemtableSwitchedNotification(previous));</span>
+<span class="fc" id="L471">    }</span>
+
+    public void notifyDiscarded(Memtable discarded)
+    {
+<span class="fc" id="L475">        notify(new MemtableDiscardedNotification(discarded));</span>
+<span class="fc" id="L476">    }</span>
+
+    private void notify(INotification notification)
+    {
+<span class="fc bfc" id="L480" title="All 2 branches covered.">        for (INotificationConsumer subscriber : subscribers)</span>
+<span class="fc" id="L481">            subscriber.handleNotification(notification, this);</span>
+<span class="fc" id="L482">    }</span>
+
+    public boolean isDummy()
+    {
+<span class="pc bpc" id="L486" title="1 of 4 branches missed.">        return cfstore == null || !DatabaseDescriptor.isDaemonInitialized();</span>
+    }
+
+    public void subscribe(INotificationConsumer consumer)
+    {
+<span class="fc" id="L491">        subscribers.add(consumer);</span>
+<span class="fc" id="L492">    }</span>
+
+    public void unsubscribe(INotificationConsumer consumer)
+    {
+<span class="nc" id="L496">        subscribers.remove(consumer);</span>
+<span class="nc" id="L497">    }</span>
+
+    private static Set&lt;SSTableReader&gt; emptySet()
+    {
+<span class="fc" id="L501">        return Collections.emptySet();</span>
+    }
+
+    public View getView()
+    {
+<span class="fc" id="L506">        return view.get();</span>
+    }
+
+    @VisibleForTesting
+    public void removeUnsafe(Set&lt;SSTableReader&gt; toRemove)
+    {
+<span class="nc" id="L512">        Pair&lt;View, View&gt; result = apply(view -&gt; {</span>
+<span class="nc" id="L513">            return updateLiveSet(toRemove, emptySet()).apply(view);</span>
+        });
+<span class="nc" id="L515">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

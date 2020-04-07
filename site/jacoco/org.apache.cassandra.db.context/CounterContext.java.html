@@ -1,0 +1,931 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CounterContext.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.context</a> &gt; <span class="el_source">CounterContext.java</span></div><h1>CounterContext.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.context;
+
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ClockAndCount;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.utils.*;
+
+/**
+ * An implementation of a partitioned counter context.
+ *
+ * A context is primarily a list of tuples (counter id, clock, count) -- called
+ * shards, with some shards flagged as global or local (with
+ * special resolution rules in merge()).
+ *
+ * The data structure has two parts:
+ *   a) a header containing the lists of global and local shard indexes in the body
+ *   b) a list of shards -- (counter id, logical clock, count) tuples -- (the so-called 'body' below)
+ *
+ * The exact layout is:
+ *            | header  |   body   |
+ * context :  |--|------|----------|
+ *             ^     ^
+ *             |   list of indices in the body list (2*#elt bytes)
+ *    #elt in rest of header (2 bytes)
+ *
+ * Non-negative indices refer to local shards. Global shard indices are encoded as [idx + Short.MIN_VALUE],
+ * and are thus always negative.
+ *
+ * The body layout being:
+ *
+ * body:     |----|----|----|----|----|----|....
+ *             ^    ^    ^     ^   ^    ^
+ *             |    |  count_1 |   |   count_2
+ *             |  clock_1      |  clock_2
+ *       counterid_1         counterid_2
+ *
+ * The rules when merging two shard with the same counter id are:
+ *   - global + global = keep the shard with the highest logical clock
+ *   - global + local  = keep the global one
+ *   - global + remote = keep the global one
+ *   - local  + local  = sum counts (and logical clocks)
+ *   - local  + remote = keep the local one
+ *   - remote + remote = keep the shard with the highest logical clock
+ *
+ * For a detailed description of the meaning of a local and why the merging
+ * rules work this way, see CASSANDRA-1938 - specifically the 1938_discussion
+ * attachment (doesn't cover global shards, see CASSANDRA-4775 for that).
+ */
+<span class="nc" id="L76">public class CounterContext</span>
+{
+<span class="nc" id="L78">    private static final int HEADER_SIZE_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);</span>
+<span class="nc" id="L79">    private static final int HEADER_ELT_LENGTH = TypeSizes.sizeof(Short.MAX_VALUE);</span>
+<span class="nc" id="L80">    private static final int CLOCK_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);</span>
+<span class="nc" id="L81">    private static final int COUNT_LENGTH = TypeSizes.sizeof(Long.MAX_VALUE);</span>
+<span class="nc" id="L82">    private static final int STEP_LENGTH = CounterId.LENGTH + CLOCK_LENGTH + COUNT_LENGTH;</span>
+
+    /*
+     * A special hard-coded value we use for clock ids to differentiate between regular local shards
+     * and 'fake' local shards used to emulate pre-3.0 CounterUpdateCell-s in UpdateParameters.
+     *
+     * Important for handling counter writes and reads during rolling 2.1/2.2 -&gt; 3.0 upgrades.
+     */
+<span class="nc" id="L90">    static final CounterId UPDATE_CLOCK_ID = CounterId.fromInt(0);</span>
+
+<span class="nc" id="L92">    private static final Logger logger = LoggerFactory.getLogger(CounterContext.class);</span>
+
+<span class="nc" id="L94">    public static enum Relationship</span>
+    {
+<span class="nc" id="L96">        EQUAL, GREATER_THAN, LESS_THAN, DISJOINT</span>
+    }
+
+    // lazy-load singleton
+    private static class LazyHolder
+    {
+<span class="nc" id="L102">        private static final CounterContext counterContext = new CounterContext();</span>
+    }
+
+    public static CounterContext instance()
+    {
+<span class="nc" id="L107">        return LazyHolder.counterContext;</span>
+    }
+
+    /**
+     * Creates a counter context with a single local shard with clock id of UPDATE_CLOCK_ID.
+     *
+     * This is only used in a PartitionUpdate until the update has gone through
+     * CounterMutation.apply(), at which point this special local shard will be replaced by a regular global one.
+     * It should never hit commitlog / memtable / disk, but can hit network.
+     *
+     * We use this so that if an update statement has multiple increments of the same counter we properly
+     * add them rather than keeping only one of them.
+     *
+     * NOTE: Before CASSANDRA-13691 we used a regular local shard without a hard-coded clock id value here.
+     * It was problematic, because it was possible to return a false positive, and on read path encode an old counter
+     * cell from 2.0 era with a regular local shard as a counter update, and to break the 2.1 coordinator.
+     */
+    public ByteBuffer createUpdate(long count)
+    {
+<span class="nc" id="L126">        ContextState state = ContextState.allocate(0, 1, 0);</span>
+<span class="nc" id="L127">        state.writeLocal(UPDATE_CLOCK_ID, 1L, count);</span>
+<span class="nc" id="L128">        return state.context;</span>
+    }
+
+    /**
+     * Checks if a context is an update (see createUpdate() for justification).
+     */
+    public boolean isUpdate(ByteBuffer context)
+    {
+<span class="nc" id="L136">        return ContextState.wrap(context).getCounterId().equals(UPDATE_CLOCK_ID);</span>
+    }
+
+    /**
+     * Returns the count associated with the update counter id, or 0 if no such shard is present.
+     */
+    public long getUpdateCount(ByteBuffer context)
+    {
+<span class="nc" id="L144">        return getClockAndCountOf(context, UPDATE_CLOCK_ID).count;</span>
+    }
+
+    /**
+     * Creates a counter context with a single global, 2.1+ shard (a result of increment).
+     */
+    public ByteBuffer createGlobal(CounterId id, long clock, long count)
+    {
+<span class="nc" id="L152">        ContextState state = ContextState.allocate(1, 0, 0);</span>
+<span class="nc" id="L153">        state.writeGlobal(id, clock, count);</span>
+<span class="nc" id="L154">        return state.context;</span>
+    }
+
+    /**
+     * Creates a counter context with a single local shard.
+     * For use by tests of compatibility with pre-2.1 counters only.
+     */
+    public ByteBuffer createLocal(long count)
+    {
+<span class="nc" id="L163">        ContextState state = ContextState.allocate(0, 1, 0);</span>
+<span class="nc" id="L164">        state.writeLocal(CounterId.getLocalId(), 1L, count);</span>
+<span class="nc" id="L165">        return state.context;</span>
+    }
+
+    /**
+     * Creates a counter context with a single remote shard.
+     * For use by tests of compatibility with pre-2.1 counters only.
+     */
+    public ByteBuffer createRemote(CounterId id, long clock, long count)
+    {
+<span class="nc" id="L174">        ContextState state = ContextState.allocate(0, 0, 1);</span>
+<span class="nc" id="L175">        state.writeRemote(id, clock, count);</span>
+<span class="nc" id="L176">        return state.context;</span>
+    }
+
+    private static int headerLength(ByteBuffer context)
+    {
+<span class="nc" id="L181">        return HEADER_SIZE_LENGTH + Math.abs(context.getShort(context.position())) * HEADER_ELT_LENGTH;</span>
+    }
+
+    private static int compareId(ByteBuffer bb1, int pos1, ByteBuffer bb2, int pos2)
+    {
+<span class="nc" id="L186">        return ByteBufferUtil.compareSubArrays(bb1, pos1, bb2, pos2, CounterId.LENGTH);</span>
+    }
+
+    /**
+     * Determine the count relationship between two contexts.
+     *
+     * EQUAL:        Equal set of nodes and every count is equal.
+     * GREATER_THAN: Superset of nodes and every count is equal or greater than its corollary.
+     * LESS_THAN:    Subset of nodes and every count is equal or less than its corollary.
+     * DISJOINT:     Node sets are not equal and/or counts are not all greater or less than.
+     *
+     * Strategy: compare node logical clocks (like a version vector).
+     *
+     * @param left counter context.
+     * @param right counter context.
+     * @return the Relationship between the contexts.
+     */
+    public Relationship diff(ByteBuffer left, ByteBuffer right)
+    {
+<span class="nc" id="L205">        Relationship relationship = Relationship.EQUAL;</span>
+<span class="nc" id="L206">        ContextState leftState = ContextState.wrap(left);</span>
+<span class="nc" id="L207">        ContextState rightState = ContextState.wrap(right);</span>
+
+<span class="nc bnc" id="L209" title="All 4 branches missed.">        while (leftState.hasRemaining() &amp;&amp; rightState.hasRemaining())</span>
+        {
+            // compare id bytes
+<span class="nc" id="L212">            int compareId = leftState.compareIdTo(rightState);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (compareId == 0)</span>
+            {
+<span class="nc" id="L215">                long leftClock  = leftState.getClock();</span>
+<span class="nc" id="L216">                long rightClock = rightState.getClock();</span>
+<span class="nc" id="L217">                long leftCount = leftState.getCount();</span>
+<span class="nc" id="L218">                long rightCount = rightState.getCount();</span>
+
+                // advance
+<span class="nc" id="L221">                leftState.moveToNext();</span>
+<span class="nc" id="L222">                rightState.moveToNext();</span>
+
+                // process clock comparisons
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                if (leftClock == rightClock)</span>
+                {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                    if (leftCount != rightCount)</span>
+                    {
+                        // Inconsistent shard (see the corresponding code in merge()). We return DISJOINT in this
+                        // case so that it will be treated as a difference, allowing read-repair to work.
+<span class="nc" id="L231">                        return Relationship.DISJOINT;</span>
+                    }
+                }
+<span class="nc bnc" id="L234" title="All 12 branches missed.">                else if ((leftClock &gt;= 0 &amp;&amp; rightClock &gt; 0 &amp;&amp; leftClock &gt; rightClock)</span>
+                      || (leftClock &lt; 0 &amp;&amp; (rightClock &gt; 0 || leftClock &lt; rightClock)))
+                {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">                    if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L238">                        relationship = Relationship.GREATER_THAN;</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                    else if (relationship == Relationship.LESS_THAN)</span>
+<span class="nc" id="L240">                        return Relationship.DISJOINT;</span>
+                    // relationship == Relationship.GREATER_THAN
+                }
+                else
+                {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                    if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L246">                        relationship = Relationship.LESS_THAN;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                    else if (relationship == Relationship.GREATER_THAN)</span>
+<span class="nc" id="L248">                        return Relationship.DISJOINT;</span>
+                    // relationship == Relationship.LESS_THAN
+                }
+<span class="nc" id="L251">            }</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            else if (compareId &gt; 0)</span>
+            {
+                // only advance the right context
+<span class="nc" id="L255">                rightState.moveToNext();</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">                if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L258">                    relationship = Relationship.LESS_THAN;</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                else if (relationship == Relationship.GREATER_THAN)</span>
+<span class="nc" id="L260">                    return Relationship.DISJOINT;</span>
+                // relationship == Relationship.LESS_THAN
+            }
+            else // compareId &lt; 0
+            {
+                // only advance the left context
+<span class="nc" id="L266">                leftState.moveToNext();</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L269">                    relationship = Relationship.GREATER_THAN;</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                else if (relationship == Relationship.LESS_THAN)</span>
+<span class="nc" id="L271">                    return Relationship.DISJOINT;</span>
+                // relationship == Relationship.GREATER_THAN
+            }
+<span class="nc" id="L274">        }</span>
+
+        // check final lengths
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        if (leftState.hasRemaining())</span>
+        {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L280">                return Relationship.GREATER_THAN;</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            else if (relationship == Relationship.LESS_THAN)</span>
+<span class="nc" id="L282">                return Relationship.DISJOINT;</span>
+        }
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (rightState.hasRemaining())</span>
+        {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (relationship == Relationship.EQUAL)</span>
+<span class="nc" id="L288">                return Relationship.LESS_THAN;</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            else if (relationship == Relationship.GREATER_THAN)</span>
+<span class="nc" id="L290">                return Relationship.DISJOINT;</span>
+        }
+
+<span class="nc" id="L293">        return relationship;</span>
+    }
+
+    /**
+     * Return a context w/ an aggregated count for each counter id.
+     *
+     * @param left counter context.
+     * @param right counter context.
+     */
+    public ByteBuffer merge(ByteBuffer left, ByteBuffer right)
+    {
+<span class="nc" id="L304">        boolean leftIsSuperSet = true;</span>
+<span class="nc" id="L305">        boolean rightIsSuperSet = true;</span>
+
+<span class="nc" id="L307">        int globalCount = 0;</span>
+<span class="nc" id="L308">        int localCount = 0;</span>
+<span class="nc" id="L309">        int remoteCount = 0;</span>
+
+<span class="nc" id="L311">        ContextState leftState = ContextState.wrap(left);</span>
+<span class="nc" id="L312">        ContextState rightState = ContextState.wrap(right);</span>
+
+<span class="nc bnc" id="L314" title="All 4 branches missed.">        while (leftState.hasRemaining() &amp;&amp; rightState.hasRemaining())</span>
+        {
+<span class="nc" id="L316">            int cmp = leftState.compareIdTo(rightState);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">            if (cmp == 0)</span>
+            {
+<span class="nc" id="L319">                Relationship rel = compare(leftState, rightState);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                if (rel == Relationship.GREATER_THAN)</span>
+<span class="nc" id="L321">                    rightIsSuperSet = false;</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                else if (rel == Relationship.LESS_THAN)</span>
+<span class="nc" id="L323">                    leftIsSuperSet = false;</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">                else if (rel == Relationship.DISJOINT)</span>
+<span class="nc" id="L325">                    leftIsSuperSet = rightIsSuperSet = false;</span>
+
+<span class="nc bnc" id="L327" title="All 4 branches missed.">                if (leftState.isGlobal() || rightState.isGlobal())</span>
+<span class="nc" id="L328">                    globalCount += 1;</span>
+<span class="nc bnc" id="L329" title="All 4 branches missed.">                else if (leftState.isLocal() || rightState.isLocal())</span>
+<span class="nc" id="L330">                    localCount += 1;</span>
+                else
+<span class="nc" id="L332">                    remoteCount += 1;</span>
+
+<span class="nc" id="L334">                leftState.moveToNext();</span>
+<span class="nc" id="L335">                rightState.moveToNext();</span>
+<span class="nc" id="L336">            }</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            else if (cmp &gt; 0)</span>
+            {
+<span class="nc" id="L339">                leftIsSuperSet = false;</span>
+
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                if (rightState.isGlobal())</span>
+<span class="nc" id="L342">                    globalCount += 1;</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                else if (rightState.isLocal())</span>
+<span class="nc" id="L344">                    localCount += 1;</span>
+                else
+<span class="nc" id="L346">                    remoteCount += 1;</span>
+
+<span class="nc" id="L348">                rightState.moveToNext();</span>
+            }
+            else // cmp &lt; 0
+            {
+<span class="nc" id="L352">                rightIsSuperSet = false;</span>
+
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                if (leftState.isGlobal())</span>
+<span class="nc" id="L355">                    globalCount += 1;</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                else if (leftState.isLocal())</span>
+<span class="nc" id="L357">                    localCount += 1;</span>
+                else
+<span class="nc" id="L359">                    remoteCount += 1;</span>
+
+<span class="nc" id="L361">                leftState.moveToNext();</span>
+            }
+<span class="nc" id="L363">        }</span>
+
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (leftState.hasRemaining())</span>
+<span class="nc" id="L366">            rightIsSuperSet = false;</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        else if (rightState.hasRemaining())</span>
+<span class="nc" id="L368">            leftIsSuperSet = false;</span>
+
+        // if one of the contexts is a superset, return it early.
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        if (leftIsSuperSet)</span>
+<span class="nc" id="L372">            return left;</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        else if (rightIsSuperSet)</span>
+<span class="nc" id="L374">            return right;</span>
+
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        while (leftState.hasRemaining())</span>
+        {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            if (leftState.isGlobal())</span>
+<span class="nc" id="L379">                globalCount += 1;</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            else if (leftState.isLocal())</span>
+<span class="nc" id="L381">                localCount += 1;</span>
+            else
+<span class="nc" id="L383">                remoteCount += 1;</span>
+
+<span class="nc" id="L385">            leftState.moveToNext();</span>
+        }
+
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        while (rightState.hasRemaining())</span>
+        {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            if (rightState.isGlobal())</span>
+<span class="nc" id="L391">                globalCount += 1;</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            else if (rightState.isLocal())</span>
+<span class="nc" id="L393">                localCount += 1;</span>
+            else
+<span class="nc" id="L395">                remoteCount += 1;</span>
+
+<span class="nc" id="L397">            rightState.moveToNext();</span>
+        }
+
+<span class="nc" id="L400">        leftState.reset();</span>
+<span class="nc" id="L401">        rightState.reset();</span>
+
+<span class="nc" id="L403">        return merge(ContextState.allocate(globalCount, localCount, remoteCount), leftState, rightState);</span>
+    }
+
+    private ByteBuffer merge(ContextState mergedState, ContextState leftState, ContextState rightState)
+    {
+<span class="nc bnc" id="L408" title="All 4 branches missed.">        while (leftState.hasRemaining() &amp;&amp; rightState.hasRemaining())</span>
+        {
+<span class="nc" id="L410">            int cmp = leftState.compareIdTo(rightState);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (cmp == 0)</span>
+            {
+<span class="nc" id="L413">                Relationship rel = compare(leftState, rightState);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                if (rel == Relationship.DISJOINT) // two local shards</span>
+<span class="nc" id="L415">                    mergedState.writeLocal(leftState.getCounterId(),</span>
+<span class="nc" id="L416">                                           leftState.getClock() + rightState.getClock(),</span>
+<span class="nc" id="L417">                                           leftState.getCount() + rightState.getCount());</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">                else if (rel == Relationship.GREATER_THAN)</span>
+<span class="nc" id="L419">                    leftState.copyTo(mergedState);</span>
+                else // EQUAL or LESS_THAN
+<span class="nc" id="L421">                    rightState.copyTo(mergedState);</span>
+
+<span class="nc" id="L423">                rightState.moveToNext();</span>
+<span class="nc" id="L424">                leftState.moveToNext();</span>
+<span class="nc" id="L425">            }</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            else if (cmp &gt; 0)</span>
+            {
+<span class="nc" id="L428">                rightState.copyTo(mergedState);</span>
+<span class="nc" id="L429">                rightState.moveToNext();</span>
+            }
+            else // cmp &lt; 0
+            {
+<span class="nc" id="L433">                leftState.copyTo(mergedState);</span>
+<span class="nc" id="L434">                leftState.moveToNext();</span>
+            }
+<span class="nc" id="L436">        }</span>
+
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        while (leftState.hasRemaining())</span>
+        {
+<span class="nc" id="L440">            leftState.copyTo(mergedState);</span>
+<span class="nc" id="L441">            leftState.moveToNext();</span>
+        }
+
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        while (rightState.hasRemaining())</span>
+        {
+<span class="nc" id="L446">            rightState.copyTo(mergedState);</span>
+<span class="nc" id="L447">            rightState.moveToNext();</span>
+        }
+
+<span class="nc" id="L450">        return mergedState.context;</span>
+    }
+
+    /*
+     * Compares two shards, returns:
+     * - GREATER_THAN if leftState overrides rightState
+     * - LESS_THAN if rightState overrides leftState
+     * - EQUAL for two equal, non-local, shards
+     * - DISJOINT for any two local shards
+     */
+    private Relationship compare(ContextState leftState, ContextState rightState)
+    {
+<span class="nc" id="L462">        long leftClock = leftState.getClock();</span>
+<span class="nc" id="L463">        long leftCount = leftState.getCount();</span>
+<span class="nc" id="L464">        long rightClock = rightState.getClock();</span>
+<span class="nc" id="L465">        long rightCount = rightState.getCount();</span>
+
+<span class="nc bnc" id="L467" title="All 4 branches missed.">        if (leftState.isGlobal() || rightState.isGlobal())</span>
+        {
+<span class="nc bnc" id="L469" title="All 4 branches missed.">            if (leftState.isGlobal() &amp;&amp; rightState.isGlobal())</span>
+            {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (leftClock == rightClock)</span>
+                {
+                    // Can happen if an sstable gets lost and disk failure policy is set to 'best effort'
+<span class="nc bnc" id="L474" title="All 4 branches missed.">                    if (leftCount != rightCount &amp;&amp; CompactionManager.isCompactionManager.get())</span>
+                    {
+<span class="nc" id="L476">                        logger.warn(&quot;invalid global counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in &quot;</span>
+                                    + &quot;count; will pick highest to self-heal on compaction&quot;,
+<span class="nc" id="L478">                                    leftState.getCounterId(), leftClock, leftCount,</span>
+<span class="nc" id="L479">                                    rightState.getCounterId(), rightClock, rightCount);</span>
+                    }
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">                    if (leftCount &gt; rightCount)</span>
+<span class="nc" id="L483">                        return Relationship.GREATER_THAN;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">                    else if (leftCount == rightCount)</span>
+<span class="nc" id="L485">                        return Relationship.EQUAL;</span>
+                    else
+<span class="nc" id="L487">                        return Relationship.LESS_THAN;</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                    return leftClock &gt; rightClock ? Relationship.GREATER_THAN : Relationship.LESS_THAN;</span>
+                }
+            }
+            else // only one is global - keep that one
+            {
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                return leftState.isGlobal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;</span>
+            }
+        }
+
+<span class="nc bnc" id="L500" title="All 4 branches missed.">        if (leftState.isLocal() || rightState.isLocal())</span>
+        {
+            // Local id and at least one is a local shard.
+<span class="nc bnc" id="L503" title="All 4 branches missed.">            if (leftState.isLocal() &amp;&amp; rightState.isLocal())</span>
+<span class="nc" id="L504">                return Relationship.DISJOINT;</span>
+            else // only one is local - keep that one
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                return leftState.isLocal() ? Relationship.GREATER_THAN : Relationship.LESS_THAN;</span>
+        }
+
+        // both are remote shards
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (leftClock == rightClock)</span>
+        {
+            // We should never see non-local shards w/ same id+clock but different counts. However, if we do
+            // we should &quot;heal&quot; the problem by being deterministic in our selection of shard - and
+            // log the occurrence so that the operator will know something is wrong.
+<span class="nc bnc" id="L515" title="All 4 branches missed.">            if (leftCount != rightCount &amp;&amp; CompactionManager.isCompactionManager.get())</span>
+            {
+<span class="nc" id="L517">                logger.warn(&quot;invalid remote counter shard detected; ({}, {}, {}) and ({}, {}, {}) differ only in &quot;</span>
+                            + &quot;count; will pick highest to self-heal on compaction&quot;,
+<span class="nc" id="L519">                            leftState.getCounterId(), leftClock, leftCount,</span>
+<span class="nc" id="L520">                            rightState.getCounterId(), rightClock, rightCount);</span>
+            }
+
+<span class="nc bnc" id="L523" title="All 2 branches missed.">            if (leftCount &gt; rightCount)</span>
+<span class="nc" id="L524">                return Relationship.GREATER_THAN;</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            else if (leftCount == rightCount)</span>
+<span class="nc" id="L526">                return Relationship.EQUAL;</span>
+            else
+<span class="nc" id="L528">                return Relationship.LESS_THAN;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L532" title="All 12 branches missed.">            if ((leftClock &gt;= 0 &amp;&amp; rightClock &gt; 0 &amp;&amp; leftClock &gt;= rightClock)</span>
+                    || (leftClock &lt; 0 &amp;&amp; (rightClock &gt; 0 || leftClock &lt; rightClock)))
+<span class="nc" id="L534">                return Relationship.GREATER_THAN;</span>
+            else
+<span class="nc" id="L536">                return Relationship.LESS_THAN;</span>
+        }
+    }
+
+    /**
+     * Human-readable String from context.
+     *
+     * @param context counter context.
+     * @return a human-readable String of the context.
+     */
+    public String toString(ByteBuffer context)
+    {
+<span class="nc" id="L548">        ContextState state = ContextState.wrap(context);</span>
+<span class="nc" id="L549">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L550">        sb.append(&quot;[&quot;);</span>
+
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        while (state.hasRemaining())</span>
+        {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            if (state.getElementIndex() &gt; 0)</span>
+<span class="nc" id="L555">                sb.append(&quot;,&quot;);</span>
+<span class="nc" id="L556">            sb.append(&quot;{&quot;);</span>
+<span class="nc" id="L557">            sb.append(state.getCounterId()).append(&quot;, &quot;);</span>
+<span class="nc" id="L558">            sb.append(state.getClock()).append(&quot;, &quot;);</span>
+<span class="nc" id="L559">            sb.append(state.getCount());</span>
+<span class="nc" id="L560">            sb.append(&quot;}&quot;);</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">            if (state.isGlobal())</span>
+<span class="nc" id="L562">                sb.append(&quot;$&quot;);</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            else if (state.isLocal())</span>
+<span class="nc" id="L564">                sb.append(&quot;*&quot;);</span>
+<span class="nc" id="L565">            state.moveToNext();</span>
+        }
+
+<span class="nc" id="L568">        sb.append(&quot;]&quot;);</span>
+<span class="nc" id="L569">        return sb.toString();</span>
+    }
+
+    /**
+     * Returns the aggregated count across all counter ids.
+     *
+     * @param context a counter context
+     * @return the aggregated count represented by {@code context}
+     */
+    public long total(ByteBuffer context)
+    {
+<span class="nc" id="L580">        long total = 0L;</span>
+        // we could use a ContextState but it is easy enough that we avoid the object creation
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        for (int offset = context.position() + headerLength(context); offset &lt; context.limit(); offset += STEP_LENGTH)</span>
+<span class="nc" id="L583">            total += context.getLong(offset + CounterId.LENGTH + CLOCK_LENGTH);</span>
+<span class="nc" id="L584">        return total;</span>
+    }
+
+    public boolean shouldClearLocal(ByteBuffer context)
+    {
+        // #elt being negative means we have to clean local shards.
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        return context.getShort(context.position()) &lt; 0;</span>
+    }
+
+    /**
+     * Detects whether or not the context has any legacy (local or remote) shards in it.
+     */
+    public boolean hasLegacyShards(ByteBuffer context)
+    {
+<span class="nc" id="L598">        int totalCount = (context.remaining() - headerLength(context)) / STEP_LENGTH;</span>
+<span class="nc" id="L599">        int localAndGlobalCount = Math.abs(context.getShort(context.position()));</span>
+
+<span class="nc bnc" id="L601" title="All 2 branches missed.">        if (localAndGlobalCount &lt; totalCount)</span>
+<span class="nc" id="L602">            return true; // remote shard(s) present</span>
+
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        for (int i = 0; i &lt; localAndGlobalCount; i++)</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">            if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) &gt;= 0)</span>
+<span class="nc" id="L606">                return true; // found a local shard</span>
+
+<span class="nc" id="L608">        return false;</span>
+    }
+
+    /**
+     * Mark context to delete local references afterward.
+     * Marking is done by multiply #elt by -1 to preserve header length
+     * and #elt count in order to clear all local refs later.
+     *
+     * @param context a counter context
+     * @return context that marked to delete local refs
+     */
+    public ByteBuffer markLocalToBeCleared(ByteBuffer context)
+    {
+<span class="nc" id="L621">        short count = context.getShort(context.position());</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (count &lt;= 0)</span>
+<span class="nc" id="L623">            return context; // already marked or all are remote.</span>
+
+<span class="nc" id="L625">        boolean hasLocalShards = false;</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++)</span>
+        {
+<span class="nc bnc" id="L628" title="All 2 branches missed.">            if (context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH) &gt;= 0)</span>
+            {
+<span class="nc" id="L630">                hasLocalShards = true;</span>
+<span class="nc" id="L631">                break;</span>
+            }
+        }
+
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (!hasLocalShards)</span>
+<span class="nc" id="L636">            return context; // all shards are global or remote.</span>
+
+<span class="nc" id="L638">        ByteBuffer marked = ByteBuffer.allocate(context.remaining());</span>
+<span class="nc" id="L639">        marked.putShort(marked.position(), (short) (count * -1));</span>
+<span class="nc" id="L640">        ByteBufferUtil.arrayCopy(context,</span>
+<span class="nc" id="L641">                                 context.position() + HEADER_SIZE_LENGTH,</span>
+                                 marked,
+<span class="nc" id="L643">                                 marked.position() + HEADER_SIZE_LENGTH,</span>
+<span class="nc" id="L644">                                 context.remaining() - HEADER_SIZE_LENGTH);</span>
+<span class="nc" id="L645">        return marked;</span>
+    }
+
+    /**
+     * Remove all the local of a context (but keep global).
+     *
+     * @param context a counter context
+     * @return a version of {@code context} where no shards are local.
+     */
+    public ByteBuffer clearAllLocal(ByteBuffer context)
+    {
+<span class="nc" id="L656">        int count = Math.abs(context.getShort(context.position()));</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (count == 0)</span>
+<span class="nc" id="L658">            return context; // no local or global shards present.</span>
+
+<span class="nc" id="L660">        List&lt;Short&gt; globalShardIndexes = new ArrayList&lt;&gt;(count);</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++)</span>
+        {
+<span class="nc" id="L663">            short elt = context.getShort(context.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH);</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            if (elt &lt; 0)</span>
+<span class="nc" id="L665">                globalShardIndexes.add(elt);</span>
+        }
+
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        if (count == globalShardIndexes.size())</span>
+<span class="nc" id="L669">            return context; // no local shards detected.</span>
+
+        // allocate a smaller BB for the cleared context - with no local header elts.
+<span class="nc" id="L672">        ByteBuffer cleared = ByteBuffer.allocate(context.remaining() - (count - globalShardIndexes.size()) * HEADER_ELT_LENGTH);</span>
+
+<span class="nc" id="L674">        cleared.putShort(cleared.position(), (short) globalShardIndexes.size());</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        for (int i = 0; i &lt; globalShardIndexes.size(); i++)</span>
+<span class="nc" id="L676">            cleared.putShort(cleared.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH, globalShardIndexes.get(i));</span>
+
+<span class="nc" id="L678">        int origHeaderLength = headerLength(context);</span>
+<span class="nc" id="L679">        ByteBufferUtil.arrayCopy(context,</span>
+<span class="nc" id="L680">                                 context.position() + origHeaderLength,</span>
+                                 cleared,
+<span class="nc" id="L682">                                 cleared.position() + headerLength(cleared),</span>
+<span class="nc" id="L683">                                 context.remaining() - origHeaderLength);</span>
+
+<span class="nc" id="L685">        return cleared;</span>
+    }
+
+    public void validateContext(ByteBuffer context) throws MarshalException
+    {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        if ((context.remaining() - headerLength(context)) % STEP_LENGTH != 0)</span>
+<span class="nc" id="L691">            throw new MarshalException(&quot;Invalid size for a counter context&quot;);</span>
+<span class="nc" id="L692">    }</span>
+
+    /**
+     * Update a MessageDigest with the content of a context.
+     * Note that this skips the header entirely since the header information
+     * has local meaning only, while digests are meant for comparison across
+     * nodes. This means in particular that we always have:
+     *  updateDigest(ctx) == updateDigest(clearAllLocal(ctx))
+     */
+    public void updateDigest(MessageDigest message, ByteBuffer context)
+    {
+        // context can be empty due to the optimization from CASSANDRA-10657
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        if (!context.hasRemaining())</span>
+<span class="nc" id="L705">            return;</span>
+<span class="nc" id="L706">        ByteBuffer dup = context.duplicate();</span>
+<span class="nc" id="L707">        dup.position(context.position() + headerLength(context));</span>
+<span class="nc" id="L708">        message.update(dup);</span>
+<span class="nc" id="L709">    }</span>
+
+    /**
+     * Returns the clock and the count associated with the local counter id, or (0, 0) if no such shard is present.
+     */
+    public ClockAndCount getLocalClockAndCount(ByteBuffer context)
+    {
+<span class="nc" id="L716">        return getClockAndCountOf(context, CounterId.getLocalId());</span>
+    }
+
+    /**
+     * Returns the clock and the count associated with the given counter id, or (0, 0) if no such shard is present.
+     */
+    @VisibleForTesting
+    public ClockAndCount getClockAndCountOf(ByteBuffer context, CounterId id)
+    {
+<span class="nc" id="L725">        int position = findPositionOf(context, id);</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        if (position == -1)</span>
+<span class="nc" id="L727">            return ClockAndCount.BLANK;</span>
+
+<span class="nc" id="L729">        long clock = context.getLong(position + CounterId.LENGTH);</span>
+<span class="nc" id="L730">        long count = context.getLong(position + CounterId.LENGTH + CLOCK_LENGTH);</span>
+<span class="nc" id="L731">        return ClockAndCount.create(clock, count);</span>
+    }
+
+    /**
+     * Finds the position of a shard with the given id within the context (via binary search).
+     */
+    @VisibleForTesting
+    public int findPositionOf(ByteBuffer context, CounterId id)
+    {
+<span class="nc" id="L740">        int headerLength = headerLength(context);</span>
+<span class="nc" id="L741">        int offset = context.position() + headerLength;</span>
+
+<span class="nc" id="L743">        int left = 0;</span>
+<span class="nc" id="L744">        int right = (context.remaining() - headerLength) / STEP_LENGTH - 1;</span>
+
+<span class="nc bnc" id="L746" title="All 2 branches missed.">        while (right &gt;= left)</span>
+        {
+<span class="nc" id="L748">            int middle = (left + right) / 2;</span>
+<span class="nc" id="L749">            int cmp = compareId(context, offset + middle * STEP_LENGTH, id.bytes(), id.bytes().position());</span>
+
+<span class="nc bnc" id="L751" title="All 2 branches missed.">            if (cmp == -1)</span>
+<span class="nc" id="L752">                left = middle + 1;</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">            else if (cmp == 0)</span>
+<span class="nc" id="L754">                return offset + middle * STEP_LENGTH;</span>
+            else
+<span class="nc" id="L756">                right = middle - 1;</span>
+<span class="nc" id="L757">        }</span>
+
+<span class="nc" id="L759">        return -1; // position not found</span>
+    }
+
+    /**
+     * Helper class to work on contexts (works by iterating over them).
+     * A context being abstractly a list of tuple (counterid, clock, count), a
+     * ContextState encapsulate a context and a position to one of the tuple.
+     * It also allow to create new context iteratively.
+     *
+     * Note: this is intrinsically a private class intended for use by the
+     * methods of CounterContext only. It is however public because it is
+     * convenient to create handcrafted context for unit tests.
+     */
+    public static class ContextState
+    {
+        public final ByteBuffer context;
+        public final int headerLength;
+
+        private int headerOffset;        // offset from context.position()
+        private int bodyOffset;          // offset from context.position()
+        private boolean currentIsGlobal;
+        private boolean currentIsLocal;
+
+        private ContextState(ByteBuffer context)
+<span class="nc" id="L783">        {</span>
+<span class="nc" id="L784">            this.context = context;</span>
+<span class="nc" id="L785">            this.headerLength = this.bodyOffset = headerLength(context);</span>
+<span class="nc" id="L786">            this.headerOffset = HEADER_SIZE_LENGTH;</span>
+<span class="nc" id="L787">            updateIsGlobalOrLocal();</span>
+<span class="nc" id="L788">        }</span>
+
+        public static ContextState wrap(ByteBuffer context)
+        {
+<span class="nc" id="L792">            return new ContextState(context);</span>
+        }
+
+        /**
+         * Allocate a new context big enough for globalCount + localCount + remoteCount elements
+         * and return the initial corresponding ContextState.
+         */
+        public static ContextState allocate(int globalCount, int localCount, int remoteCount)
+        {
+<span class="nc" id="L801">            int headerLength = HEADER_SIZE_LENGTH + (globalCount + localCount) * HEADER_ELT_LENGTH;</span>
+<span class="nc" id="L802">            int bodyLength = (globalCount + localCount + remoteCount) * STEP_LENGTH;</span>
+
+<span class="nc" id="L804">            ByteBuffer buffer = ByteBuffer.allocate(headerLength + bodyLength);</span>
+<span class="nc" id="L805">            buffer.putShort(buffer.position(), (short) (globalCount + localCount));</span>
+
+<span class="nc" id="L807">            return ContextState.wrap(buffer);</span>
+        }
+
+        public boolean isGlobal()
+        {
+<span class="nc" id="L812">            return currentIsGlobal;</span>
+        }
+
+        public boolean isLocal()
+        {
+<span class="nc" id="L817">            return currentIsLocal;</span>
+        }
+
+        public boolean isRemote()
+        {
+<span class="nc bnc" id="L822" title="All 4 branches missed.">            return !(currentIsGlobal || currentIsLocal);</span>
+        }
+
+        private void updateIsGlobalOrLocal()
+        {
+<span class="nc bnc" id="L827" title="All 2 branches missed.">            if (headerOffset &gt;= headerLength)</span>
+            {
+<span class="nc" id="L829">                currentIsGlobal = currentIsLocal = false;</span>
+            }
+            else
+            {
+<span class="nc" id="L833">                short headerElt = context.getShort(context.position() + headerOffset);</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">                currentIsGlobal = headerElt == getElementIndex() + Short.MIN_VALUE;</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">                currentIsLocal = headerElt == getElementIndex();</span>
+            }
+<span class="nc" id="L837">        }</span>
+
+        public boolean hasRemaining()
+        {
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            return bodyOffset &lt; context.remaining();</span>
+        }
+
+        public void moveToNext()
+        {
+<span class="nc" id="L846">            bodyOffset += STEP_LENGTH;</span>
+<span class="nc bnc" id="L847" title="All 4 branches missed.">            if (currentIsGlobal || currentIsLocal)</span>
+<span class="nc" id="L848">                headerOffset += HEADER_ELT_LENGTH;</span>
+<span class="nc" id="L849">            updateIsGlobalOrLocal();</span>
+<span class="nc" id="L850">        }</span>
+
+        public void copyTo(ContextState other)
+        {
+<span class="nc" id="L854">            other.writeElement(getCounterId(), getClock(), getCount(), currentIsGlobal, currentIsLocal);</span>
+<span class="nc" id="L855">        }</span>
+
+        public int compareIdTo(ContextState other)
+        {
+<span class="nc" id="L859">            return compareId(context, context.position() + bodyOffset, other.context, other.context.position() + other.bodyOffset);</span>
+        }
+
+        public void reset()
+        {
+<span class="nc" id="L864">            this.headerOffset = HEADER_SIZE_LENGTH;</span>
+<span class="nc" id="L865">            this.bodyOffset = headerLength;</span>
+<span class="nc" id="L866">            updateIsGlobalOrLocal();</span>
+<span class="nc" id="L867">        }</span>
+
+        public int getElementIndex()
+        {
+<span class="nc" id="L871">            return (bodyOffset - headerLength) / STEP_LENGTH;</span>
+        }
+
+        public CounterId getCounterId()
+        {
+<span class="nc" id="L876">            return CounterId.wrap(context, context.position() + bodyOffset);</span>
+        }
+
+        public long getClock()
+        {
+<span class="nc" id="L881">            return context.getLong(context.position() + bodyOffset + CounterId.LENGTH);</span>
+        }
+
+        public long getCount()
+        {
+<span class="nc" id="L886">            return context.getLong(context.position() + bodyOffset + CounterId.LENGTH + CLOCK_LENGTH);</span>
+        }
+
+        public void writeGlobal(CounterId id, long clock, long count)
+        {
+<span class="nc" id="L891">            writeElement(id, clock, count, true, false);</span>
+<span class="nc" id="L892">        }</span>
+
+        // In 2.1 only used by the unit tests.
+        public void writeLocal(CounterId id, long clock, long count)
+        {
+<span class="nc" id="L897">            writeElement(id, clock, count, false, true);</span>
+<span class="nc" id="L898">        }</span>
+
+        // In 2.1 only used by the unit tests.
+        public void writeRemote(CounterId id, long clock, long count)
+        {
+<span class="nc" id="L903">            writeElement(id, clock, count, false, false);</span>
+<span class="nc" id="L904">        }</span>
+
+        private void writeElement(CounterId id, long clock, long count, boolean isGlobal, boolean isLocal)
+        {
+<span class="nc" id="L908">            writeElementAtOffset(context, context.position() + bodyOffset, id, clock, count);</span>
+
+<span class="nc bnc" id="L910" title="All 2 branches missed.">            if (isGlobal)</span>
+<span class="nc" id="L911">                context.putShort(context.position() + headerOffset, (short) (getElementIndex() + Short.MIN_VALUE));</span>
+<span class="nc bnc" id="L912" title="All 2 branches missed.">            else if (isLocal)</span>
+<span class="nc" id="L913">                context.putShort(context.position() + headerOffset, (short) getElementIndex());</span>
+
+<span class="nc" id="L915">            currentIsGlobal = isGlobal;</span>
+<span class="nc" id="L916">            currentIsLocal = isLocal;</span>
+<span class="nc" id="L917">            moveToNext();</span>
+<span class="nc" id="L918">        }</span>
+
+        // write a tuple (counter id, clock, count) at an absolute (bytebuffer-wise) offset
+        private void writeElementAtOffset(ByteBuffer ctx, int offset, CounterId id, long clock, long count)
+        {
+<span class="nc" id="L923">            ctx = ctx.duplicate();</span>
+<span class="nc" id="L924">            ctx.position(offset);</span>
+<span class="nc" id="L925">            ctx.put(id.bytes().duplicate());</span>
+<span class="nc" id="L926">            ctx.putLong(clock);</span>
+<span class="nc" id="L927">            ctx.putLong(count);</span>
+<span class="nc" id="L928">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

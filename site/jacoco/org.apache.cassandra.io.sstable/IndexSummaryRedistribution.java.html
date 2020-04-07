@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IndexSummaryRedistribution.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">IndexSummaryRedistribution.java</span></div><h1>IndexSummaryRedistribution.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.io.sstable;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionInfo;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.compaction.CompactionInfo.Unit;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.io.sstable.Downsampling.BASE_SAMPLING_LEVEL;
+
+public class IndexSummaryRedistribution extends CompactionInfo.Holder
+{
+<span class="nc" id="L53">    private static final Logger logger = LoggerFactory.getLogger(IndexSummaryRedistribution.class);</span>
+
+    // The target (or ideal) number of index summary entries must differ from the actual number of
+    // entries by this ratio in order to trigger an upsample or downsample of the summary.  Because
+    // upsampling requires reading the primary index in order to rebuild the summary, the threshold
+    // for upsampling is is higher.
+    static final double UPSAMPLE_THRESHOLD = 1.5;
+    static final double DOWNSAMPLE_THESHOLD = 0.75;
+
+    private final List&lt;SSTableReader&gt; compacting;
+    private final Map&lt;UUID, LifecycleTransaction&gt; transactions;
+    private final long memoryPoolBytes;
+    private final UUID compactionId;
+    private volatile long remainingSpace;
+
+    public IndexSummaryRedistribution(List&lt;SSTableReader&gt; compacting, Map&lt;UUID, LifecycleTransaction&gt; transactions, long memoryPoolBytes)
+<span class="nc" id="L69">    {</span>
+<span class="nc" id="L70">        this.compacting = compacting;</span>
+<span class="nc" id="L71">        this.transactions = transactions;</span>
+<span class="nc" id="L72">        this.memoryPoolBytes = memoryPoolBytes;</span>
+<span class="nc" id="L73">        this.compactionId = UUID.randomUUID();</span>
+<span class="nc" id="L74">    }</span>
+
+    public List&lt;SSTableReader&gt; redistributeSummaries() throws IOException
+    {
+<span class="nc" id="L78">        logger.info(&quot;Redistributing index summaries&quot;);</span>
+<span class="nc" id="L79">        List&lt;SSTableReader&gt; oldFormatSSTables = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L80">        List&lt;SSTableReader&gt; redistribute = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">        for (LifecycleTransaction txn : transactions.values())</span>
+        {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            for (SSTableReader sstable : ImmutableList.copyOf(txn.originals()))</span>
+            {
+                // We can't change the sampling level of sstables with the old format, because the serialization format
+                // doesn't include the sampling level.  Leave this one as it is.  (See CASSANDRA-8993 for details.)
+<span class="nc" id="L87">                logger.trace(&quot;SSTable {} cannot be re-sampled due to old sstable format&quot;, sstable);</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">                if (!sstable.descriptor.version.hasSamplingLevel())</span>
+                {
+<span class="nc" id="L90">                    oldFormatSSTables.add(sstable);</span>
+<span class="nc" id="L91">                    txn.cancel(sstable);</span>
+                }
+<span class="nc" id="L93">            }</span>
+<span class="nc" id="L94">            redistribute.addAll(txn.originals());</span>
+<span class="nc" id="L95">        }</span>
+
+<span class="nc" id="L97">        long total = 0;</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        for (SSTableReader sstable : Iterables.concat(compacting, redistribute))</span>
+<span class="nc" id="L99">            total += sstable.getIndexSummaryOffHeapSize();</span>
+
+<span class="nc" id="L101">        logger.trace(&quot;Beginning redistribution of index summaries for {} sstables with memory pool size {} MB; current spaced used is {} MB&quot;,</span>
+<span class="nc" id="L102">                     redistribute.size(), memoryPoolBytes / 1024L / 1024L, total / 1024.0 / 1024.0);</span>
+
+<span class="nc" id="L104">        final Map&lt;SSTableReader, Double&gt; readRates = new HashMap&lt;&gt;(redistribute.size());</span>
+<span class="nc" id="L105">        double totalReadsPerSec = 0.0;</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        for (SSTableReader sstable : redistribute)</span>
+        {
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (isStopRequested())</span>
+<span class="nc" id="L109">                throw new CompactionInterruptedException(getCompactionInfo());</span>
+
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (sstable.getReadMeter() != null)</span>
+            {
+<span class="nc" id="L113">                Double readRate = sstable.getReadMeter().fifteenMinuteRate();</span>
+<span class="nc" id="L114">                totalReadsPerSec += readRate;</span>
+<span class="nc" id="L115">                readRates.put(sstable, readRate);</span>
+            }
+<span class="nc" id="L117">        }</span>
+<span class="nc" id="L118">        logger.trace(&quot;Total reads/sec across all sstables in index summary resize process: {}&quot;, totalReadsPerSec);</span>
+
+        // copy and sort by read rates (ascending)
+<span class="nc" id="L121">        List&lt;SSTableReader&gt; sstablesByHotness = new ArrayList&lt;&gt;(redistribute);</span>
+<span class="nc" id="L122">        Collections.sort(sstablesByHotness, new ReadRateComparator(readRates));</span>
+
+<span class="nc" id="L124">        long remainingBytes = memoryPoolBytes;</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        for (SSTableReader sstable : Iterables.concat(compacting, oldFormatSSTables))</span>
+<span class="nc" id="L126">            remainingBytes -= sstable.getIndexSummaryOffHeapSize();</span>
+
+<span class="nc" id="L128">        logger.trace(&quot;Index summaries for compacting SSTables are using {} MB of space&quot;,</span>
+<span class="nc" id="L129">                     (memoryPoolBytes - remainingBytes) / 1024.0 / 1024.0);</span>
+        List&lt;SSTableReader&gt; newSSTables;
+<span class="nc" id="L131">        try (Refs&lt;SSTableReader&gt; refs = Refs.ref(sstablesByHotness))</span>
+        {
+<span class="nc" id="L133">            newSSTables = adjustSamplingLevels(sstablesByHotness, transactions, totalReadsPerSec, remainingBytes);</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            for (LifecycleTransaction txn : transactions.values())</span>
+<span class="nc" id="L136">                txn.finish();</span>
+        }
+<span class="nc" id="L138">        total = 0;</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        for (SSTableReader sstable : Iterables.concat(compacting, oldFormatSSTables, newSSTables))</span>
+<span class="nc" id="L140">            total += sstable.getIndexSummaryOffHeapSize();</span>
+<span class="nc" id="L141">        logger.trace(&quot;Completed resizing of index summaries; current approximate memory used: {}&quot;,</span>
+<span class="nc" id="L142">                     FBUtilities.prettyPrintMemory(total));</span>
+
+<span class="nc" id="L144">        return newSSTables;</span>
+    }
+
+    private List&lt;SSTableReader&gt; adjustSamplingLevels(List&lt;SSTableReader&gt; sstables,
+                                                     Map&lt;UUID, LifecycleTransaction&gt; transactions,
+                                                     double totalReadsPerSec, long memoryPoolCapacity) throws IOException
+    {
+<span class="nc" id="L151">        List&lt;ResampleEntry&gt; toDownsample = new ArrayList&lt;&gt;(sstables.size() / 4);</span>
+<span class="nc" id="L152">        List&lt;ResampleEntry&gt; toUpsample = new ArrayList&lt;&gt;(sstables.size() / 4);</span>
+<span class="nc" id="L153">        List&lt;ResampleEntry&gt; forceResample = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L154">        List&lt;ResampleEntry&gt; forceUpsample = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L155">        List&lt;SSTableReader&gt; newSSTables = new ArrayList&lt;&gt;(sstables.size());</span>
+
+        // Going from the coldest to the hottest sstables, try to give each sstable an amount of space proportional
+        // to the number of total reads/sec it handles.
+<span class="nc" id="L159">        remainingSpace = memoryPoolCapacity;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (isStopRequested())</span>
+<span class="nc" id="L163">                throw new CompactionInterruptedException(getCompactionInfo());</span>
+
+<span class="nc" id="L165">            int minIndexInterval = sstable.metadata.params.minIndexInterval;</span>
+<span class="nc" id="L166">            int maxIndexInterval = sstable.metadata.params.maxIndexInterval;</span>
+
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            double readsPerSec = sstable.getReadMeter() == null ? 0.0 : sstable.getReadMeter().fifteenMinuteRate();</span>
+<span class="nc" id="L169">            long idealSpace = Math.round(remainingSpace * (readsPerSec / totalReadsPerSec));</span>
+
+            // figure out how many entries our idealSpace would buy us, and pick a new sampling level based on that
+<span class="nc" id="L172">            int currentNumEntries = sstable.getIndexSummarySize();</span>
+<span class="nc" id="L173">            double avgEntrySize = sstable.getIndexSummaryOffHeapSize() / (double) currentNumEntries;</span>
+<span class="nc" id="L174">            long targetNumEntries = Math.max(1, Math.round(idealSpace / avgEntrySize));</span>
+<span class="nc" id="L175">            int currentSamplingLevel = sstable.getIndexSummarySamplingLevel();</span>
+<span class="nc" id="L176">            int maxSummarySize = sstable.getMaxIndexSummarySize();</span>
+
+            // if the min_index_interval changed, calculate what our current sampling level would be under the new min
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (sstable.getMinIndexInterval() != minIndexInterval)</span>
+            {
+<span class="nc" id="L181">                int effectiveSamplingLevel = (int) Math.round(currentSamplingLevel * (minIndexInterval / (double) sstable.getMinIndexInterval()));</span>
+<span class="nc" id="L182">                maxSummarySize = (int) Math.round(maxSummarySize * (sstable.getMinIndexInterval() / (double) minIndexInterval));</span>
+<span class="nc" id="L183">                logger.trace(&quot;min_index_interval changed from {} to {}, so the current sampling level for {} is effectively now {} (was {})&quot;,</span>
+<span class="nc" id="L184">                             sstable.getMinIndexInterval(), minIndexInterval, sstable, effectiveSamplingLevel, currentSamplingLevel);</span>
+<span class="nc" id="L185">                currentSamplingLevel = effectiveSamplingLevel;</span>
+            }
+
+<span class="nc" id="L188">            int newSamplingLevel = IndexSummaryBuilder.calculateSamplingLevel(currentSamplingLevel, currentNumEntries, targetNumEntries,</span>
+                    minIndexInterval, maxIndexInterval);
+<span class="nc" id="L190">            int numEntriesAtNewSamplingLevel = IndexSummaryBuilder.entriesAtSamplingLevel(newSamplingLevel, maxSummarySize);</span>
+<span class="nc" id="L191">            double effectiveIndexInterval = sstable.getEffectiveIndexInterval();</span>
+
+<span class="nc" id="L193">            logger.trace(&quot;{} has {} reads/sec; ideal space for index summary: {} ({} entries); considering moving &quot; +</span>
+                    &quot;from level {} ({} entries, {}) &quot; +
+                    &quot;to level {} ({} entries, {})&quot;,
+<span class="nc" id="L196">                    sstable.getFilename(), readsPerSec, FBUtilities.prettyPrintMemory(idealSpace), targetNumEntries,</span>
+<span class="nc" id="L197">                    currentSamplingLevel, currentNumEntries, FBUtilities.prettyPrintMemory((long) (currentNumEntries * avgEntrySize)),</span>
+<span class="nc" id="L198">                    newSamplingLevel, numEntriesAtNewSamplingLevel, FBUtilities.prettyPrintMemory((long) (numEntriesAtNewSamplingLevel * avgEntrySize)));</span>
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (effectiveIndexInterval &lt; minIndexInterval)</span>
+            {
+                // The min_index_interval was changed; re-sample to match it.
+<span class="nc" id="L203">                logger.trace(&quot;Forcing resample of {} because the current index interval ({}) is below min_index_interval ({})&quot;,</span>
+<span class="nc" id="L204">                        sstable, effectiveIndexInterval, minIndexInterval);</span>
+<span class="nc" id="L205">                long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);</span>
+<span class="nc" id="L206">                forceResample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));</span>
+<span class="nc" id="L207">                remainingSpace -= spaceUsed;</span>
+<span class="nc" id="L208">            }</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">            else if (effectiveIndexInterval &gt; maxIndexInterval)</span>
+            {
+                // The max_index_interval was lowered; force an upsample to the effective minimum sampling level
+<span class="nc" id="L212">                logger.trace(&quot;Forcing upsample of {} because the current index interval ({}) is above max_index_interval ({})&quot;,</span>
+<span class="nc" id="L213">                        sstable, effectiveIndexInterval, maxIndexInterval);</span>
+<span class="nc" id="L214">                newSamplingLevel = Math.max(1, (BASE_SAMPLING_LEVEL * minIndexInterval) / maxIndexInterval);</span>
+<span class="nc" id="L215">                numEntriesAtNewSamplingLevel = IndexSummaryBuilder.entriesAtSamplingLevel(newSamplingLevel, sstable.getMaxIndexSummarySize());</span>
+<span class="nc" id="L216">                long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);</span>
+<span class="nc" id="L217">                forceUpsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));</span>
+<span class="nc" id="L218">                remainingSpace -= avgEntrySize * numEntriesAtNewSamplingLevel;</span>
+<span class="nc" id="L219">            }</span>
+<span class="nc bnc" id="L220" title="All 4 branches missed.">            else if (targetNumEntries &gt;= currentNumEntries * UPSAMPLE_THRESHOLD &amp;&amp; newSamplingLevel &gt; currentSamplingLevel)</span>
+            {
+<span class="nc" id="L222">                long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);</span>
+<span class="nc" id="L223">                toUpsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));</span>
+<span class="nc" id="L224">                remainingSpace -= avgEntrySize * numEntriesAtNewSamplingLevel;</span>
+<span class="nc" id="L225">            }</span>
+<span class="nc bnc" id="L226" title="All 4 branches missed.">            else if (targetNumEntries &lt; currentNumEntries * DOWNSAMPLE_THESHOLD &amp;&amp; newSamplingLevel &lt; currentSamplingLevel)</span>
+            {
+<span class="nc" id="L228">                long spaceUsed = (long) Math.ceil(avgEntrySize * numEntriesAtNewSamplingLevel);</span>
+<span class="nc" id="L229">                toDownsample.add(new ResampleEntry(sstable, spaceUsed, newSamplingLevel));</span>
+<span class="nc" id="L230">                remainingSpace -= spaceUsed;</span>
+<span class="nc" id="L231">            }</span>
+            else
+            {
+                // keep the same sampling level
+<span class="nc" id="L235">                logger.trace(&quot;SSTable {} is within thresholds of ideal sampling&quot;, sstable);</span>
+<span class="nc" id="L236">                remainingSpace -= sstable.getIndexSummaryOffHeapSize();</span>
+<span class="nc" id="L237">                newSSTables.add(sstable);</span>
+<span class="nc" id="L238">                transactions.get(sstable.metadata.cfId).cancel(sstable);</span>
+            }
+<span class="nc" id="L240">            totalReadsPerSec -= readsPerSec;</span>
+<span class="nc" id="L241">        }</span>
+
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (remainingSpace &gt; 0)</span>
+        {
+<span class="nc" id="L245">            Pair&lt;List&lt;SSTableReader&gt;, List&lt;ResampleEntry&gt;&gt; result = distributeRemainingSpace(toDownsample, remainingSpace);</span>
+<span class="nc" id="L246">            toDownsample = result.right;</span>
+<span class="nc" id="L247">            newSSTables.addAll(result.left);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">            for (SSTableReader sstable : result.left)</span>
+<span class="nc" id="L249">                transactions.get(sstable.metadata.cfId).cancel(sstable);</span>
+        }
+
+        // downsample first, then upsample
+<span class="nc" id="L253">        toDownsample.addAll(forceResample);</span>
+<span class="nc" id="L254">        toDownsample.addAll(toUpsample);</span>
+<span class="nc" id="L255">        toDownsample.addAll(forceUpsample);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        for (ResampleEntry entry : toDownsample)</span>
+        {
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (isStopRequested())</span>
+<span class="nc" id="L259">                throw new CompactionInterruptedException(getCompactionInfo());</span>
+
+<span class="nc" id="L261">            SSTableReader sstable = entry.sstable;</span>
+<span class="nc" id="L262">            logger.trace(&quot;Re-sampling index summary for {} from {}/{} to {}/{} of the original number of entries&quot;,</span>
+<span class="nc" id="L263">                         sstable, sstable.getIndexSummarySamplingLevel(), Downsampling.BASE_SAMPLING_LEVEL,</span>
+<span class="nc" id="L264">                         entry.newSamplingLevel, Downsampling.BASE_SAMPLING_LEVEL);</span>
+<span class="nc" id="L265">            ColumnFamilyStore cfs = Keyspace.open(sstable.metadata.ksName).getColumnFamilyStore(sstable.metadata.cfId);</span>
+<span class="nc" id="L266">            SSTableReader replacement = sstable.cloneWithNewSummarySamplingLevel(cfs, entry.newSamplingLevel);</span>
+<span class="nc" id="L267">            newSSTables.add(replacement);</span>
+<span class="nc" id="L268">            transactions.get(sstable.metadata.cfId).update(replacement, true);</span>
+<span class="nc" id="L269">        }</span>
+
+<span class="nc" id="L271">        return newSSTables;</span>
+    }
+
+    @VisibleForTesting
+    static Pair&lt;List&lt;SSTableReader&gt;, List&lt;ResampleEntry&gt;&gt; distributeRemainingSpace(List&lt;ResampleEntry&gt; toDownsample, long remainingSpace)
+    {
+        // sort by the amount of space regained by doing the downsample operation; we want to try to avoid operations
+        // that will make little difference.
+<span class="nc" id="L279">        Collections.sort(toDownsample, new Comparator&lt;ResampleEntry&gt;()</span>
+<span class="nc" id="L280">        {</span>
+            public int compare(ResampleEntry o1, ResampleEntry o2)
+            {
+<span class="nc" id="L283">                return Double.compare(o1.sstable.getIndexSummaryOffHeapSize() - o1.newSpaceUsed,</span>
+<span class="nc" id="L284">                                      o2.sstable.getIndexSummaryOffHeapSize() - o2.newSpaceUsed);</span>
+            }
+        });
+
+<span class="nc" id="L288">        int noDownsampleCutoff = 0;</span>
+<span class="nc" id="L289">        List&lt;SSTableReader&gt; willNotDownsample = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">        while (remainingSpace &gt; 0 &amp;&amp; noDownsampleCutoff &lt; toDownsample.size())</span>
+        {
+<span class="nc" id="L292">            ResampleEntry entry = toDownsample.get(noDownsampleCutoff);</span>
+
+<span class="nc" id="L294">            long extraSpaceRequired = entry.sstable.getIndexSummaryOffHeapSize() - entry.newSpaceUsed;</span>
+            // see if we have enough leftover space to keep the current sampling level
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            if (extraSpaceRequired &lt;= remainingSpace)</span>
+            {
+<span class="nc" id="L298">                logger.trace(&quot;Using leftover space to keep {} at the current sampling level ({})&quot;,</span>
+<span class="nc" id="L299">                             entry.sstable, entry.sstable.getIndexSummarySamplingLevel());</span>
+<span class="nc" id="L300">                willNotDownsample.add(entry.sstable);</span>
+<span class="nc" id="L301">                remainingSpace -= extraSpaceRequired;</span>
+            }
+            else
+            {
+                break;
+            }
+
+<span class="nc" id="L308">            noDownsampleCutoff++;</span>
+<span class="nc" id="L309">        }</span>
+<span class="nc" id="L310">        return Pair.create(willNotDownsample, toDownsample.subList(noDownsampleCutoff, toDownsample.size()));</span>
+    }
+
+    public CompactionInfo getCompactionInfo()
+    {
+<span class="nc" id="L315">        return new CompactionInfo(OperationType.INDEX_SUMMARY, (memoryPoolBytes - remainingSpace), memoryPoolBytes, Unit.BYTES, compactionId);</span>
+    }
+
+    public boolean isGlobal()
+    {
+<span class="nc" id="L320">        return true;</span>
+    }
+
+    /** Utility class for sorting sstables by their read rates. */
+    private static class ReadRateComparator implements Comparator&lt;SSTableReader&gt;
+    {
+        private final Map&lt;SSTableReader, Double&gt; readRates;
+
+        ReadRateComparator(Map&lt;SSTableReader, Double&gt; readRates)
+<span class="nc" id="L329">        {</span>
+<span class="nc" id="L330">            this.readRates = readRates;</span>
+<span class="nc" id="L331">        }</span>
+
+        @Override
+        public int compare(SSTableReader o1, SSTableReader o2)
+        {
+<span class="nc" id="L336">            Double readRate1 = readRates.get(o1);</span>
+<span class="nc" id="L337">            Double readRate2 = readRates.get(o2);</span>
+<span class="nc bnc" id="L338" title="All 4 branches missed.">            if (readRate1 == null &amp;&amp; readRate2 == null)</span>
+<span class="nc" id="L339">                return 0;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            else if (readRate1 == null)</span>
+<span class="nc" id="L341">                return -1;</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            else if (readRate2 == null)</span>
+<span class="nc" id="L343">                return 1;</span>
+            else
+<span class="nc" id="L345">                return Double.compare(readRate1, readRate2);</span>
+        }
+    }
+
+    private static class ResampleEntry
+    {
+        public final SSTableReader sstable;
+        public final long newSpaceUsed;
+        public final int newSamplingLevel;
+
+        ResampleEntry(SSTableReader sstable, long newSpaceUsed, int newSamplingLevel)
+<span class="nc" id="L356">        {</span>
+<span class="nc" id="L357">            this.sstable = sstable;</span>
+<span class="nc" id="L358">            this.newSpaceUsed = newSpaceUsed;</span>
+<span class="nc" id="L359">            this.newSamplingLevel = newSamplingLevel;</span>
+<span class="nc" id="L360">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

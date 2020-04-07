@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CipherFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.security</a> &gt; <span class="el_source">CipherFactory.java</span></div><h1>CipherFactory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.security;
+
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.Key;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.concurrent.ExecutionException;
+import javax.crypto.Cipher;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.IvParameterSpec;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.cache.RemovalListener;
+import com.google.common.cache.RemovalNotification;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.config.TransparentDataEncryptionOptions;
+
+/**
+ * A factory for loading encryption keys from {@link KeyProvider} instances.
+ * Maintains a cache of loaded keys to avoid invoking the key provider on every call.
+ */
+<span class="nc bnc" id="L49" title="All 2 branches missed.">public class CipherFactory</span>
+{
+<span class="nc" id="L51">    private final Logger logger = LoggerFactory.getLogger(CipherFactory.class);</span>
+
+    /**
+     * Keep around thread local instances of Cipher as they are quite expensive to instantiate (@code Cipher#getInstance).
+     * Bonus points if you can avoid calling (@code Cipher#init); hence, the point of the supporting struct
+     * for caching Cipher instances.
+     */
+<span class="nc" id="L58">    private static final FastThreadLocal&lt;CachedCipher&gt; cipherThreadLocal = new FastThreadLocal&lt;&gt;();</span>
+
+    private final SecureRandom secureRandom;
+    private final LoadingCache&lt;String, Key&gt; cache;
+    private final int ivLength;
+    private final KeyProvider keyProvider;
+
+    public CipherFactory(TransparentDataEncryptionOptions options)
+<span class="nc" id="L66">    {</span>
+<span class="nc" id="L67">        logger.info(&quot;initializing CipherFactory&quot;);</span>
+<span class="nc" id="L68">        ivLength = options.iv_length;</span>
+
+        try
+        {
+<span class="nc" id="L72">            secureRandom = SecureRandom.getInstance(&quot;SHA1PRNG&quot;);</span>
+<span class="nc" id="L73">            Class&lt;KeyProvider&gt; keyProviderClass = (Class&lt;KeyProvider&gt;)Class.forName(options.key_provider.class_name);</span>
+<span class="nc" id="L74">            Constructor ctor = keyProviderClass.getConstructor(TransparentDataEncryptionOptions.class);</span>
+<span class="nc" id="L75">            keyProvider = (KeyProvider)ctor.newInstance(options);</span>
+        }
+<span class="nc" id="L77">        catch (Exception e)</span>
+        {
+<span class="nc" id="L79">            throw new RuntimeException(&quot;couldn't load cipher factory&quot;, e);</span>
+<span class="nc" id="L80">        }</span>
+
+<span class="nc" id="L82">        cache = CacheBuilder.newBuilder() // by default cache is unbounded</span>
+<span class="nc" id="L83">                .maximumSize(64) // a value large enough that we should never even get close (so nothing gets evicted)</span>
+<span class="nc" id="L84">                .concurrencyLevel(Runtime.getRuntime().availableProcessors())</span>
+<span class="nc" id="L85">                .removalListener(new RemovalListener&lt;String, Key&gt;()</span>
+<span class="nc" id="L86">                {</span>
+                    public void onRemoval(RemovalNotification&lt;String, Key&gt; notice)
+                    {
+                        // maybe reload the key? (to avoid the reload being on the user's dime)
+<span class="nc" id="L90">                        logger.info(&quot;key {} removed from cipher key cache&quot;, notice.getKey());</span>
+<span class="nc" id="L91">                    }</span>
+                })
+<span class="nc" id="L93">                .build(new CacheLoader&lt;String, Key&gt;()</span>
+<span class="nc" id="L94">                {</span>
+                    @Override
+                    public Key load(String alias) throws Exception
+                    {
+<span class="nc" id="L98">                        logger.info(&quot;loading secret key for alias {}&quot;, alias);</span>
+<span class="nc" id="L99">                        return keyProvider.getSecretKey(alias);</span>
+                    }
+                });
+<span class="nc" id="L102">    }</span>
+
+    public Cipher getEncryptor(String transformation, String keyAlias) throws IOException
+    {
+<span class="nc" id="L106">        byte[] iv = new byte[ivLength];</span>
+<span class="nc" id="L107">        secureRandom.nextBytes(iv);</span>
+<span class="nc" id="L108">        return buildCipher(transformation, keyAlias, iv, Cipher.ENCRYPT_MODE);</span>
+    }
+
+    public Cipher getDecryptor(String transformation, String keyAlias, byte[] iv) throws IOException
+    {
+<span class="nc bnc" id="L113" title="All 6 branches missed.">        assert iv != null &amp;&amp; iv.length &gt; 0 : &quot;trying to decrypt, but the initialization vector is empty&quot;;</span>
+<span class="nc" id="L114">        return buildCipher(transformation, keyAlias, iv, Cipher.DECRYPT_MODE);</span>
+    }
+
+    @VisibleForTesting
+    Cipher buildCipher(String transformation, String keyAlias, byte[] iv, int cipherMode) throws IOException
+    {
+        try
+        {
+<span class="nc" id="L122">            CachedCipher cachedCipher = cipherThreadLocal.get();</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">            if (cachedCipher != null)</span>
+            {
+<span class="nc" id="L125">                Cipher cipher = cachedCipher.cipher;</span>
+                // rigorous checks to make sure we've absolutely got the correct instance (with correct alg/key/iv/...)
+<span class="nc bnc" id="L127" title="All 4 branches missed.">                if (cachedCipher.mode == cipherMode &amp;&amp; cipher.getAlgorithm().equals(transformation)</span>
+<span class="nc bnc" id="L128" title="All 4 branches missed.">                    &amp;&amp; cachedCipher.keyAlias.equals(keyAlias) &amp;&amp; Arrays.equals(cipher.getIV(), iv))</span>
+<span class="nc" id="L129">                    return cipher;</span>
+            }
+
+<span class="nc" id="L132">            Key key = retrieveKey(keyAlias);</span>
+<span class="nc" id="L133">            Cipher cipher = Cipher.getInstance(transformation);</span>
+<span class="nc" id="L134">            cipher.init(cipherMode, key, new IvParameterSpec(iv));</span>
+<span class="nc" id="L135">            cipherThreadLocal.set(new CachedCipher(cipherMode, keyAlias, cipher));</span>
+<span class="nc" id="L136">            return cipher;</span>
+        }
+<span class="nc" id="L138">        catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidAlgorithmParameterException | InvalidKeyException e)</span>
+        {
+<span class="nc" id="L140">            logger.error(&quot;could not build cipher&quot;, e);</span>
+<span class="nc" id="L141">            throw new IOException(&quot;cannot load cipher&quot;, e);</span>
+        }
+    }
+
+    private Key retrieveKey(String keyAlias) throws IOException
+    {
+        try
+        {
+<span class="nc" id="L149">            return cache.get(keyAlias);</span>
+        }
+<span class="nc" id="L151">        catch (ExecutionException e)</span>
+        {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (e.getCause() instanceof IOException)</span>
+<span class="nc" id="L154">                throw (IOException)e.getCause();</span>
+<span class="nc" id="L155">            throw new IOException(&quot;failed to load key from cache: &quot; + keyAlias, e);</span>
+        }
+    }
+
+    /**
+     * A simple struct to use with the thread local caching of Cipher as we can't get the mode (encrypt/decrypt) nor
+     * key_alias (or key!) from the Cipher itself to use for comparisons
+     */
+    private static class CachedCipher
+    {
+        public final int mode;
+        public final String keyAlias;
+        public final Cipher cipher;
+
+        private CachedCipher(int mode, String keyAlias, Cipher cipher)
+<span class="nc" id="L170">        {</span>
+<span class="nc" id="L171">            this.mode = mode;</span>
+<span class="nc" id="L172">            this.keyAlias = keyAlias;</span>
+<span class="nc" id="L173">            this.cipher = cipher;</span>
+<span class="nc" id="L174">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

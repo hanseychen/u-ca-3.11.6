@@ -1,0 +1,2824 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StorageProxy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">StorageProxy.java</span></div><h1>StorageProxy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.base.Predicate;
+import com.google.common.cache.CacheLoader;
+import com.google.common.collect.*;
+import com.google.common.primitives.Ints;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import org.apache.commons.lang3.StringUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.batchlog.Batch;
+import org.apache.cassandra.batchlog.BatchlogManager;
+import org.apache.cassandra.batchlog.LegacyBatchlogMigrator;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.view.ViewUtils;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.hints.Hint;
+import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.locator.*;
+import org.apache.cassandra.metrics.*;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PaxosState;
+import org.apache.cassandra.service.paxos.PrepareCallback;
+import org.apache.cassandra.service.paxos.ProposeCallback;
+import org.apache.cassandra.net.MessagingService.Verb;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.triggers.TriggerExecutor;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.AbstractIterator;
+
+<span class="pc bpc" id="L75" title="1 of 2 branches missed.">public class StorageProxy implements StorageProxyMBean</span>
+{
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.db:type=StorageProxy&quot;;
+<span class="fc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(StorageProxy.class);</span>
+
+    public static final String UNREACHABLE = &quot;UNREACHABLE&quot;;
+
+    private static final WritePerformer standardWritePerformer;
+    private static final WritePerformer counterWritePerformer;
+    private static final WritePerformer counterWriteOnCoordinatorPerformer;
+
+<span class="fc" id="L86">    public static final StorageProxy instance = new StorageProxy();</span>
+
+<span class="fc" id="L88">    private static volatile int maxHintsInProgress = 128 * FBUtilities.getAvailableProcessors();</span>
+<span class="fc" id="L89">    private static final CacheLoader&lt;InetAddress, AtomicInteger&gt; hintsInProgress = new CacheLoader&lt;InetAddress, AtomicInteger&gt;()</span>
+<span class="fc" id="L90">    {</span>
+        public AtomicInteger load(InetAddress inetAddress)
+        {
+<span class="nc" id="L93">            return new AtomicInteger(0);</span>
+        }
+    };
+<span class="fc" id="L96">    private static final ClientRequestMetrics readMetrics = new ClientRequestMetrics(&quot;Read&quot;);</span>
+<span class="fc" id="L97">    private static final ClientRequestMetrics rangeMetrics = new ClientRequestMetrics(&quot;RangeSlice&quot;);</span>
+<span class="fc" id="L98">    private static final ClientRequestMetrics writeMetrics = new ClientRequestMetrics(&quot;Write&quot;);</span>
+<span class="fc" id="L99">    private static final CASClientRequestMetrics casWriteMetrics = new CASClientRequestMetrics(&quot;CASWrite&quot;);</span>
+<span class="fc" id="L100">    private static final CASClientRequestMetrics casReadMetrics = new CASClientRequestMetrics(&quot;CASRead&quot;);</span>
+<span class="fc" id="L101">    private static final ViewWriteMetrics viewWriteMetrics = new ViewWriteMetrics(&quot;ViewWrite&quot;);</span>
+<span class="fc" id="L102">    private static final Map&lt;ConsistencyLevel, ClientRequestMetrics&gt; readMetricsMap = new EnumMap&lt;&gt;(ConsistencyLevel.class);</span>
+<span class="fc" id="L103">    private static final Map&lt;ConsistencyLevel, ClientRequestMetrics&gt; writeMetricsMap = new EnumMap&lt;&gt;(ConsistencyLevel.class);</span>
+
+    private static final double CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
+
+    private StorageProxy()
+    {
+    }
+
+    static
+    {
+<span class="fc" id="L113">        MBeanWrapper.instance.registerMBean(instance, MBEAN_NAME);</span>
+<span class="fc" id="L114">        HintsService.instance.registerMBean();</span>
+<span class="fc" id="L115">        HintedHandOffManager.instance.registerMBean();</span>
+
+<span class="fc" id="L117">        standardWritePerformer = new WritePerformer()</span>
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        {</span>
+            public void apply(IMutation mutation,
+                              Iterable&lt;InetAddress&gt; targets,
+                              AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                              String localDataCenter,
+                              ConsistencyLevel consistency_level)
+            throws OverloadedException
+            {
+<span class="pc bpc" id="L126" title="2 of 4 branches missed.">                assert mutation instanceof Mutation;</span>
+<span class="fc" id="L127">                sendToHintedEndpoints((Mutation) mutation, targets, responseHandler, localDataCenter, Stage.MUTATION);</span>
+<span class="fc" id="L128">            }</span>
+        };
+
+        /*
+         * We execute counter writes in 2 places: either directly in the coordinator node if it is a replica, or
+         * in CounterMutationVerbHandler on a replica othewise. The write must be executed on the COUNTER_MUTATION stage
+         * but on the latter case, the verb handler already run on the COUNTER_MUTATION stage, so we must not execute the
+         * underlying on the stage otherwise we risk a deadlock. Hence two different performer.
+         */
+<span class="fc" id="L137">        counterWritePerformer = new WritePerformer()</span>
+<span class="fc" id="L138">        {</span>
+            public void apply(IMutation mutation,
+                              Iterable&lt;InetAddress&gt; targets,
+                              AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                              String localDataCenter,
+                              ConsistencyLevel consistencyLevel)
+            {
+<span class="nc" id="L145">                counterWriteTask(mutation, targets, responseHandler, localDataCenter).run();</span>
+<span class="nc" id="L146">            }</span>
+        };
+
+<span class="fc" id="L149">        counterWriteOnCoordinatorPerformer = new WritePerformer()</span>
+<span class="fc" id="L150">        {</span>
+            public void apply(IMutation mutation,
+                              Iterable&lt;InetAddress&gt; targets,
+                              AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                              String localDataCenter,
+                              ConsistencyLevel consistencyLevel)
+            {
+<span class="nc" id="L157">                StageManager.getStage(Stage.COUNTER_MUTATION)</span>
+<span class="nc" id="L158">                            .execute(counterWriteTask(mutation, targets, responseHandler, localDataCenter));</span>
+<span class="nc" id="L159">            }</span>
+        };
+
+<span class="fc bfc" id="L162" title="All 2 branches covered.">        for(ConsistencyLevel level : ConsistencyLevel.values())</span>
+        {
+<span class="fc" id="L164">            readMetricsMap.put(level, new ClientRequestMetrics(&quot;Read-&quot; + level.name()));</span>
+<span class="fc" id="L165">            writeMetricsMap.put(level, new ClientRequestMetrics(&quot;Write-&quot; + level.name()));</span>
+        }
+<span class="fc" id="L167">    }</span>
+
+    /**
+     * Apply @param updates if and only if the current values in the row for @param key
+     * match the provided @param conditions.  The algorithm is &quot;raw&quot; Paxos: that is, Paxos
+     * minus leader election -- any node in the cluster may propose changes for any row,
+     * which (that is, the row) is the unit of values being proposed, not single columns.
+     *
+     * The Paxos cohort is only the replicas for the given key, not the entire cluster.
+     * So we expect performance to be reasonable, but CAS is still intended to be used
+     * &quot;when you really need it,&quot; not for all your updates.
+     *
+     * There are three phases to Paxos:
+     *  1. Prepare: the coordinator generates a ballot (timeUUID in our case) and asks replicas to (a) promise
+     *     not to accept updates from older ballots and (b) tell us about the most recent update it has already
+     *     accepted.
+     *  2. Accept: if a majority of replicas reply, the coordinator asks replicas to accept the value of the
+     *     highest proposal ballot it heard about, or a new value if no in-progress proposals were reported.
+     *  3. Commit (Learn): if a majority of replicas acknowledge the accept request, we can commit the new
+     *     value.
+     *
+     *  Commit procedure is not covered in &quot;Paxos Made Simple,&quot; and only briefly mentioned in &quot;Paxos Made Live,&quot;
+     *  so here is our approach:
+     *   3a. The coordinator sends a commit message to all replicas with the ballot and value.
+     *   3b. Because of 1-2, this will be the highest-seen commit ballot.  The replicas will note that,
+     *       and send it with subsequent promise replies.  This allows us to discard acceptance records
+     *       for successfully committed replicas, without allowing incomplete proposals to commit erroneously
+     *       later on.
+     *
+     *  Note that since we are performing a CAS rather than a simple update, we perform a read (of committed
+     *  values) between the prepare and accept phases.  This gives us a slightly longer window for another
+     *  coordinator to come along and trump our own promise with a newer one but is otherwise safe.
+     *
+     * @param keyspaceName the keyspace for the CAS
+     * @param cfName the column family for the CAS
+     * @param key the row key for the row to CAS
+     * @param request the conditions for the CAS to apply as well as the update to perform if the conditions hold.
+     * @param consistencyForPaxos the consistency for the paxos prepare and propose round. This can only be either SERIAL or LOCAL_SERIAL.
+     * @param consistencyForCommit the consistency for write done during the commit phase. This can be anything, except SERIAL or LOCAL_SERIAL.
+     *
+     * @return null if the operation succeeds in updating the row, or the current values corresponding to conditions.
+     * (since, if the CAS doesn't succeed, it means the current value do not match the conditions).
+     */
+    public static RowIterator cas(String keyspaceName,
+                                  String cfName,
+                                  DecoratedKey key,
+                                  CASRequest request,
+                                  ConsistencyLevel consistencyForPaxos,
+                                  ConsistencyLevel consistencyForCommit,
+                                  ClientState state,
+                                  long queryStartNanoTime)
+    throws UnavailableException, IsBootstrappingException, RequestFailureException, RequestTimeoutException, InvalidRequestException
+    {
+<span class="nc" id="L220">        final long startTimeForMetrics = System.nanoTime();</span>
+<span class="nc" id="L221">        int contentions = 0;</span>
+        try
+        {
+<span class="nc" id="L224">            consistencyForPaxos.validateForCas();</span>
+<span class="nc" id="L225">            consistencyForCommit.validateForCasCommit(keyspaceName);</span>
+
+<span class="nc" id="L227">            CFMetaData metadata = Schema.instance.getCFMetaData(keyspaceName, cfName);</span>
+
+<span class="nc" id="L229">            long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getCasContentionTimeout());</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            while (System.nanoTime() - queryStartNanoTime &lt; timeout)</span>
+            {
+                // for simplicity, we'll do a single liveness check at the start of each attempt
+<span class="nc" id="L233">                Pair&lt;List&lt;InetAddress&gt;, Integer&gt; p = getPaxosParticipants(metadata, key, consistencyForPaxos);</span>
+<span class="nc" id="L234">                List&lt;InetAddress&gt; liveEndpoints = p.left;</span>
+<span class="nc" id="L235">                int requiredParticipants = p.right;</span>
+
+<span class="nc" id="L237">                final Pair&lt;UUID, Integer&gt; pair = beginAndRepairPaxos(queryStartNanoTime, key, metadata, liveEndpoints, requiredParticipants, consistencyForPaxos, consistencyForCommit, true, state);</span>
+<span class="nc" id="L238">                final UUID ballot = pair.left;</span>
+<span class="nc" id="L239">                contentions += pair.right;</span>
+
+                // read the current values and check they validate the conditions
+<span class="nc" id="L242">                Tracing.trace(&quot;Reading existing values for CAS precondition&quot;);</span>
+<span class="nc" id="L243">                SinglePartitionReadCommand readCommand = request.readCommand(FBUtilities.nowInSeconds());</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                ConsistencyLevel readConsistency = consistencyForPaxos == ConsistencyLevel.LOCAL_SERIAL ? ConsistencyLevel.LOCAL_QUORUM : ConsistencyLevel.QUORUM;</span>
+
+                FilteredPartition current;
+<span class="nc" id="L247">                try (RowIterator rowIter = readOne(readCommand, readConsistency, queryStartNanoTime))</span>
+                {
+<span class="nc" id="L249">                    current = FilteredPartition.create(rowIter);</span>
+                }
+
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                if (!request.appliesTo(current))</span>
+                {
+<span class="nc" id="L254">                    Tracing.trace(&quot;CAS precondition does not match current values {}&quot;, current);</span>
+<span class="nc" id="L255">                    casWriteMetrics.conditionNotMet.inc();</span>
+<span class="nc" id="L256">                    return current.rowIterator();</span>
+                }
+
+                // finish the paxos round w/ the desired updates
+                // TODO turn null updates into delete?
+<span class="nc" id="L261">                PartitionUpdate updates = request.makeUpdates(current);</span>
+
+                // Apply triggers to cas updates. A consideration here is that
+                // triggers emit Mutations, and so a given trigger implementation
+                // may generate mutations for partitions other than the one this
+                // paxos round is scoped for. In this case, TriggerExecutor will
+                // validate that the generated mutations are targetted at the same
+                // partition as the initial updates and reject (via an
+                // InvalidRequestException) any which aren't.
+<span class="nc" id="L270">                updates = TriggerExecutor.instance.execute(updates);</span>
+
+
+<span class="nc" id="L273">                Commit proposal = Commit.newProposal(ballot, updates);</span>
+<span class="nc" id="L274">                Tracing.trace(&quot;CAS precondition is met; proposing client-requested updates for {}&quot;, ballot);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">                if (proposePaxos(proposal, liveEndpoints, requiredParticipants, true, consistencyForPaxos, queryStartNanoTime))</span>
+                {
+<span class="nc" id="L277">                    commitPaxos(proposal, consistencyForCommit, true, queryStartNanoTime);</span>
+<span class="nc" id="L278">                    Tracing.trace(&quot;CAS successful&quot;);</span>
+<span class="nc" id="L279">                    return null;</span>
+                }
+
+<span class="nc" id="L282">                Tracing.trace(&quot;Paxos proposal not accepted (pre-empted by a higher ballot)&quot;);</span>
+<span class="nc" id="L283">                contentions++;</span>
+<span class="nc" id="L284">                Uninterruptibles.sleepUninterruptibly(ThreadLocalRandom.current().nextInt(100), TimeUnit.MILLISECONDS);</span>
+                // continue to retry
+<span class="nc" id="L286">            }</span>
+
+<span class="nc" id="L288">            throw new WriteTimeoutException(WriteType.CAS, consistencyForPaxos, 0, consistencyForPaxos.blockFor(Keyspace.open(keyspaceName)));</span>
+        }
+<span class="nc" id="L290">        catch (WriteTimeoutException|ReadTimeoutException e)</span>
+        {
+<span class="nc" id="L292">            casWriteMetrics.timeouts.mark();</span>
+<span class="nc" id="L293">            writeMetricsMap.get(consistencyForPaxos).timeouts.mark();</span>
+<span class="nc" id="L294">            throw e;</span>
+        }
+<span class="nc" id="L296">        catch (WriteFailureException|ReadFailureException e)</span>
+        {
+<span class="nc" id="L298">            casWriteMetrics.failures.mark();</span>
+<span class="nc" id="L299">            writeMetricsMap.get(consistencyForPaxos).failures.mark();</span>
+<span class="nc" id="L300">            throw e;</span>
+        }
+<span class="nc" id="L302">        catch(UnavailableException e)</span>
+        {
+<span class="nc" id="L304">            casWriteMetrics.unavailables.mark();</span>
+<span class="nc" id="L305">            writeMetricsMap.get(consistencyForPaxos).unavailables.mark();</span>
+<span class="nc" id="L306">            throw e;</span>
+        }
+        finally
+        {
+<span class="nc" id="L310">            recordCasContention(contentions);</span>
+<span class="nc" id="L311">            final long latency = System.nanoTime() - startTimeForMetrics;</span>
+<span class="nc" id="L312">            casWriteMetrics.addNano(latency);</span>
+<span class="nc" id="L313">            writeMetricsMap.get(consistencyForPaxos).addNano(latency);</span>
+        }
+    }
+
+    private static void recordCasContention(int contentions)
+    {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if(contentions &gt; 0)</span>
+<span class="nc" id="L320">            casWriteMetrics.contention.update(contentions);</span>
+<span class="nc" id="L321">    }</span>
+
+    private static Predicate&lt;InetAddress&gt; sameDCPredicateFor(final String dc)
+    {
+<span class="nc" id="L325">        final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="nc" id="L326">        return new Predicate&lt;InetAddress&gt;()</span>
+<span class="nc" id="L327">        {</span>
+            public boolean apply(InetAddress host)
+            {
+<span class="nc" id="L330">                return dc.equals(snitch.getDatacenter(host));</span>
+            }
+        };
+    }
+
+    private static Pair&lt;List&lt;InetAddress&gt;, Integer&gt; getPaxosParticipants(CFMetaData cfm, DecoratedKey key, ConsistencyLevel consistencyForPaxos) throws UnavailableException
+    {
+<span class="nc" id="L337">        Token tk = key.getToken();</span>
+<span class="nc" id="L338">        List&lt;InetAddress&gt; naturalEndpoints = StorageService.instance.getNaturalEndpoints(cfm.ksName, tk);</span>
+<span class="nc" id="L339">        Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, cfm.ksName);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (consistencyForPaxos == ConsistencyLevel.LOCAL_SERIAL)</span>
+        {
+            // Restrict naturalEndpoints and pendingEndpoints to node in the local DC only
+<span class="nc" id="L343">            String localDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());</span>
+<span class="nc" id="L344">            Predicate&lt;InetAddress&gt; isLocalDc = sameDCPredicateFor(localDc);</span>
+<span class="nc" id="L345">            naturalEndpoints = ImmutableList.copyOf(Iterables.filter(naturalEndpoints, isLocalDc));</span>
+<span class="nc" id="L346">            pendingEndpoints = ImmutableList.copyOf(Iterables.filter(pendingEndpoints, isLocalDc));</span>
+        }
+<span class="nc" id="L348">        int participants = pendingEndpoints.size() + naturalEndpoints.size();</span>
+<span class="nc" id="L349">        int requiredParticipants = participants / 2 + 1; // See CASSANDRA-8346, CASSANDRA-833</span>
+<span class="nc" id="L350">        List&lt;InetAddress&gt; liveEndpoints = ImmutableList.copyOf(Iterables.filter(Iterables.concat(naturalEndpoints, pendingEndpoints), IAsyncCallback.isAlive));</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (liveEndpoints.size() &lt; requiredParticipants)</span>
+<span class="nc" id="L352">            throw new UnavailableException(consistencyForPaxos, requiredParticipants, liveEndpoints.size());</span>
+
+        // We cannot allow CAS operations with 2 or more pending endpoints, see #8346.
+        // Note that we fake an impossible number of required nodes in the unavailable exception
+        // to nail home the point that it's an impossible operation no matter how many nodes are live.
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (pendingEndpoints.size() &gt; 1)</span>
+<span class="nc" id="L358">            throw new UnavailableException(String.format(&quot;Cannot perform LWT operation as there is more than one (%d) pending range movement&quot;, pendingEndpoints.size()),</span>
+                                           consistencyForPaxos,
+                                           participants + 1,
+<span class="nc" id="L361">                                           liveEndpoints.size());</span>
+
+<span class="nc" id="L363">        return Pair.create(liveEndpoints, requiredParticipants);</span>
+    }
+
+    /**
+     * begin a Paxos session by sending a prepare request and completing any in-progress requests seen in the replies
+     *
+     * @return the Paxos ballot promised by the replicas if no in-progress requests were seen and a quorum of
+     * nodes have seen the mostRecentCommit.  Otherwise, return null.
+     */
+    private static Pair&lt;UUID, Integer&gt; beginAndRepairPaxos(long queryStartNanoTime,
+                                                           DecoratedKey key,
+                                                           CFMetaData metadata,
+                                                           List&lt;InetAddress&gt; liveEndpoints,
+                                                           int requiredParticipants,
+                                                           ConsistencyLevel consistencyForPaxos,
+                                                           ConsistencyLevel consistencyForCommit,
+                                                           final boolean isWrite,
+                                                           ClientState state)
+    throws WriteTimeoutException, WriteFailureException
+    {
+<span class="nc" id="L383">        long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getCasContentionTimeout());</span>
+
+<span class="nc" id="L385">        PrepareCallback summary = null;</span>
+<span class="nc" id="L386">        int contentions = 0;</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        while (System.nanoTime() - queryStartNanoTime &lt; timeout)</span>
+        {
+            // We want a timestamp that is guaranteed to be unique for that node (so that the ballot is globally unique), but if we've got a prepare rejected
+            // already we also want to make sure we pick a timestamp that has a chance to be promised, i.e. one that is greater that the most recently known
+            // in progress (#5667). Lastly, we don't want to use a timestamp that is older than the last one assigned by ClientState or operations may appear
+            // out-of-order (#7801).
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            long minTimestampMicrosToUse = summary == null ? Long.MIN_VALUE : 1 + UUIDGen.microsTimestamp(summary.mostRecentInProgressCommit.ballot);</span>
+<span class="nc" id="L394">            long ballotMicros = state.getTimestampForPaxos(minTimestampMicrosToUse);</span>
+            // Note that ballotMicros is not guaranteed to be unique if two proposal are being handled concurrently by the same coordinator. But we still
+            // need ballots to be unique for each proposal so we have to use getRandomTimeUUIDFromMicros.
+<span class="nc" id="L397">            UUID ballot = UUIDGen.getRandomTimeUUIDFromMicros(ballotMicros);</span>
+
+            // prepare
+<span class="nc" id="L400">            Tracing.trace(&quot;Preparing {}&quot;, ballot);</span>
+<span class="nc" id="L401">            Commit toPrepare = Commit.newPrepare(key, metadata, ballot);</span>
+<span class="nc" id="L402">            summary = preparePaxos(toPrepare, liveEndpoints, requiredParticipants, consistencyForPaxos, queryStartNanoTime);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if (!summary.promised)</span>
+            {
+<span class="nc" id="L405">                Tracing.trace(&quot;Some replicas have already promised a higher ballot than ours; aborting&quot;);</span>
+<span class="nc" id="L406">                contentions++;</span>
+                // sleep a random amount to give the other proposer a chance to finish
+<span class="nc" id="L408">                Uninterruptibles.sleepUninterruptibly(ThreadLocalRandom.current().nextInt(100), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L409">                continue;</span>
+            }
+
+<span class="nc" id="L412">            Commit inProgress = summary.mostRecentInProgressCommitWithUpdate;</span>
+<span class="nc" id="L413">            Commit mostRecent = summary.mostRecentCommit;</span>
+
+            // If we have an in-progress ballot greater than the MRC we know, then it's an in-progress round that
+            // needs to be completed, so do it.
+<span class="nc bnc" id="L417" title="All 4 branches missed.">            if (!inProgress.update.isEmpty() &amp;&amp; inProgress.isAfter(mostRecent))</span>
+            {
+<span class="nc" id="L419">                Tracing.trace(&quot;Finishing incomplete paxos round {}&quot;, inProgress);</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                if(isWrite)</span>
+<span class="nc" id="L421">                    casWriteMetrics.unfinishedCommit.inc();</span>
+                else
+<span class="nc" id="L423">                    casReadMetrics.unfinishedCommit.inc();</span>
+<span class="nc" id="L424">                Commit refreshedInProgress = Commit.newProposal(ballot, inProgress.update);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (proposePaxos(refreshedInProgress, liveEndpoints, requiredParticipants, false, consistencyForPaxos, queryStartNanoTime))</span>
+                {
+                    try
+                    {
+<span class="nc" id="L429">                        commitPaxos(refreshedInProgress, consistencyForCommit, false, queryStartNanoTime);</span>
+                    }
+<span class="nc" id="L431">                    catch (WriteTimeoutException e)</span>
+                    {
+<span class="nc" id="L433">                        recordCasContention(contentions);</span>
+                        // We're still doing preparation for the paxos rounds, so we want to use the CAS (see CASSANDRA-8672)
+<span class="nc" id="L435">                        throw new WriteTimeoutException(WriteType.CAS, e.consistency, e.received, e.blockFor);</span>
+<span class="nc" id="L436">                    }</span>
+                }
+                else
+                {
+<span class="nc" id="L440">                    Tracing.trace(&quot;Some replicas have already promised a higher ballot than ours; aborting&quot;);</span>
+                    // sleep a random amount to give the other proposer a chance to finish
+<span class="nc" id="L442">                    contentions++;</span>
+<span class="nc" id="L443">                    Uninterruptibles.sleepUninterruptibly(ThreadLocalRandom.current().nextInt(100), TimeUnit.MILLISECONDS);</span>
+                }
+<span class="nc" id="L445">                continue;</span>
+            }
+
+            // To be able to propose our value on a new round, we need a quorum of replica to have learn the previous one. Why is explained at:
+            // https://issues.apache.org/jira/browse/CASSANDRA-5062?focusedCommentId=13619810&amp;page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13619810)
+            // Since we waited for quorum nodes, if some of them haven't seen the last commit (which may just be a timing issue, but may also
+            // mean we lost messages), we pro-actively &quot;repair&quot; those nodes, and retry.
+<span class="nc" id="L452">            int nowInSec = Ints.checkedCast(TimeUnit.MICROSECONDS.toSeconds(ballotMicros));</span>
+<span class="nc" id="L453">            Iterable&lt;InetAddress&gt; missingMRC = summary.replicasMissingMostRecentCommit(metadata, nowInSec);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">            if (Iterables.size(missingMRC) &gt; 0)</span>
+            {
+<span class="nc" id="L456">                Tracing.trace(&quot;Repairing replicas that missed the most recent commit&quot;);</span>
+<span class="nc" id="L457">                sendCommit(mostRecent, missingMRC);</span>
+                // TODO: provided commits don't invalid the prepare we just did above (which they don't), we could just wait
+                // for all the missingMRC to acknowledge this commit and then move on with proposing our value. But that means
+                // adding the ability to have commitPaxos block, which is exactly CASSANDRA-5442 will do. So once we have that
+                // latter ticket, we can pass CL.ALL to the commit above and remove the 'continue'.
+<span class="nc" id="L462">                continue;</span>
+            }
+
+<span class="nc" id="L465">            return Pair.create(ballot, contentions);</span>
+        }
+
+<span class="nc" id="L468">        recordCasContention(contentions);</span>
+<span class="nc" id="L469">        throw new WriteTimeoutException(WriteType.CAS, consistencyForPaxos, 0, consistencyForPaxos.blockFor(Keyspace.open(metadata.ksName)));</span>
+    }
+
+    /**
+     * Unlike commitPaxos, this does not wait for replies
+     */
+    private static void sendCommit(Commit commit, Iterable&lt;InetAddress&gt; replicas)
+    {
+<span class="nc" id="L477">        MessageOut&lt;Commit&gt; message = new MessageOut&lt;Commit&gt;(MessagingService.Verb.PAXOS_COMMIT, commit, Commit.serializer);</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">        for (InetAddress target : replicas)</span>
+<span class="nc" id="L479">            MessagingService.instance().sendOneWay(message, target);</span>
+<span class="nc" id="L480">    }</span>
+
+    private static PrepareCallback preparePaxos(Commit toPrepare, List&lt;InetAddress&gt; endpoints, int requiredParticipants, ConsistencyLevel consistencyForPaxos, long queryStartNanoTime)
+    throws WriteTimeoutException
+    {
+<span class="nc" id="L485">        PrepareCallback callback = new PrepareCallback(toPrepare.update.partitionKey(), toPrepare.update.metadata(), requiredParticipants, consistencyForPaxos, queryStartNanoTime);</span>
+<span class="nc" id="L486">        MessageOut&lt;Commit&gt; message = new MessageOut&lt;Commit&gt;(MessagingService.Verb.PAXOS_PREPARE, toPrepare, Commit.serializer);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        for (InetAddress target : endpoints)</span>
+<span class="nc" id="L488">            MessagingService.instance().sendRR(message, target, callback);</span>
+<span class="nc" id="L489">        callback.await();</span>
+<span class="nc" id="L490">        return callback;</span>
+    }
+
+    private static boolean proposePaxos(Commit proposal, List&lt;InetAddress&gt; endpoints, int requiredParticipants, boolean timeoutIfPartial, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    throws WriteTimeoutException
+    {
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        ProposeCallback callback = new ProposeCallback(endpoints.size(), requiredParticipants, !timeoutIfPartial, consistencyLevel, queryStartNanoTime);</span>
+<span class="nc" id="L497">        MessageOut&lt;Commit&gt; message = new MessageOut&lt;Commit&gt;(MessagingService.Verb.PAXOS_PROPOSE, proposal, Commit.serializer);</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        for (InetAddress target : endpoints)</span>
+<span class="nc" id="L499">            MessagingService.instance().sendRR(message, target, callback);</span>
+
+<span class="nc" id="L501">        callback.await();</span>
+
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (callback.isSuccessful())</span>
+<span class="nc" id="L504">            return true;</span>
+
+<span class="nc bnc" id="L506" title="All 4 branches missed.">        if (timeoutIfPartial &amp;&amp; !callback.isFullyRefused())</span>
+<span class="nc" id="L507">            throw new WriteTimeoutException(WriteType.CAS, consistencyLevel, callback.getAcceptCount(), requiredParticipants);</span>
+
+<span class="nc" id="L509">        return false;</span>
+    }
+
+    private static void commitPaxos(Commit proposal, ConsistencyLevel consistencyLevel, boolean allowHints, long queryStartNanoTime) throws WriteTimeoutException
+    {
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        boolean shouldBlock = consistencyLevel != ConsistencyLevel.ANY;</span>
+<span class="nc" id="L515">        Keyspace keyspace = Keyspace.open(proposal.update.metadata().ksName);</span>
+
+<span class="nc" id="L517">        Token tk = proposal.update.partitionKey().getToken();</span>
+<span class="nc" id="L518">        List&lt;InetAddress&gt; naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspace.getName(), tk);</span>
+<span class="nc" id="L519">        Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspace.getName());</span>
+
+<span class="nc" id="L521">        AbstractWriteResponseHandler&lt;Commit&gt; responseHandler = null;</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (shouldBlock)</span>
+        {
+<span class="nc" id="L524">            AbstractReplicationStrategy rs = keyspace.getReplicationStrategy();</span>
+<span class="nc" id="L525">            responseHandler = rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistencyLevel, null, WriteType.SIMPLE, queryStartNanoTime);</span>
+<span class="nc" id="L526">            responseHandler.setSupportsBackPressure(false);</span>
+        }
+
+<span class="nc" id="L529">        MessageOut&lt;Commit&gt; message = new MessageOut&lt;Commit&gt;(MessagingService.Verb.PAXOS_COMMIT, proposal, Commit.serializer);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        for (InetAddress destination : Iterables.concat(naturalEndpoints, pendingEndpoints))</span>
+        {
+<span class="nc" id="L532">            checkHintOverload(destination);</span>
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            if (FailureDetector.instance.isAlive(destination))</span>
+            {
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                if (shouldBlock)</span>
+                {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                    if (canDoLocalRequest(destination))</span>
+<span class="nc" id="L539">                        commitPaxosLocal(message, responseHandler);</span>
+                    else
+<span class="nc bnc" id="L541" title="All 4 branches missed.">                        MessagingService.instance().sendRR(message, destination, responseHandler, allowHints &amp;&amp; shouldHint(destination));</span>
+                }
+                else
+                {
+<span class="nc" id="L545">                    MessagingService.instance().sendOneWay(message, destination);</span>
+                }
+            }
+<span class="nc bnc" id="L548" title="All 4 branches missed.">            else if (allowHints &amp;&amp; shouldHint(destination))</span>
+            {
+<span class="nc" id="L550">                submitHint(proposal.makeMutation(), destination, null);</span>
+            }
+<span class="nc" id="L552">        }</span>
+
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if (shouldBlock)</span>
+<span class="nc" id="L555">            responseHandler.get();</span>
+<span class="nc" id="L556">    }</span>
+
+    /**
+     * Commit a PAXOS task locally, and if the task times out rather then submitting a real hint
+     * submit a fake one that executes immediately on the mutation stage, but generates the necessary backpressure
+     * signal for hints
+     */
+    private static void commitPaxosLocal(final MessageOut&lt;Commit&gt; message, final AbstractWriteResponseHandler&lt;?&gt; responseHandler)
+    {
+<span class="nc" id="L565">        StageManager.getStage(MessagingService.verbStages.get(MessagingService.Verb.PAXOS_COMMIT)).maybeExecuteImmediately(new LocalMutationRunnable()</span>
+<span class="nc" id="L566">        {</span>
+            public void runMayThrow()
+            {
+                try
+                {
+<span class="nc" id="L571">                    PaxosState.commit(message.payload);</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                    if (responseHandler != null)</span>
+<span class="nc" id="L573">                        responseHandler.response(null);</span>
+                }
+<span class="nc" id="L575">                catch (Exception ex)</span>
+                {
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    if (!(ex instanceof WriteTimeoutException))</span>
+<span class="nc" id="L578">                        logger.error(&quot;Failed to apply paxos commit locally : {}&quot;, ex);</span>
+<span class="nc" id="L579">                    responseHandler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.UNKNOWN);</span>
+<span class="nc" id="L580">                }</span>
+<span class="nc" id="L581">            }</span>
+
+            @Override
+            protected Verb verb()
+            {
+<span class="nc" id="L586">                return MessagingService.Verb.PAXOS_COMMIT;</span>
+            }
+        });
+<span class="nc" id="L589">    }</span>
+
+    /**
+     * Use this method to have these Mutations applied
+     * across all replicas. This method will take care
+     * of the possibility of a replica being down and hint
+     * the data across to some other replica.
+     *
+     * @param mutations the mutations to be applied across the replicas
+     * @param consistency_level the consistency level for the operation
+     * @param queryStartNanoTime the value of System.nanoTime() when the query started to be processed
+     */
+    public static void mutate(Collection&lt;? extends IMutation&gt; mutations, ConsistencyLevel consistency_level, long queryStartNanoTime)
+    throws UnavailableException, OverloadedException, WriteTimeoutException, WriteFailureException
+    {
+<span class="fc" id="L604">        Tracing.trace(&quot;Determining replicas for mutation&quot;);</span>
+<span class="fc" id="L605">        final String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());</span>
+
+<span class="fc" id="L607">        long startTime = System.nanoTime();</span>
+<span class="fc" id="L608">        List&lt;AbstractWriteResponseHandler&lt;IMutation&gt;&gt; responseHandlers = new ArrayList&lt;&gt;(mutations.size());</span>
+
+        try
+        {
+<span class="fc bfc" id="L612" title="All 2 branches covered.">            for (IMutation mutation : mutations)</span>
+            {
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">                if (mutation instanceof CounterMutation)</span>
+                {
+<span class="nc" id="L616">                    responseHandlers.add(mutateCounter((CounterMutation)mutation, localDataCenter, queryStartNanoTime));</span>
+                }
+                else
+                {
+<span class="pc bpc" id="L620" title="1 of 2 branches missed.">                    WriteType wt = mutations.size() &lt;= 1 ? WriteType.SIMPLE : WriteType.UNLOGGED_BATCH;</span>
+<span class="fc" id="L621">                    responseHandlers.add(performWrite(mutation, consistency_level, localDataCenter, standardWritePerformer, null, wt, queryStartNanoTime));</span>
+                }
+<span class="fc" id="L623">            }</span>
+
+            // wait for writes.  throws TimeoutException if necessary
+<span class="fc bfc" id="L626" title="All 2 branches covered.">            for (AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler : responseHandlers)</span>
+            {
+<span class="fc" id="L628">                responseHandler.get();</span>
+<span class="fc" id="L629">            }</span>
+        }
+<span class="nc" id="L631">        catch (WriteTimeoutException|WriteFailureException ex)</span>
+        {
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            if (consistency_level == ConsistencyLevel.ANY)</span>
+            {
+<span class="nc" id="L635">                hintMutations(mutations);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">                if (ex instanceof WriteFailureException)</span>
+                {
+<span class="nc" id="L641">                    writeMetrics.failures.mark();</span>
+<span class="nc" id="L642">                    writeMetricsMap.get(consistency_level).failures.mark();</span>
+<span class="nc" id="L643">                    WriteFailureException fe = (WriteFailureException)ex;</span>
+<span class="nc" id="L644">                    Tracing.trace(&quot;Write failure; received {} of {} required replies, failed {} requests&quot;,</span>
+<span class="nc" id="L645">                                  fe.received, fe.blockFor, fe.failureReasonByEndpoint.size());</span>
+<span class="nc" id="L646">                }</span>
+                else
+                {
+<span class="nc" id="L649">                    writeMetrics.timeouts.mark();</span>
+<span class="nc" id="L650">                    writeMetricsMap.get(consistency_level).timeouts.mark();</span>
+<span class="nc" id="L651">                    WriteTimeoutException te = (WriteTimeoutException)ex;</span>
+<span class="nc" id="L652">                    Tracing.trace(&quot;Write timeout; received {} of {} required replies&quot;, te.received, te.blockFor);</span>
+                }
+<span class="nc" id="L654">                throw ex;</span>
+            }
+        }
+<span class="nc" id="L657">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L659">            writeMetrics.unavailables.mark();</span>
+<span class="nc" id="L660">            writeMetricsMap.get(consistency_level).unavailables.mark();</span>
+<span class="nc" id="L661">            Tracing.trace(&quot;Unavailable&quot;);</span>
+<span class="nc" id="L662">            throw e;</span>
+        }
+<span class="nc" id="L664">        catch (OverloadedException e)</span>
+        {
+<span class="nc" id="L666">            writeMetrics.unavailables.mark();</span>
+<span class="nc" id="L667">            writeMetricsMap.get(consistency_level).unavailables.mark();</span>
+<span class="nc" id="L668">            Tracing.trace(&quot;Overloaded&quot;);</span>
+<span class="nc" id="L669">            throw e;</span>
+        }
+        finally
+        {
+<span class="fc" id="L673">            long latency = System.nanoTime() - startTime;</span>
+<span class="fc" id="L674">            writeMetrics.addNano(latency);</span>
+<span class="fc" id="L675">            writeMetricsMap.get(consistency_level).addNano(latency);</span>
+        }
+<span class="fc" id="L677">    }</span>
+
+    /**
+     * Hint all the mutations (except counters, which can't be safely retried).  This means
+     * we'll re-hint any successful ones; doesn't seem worth it to track individual success
+     * just for this unusual case.
+     *
+     * Only used for CL.ANY
+     *
+     * @param mutations the mutations that require hints
+     */
+    private static void hintMutations(Collection&lt;? extends IMutation&gt; mutations)
+    {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        for (IMutation mutation : mutations)</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            if (!(mutation instanceof CounterMutation))</span>
+<span class="nc" id="L692">                hintMutation((Mutation) mutation);</span>
+
+<span class="nc" id="L694">        Tracing.trace(&quot;Wrote hints to satisfy CL.ANY after no replicas acknowledged the write&quot;);</span>
+<span class="nc" id="L695">    }</span>
+
+    private static void hintMutation(Mutation mutation)
+    {
+<span class="nc" id="L699">        String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="nc" id="L700">        Token token = mutation.key().getToken();</span>
+
+<span class="nc" id="L702">        Iterable&lt;InetAddress&gt; endpoints = StorageService.instance.getNaturalAndPendingEndpoints(keyspaceName, token);</span>
+<span class="nc" id="L703">        ArrayList&lt;InetAddress&gt; endpointsToHint = new ArrayList&lt;&gt;(Iterables.size(endpoints));</span>
+
+        // local writes can timeout, but cannot be dropped (see LocalMutationRunnable and CASSANDRA-6510),
+        // so there is no need to hint or retry.
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        for (InetAddress target : endpoints)</span>
+<span class="nc bnc" id="L708" title="All 4 branches missed.">            if (!target.equals(FBUtilities.getBroadcastAddress()) &amp;&amp; shouldHint(target))</span>
+<span class="nc" id="L709">                endpointsToHint.add(target);</span>
+
+<span class="nc" id="L711">        submitHint(mutation, endpointsToHint, null);</span>
+<span class="nc" id="L712">    }</span>
+
+    public boolean appliesLocally(Mutation mutation)
+    {
+<span class="nc" id="L716">        String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="nc" id="L717">        Token token = mutation.key().getToken();</span>
+<span class="nc" id="L718">        InetAddress local = FBUtilities.getBroadcastAddress();</span>
+
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        return StorageService.instance.getNaturalEndpoints(keyspaceName, token).contains(local)</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">               || StorageService.instance.getTokenMetadata().pendingEndpointsFor(token, keyspaceName).contains(local);</span>
+    }
+
+    /**
+     * Use this method to have these Mutations applied
+     * across all replicas.
+     *
+     * @param mutations the mutations to be applied across the replicas
+     * @param writeCommitLog if commitlog should be written
+     * @param baseComplete time from epoch in ms that the local base mutation was(or will be) completed
+     * @param queryStartNanoTime the value of System.nanoTime() when the query started to be processed
+     */
+    public static void mutateMV(ByteBuffer dataKey, Collection&lt;Mutation&gt; mutations, boolean writeCommitLog, AtomicLong baseComplete, long queryStartNanoTime)
+    throws UnavailableException, OverloadedException, WriteTimeoutException
+    {
+<span class="nc" id="L736">        Tracing.trace(&quot;Determining replicas for mutation&quot;);</span>
+<span class="nc" id="L737">        final String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());</span>
+
+<span class="nc" id="L739">        long startTime = System.nanoTime();</span>
+
+
+        try
+        {
+            // if we haven't joined the ring, write everything to batchlog because paired replicas may be stale
+<span class="nc" id="L745">            final UUID batchUUID = UUIDGen.getTimeUUID();</span>
+
+<span class="nc bnc" id="L747" title="All 6 branches missed.">            if (StorageService.instance.isStarting() || StorageService.instance.isJoining() || StorageService.instance.isMoving())</span>
+            {
+<span class="nc" id="L749">                BatchlogManager.store(Batch.createLocal(batchUUID, FBUtilities.timestampMicros(),</span>
+                                                        mutations), writeCommitLog);
+            }
+            else
+            {
+<span class="nc" id="L754">                List&lt;WriteResponseHandlerWrapper&gt; wrappers = new ArrayList&lt;&gt;(mutations.size());</span>
+                //non-local mutations rely on the base mutation commit-log entry for eventual consistency
+<span class="nc" id="L756">                Set&lt;Mutation&gt; nonLocalMutations = new HashSet&lt;&gt;(mutations);</span>
+<span class="nc" id="L757">                Token baseToken = StorageService.instance.getTokenMetadata().partitioner.getToken(dataKey);</span>
+
+<span class="nc" id="L759">                ConsistencyLevel consistencyLevel = ConsistencyLevel.ONE;</span>
+
+                //Since the base -&gt; view replication is 1:1 we only need to store the BL locally
+<span class="nc" id="L762">                final Collection&lt;InetAddress&gt; batchlogEndpoints = Collections.singleton(FBUtilities.getBroadcastAddress());</span>
+<span class="nc" id="L763">                BatchlogResponseHandler.BatchlogCleanup cleanup = new BatchlogResponseHandler.BatchlogCleanup(mutations.size(), () -&gt; asyncRemoveFromBatchlog(batchlogEndpoints, batchUUID));</span>
+
+                // add a handler for each mutation - includes checking availability, but doesn't initiate any writes, yet
+<span class="nc bnc" id="L766" title="All 2 branches missed.">                for (Mutation mutation : mutations)</span>
+                {
+<span class="nc" id="L768">                    String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="nc" id="L769">                    Token tk = mutation.key().getToken();</span>
+<span class="nc" id="L770">                    Optional&lt;InetAddress&gt; pairedEndpoint = ViewUtils.getViewNaturalEndpoint(keyspaceName, baseToken, tk);</span>
+<span class="nc" id="L771">                    Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);</span>
+
+                    // if there are no paired endpoints there are probably range movements going on, so we write to the local batchlog to replay later
+<span class="nc bnc" id="L774" title="All 2 branches missed.">                    if (!pairedEndpoint.isPresent())</span>
+                    {
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                        if (pendingEndpoints.isEmpty())</span>
+<span class="nc" id="L777">                            logger.warn(&quot;Received base materialized view mutation for key {} that does not belong &quot; +</span>
+                                        &quot;to this node. There is probably a range movement happening (move or decommission),&quot; +
+                                        &quot;but this node hasn't updated its ring metadata yet. Adding mutation to &quot; +
+                                        &quot;local batchlog to be replayed later.&quot;,
+<span class="nc" id="L781">                                        mutation.key());</span>
+                        continue;
+                    }
+
+                    // When local node is the endpoint we can just apply the mutation locally,
+                    // unless there are pending endpoints, in which case we want to do an ordinary
+                    // write so the view mutation is sent to the pending endpoint
+<span class="nc bnc" id="L788" title="All 4 branches missed.">                    if (pairedEndpoint.get().equals(FBUtilities.getBroadcastAddress()) &amp;&amp; StorageService.instance.isJoined()</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">                        &amp;&amp; pendingEndpoints.isEmpty())</span>
+                    {
+                        try
+                        {
+<span class="nc" id="L793">                            mutation.apply(writeCommitLog);</span>
+<span class="nc" id="L794">                            nonLocalMutations.remove(mutation);</span>
+<span class="nc" id="L795">                            cleanup.ackMutation();</span>
+                        }
+<span class="nc" id="L797">                        catch (Exception exc)</span>
+                        {
+<span class="nc" id="L799">                            logger.error(&quot;Error applying local view update to keyspace {}: {}&quot;, mutation.getKeyspaceName(), mutation);</span>
+<span class="nc" id="L800">                            throw exc;</span>
+<span class="nc" id="L801">                        }</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L805">                        wrappers.add(wrapViewBatchResponseHandler(mutation,</span>
+                                                                  consistencyLevel,
+                                                                  consistencyLevel,
+<span class="nc" id="L808">                                                                  Collections.singletonList(pairedEndpoint.get()),</span>
+                                                                  baseComplete,
+                                                                  WriteType.BATCH,
+                                                                  cleanup,
+                                                                  queryStartNanoTime));
+                    }
+<span class="nc" id="L814">                }</span>
+
+                // Apply to local batchlog memtable in this thread
+<span class="nc bnc" id="L817" title="All 2 branches missed.">                if (!nonLocalMutations.isEmpty())</span>
+<span class="nc" id="L818">                    BatchlogManager.store(Batch.createLocal(batchUUID, FBUtilities.timestampMicros(), nonLocalMutations), writeCommitLog);</span>
+
+                // Perform remote writes
+<span class="nc bnc" id="L821" title="All 2 branches missed.">                if (!wrappers.isEmpty())</span>
+<span class="nc" id="L822">                    asyncWriteBatchedMutations(wrappers, localDataCenter, Stage.VIEW_MUTATION);</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L827">            viewWriteMetrics.addNano(System.nanoTime() - startTime);</span>
+        }
+<span class="nc" id="L829">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static void mutateWithTriggers(Collection&lt;? extends IMutation&gt; mutations,
+                                          ConsistencyLevel consistencyLevel,
+                                          boolean mutateAtomically,
+                                          long queryStartNanoTime)
+    throws WriteTimeoutException, WriteFailureException, UnavailableException, OverloadedException, InvalidRequestException
+    {
+<span class="fc" id="L838">        Collection&lt;Mutation&gt; augmented = TriggerExecutor.instance.execute(mutations);</span>
+
+<span class="fc" id="L840">        boolean updatesView = Keyspace.open(mutations.iterator().next().getKeyspaceName())</span>
+                              .viewManager
+<span class="fc" id="L842">                              .updatesAffectView(mutations, true);</span>
+
+<span class="pc bpc" id="L844" title="1 of 2 branches missed.">        if (augmented != null)</span>
+<span class="nc" id="L845">            mutateAtomically(augmented, consistencyLevel, updatesView, queryStartNanoTime);</span>
+        else
+        {
+<span class="pc bpc" id="L848" title="2 of 4 branches missed.">            if (mutateAtomically || updatesView)</span>
+<span class="nc" id="L849">                mutateAtomically((Collection&lt;Mutation&gt;) mutations, consistencyLevel, updatesView, queryStartNanoTime);</span>
+            else
+<span class="fc" id="L851">                mutate(mutations, consistencyLevel, queryStartNanoTime);</span>
+        }
+<span class="fc" id="L853">    }</span>
+
+    /**
+     * See mutate. Adds additional steps before and after writing a batch.
+     * Before writing the batch (but after doing availability check against the FD for the row replicas):
+     *      write the entire batch to a batchlog elsewhere in the cluster.
+     * After: remove the batchlog entry (after writing hints for the batch rows, if necessary).
+     *
+     * @param mutations the Mutations to be applied across the replicas
+     * @param consistency_level the consistency level for the operation
+     * @param requireQuorumForRemove at least a quorum of nodes will see update before deleting batchlog
+     * @param queryStartNanoTime the value of System.nanoTime() when the query started to be processed
+     */
+    public static void mutateAtomically(Collection&lt;Mutation&gt; mutations,
+                                        ConsistencyLevel consistency_level,
+                                        boolean requireQuorumForRemove,
+                                        long queryStartNanoTime)
+    throws UnavailableException, OverloadedException, WriteTimeoutException
+    {
+<span class="nc" id="L872">        Tracing.trace(&quot;Determining replicas for atomic batch&quot;);</span>
+<span class="nc" id="L873">        long startTime = System.nanoTime();</span>
+
+<span class="nc" id="L875">        List&lt;WriteResponseHandlerWrapper&gt; wrappers = new ArrayList&lt;WriteResponseHandlerWrapper&gt;(mutations.size());</span>
+<span class="nc" id="L876">        String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());</span>
+
+        try
+        {
+
+            // If we are requiring quorum nodes for removal, we upgrade consistency level to QUORUM unless we already
+            // require ALL, or EACH_QUORUM. This is so that *at least* QUORUM nodes see the update.
+<span class="nc bnc" id="L883" title="All 2 branches missed.">            ConsistencyLevel batchConsistencyLevel = requireQuorumForRemove</span>
+                                                     ? ConsistencyLevel.QUORUM
+                                                     : consistency_level;
+
+<span class="nc bnc" id="L887" title="All 2 branches missed.">            switch (consistency_level)</span>
+            {
+                case ALL:
+                case EACH_QUORUM:
+<span class="nc" id="L891">                    batchConsistencyLevel = consistency_level;</span>
+            }
+
+<span class="nc" id="L894">            final BatchlogEndpoints batchlogEndpoints = getBatchlogEndpoints(localDataCenter, batchConsistencyLevel);</span>
+<span class="nc" id="L895">            final UUID batchUUID = UUIDGen.getTimeUUID();</span>
+<span class="nc" id="L896">            BatchlogResponseHandler.BatchlogCleanup cleanup = new BatchlogResponseHandler.BatchlogCleanup(mutations.size(),</span>
+<span class="nc" id="L897">                                                                                                          () -&gt; asyncRemoveFromBatchlog(batchlogEndpoints, batchUUID, queryStartNanoTime));</span>
+
+            // add a handler for each mutation - includes checking availability, but doesn't initiate any writes, yet
+<span class="nc bnc" id="L900" title="All 2 branches missed.">            for (Mutation mutation : mutations)</span>
+            {
+<span class="nc" id="L902">                WriteResponseHandlerWrapper wrapper = wrapBatchResponseHandler(mutation,</span>
+                                                                               consistency_level,
+                                                                               batchConsistencyLevel,
+                                                                               WriteType.BATCH,
+                                                                               cleanup,
+                                                                               queryStartNanoTime);
+                // exit early if we can't fulfill the CL at this time.
+<span class="nc" id="L909">                wrapper.handler.assureSufficientLiveNodes();</span>
+<span class="nc" id="L910">                wrappers.add(wrapper);</span>
+<span class="nc" id="L911">            }</span>
+
+            // write to the batchlog
+<span class="nc" id="L914">            syncWriteToBatchlog(mutations, batchlogEndpoints, batchUUID, queryStartNanoTime);</span>
+
+            // now actually perform the writes and wait for them to complete
+<span class="nc" id="L917">            syncWriteBatchedMutations(wrappers, localDataCenter, Stage.MUTATION);</span>
+        }
+<span class="nc" id="L919">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L921">            writeMetrics.unavailables.mark();</span>
+<span class="nc" id="L922">            writeMetricsMap.get(consistency_level).unavailables.mark();</span>
+<span class="nc" id="L923">            Tracing.trace(&quot;Unavailable&quot;);</span>
+<span class="nc" id="L924">            throw e;</span>
+        }
+<span class="nc" id="L926">        catch (WriteTimeoutException e)</span>
+        {
+<span class="nc" id="L928">            writeMetrics.timeouts.mark();</span>
+<span class="nc" id="L929">            writeMetricsMap.get(consistency_level).timeouts.mark();</span>
+<span class="nc" id="L930">            Tracing.trace(&quot;Write timeout; received {} of {} required replies&quot;, e.received, e.blockFor);</span>
+<span class="nc" id="L931">            throw e;</span>
+        }
+<span class="nc" id="L933">        catch (WriteFailureException e)</span>
+        {
+<span class="nc" id="L935">            writeMetrics.failures.mark();</span>
+<span class="nc" id="L936">            writeMetricsMap.get(consistency_level).failures.mark();</span>
+<span class="nc" id="L937">            Tracing.trace(&quot;Write failure; received {} of {} required replies&quot;, e.received, e.blockFor);</span>
+<span class="nc" id="L938">            throw e;</span>
+        }
+        finally
+        {
+<span class="nc" id="L942">            long latency = System.nanoTime() - startTime;</span>
+<span class="nc" id="L943">            writeMetrics.addNano(latency);</span>
+<span class="nc" id="L944">            writeMetricsMap.get(consistency_level).addNano(latency);</span>
+
+        }
+<span class="nc" id="L947">    }</span>
+
+    public static boolean canDoLocalRequest(InetAddress replica)
+    {
+<span class="fc" id="L951">        return replica.equals(FBUtilities.getBroadcastAddress());</span>
+    }
+
+    private static void syncWriteToBatchlog(Collection&lt;Mutation&gt; mutations, BatchlogEndpoints endpoints, UUID uuid, long queryStartNanoTime)
+    throws WriteTimeoutException, WriteFailureException
+    {
+<span class="nc" id="L957">        WriteResponseHandler&lt;?&gt; handler = new WriteResponseHandler&lt;&gt;(endpoints.all,</span>
+<span class="nc" id="L958">                                                                     Collections.&lt;InetAddress&gt;emptyList(),</span>
+<span class="nc bnc" id="L959" title="All 2 branches missed.">                                                                     endpoints.all.size() == 1 ? ConsistencyLevel.ONE : ConsistencyLevel.TWO,</span>
+<span class="nc" id="L960">                                                                     Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME),</span>
+                                                                     null,
+                                                                     WriteType.BATCH_LOG,
+                                                                     queryStartNanoTime);
+
+<span class="nc" id="L965">        Batch batch = Batch.createLocal(uuid, FBUtilities.timestampMicros(), mutations);</span>
+
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        if (!endpoints.current.isEmpty())</span>
+<span class="nc" id="L968">            syncWriteToBatchlog(handler, batch, endpoints.current);</span>
+
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        if (!endpoints.legacy.isEmpty())</span>
+<span class="nc" id="L971">            LegacyBatchlogMigrator.syncWriteToBatchlog(handler, batch, endpoints.legacy);</span>
+
+<span class="nc" id="L973">        handler.get();</span>
+<span class="nc" id="L974">    }</span>
+
+    private static void syncWriteToBatchlog(WriteResponseHandler&lt;?&gt; handler, Batch batch, Collection&lt;InetAddress&gt; endpoints)
+    throws WriteTimeoutException, WriteFailureException
+    {
+<span class="nc" id="L979">        MessageOut&lt;Batch&gt; message = new MessageOut&lt;&gt;(MessagingService.Verb.BATCH_STORE, batch, Batch.serializer);</span>
+
+<span class="nc bnc" id="L981" title="All 2 branches missed.">        for (InetAddress target : endpoints)</span>
+        {
+<span class="nc" id="L983">            logger.trace(&quot;Sending batchlog store request {} to {} for {} mutations&quot;, batch.id, target, batch.size());</span>
+
+<span class="nc bnc" id="L985" title="All 2 branches missed.">            if (canDoLocalRequest(target))</span>
+<span class="nc" id="L986">                performLocally(Stage.MUTATION, Optional.empty(), () -&gt; BatchlogManager.store(batch), handler);</span>
+            else
+<span class="nc" id="L988">                MessagingService.instance().sendRR(message, target, handler);</span>
+<span class="nc" id="L989">        }</span>
+<span class="nc" id="L990">    }</span>
+
+    private static void asyncRemoveFromBatchlog(BatchlogEndpoints endpoints, UUID uuid, long queryStartNanoTime)
+    {
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        if (!endpoints.current.isEmpty())</span>
+<span class="nc" id="L995">            asyncRemoveFromBatchlog(endpoints.current, uuid);</span>
+
+<span class="nc bnc" id="L997" title="All 2 branches missed.">        if (!endpoints.legacy.isEmpty())</span>
+<span class="nc" id="L998">            LegacyBatchlogMigrator.asyncRemoveFromBatchlog(endpoints.legacy, uuid, queryStartNanoTime);</span>
+<span class="nc" id="L999">    }</span>
+
+    private static void asyncRemoveFromBatchlog(Collection&lt;InetAddress&gt; endpoints, UUID uuid)
+    {
+<span class="nc" id="L1003">        MessageOut&lt;UUID&gt; message = new MessageOut&lt;&gt;(MessagingService.Verb.BATCH_REMOVE, uuid, UUIDSerializer.serializer);</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        for (InetAddress target : endpoints)</span>
+        {
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1007">                logger.trace(&quot;Sending batchlog remove request {} to {}&quot;, uuid, target);</span>
+
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">            if (canDoLocalRequest(target))</span>
+<span class="nc" id="L1010">                performLocally(Stage.MUTATION, () -&gt; BatchlogManager.remove(uuid));</span>
+            else
+<span class="nc" id="L1012">                MessagingService.instance().sendOneWay(message, target);</span>
+<span class="nc" id="L1013">        }</span>
+<span class="nc" id="L1014">    }</span>
+
+    private static void asyncWriteBatchedMutations(List&lt;WriteResponseHandlerWrapper&gt; wrappers, String localDataCenter, Stage stage)
+    {
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        for (WriteResponseHandlerWrapper wrapper : wrappers)</span>
+        {
+<span class="nc" id="L1020">            Iterable&lt;InetAddress&gt; endpoints = Iterables.concat(wrapper.handler.naturalEndpoints, wrapper.handler.pendingEndpoints);</span>
+
+            try
+            {
+<span class="nc" id="L1024">                sendToHintedEndpoints(wrapper.mutation, endpoints, wrapper.handler, localDataCenter, stage);</span>
+            }
+<span class="nc" id="L1026">            catch (OverloadedException | WriteTimeoutException e)</span>
+            {
+<span class="nc" id="L1028">                wrapper.handler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.UNKNOWN);</span>
+<span class="nc" id="L1029">            }</span>
+<span class="nc" id="L1030">        }</span>
+<span class="nc" id="L1031">    }</span>
+
+    private static void syncWriteBatchedMutations(List&lt;WriteResponseHandlerWrapper&gt; wrappers, String localDataCenter, Stage stage)
+    throws WriteTimeoutException, OverloadedException
+    {
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">        for (WriteResponseHandlerWrapper wrapper : wrappers)</span>
+        {
+<span class="nc" id="L1038">            Iterable&lt;InetAddress&gt; endpoints = Iterables.concat(wrapper.handler.naturalEndpoints, wrapper.handler.pendingEndpoints);</span>
+<span class="nc" id="L1039">            sendToHintedEndpoints(wrapper.mutation, endpoints, wrapper.handler, localDataCenter, stage);</span>
+<span class="nc" id="L1040">        }</span>
+
+
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">        for (WriteResponseHandlerWrapper wrapper : wrappers)</span>
+<span class="nc" id="L1044">            wrapper.handler.get();</span>
+<span class="nc" id="L1045">    }</span>
+
+    /**
+     * Perform the write of a mutation given a WritePerformer.
+     * Gather the list of write endpoints, apply locally and/or forward the mutation to
+     * said write endpoint (deletaged to the actual WritePerformer) and wait for the
+     * responses based on consistency level.
+     *
+     * @param mutation the mutation to be applied
+     * @param consistency_level the consistency level for the write operation
+     * @param performer the WritePerformer in charge of appliying the mutation
+     * given the list of write endpoints (either standardWritePerformer for
+     * standard writes or counterWritePerformer for counter writes).
+     * @param callback an optional callback to be run if and when the write is
+     * @param queryStartNanoTime the value of System.nanoTime() when the query started to be processed
+     */
+    public static AbstractWriteResponseHandler&lt;IMutation&gt; performWrite(IMutation mutation,
+                                                                       ConsistencyLevel consistency_level,
+                                                                       String localDataCenter,
+                                                                       WritePerformer performer,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime)
+    throws UnavailableException, OverloadedException
+    {
+<span class="fc" id="L1070">        String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="fc" id="L1071">        AbstractReplicationStrategy rs = Keyspace.open(keyspaceName).getReplicationStrategy();</span>
+
+<span class="fc" id="L1073">        Token tk = mutation.key().getToken();</span>
+<span class="fc" id="L1074">        List&lt;InetAddress&gt; naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);</span>
+<span class="fc" id="L1075">        Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);</span>
+
+<span class="fc" id="L1077">        AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler = rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, callback, writeType, queryStartNanoTime);</span>
+
+        // exit early if we can't fulfill the CL at this time
+<span class="fc" id="L1080">        responseHandler.assureSufficientLiveNodes();</span>
+
+<span class="fc" id="L1082">        performer.apply(mutation, Iterables.concat(naturalEndpoints, pendingEndpoints), responseHandler, localDataCenter, consistency_level);</span>
+<span class="fc" id="L1083">        return responseHandler;</span>
+    }
+
+    // same as performWrites except does not initiate writes (but does perform availability checks).
+    private static WriteResponseHandlerWrapper wrapBatchResponseHandler(Mutation mutation,
+                                                                        ConsistencyLevel consistency_level,
+                                                                        ConsistencyLevel batchConsistencyLevel,
+                                                                        WriteType writeType,
+                                                                        BatchlogResponseHandler.BatchlogCleanup cleanup,
+                                                                        long queryStartNanoTime)
+    {
+<span class="nc" id="L1094">        Keyspace keyspace = Keyspace.open(mutation.getKeyspaceName());</span>
+<span class="nc" id="L1095">        AbstractReplicationStrategy rs = keyspace.getReplicationStrategy();</span>
+<span class="nc" id="L1096">        String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="nc" id="L1097">        Token tk = mutation.key().getToken();</span>
+<span class="nc" id="L1098">        List&lt;InetAddress&gt; naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);</span>
+<span class="nc" id="L1099">        Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);</span>
+<span class="nc" id="L1100">        AbstractWriteResponseHandler&lt;IMutation&gt; writeHandler = rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, null, writeType, queryStartNanoTime);</span>
+<span class="nc" id="L1101">        BatchlogResponseHandler&lt;IMutation&gt; batchHandler = new BatchlogResponseHandler&lt;&gt;(writeHandler, batchConsistencyLevel.blockFor(keyspace), cleanup, queryStartNanoTime);</span>
+<span class="nc" id="L1102">        return new WriteResponseHandlerWrapper(batchHandler, mutation);</span>
+    }
+
+    /**
+     * Same as performWrites except does not initiate writes (but does perform availability checks).
+     * Keeps track of ViewWriteMetrics
+     */
+    private static WriteResponseHandlerWrapper wrapViewBatchResponseHandler(Mutation mutation,
+                                                                            ConsistencyLevel consistency_level,
+                                                                            ConsistencyLevel batchConsistencyLevel,
+                                                                            List&lt;InetAddress&gt; naturalEndpoints,
+                                                                            AtomicLong baseComplete,
+                                                                            WriteType writeType,
+                                                                            BatchlogResponseHandler.BatchlogCleanup cleanup,
+                                                                            long queryStartNanoTime)
+    {
+<span class="nc" id="L1118">        Keyspace keyspace = Keyspace.open(mutation.getKeyspaceName());</span>
+<span class="nc" id="L1119">        AbstractReplicationStrategy rs = keyspace.getReplicationStrategy();</span>
+<span class="nc" id="L1120">        String keyspaceName = mutation.getKeyspaceName();</span>
+<span class="nc" id="L1121">        Token tk = mutation.key().getToken();</span>
+<span class="nc" id="L1122">        Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);</span>
+<span class="nc" id="L1123">        AbstractWriteResponseHandler&lt;IMutation&gt; writeHandler = rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, () -&gt; {</span>
+<span class="nc" id="L1124">            long delay = Math.max(0, System.currentTimeMillis() - baseComplete.get());</span>
+<span class="nc" id="L1125">            viewWriteMetrics.viewWriteLatency.update(delay, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1126">        }, writeType, queryStartNanoTime);</span>
+<span class="nc" id="L1127">        BatchlogResponseHandler&lt;IMutation&gt; batchHandler = new ViewWriteMetricsWrapped(writeHandler, batchConsistencyLevel.blockFor(keyspace), cleanup, queryStartNanoTime);</span>
+<span class="nc" id="L1128">        return new WriteResponseHandlerWrapper(batchHandler, mutation);</span>
+    }
+
+    // used by atomic_batch_mutate to decouple availability check from the write itself, caches consistency level and endpoints.
+    private static class WriteResponseHandlerWrapper
+    {
+        final BatchlogResponseHandler&lt;IMutation&gt; handler;
+        final Mutation mutation;
+
+        WriteResponseHandlerWrapper(BatchlogResponseHandler&lt;IMutation&gt; handler, Mutation mutation)
+<span class="nc" id="L1138">        {</span>
+<span class="nc" id="L1139">            this.handler = handler;</span>
+<span class="nc" id="L1140">            this.mutation = mutation;</span>
+<span class="nc" id="L1141">        }</span>
+    }
+
+    /*
+     * A class to filter batchlog endpoints into legacy endpoints (version &lt; 3.0) or not.
+     */
+    private static final class BatchlogEndpoints
+    {
+        public final Collection&lt;InetAddress&gt; all;
+        public final Collection&lt;InetAddress&gt; current;
+        public final Collection&lt;InetAddress&gt; legacy;
+
+        BatchlogEndpoints(Collection&lt;InetAddress&gt; endpoints)
+<span class="nc" id="L1154">        {</span>
+<span class="nc" id="L1155">            all = endpoints;</span>
+<span class="nc" id="L1156">            current = new ArrayList&lt;&gt;(2);</span>
+<span class="nc" id="L1157">            legacy = new ArrayList&lt;&gt;(2);</span>
+
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">            for (InetAddress ep : endpoints)</span>
+            {
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">                if (MessagingService.instance().getVersion(ep) &gt;= MessagingService.VERSION_30)</span>
+<span class="nc" id="L1162">                    current.add(ep);</span>
+                else
+<span class="nc" id="L1164">                    legacy.add(ep);</span>
+<span class="nc" id="L1165">            }</span>
+<span class="nc" id="L1166">        }</span>
+    }
+
+    /*
+     * Replicas are picked manually:
+     * - replicas should be alive according to the failure detector
+     * - replicas should be in the local datacenter
+     * - choose min(2, number of qualifying candiates above)
+     * - allow the local node to be the only replica only if it's a single-node DC
+     */
+    private static BatchlogEndpoints getBatchlogEndpoints(String localDataCenter, ConsistencyLevel consistencyLevel)
+    throws UnavailableException
+    {
+<span class="nc" id="L1179">        TokenMetadata.Topology topology = StorageService.instance.getTokenMetadata().cachedOnlyTokenMap().getTopology();</span>
+<span class="nc" id="L1180">        Multimap&lt;String, InetAddress&gt; localEndpoints = HashMultimap.create(topology.getDatacenterRacks().get(localDataCenter));</span>
+<span class="nc" id="L1181">        String localRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());</span>
+
+<span class="nc" id="L1183">        Collection&lt;InetAddress&gt; chosenEndpoints = new BatchlogManager.EndpointFilter(localRack, localEndpoints).filter();</span>
+<span class="nc bnc" id="L1184" title="All 2 branches missed.">        if (chosenEndpoints.isEmpty())</span>
+        {
+<span class="nc bnc" id="L1186" title="All 2 branches missed.">            if (consistencyLevel == ConsistencyLevel.ANY)</span>
+<span class="nc" id="L1187">                return new BatchlogEndpoints(Collections.singleton(FBUtilities.getBroadcastAddress()));</span>
+
+<span class="nc" id="L1189">            throw new UnavailableException(ConsistencyLevel.ONE, 1, 0);</span>
+        }
+
+<span class="nc" id="L1192">        return new BatchlogEndpoints(chosenEndpoints);</span>
+    }
+
+    /**
+     * Send the mutations to the right targets, write it locally if it corresponds or writes a hint when the node
+     * is not available.
+     *
+     * Note about hints:
+     * &lt;pre&gt;
+     * {@code
+     * | Hinted Handoff | Consist. Level |
+     * | on             |       &gt;=1      | --&gt; wait for hints. We DO NOT notify the handler with handler.response() for hints;
+     * | on             |       ANY      | --&gt; wait for hints. Responses count towards consistency.
+     * | off            |       &gt;=1      | --&gt; DO NOT fire hints. And DO NOT wait for them to complete.
+     * | off            |       ANY      | --&gt; DO NOT fire hints. And DO NOT wait for them to complete.
+     * }
+     * &lt;/pre&gt;
+     *
+     * @throws OverloadedException if the hints cannot be written/enqueued
+     */
+    public static void sendToHintedEndpoints(final Mutation mutation,
+                                             Iterable&lt;InetAddress&gt; targets,
+                                             AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                                             String localDataCenter,
+                                             Stage stage)
+    throws OverloadedException
+    {
+<span class="fc" id="L1219">        int targetsSize = Iterables.size(targets);</span>
+
+        // this dc replicas:
+<span class="fc" id="L1222">        Collection&lt;InetAddress&gt; localDc = null;</span>
+        // extra-datacenter replicas, grouped by dc
+<span class="fc" id="L1224">        Map&lt;String, Collection&lt;InetAddress&gt;&gt; dcGroups = null;</span>
+        // only need to create a Message for non-local writes
+<span class="fc" id="L1226">        MessageOut&lt;Mutation&gt; message = null;</span>
+
+<span class="fc" id="L1228">        boolean insertLocal = false;</span>
+<span class="fc" id="L1229">        ArrayList&lt;InetAddress&gt; endpointsToHint = null;</span>
+
+<span class="fc" id="L1231">        List&lt;InetAddress&gt; backPressureHosts = null;</span>
+
+<span class="fc bfc" id="L1233" title="All 2 branches covered.">        for (InetAddress destination : targets)</span>
+        {
+<span class="fc" id="L1235">            checkHintOverload(destination);</span>
+
+<span class="pc bpc" id="L1237" title="1 of 2 branches missed.">            if (FailureDetector.instance.isAlive(destination))</span>
+            {
+<span class="pc bpc" id="L1239" title="1 of 2 branches missed.">                if (canDoLocalRequest(destination))</span>
+                {
+<span class="fc" id="L1241">                    insertLocal = true;</span>
+                }
+                else
+                {
+                    // belongs on a different server
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">                    if (message == null)</span>
+<span class="nc" id="L1247">                        message = mutation.createMessage();</span>
+
+<span class="nc" id="L1249">                    String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(destination);</span>
+
+                    // direct writes to local DC or old Cassandra versions
+                    // (1.1 knows how to forward old-style String message IDs; updated to int in 2.0)
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">                    if (localDataCenter.equals(dc))</span>
+                    {
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">                        if (localDc == null)</span>
+<span class="nc" id="L1256">                            localDc = new ArrayList&lt;&gt;(targetsSize);</span>
+
+<span class="nc" id="L1258">                        localDc.add(destination);</span>
+                    }
+                    else
+                    {
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">                        Collection&lt;InetAddress&gt; messages = (dcGroups != null) ? dcGroups.get(dc) : null;</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">                        if (messages == null)</span>
+                        {
+<span class="nc" id="L1265">                            messages = new ArrayList&lt;&gt;(3); // most DCs will have &lt;= 3 replicas</span>
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">                            if (dcGroups == null)</span>
+<span class="nc" id="L1267">                                dcGroups = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1268">                            dcGroups.put(dc, messages);</span>
+                        }
+
+<span class="nc" id="L1271">                        messages.add(destination);</span>
+                    }
+
+<span class="nc bnc" id="L1274" title="All 2 branches missed.">                    if (backPressureHosts == null)</span>
+<span class="nc" id="L1275">                        backPressureHosts = new ArrayList&lt;&gt;(targetsSize);</span>
+
+<span class="nc" id="L1277">                    backPressureHosts.add(destination);</span>
+<span class="nc" id="L1278">                }</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">                if (shouldHint(destination))</span>
+                {
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">                    if (endpointsToHint == null)</span>
+<span class="nc" id="L1285">                        endpointsToHint = new ArrayList&lt;&gt;(targetsSize);</span>
+
+<span class="nc" id="L1287">                    endpointsToHint.add(destination);</span>
+                }
+            }
+<span class="fc" id="L1290">        }</span>
+
+<span class="pc bpc" id="L1292" title="1 of 2 branches missed.">        if (backPressureHosts != null)</span>
+<span class="nc" id="L1293">            MessagingService.instance().applyBackPressure(backPressureHosts, responseHandler.currentTimeout());</span>
+
+<span class="pc bpc" id="L1295" title="1 of 2 branches missed.">        if (endpointsToHint != null)</span>
+<span class="nc" id="L1296">            submitHint(mutation, endpointsToHint, responseHandler);</span>
+
+<span class="pc bpc" id="L1298" title="1 of 2 branches missed.">        if (insertLocal)</span>
+<span class="fc" id="L1299">            performLocally(stage, Optional.of(mutation), mutation::apply, responseHandler);</span>
+
+<span class="pc bpc" id="L1301" title="1 of 2 branches missed.">        if (localDc != null)</span>
+        {
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">            for (InetAddress destination : localDc)</span>
+<span class="nc" id="L1304">                MessagingService.instance().sendRR(message, destination, responseHandler, true);</span>
+        }
+<span class="pc bpc" id="L1306" title="1 of 2 branches missed.">        if (dcGroups != null)</span>
+        {
+            // for each datacenter, send the message to one node to relay the write to other replicas
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">            for (Collection&lt;InetAddress&gt; dcTargets : dcGroups.values())</span>
+<span class="nc" id="L1310">                sendMessagesToNonlocalDC(message, dcTargets, responseHandler);</span>
+        }
+<span class="fc" id="L1312">    }</span>
+
+    private static void checkHintOverload(InetAddress destination)
+    {
+        // avoid OOMing due to excess hints.  we need to do this check even for &quot;live&quot; nodes, since we can
+        // still generate hints for those if it's overloaded or simply dead but not yet known-to-be-dead.
+        // The idea is that if we have over maxHintsInProgress hints in flight, this is probably due to
+        // a small number of nodes causing problems, so we should avoid shutting down writes completely to
+        // healthy nodes.  Any node with no hintsInProgress is considered healthy.
+<span class="pc bpc" id="L1321" title="1 of 2 branches missed.">        if (StorageMetrics.totalHintsInProgress.getCount() &gt; maxHintsInProgress</span>
+<span class="nc bnc" id="L1322" title="All 4 branches missed.">                &amp;&amp; (getHintsInProgressFor(destination).get() &gt; 0 &amp;&amp; shouldHint(destination)))</span>
+        {
+<span class="nc" id="L1324">            throw new OverloadedException(&quot;Too many in flight hints: &quot; + StorageMetrics.totalHintsInProgress.getCount() +</span>
+                                          &quot; destination: &quot; + destination +
+<span class="nc" id="L1326">                                          &quot; destination hints: &quot; + getHintsInProgressFor(destination).get());</span>
+        }
+<span class="fc" id="L1328">    }</span>
+
+    private static void sendMessagesToNonlocalDC(MessageOut&lt;? extends IMutation&gt; message,
+                                                 Collection&lt;InetAddress&gt; targets,
+                                                 AbstractWriteResponseHandler&lt;IMutation&gt; handler)
+    {
+<span class="nc" id="L1334">        Iterator&lt;InetAddress&gt; iter = targets.iterator();</span>
+<span class="nc" id="L1335">        InetAddress target = iter.next();</span>
+
+        // Add the other destinations of the same message as a FORWARD_HEADER entry
+<span class="nc" id="L1338">        try(DataOutputBuffer out = new DataOutputBuffer())</span>
+        {
+<span class="nc" id="L1340">            out.writeInt(targets.size() - 1);</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">            while (iter.hasNext())</span>
+            {
+<span class="nc" id="L1343">                InetAddress destination = iter.next();</span>
+<span class="nc" id="L1344">                CompactEndpointSerializationHelper.serialize(destination, out);</span>
+<span class="nc" id="L1345">                int id = MessagingService.instance().addCallback(handler,</span>
+                                                                 message,
+                                                                 destination,
+<span class="nc" id="L1348">                                                                 message.getTimeout(),</span>
+                                                                 handler.consistencyLevel,
+                                                                 true);
+<span class="nc" id="L1351">                out.writeInt(id);</span>
+<span class="nc" id="L1352">                logger.trace(&quot;Adding FWD message to {}@{}&quot;, id, destination);</span>
+<span class="nc" id="L1353">            }</span>
+<span class="nc" id="L1354">            message = message.withParameter(Mutation.FORWARD_TO, out.getData());</span>
+            // send the combined message + forward headers
+<span class="nc" id="L1356">            int id = MessagingService.instance().sendRR(message, target, handler, true);</span>
+<span class="nc" id="L1357">            logger.trace(&quot;Sending message to {}@{}&quot;, id, target);</span>
+        }
+<span class="nc" id="L1359">        catch (IOException e)</span>
+        {
+            // DataOutputBuffer is in-memory, doesn't throw IOException
+<span class="nc" id="L1362">            throw new AssertionError(e);</span>
+<span class="nc" id="L1363">        }</span>
+<span class="nc" id="L1364">    }</span>
+
+    private static void performLocally(Stage stage, final Runnable runnable)
+    {
+<span class="nc" id="L1368">        StageManager.getStage(stage).maybeExecuteImmediately(new LocalMutationRunnable()</span>
+<span class="nc" id="L1369">        {</span>
+            public void runMayThrow()
+            {
+                try
+                {
+<span class="nc" id="L1374">                    runnable.run();</span>
+                }
+<span class="nc" id="L1376">                catch (Exception ex)</span>
+                {
+<span class="nc" id="L1378">                    logger.error(&quot;Failed to apply mutation locally : {}&quot;, ex);</span>
+<span class="nc" id="L1379">                }</span>
+<span class="nc" id="L1380">            }</span>
+
+            @Override
+            protected Verb verb()
+            {
+<span class="nc" id="L1385">                return MessagingService.Verb.MUTATION;</span>
+            }
+        });
+<span class="nc" id="L1388">    }</span>
+
+    private static void performLocally(Stage stage, Optional&lt;IMutation&gt; mutation, final Runnable runnable, final IAsyncCallbackWithFailure&lt;?&gt; handler)
+    {
+<span class="fc" id="L1392">        StageManager.getStage(stage).maybeExecuteImmediately(new LocalMutationRunnable(mutation)</span>
+<span class="fc" id="L1393">        {</span>
+            public void runMayThrow()
+            {
+                try
+                {
+<span class="fc" id="L1398">                    runnable.run();</span>
+<span class="fc" id="L1399">                    handler.response(null);</span>
+                }
+<span class="nc" id="L1401">                catch (Exception ex)</span>
+                {
+<span class="nc bnc" id="L1403" title="All 2 branches missed.">                    if (!(ex instanceof WriteTimeoutException))</span>
+<span class="nc" id="L1404">                        logger.error(&quot;Failed to apply mutation locally : {}&quot;, ex);</span>
+<span class="nc" id="L1405">                    handler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.UNKNOWN);</span>
+<span class="fc" id="L1406">                }</span>
+<span class="fc" id="L1407">            }</span>
+
+            @Override
+            protected Verb verb()
+            {
+<span class="fc" id="L1412">                return MessagingService.Verb.MUTATION;</span>
+            }
+        });
+<span class="fc" id="L1415">    }</span>
+
+    /**
+     * Handle counter mutation on the coordinator host.
+     *
+     * A counter mutation needs to first be applied to a replica (that we'll call the leader for the mutation) before being
+     * replicated to the other endpoint. To achieve so, there is two case:
+     *   1) the coordinator host is a replica: we proceed to applying the update locally and replicate throug
+     *   applyCounterMutationOnCoordinator
+     *   2) the coordinator is not a replica: we forward the (counter)mutation to a chosen replica (that will proceed through
+     *   applyCounterMutationOnLeader upon receive) and wait for its acknowledgment.
+     *
+     * Implementation note: We check if we can fulfill the CL on the coordinator host even if he is not a replica to allow
+     * quicker response and because the WriteResponseHandlers don't make it easy to send back an error. We also always gather
+     * the write latencies at the coordinator node to make gathering point similar to the case of standard writes.
+     */
+    public static AbstractWriteResponseHandler&lt;IMutation&gt; mutateCounter(CounterMutation cm, String localDataCenter, long queryStartNanoTime) throws UnavailableException, OverloadedException
+    {
+<span class="nc" id="L1433">        InetAddress endpoint = findSuitableEndpoint(cm.getKeyspaceName(), cm.key(), localDataCenter, cm.consistency());</span>
+
+<span class="nc bnc" id="L1435" title="All 2 branches missed.">        if (endpoint.equals(FBUtilities.getBroadcastAddress()))</span>
+        {
+<span class="nc" id="L1437">            return applyCounterMutationOnCoordinator(cm, localDataCenter, queryStartNanoTime);</span>
+        }
+        else
+        {
+            // Exit now if we can't fulfill the CL here instead of forwarding to the leader replica
+<span class="nc" id="L1442">            String keyspaceName = cm.getKeyspaceName();</span>
+<span class="nc" id="L1443">            AbstractReplicationStrategy rs = Keyspace.open(keyspaceName).getReplicationStrategy();</span>
+<span class="nc" id="L1444">            Token tk = cm.key().getToken();</span>
+<span class="nc" id="L1445">            List&lt;InetAddress&gt; naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);</span>
+<span class="nc" id="L1446">            Collection&lt;InetAddress&gt; pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);</span>
+
+<span class="nc" id="L1448">            rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, cm.consistency(), null, WriteType.COUNTER, queryStartNanoTime).assureSufficientLiveNodes();</span>
+
+            // Forward the actual update to the chosen leader replica
+<span class="nc" id="L1451">            AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler = new WriteResponseHandler&lt;&gt;(endpoint, WriteType.COUNTER, queryStartNanoTime);</span>
+
+<span class="nc" id="L1453">            Tracing.trace(&quot;Enqueuing counter update to {}&quot;, endpoint);</span>
+<span class="nc" id="L1454">            MessagingService.instance().sendRR(cm.makeMutationMessage(), endpoint, responseHandler, false);</span>
+<span class="nc" id="L1455">            return responseHandler;</span>
+        }
+    }
+
+    /**
+     * Find a suitable replica as leader for counter update.
+     * For now, we pick a random replica in the local DC (or ask the snitch if
+     * there is no replica alive in the local DC).
+     * TODO: if we track the latency of the counter writes (which makes sense
+     * contrarily to standard writes since there is a read involved), we could
+     * trust the dynamic snitch entirely, which may be a better solution. It
+     * is unclear we want to mix those latencies with read latencies, so this
+     * may be a bit involved.
+     */
+    private static InetAddress findSuitableEndpoint(String keyspaceName, DecoratedKey key, String localDataCenter, ConsistencyLevel cl) throws UnavailableException
+    {
+<span class="nc" id="L1471">        Keyspace keyspace = Keyspace.open(keyspaceName);</span>
+<span class="nc" id="L1472">        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="nc" id="L1473">        List&lt;InetAddress&gt; endpoints = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1474">        StorageService.instance.getLiveNaturalEndpoints(keyspace, key, endpoints);</span>
+
+        // CASSANDRA-13043: filter out those endpoints not accepting clients yet, maybe because still bootstrapping
+<span class="nc bnc" id="L1477" title="All 2 branches missed.">        endpoints.removeIf(endpoint -&gt; !StorageService.instance.isRpcReady(endpoint));</span>
+
+        // TODO have a way to compute the consistency level
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">        if (endpoints.isEmpty())</span>
+<span class="nc" id="L1481">            throw new UnavailableException(cl, cl.blockFor(keyspace), 0);</span>
+
+<span class="nc" id="L1483">        List&lt;InetAddress&gt; localEndpoints = new ArrayList&lt;&gt;(endpoints.size());</span>
+
+<span class="nc bnc" id="L1485" title="All 2 branches missed.">        for (InetAddress endpoint : endpoints)</span>
+<span class="nc bnc" id="L1486" title="All 2 branches missed.">            if (snitch.getDatacenter(endpoint).equals(localDataCenter))</span>
+<span class="nc" id="L1487">                localEndpoints.add(endpoint);</span>
+
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">        if (localEndpoints.isEmpty())</span>
+        {
+            // If the consistency required is local then we should not involve other DCs
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">            if (cl.isDatacenterLocal())</span>
+<span class="nc" id="L1493">                throw new UnavailableException(cl, cl.blockFor(keyspace), 0);</span>
+
+            // No endpoint in local DC, pick the closest endpoint according to the snitch
+<span class="nc" id="L1496">            snitch.sortByProximity(FBUtilities.getBroadcastAddress(), endpoints);</span>
+<span class="nc" id="L1497">            return endpoints.get(0);</span>
+        }
+
+<span class="nc" id="L1500">        return localEndpoints.get(ThreadLocalRandom.current().nextInt(localEndpoints.size()));</span>
+    }
+
+    // Must be called on a replica of the mutation. This replica becomes the
+    // leader of this mutation.
+    public static AbstractWriteResponseHandler&lt;IMutation&gt; applyCounterMutationOnLeader(CounterMutation cm, String localDataCenter, Runnable callback, long queryStartNanoTime)
+    throws UnavailableException, OverloadedException
+    {
+<span class="nc" id="L1508">        return performWrite(cm, cm.consistency(), localDataCenter, counterWritePerformer, callback, WriteType.COUNTER, queryStartNanoTime);</span>
+    }
+
+    // Same as applyCounterMutationOnLeader but must with the difference that it use the MUTATION stage to execute the write (while
+    // applyCounterMutationOnLeader assumes it is on the MUTATION stage already)
+    public static AbstractWriteResponseHandler&lt;IMutation&gt; applyCounterMutationOnCoordinator(CounterMutation cm, String localDataCenter, long queryStartNanoTime)
+    throws UnavailableException, OverloadedException
+    {
+<span class="nc" id="L1516">        return performWrite(cm, cm.consistency(), localDataCenter, counterWriteOnCoordinatorPerformer, null, WriteType.COUNTER, queryStartNanoTime);</span>
+    }
+
+    private static Runnable counterWriteTask(final IMutation mutation,
+                                             final Iterable&lt;InetAddress&gt; targets,
+                                             final AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                                             final String localDataCenter)
+    {
+<span class="nc" id="L1524">        return new DroppableRunnable(MessagingService.Verb.COUNTER_MUTATION)</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">        {</span>
+            @Override
+            public void runMayThrow() throws OverloadedException, WriteTimeoutException
+            {
+<span class="nc bnc" id="L1529" title="All 4 branches missed.">                assert mutation instanceof CounterMutation;</span>
+
+<span class="nc" id="L1531">                Mutation result = ((CounterMutation) mutation).applyCounterMutation();</span>
+<span class="nc" id="L1532">                responseHandler.response(null);</span>
+
+<span class="nc" id="L1534">                Set&lt;InetAddress&gt; remotes = Sets.difference(ImmutableSet.copyOf(targets),</span>
+<span class="nc" id="L1535">                                                           ImmutableSet.of(FBUtilities.getBroadcastAddress()));</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">                if (!remotes.isEmpty())</span>
+<span class="nc" id="L1537">                    sendToHintedEndpoints(result, remotes, responseHandler, localDataCenter, Stage.COUNTER_MUTATION);</span>
+<span class="nc" id="L1538">            }</span>
+        };
+    }
+
+    private static boolean systemKeyspaceQuery(List&lt;? extends ReadCommand&gt; cmds)
+    {
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">        for (ReadCommand cmd : cmds)</span>
+<span class="nc bnc" id="L1545" title="All 2 branches missed.">            if (!SchemaConstants.isLocalSystemKeyspace(cmd.metadata().ksName))</span>
+<span class="nc" id="L1546">                return false;</span>
+<span class="nc" id="L1547">        return true;</span>
+    }
+
+    public static RowIterator readOne(SinglePartitionReadCommand command, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    throws UnavailableException, IsBootstrappingException, ReadFailureException, ReadTimeoutException, InvalidRequestException
+    {
+<span class="nc" id="L1553">        return readOne(command, consistencyLevel, null, queryStartNanoTime);</span>
+    }
+
+    public static RowIterator readOne(SinglePartitionReadCommand command, ConsistencyLevel consistencyLevel, ClientState state, long queryStartNanoTime)
+    throws UnavailableException, IsBootstrappingException, ReadFailureException, ReadTimeoutException, InvalidRequestException
+    {
+<span class="nc" id="L1559">        return PartitionIterators.getOnlyElement(read(SinglePartitionReadCommand.Group.one(command), consistencyLevel, state, queryStartNanoTime), command);</span>
+    }
+
+    public static PartitionIterator read(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    throws UnavailableException, IsBootstrappingException, ReadFailureException, ReadTimeoutException, InvalidRequestException
+    {
+        // When using serial CL, the ClientState should be provided
+<span class="nc bnc" id="L1566" title="All 4 branches missed.">        assert !consistencyLevel.isSerialConsistency();</span>
+<span class="nc" id="L1567">        return read(group, consistencyLevel, null, queryStartNanoTime);</span>
+    }
+
+    /**
+     * Performs the actual reading of a row out of the StorageService, fetching
+     * a specific set of column names from a given column family.
+     */
+    public static PartitionIterator read(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, ClientState state, long queryStartNanoTime)
+    throws UnavailableException, IsBootstrappingException, ReadFailureException, ReadTimeoutException, InvalidRequestException
+    {
+<span class="pc bpc" id="L1577" title="3 of 4 branches missed.">        if (StorageService.instance.isBootstrapMode() &amp;&amp; !systemKeyspaceQuery(group.commands))</span>
+        {
+<span class="nc" id="L1579">            readMetrics.unavailables.mark();</span>
+<span class="nc" id="L1580">            readMetricsMap.get(consistencyLevel).unavailables.mark();</span>
+<span class="nc" id="L1581">            throw new IsBootstrappingException();</span>
+        }
+
+<span class="pc bpc" id="L1584" title="1 of 2 branches missed.">        return consistencyLevel.isSerialConsistency()</span>
+<span class="pc" id="L1585">             ? readWithPaxos(group, consistencyLevel, state, queryStartNanoTime)</span>
+<span class="fc" id="L1586">             : readRegular(group, consistencyLevel, queryStartNanoTime);</span>
+    }
+
+    private static PartitionIterator readWithPaxos(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, ClientState state, long queryStartNanoTime)
+    throws InvalidRequestException, UnavailableException, ReadFailureException, ReadTimeoutException
+    {
+<span class="nc bnc" id="L1592" title="All 4 branches missed.">        assert state != null;</span>
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">        if (group.commands.size() &gt; 1)</span>
+<span class="nc" id="L1594">            throw new InvalidRequestException(&quot;SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time&quot;);</span>
+
+<span class="nc" id="L1596">        long start = System.nanoTime();</span>
+<span class="nc" id="L1597">        SinglePartitionReadCommand command = group.commands.get(0);</span>
+<span class="nc" id="L1598">        CFMetaData metadata = command.metadata();</span>
+<span class="nc" id="L1599">        DecoratedKey key = command.partitionKey();</span>
+
+<span class="nc" id="L1601">        PartitionIterator result = null;</span>
+        try
+        {
+            // make sure any in-progress paxos writes are done (i.e., committed to a majority of replicas), before performing a quorum read
+<span class="nc" id="L1605">            Pair&lt;List&lt;InetAddress&gt;, Integer&gt; p = getPaxosParticipants(metadata, key, consistencyLevel);</span>
+<span class="nc" id="L1606">            List&lt;InetAddress&gt; liveEndpoints = p.left;</span>
+<span class="nc" id="L1607">            int requiredParticipants = p.right;</span>
+
+            // does the work of applying in-progress writes; throws UAE or timeout if it can't
+<span class="nc bnc" id="L1610" title="All 2 branches missed.">            final ConsistencyLevel consistencyForCommitOrFetch = consistencyLevel == ConsistencyLevel.LOCAL_SERIAL</span>
+                                                                                   ? ConsistencyLevel.LOCAL_QUORUM
+                                                                                   : ConsistencyLevel.QUORUM;
+
+            try
+            {
+<span class="nc" id="L1616">                final Pair&lt;UUID, Integer&gt; pair = beginAndRepairPaxos(start, key, metadata, liveEndpoints, requiredParticipants, consistencyLevel, consistencyForCommitOrFetch, false, state);</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">                if (pair.right &gt; 0)</span>
+<span class="nc" id="L1618">                    casReadMetrics.contention.update(pair.right);</span>
+            }
+<span class="nc" id="L1620">            catch (WriteTimeoutException e)</span>
+            {
+<span class="nc" id="L1622">                throw new ReadTimeoutException(consistencyLevel, 0, consistencyLevel.blockFor(Keyspace.open(metadata.ksName)), false);</span>
+            }
+<span class="nc" id="L1624">            catch (WriteFailureException e)</span>
+            {
+<span class="nc" id="L1626">                throw new ReadFailureException(consistencyLevel, e.received, e.blockFor, false, e.failureReasonByEndpoint);</span>
+<span class="nc" id="L1627">            }</span>
+
+<span class="nc" id="L1629">            result = fetchRows(group.commands, consistencyForCommitOrFetch, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L1631">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L1633">            readMetrics.unavailables.mark();</span>
+<span class="nc" id="L1634">            casReadMetrics.unavailables.mark();</span>
+<span class="nc" id="L1635">            readMetricsMap.get(consistencyLevel).unavailables.mark();</span>
+<span class="nc" id="L1636">            throw e;</span>
+        }
+<span class="nc" id="L1638">        catch (ReadTimeoutException e)</span>
+        {
+<span class="nc" id="L1640">            readMetrics.timeouts.mark();</span>
+<span class="nc" id="L1641">            casReadMetrics.timeouts.mark();</span>
+<span class="nc" id="L1642">            readMetricsMap.get(consistencyLevel).timeouts.mark();</span>
+<span class="nc" id="L1643">            throw e;</span>
+        }
+<span class="nc" id="L1645">        catch (ReadFailureException e)</span>
+        {
+<span class="nc" id="L1647">            readMetrics.failures.mark();</span>
+<span class="nc" id="L1648">            casReadMetrics.failures.mark();</span>
+<span class="nc" id="L1649">            readMetricsMap.get(consistencyLevel).failures.mark();</span>
+<span class="nc" id="L1650">            throw e;</span>
+        }
+        finally
+        {
+<span class="nc" id="L1654">            long latency = System.nanoTime() - start;</span>
+<span class="nc" id="L1655">            readMetrics.addNano(latency);</span>
+<span class="nc" id="L1656">            casReadMetrics.addNano(latency);</span>
+<span class="nc" id="L1657">            readMetricsMap.get(consistencyLevel).addNano(latency);</span>
+<span class="nc" id="L1658">            Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).metric.coordinatorReadLatency.update(latency, TimeUnit.NANOSECONDS);</span>
+        }
+
+<span class="nc" id="L1661">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private static PartitionIterator readRegular(SinglePartitionReadCommand.Group group, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    throws UnavailableException, ReadFailureException, ReadTimeoutException
+    {
+<span class="fc" id="L1668">        long start = System.nanoTime();</span>
+        try
+        {
+<span class="fc" id="L1671">            PartitionIterator result = fetchRows(group.commands, consistencyLevel, queryStartNanoTime);</span>
+            // Note that the only difference between the command in a group must be the partition key on which
+            // they applied.
+<span class="fc" id="L1674">            boolean enforceStrictLiveness = group.commands.get(0).metadata().enforceStrictLiveness();</span>
+            // If we have more than one command, then despite each read command honoring the limit, the total result
+            // might not honor it and so we should enforce it
+<span class="pc bpc" id="L1677" title="1 of 2 branches missed.">            if (group.commands.size() &gt; 1)</span>
+<span class="nc" id="L1678">                result = group.limits().filter(result, group.nowInSec(), group.selectsFullPartition(), enforceStrictLiveness);</span>
+<span class="fc" id="L1679">            return result;</span>
+        }
+<span class="nc" id="L1681">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L1683">            readMetrics.unavailables.mark();</span>
+<span class="nc" id="L1684">            readMetricsMap.get(consistencyLevel).unavailables.mark();</span>
+<span class="nc" id="L1685">            throw e;</span>
+        }
+<span class="nc" id="L1687">        catch (ReadTimeoutException e)</span>
+        {
+<span class="nc" id="L1689">            readMetrics.timeouts.mark();</span>
+<span class="nc" id="L1690">            readMetricsMap.get(consistencyLevel).timeouts.mark();</span>
+<span class="nc" id="L1691">            throw e;</span>
+        }
+<span class="nc" id="L1693">        catch (ReadFailureException e)</span>
+        {
+<span class="nc" id="L1695">            readMetrics.failures.mark();</span>
+<span class="nc" id="L1696">            readMetricsMap.get(consistencyLevel).failures.mark();</span>
+<span class="nc" id="L1697">            throw e;</span>
+        }
+        finally
+        {
+<span class="fc" id="L1701">            long latency = System.nanoTime() - start;</span>
+<span class="fc" id="L1702">            readMetrics.addNano(latency);</span>
+<span class="fc" id="L1703">            readMetricsMap.get(consistencyLevel).addNano(latency);</span>
+            // TODO avoid giving every command the same latency number.  Can fix this in CASSADRA-5329
+<span class="fc bfc" id="L1705" title="All 2 branches covered.">            for (ReadCommand command : group.commands)</span>
+<span class="fc" id="L1706">                Keyspace.openAndGetStore(command.metadata()).metric.coordinatorReadLatency.update(latency, TimeUnit.NANOSECONDS);</span>
+        }
+    }
+
+    /**
+     * This function executes local and remote reads, and blocks for the results:
+     *
+     * 1. Get the replica locations, sorted by response time according to the snitch
+     * 2. Send a data request to the closest replica, and digest requests to either
+     *    a) all the replicas, if read repair is enabled
+     *    b) the closest R-1 replicas, where R is the number required to satisfy the ConsistencyLevel
+     * 3. Wait for a response from R replicas
+     * 4. If the digests (if any) match the data return the data
+     * 5. else carry out read repair by getting data from all the nodes.
+     */
+    private static PartitionIterator fetchRows(List&lt;SinglePartitionReadCommand&gt; commands, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    throws UnavailableException, ReadFailureException, ReadTimeoutException
+    {
+<span class="fc" id="L1724">        int cmdCount = commands.size();</span>
+
+<span class="fc" id="L1726">        SinglePartitionReadLifecycle[] reads = new SinglePartitionReadLifecycle[cmdCount];</span>
+<span class="fc bfc" id="L1727" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+<span class="fc" id="L1728">            reads[i] = new SinglePartitionReadLifecycle(commands.get(i), consistencyLevel, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L1730" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+<span class="fc" id="L1731">            reads[i].doInitialQueries();</span>
+
+<span class="fc bfc" id="L1733" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+<span class="fc" id="L1734">            reads[i].maybeTryAdditionalReplicas();</span>
+
+<span class="fc bfc" id="L1736" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+<span class="fc" id="L1737">            reads[i].awaitResultsAndRetryOnDigestMismatch();</span>
+
+<span class="fc bfc" id="L1739" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+<span class="pc bpc" id="L1740" title="1 of 2 branches missed.">            if (!reads[i].isDone())</span>
+<span class="nc" id="L1741">                reads[i].maybeAwaitFullDataRead();</span>
+
+<span class="fc" id="L1743">        List&lt;PartitionIterator&gt; results = new ArrayList&lt;&gt;(cmdCount);</span>
+<span class="fc bfc" id="L1744" title="All 2 branches covered.">        for (int i = 0; i &lt; cmdCount; i++)</span>
+        {
+<span class="pc bpc" id="L1746" title="2 of 4 branches missed.">            assert reads[i].isDone();</span>
+<span class="fc" id="L1747">            results.add(reads[i].getResult());</span>
+        }
+
+<span class="fc" id="L1750">        return PartitionIterators.concat(results);</span>
+    }
+
+<span class="pc bpc" id="L1753" title="1 of 2 branches missed.">    private static class SinglePartitionReadLifecycle</span>
+    {
+        private final SinglePartitionReadCommand command;
+        private final AbstractReadExecutor executor;
+        private final ConsistencyLevel consistency;
+        private final long queryStartNanoTime;
+
+        private PartitionIterator result;
+        private ReadCallback repairHandler;
+
+        SinglePartitionReadLifecycle(SinglePartitionReadCommand command, ConsistencyLevel consistency, long queryStartNanoTime)
+<span class="fc" id="L1764">        {</span>
+<span class="fc" id="L1765">            this.command = command;</span>
+<span class="fc" id="L1766">            this.executor = AbstractReadExecutor.getReadExecutor(command, consistency, queryStartNanoTime);</span>
+<span class="fc" id="L1767">            this.consistency = consistency;</span>
+<span class="fc" id="L1768">            this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L1769">        }</span>
+
+        boolean isDone()
+        {
+<span class="pc bpc" id="L1773" title="1 of 2 branches missed.">            return result != null;</span>
+        }
+
+        void doInitialQueries()
+        {
+<span class="fc" id="L1778">            executor.executeAsync();</span>
+<span class="fc" id="L1779">        }</span>
+
+        void maybeTryAdditionalReplicas()
+        {
+<span class="fc" id="L1783">            executor.maybeTryAdditionalReplicas();</span>
+<span class="fc" id="L1784">        }</span>
+
+        void awaitResultsAndRetryOnDigestMismatch() throws ReadFailureException, ReadTimeoutException
+        {
+            try
+            {
+<span class="fc" id="L1790">                result = executor.get();</span>
+            }
+<span class="nc" id="L1792">            catch (DigestMismatchException ex)</span>
+            {
+<span class="nc" id="L1794">                Tracing.trace(&quot;Digest mismatch: {}&quot;, ex);</span>
+
+<span class="nc" id="L1796">                ReadRepairMetrics.repairedBlocking.mark();</span>
+
+                // Do a full data read to resolve the correct response (and repair node that need be)
+<span class="nc" id="L1799">                Keyspace keyspace = Keyspace.open(command.metadata().ksName);</span>
+<span class="nc" id="L1800">                DataResolver resolver = new DataResolver(keyspace, command, ConsistencyLevel.ALL, executor.handler.endpoints.size(), queryStartNanoTime);</span>
+<span class="nc" id="L1801">                repairHandler = new ReadCallback(resolver,</span>
+                                                 ConsistencyLevel.ALL,
+<span class="nc" id="L1803">                                                 executor.getContactedReplicas().size(),</span>
+                                                 command,
+                                                 keyspace,
+                                                 executor.handler.endpoints,
+                                                 queryStartNanoTime);
+
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">                for (InetAddress endpoint : executor.getContactedReplicas())</span>
+                {
+<span class="nc" id="L1811">                    MessageOut&lt;ReadCommand&gt; message = command.createMessage(MessagingService.instance().getVersion(endpoint));</span>
+<span class="nc" id="L1812">                    Tracing.trace(&quot;Enqueuing full data read to {}&quot;, endpoint);</span>
+<span class="nc" id="L1813">                    MessagingService.instance().sendRRWithFailure(message, endpoint, repairHandler);</span>
+<span class="nc" id="L1814">                }</span>
+<span class="fc" id="L1815">            }</span>
+<span class="fc" id="L1816">        }</span>
+
+        void maybeAwaitFullDataRead() throws ReadTimeoutException
+        {
+            // There wasn't a digest mismatch, we're good
+<span class="nc bnc" id="L1821" title="All 2 branches missed.">            if (repairHandler == null)</span>
+<span class="nc" id="L1822">                return;</span>
+
+            // Otherwise, get the result from the full-data read and check that it's not a short read
+            try
+            {
+<span class="nc" id="L1827">                result = repairHandler.get();</span>
+            }
+<span class="nc" id="L1829">            catch (DigestMismatchException e)</span>
+            {
+<span class="nc" id="L1831">                throw new AssertionError(e); // full data requested from each node here, no digests should be sent</span>
+            }
+<span class="nc" id="L1833">            catch (ReadTimeoutException e)</span>
+            {
+<span class="nc bnc" id="L1835" title="All 2 branches missed.">                if (Tracing.isTracing())</span>
+<span class="nc" id="L1836">                    Tracing.trace(&quot;Timed out waiting on digest mismatch repair requests&quot;);</span>
+                else
+<span class="nc" id="L1838">                    logger.trace(&quot;Timed out waiting on digest mismatch repair requests&quot;);</span>
+                // the caught exception here will have CL.ALL from the repair command,
+                // not whatever CL the initial command was at (CASSANDRA-7947)
+<span class="nc" id="L1841">                int blockFor = consistency.blockFor(Keyspace.open(command.metadata().ksName));</span>
+<span class="nc" id="L1842">                throw new ReadTimeoutException(consistency, blockFor-1, blockFor, true);</span>
+<span class="nc" id="L1843">            }</span>
+<span class="nc" id="L1844">        }</span>
+
+        PartitionIterator getResult()
+        {
+<span class="pc bpc" id="L1848" title="2 of 4 branches missed.">            assert result != null;</span>
+<span class="fc" id="L1849">            return result;</span>
+        }
+    }
+
+    static class LocalReadRunnable extends DroppableRunnable
+    {
+        private final ReadCommand command;
+        private final ReadCallback handler;
+<span class="fc" id="L1857">        private final long start = System.nanoTime();</span>
+
+        LocalReadRunnable(ReadCommand command, ReadCallback handler)
+        {
+<span class="fc" id="L1861">            super(MessagingService.Verb.READ);</span>
+<span class="fc" id="L1862">            this.command = command;</span>
+<span class="fc" id="L1863">            this.handler = handler;</span>
+<span class="fc" id="L1864">        }</span>
+
+        protected void runMayThrow()
+        {
+            try
+            {
+<span class="fc" id="L1870">                command.setMonitoringTime(constructionTime, false, verb.getTimeout(), DatabaseDescriptor.getSlowQueryTimeout());</span>
+
+                ReadResponse response;
+<span class="fc" id="L1873">                try (ReadExecutionController executionController = command.executionController();</span>
+<span class="fc" id="L1874">                     UnfilteredPartitionIterator iterator = command.executeLocally(executionController))</span>
+                {
+<span class="fc" id="L1876">                    response = command.createResponse(iterator);</span>
+                }
+
+<span class="pc bpc" id="L1879" title="1 of 2 branches missed.">                if (command.complete())</span>
+                {
+<span class="fc" id="L1881">                    handler.response(response);</span>
+                }
+                else
+                {
+<span class="nc" id="L1885">                    MessagingService.instance().incrementDroppedMessages(verb, System.currentTimeMillis() - constructionTime);</span>
+<span class="nc" id="L1886">                    handler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.UNKNOWN);</span>
+                }
+
+<span class="fc" id="L1889">                MessagingService.instance().addLatency(FBUtilities.getBroadcastAddress(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));</span>
+            }
+<span class="nc" id="L1891">            catch (Throwable t)</span>
+            {
+<span class="nc bnc" id="L1893" title="All 2 branches missed.">                if (t instanceof TombstoneOverwhelmingException)</span>
+                {
+<span class="nc" id="L1895">                    handler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.READ_TOO_MANY_TOMBSTONES);</span>
+<span class="nc" id="L1896">                    logger.error(t.getMessage());</span>
+                }
+                else
+                {
+<span class="nc" id="L1900">                    handler.onFailure(FBUtilities.getBroadcastAddress(), RequestFailureReason.UNKNOWN);</span>
+<span class="nc" id="L1901">                    throw t;</span>
+                }
+<span class="fc" id="L1903">            }</span>
+<span class="fc" id="L1904">        }</span>
+    }
+
+    public static List&lt;InetAddress&gt; getLiveSortedEndpoints(Keyspace keyspace, ByteBuffer key)
+    {
+<span class="nc" id="L1909">        return getLiveSortedEndpoints(keyspace, StorageService.instance.getTokenMetadata().decorateKey(key));</span>
+    }
+
+    public static List&lt;InetAddress&gt; getLiveSortedEndpoints(Keyspace keyspace, RingPosition pos)
+    {
+<span class="fc" id="L1914">        List&lt;InetAddress&gt; liveEndpoints = StorageService.instance.getLiveNaturalEndpoints(keyspace, pos);</span>
+<span class="fc" id="L1915">        DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getBroadcastAddress(), liveEndpoints);</span>
+<span class="fc" id="L1916">        return liveEndpoints;</span>
+    }
+
+    private static List&lt;InetAddress&gt; intersection(List&lt;InetAddress&gt; l1, List&lt;InetAddress&gt; l2)
+    {
+        // Note: we don't use Guava Sets.intersection() for 3 reasons:
+        //   1) retainAll would be inefficient if l1 and l2 are large but in practice both are the replicas for a range and
+        //   so will be very small (&lt; RF). In that case, retainAll is in fact more efficient.
+        //   2) we do ultimately need a list so converting everything to sets don't make sense
+        //   3) l1 and l2 are sorted by proximity. The use of retainAll  maintain that sorting in the result, while using sets wouldn't.
+<span class="fc" id="L1926">        List&lt;InetAddress&gt; inter = new ArrayList&lt;InetAddress&gt;(l1);</span>
+<span class="fc" id="L1927">        inter.retainAll(l2);</span>
+<span class="fc" id="L1928">        return inter;</span>
+    }
+
+    /**
+     * Estimate the number of result rows (either cql3 rows or &quot;thrift&quot; rows, as called for by the command) per
+     * range in the ring based on our local data.  This assumes that ranges are uniformly distributed across the cluster
+     * and that the queried data is also uniformly distributed.
+     */
+    private static float estimateResultsPerRange(PartitionRangeReadCommand command, Keyspace keyspace)
+    {
+<span class="fc" id="L1938">        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().cfId);</span>
+<span class="fc" id="L1939">        Index index = command.getIndex(cfs);</span>
+<span class="pc bpc" id="L1940" title="1 of 2 branches missed.">        float maxExpectedResults = index == null</span>
+<span class="pc" id="L1941">                                 ? command.limits().estimateTotalResults(cfs)</span>
+<span class="pc" id="L1942">                                 : index.getEstimatedResultRows();</span>
+
+        // adjust maxExpectedResults by the number of tokens this node has and the replication factor for this ks
+<span class="fc" id="L1945">        return (maxExpectedResults / DatabaseDescriptor.getNumTokens()) / keyspace.getReplicationStrategy().getReplicationFactor();</span>
+    }
+
+    private static class RangeForQuery
+    {
+        public final AbstractBounds&lt;PartitionPosition&gt; range;
+        public final List&lt;InetAddress&gt; liveEndpoints;
+        public final List&lt;InetAddress&gt; filteredEndpoints;
+
+        public RangeForQuery(AbstractBounds&lt;PartitionPosition&gt; range, List&lt;InetAddress&gt; liveEndpoints, List&lt;InetAddress&gt; filteredEndpoints)
+<span class="fc" id="L1955">        {</span>
+<span class="fc" id="L1956">            this.range = range;</span>
+<span class="fc" id="L1957">            this.liveEndpoints = liveEndpoints;</span>
+<span class="fc" id="L1958">            this.filteredEndpoints = filteredEndpoints;</span>
+<span class="fc" id="L1959">        }</span>
+    }
+
+    private static class RangeIterator extends AbstractIterator&lt;RangeForQuery&gt;
+    {
+        private final Keyspace keyspace;
+        private final ConsistencyLevel consistency;
+        private final Iterator&lt;? extends AbstractBounds&lt;PartitionPosition&gt;&gt; ranges;
+        private final int rangeCount;
+
+        public RangeIterator(PartitionRangeReadCommand command, Keyspace keyspace, ConsistencyLevel consistency)
+<span class="fc" id="L1970">        {</span>
+<span class="fc" id="L1971">            this.keyspace = keyspace;</span>
+<span class="fc" id="L1972">            this.consistency = consistency;</span>
+
+<span class="pc bpc" id="L1974" title="1 of 2 branches missed.">            List&lt;? extends AbstractBounds&lt;PartitionPosition&gt;&gt; l = keyspace.getReplicationStrategy() instanceof LocalStrategy</span>
+<span class="pc" id="L1975">                                                          ? command.dataRange().keyRange().unwrap()</span>
+<span class="fc" id="L1976">                                                          : getRestrictedRanges(command.dataRange().keyRange());</span>
+<span class="fc" id="L1977">            this.ranges = l.iterator();</span>
+<span class="fc" id="L1978">            this.rangeCount = l.size();</span>
+<span class="fc" id="L1979">        }</span>
+
+        public int rangeCount()
+        {
+<span class="fc" id="L1983">            return rangeCount;</span>
+        }
+
+        protected RangeForQuery computeNext()
+        {
+<span class="fc bfc" id="L1988" title="All 2 branches covered.">            if (!ranges.hasNext())</span>
+<span class="fc" id="L1989">                return endOfData();</span>
+
+<span class="fc" id="L1991">            AbstractBounds&lt;PartitionPosition&gt; range = ranges.next();</span>
+<span class="fc" id="L1992">            List&lt;InetAddress&gt; liveEndpoints = getLiveSortedEndpoints(keyspace, range.right);</span>
+<span class="fc" id="L1993">            return new RangeForQuery(range,</span>
+                                     liveEndpoints,
+<span class="fc" id="L1995">                                     consistency.filterForQuery(keyspace, liveEndpoints));</span>
+        }
+    }
+
+    private static class RangeMerger extends AbstractIterator&lt;RangeForQuery&gt;
+    {
+        private final Keyspace keyspace;
+        private final ConsistencyLevel consistency;
+        private final PeekingIterator&lt;RangeForQuery&gt; ranges;
+
+        private RangeMerger(Iterator&lt;RangeForQuery&gt; iterator, Keyspace keyspace, ConsistencyLevel consistency)
+<span class="fc" id="L2006">        {</span>
+<span class="fc" id="L2007">            this.keyspace = keyspace;</span>
+<span class="fc" id="L2008">            this.consistency = consistency;</span>
+<span class="fc" id="L2009">            this.ranges = Iterators.peekingIterator(iterator);</span>
+<span class="fc" id="L2010">        }</span>
+
+        protected RangeForQuery computeNext()
+        {
+<span class="fc bfc" id="L2014" title="All 2 branches covered.">            if (!ranges.hasNext())</span>
+<span class="fc" id="L2015">                return endOfData();</span>
+
+<span class="fc" id="L2017">            RangeForQuery current = ranges.next();</span>
+
+            // getRestrictedRange has broken the queried range into per-[vnode] token ranges, but this doesn't take
+            // the replication factor into account. If the intersection of live endpoints for 2 consecutive ranges
+            // still meets the CL requirements, then we can merge both ranges into the same RangeSliceCommand.
+<span class="fc bfc" id="L2022" title="All 2 branches covered.">            while (ranges.hasNext())</span>
+            {
+                // If the current range right is the min token, we should stop merging because CFS.getRangeSlice
+                // don't know how to deal with a wrapping range.
+                // Note: it would be slightly more efficient to have CFS.getRangeSlice on the destination nodes unwraps
+                // the range if necessary and deal with it. However, we can't start sending wrapped range without breaking
+                // wire compatibility, so It's likely easier not to bother;
+<span class="pc bpc" id="L2029" title="1 of 2 branches missed.">                if (current.range.right.isMinimum())</span>
+<span class="nc" id="L2030">                    break;</span>
+
+<span class="fc" id="L2032">                RangeForQuery next = ranges.peek();</span>
+
+<span class="fc" id="L2034">                List&lt;InetAddress&gt; merged = intersection(current.liveEndpoints, next.liveEndpoints);</span>
+
+                // Check if there is enough endpoint for the merge to be possible.
+<span class="pc bpc" id="L2037" title="1 of 2 branches missed.">                if (!consistency.isSufficientLiveNodes(keyspace, merged))</span>
+<span class="fc" id="L2038">                    break;</span>
+
+<span class="nc" id="L2040">                List&lt;InetAddress&gt; filteredMerged = consistency.filterForQuery(keyspace, merged);</span>
+
+                // Estimate whether merging will be a win or not
+<span class="nc bnc" id="L2043" title="All 2 branches missed.">                if (!DatabaseDescriptor.getEndpointSnitch().isWorthMergingForRangeQuery(filteredMerged, current.filteredEndpoints, next.filteredEndpoints))</span>
+<span class="nc" id="L2044">                    break;</span>
+
+                // If we get there, merge this range and the next one
+<span class="nc" id="L2047">                current = new RangeForQuery(current.range.withNewRight(next.range.right), merged, filteredMerged);</span>
+<span class="nc" id="L2048">                ranges.next(); // consume the range we just merged since we've only peeked so far</span>
+<span class="nc" id="L2049">            }</span>
+<span class="fc" id="L2050">            return current;</span>
+        }
+    }
+
+    private static class SingleRangeResponse extends AbstractIterator&lt;RowIterator&gt; implements PartitionIterator
+    {
+        private final ReadCallback handler;
+        private PartitionIterator result;
+
+        private SingleRangeResponse(ReadCallback handler)
+<span class="fc" id="L2060">        {</span>
+<span class="fc" id="L2061">            this.handler = handler;</span>
+<span class="fc" id="L2062">        }</span>
+
+        private void waitForResponse() throws ReadTimeoutException
+        {
+<span class="pc bpc" id="L2066" title="1 of 2 branches missed.">            if (result != null)</span>
+<span class="nc" id="L2067">                return;</span>
+
+            try
+            {
+<span class="fc" id="L2071">                result = handler.get();</span>
+            }
+<span class="nc" id="L2073">            catch (DigestMismatchException e)</span>
+            {
+<span class="nc" id="L2075">                throw new AssertionError(e); // no digests in range slices yet</span>
+<span class="fc" id="L2076">            }</span>
+<span class="fc" id="L2077">        }</span>
+
+        protected RowIterator computeNext()
+        {
+<span class="fc" id="L2081">            waitForResponse();</span>
+<span class="pc bpc" id="L2082" title="1 of 2 branches missed.">            return result.hasNext() ? result.next() : endOfData();</span>
+        }
+
+        public void close()
+        {
+<span class="pc bpc" id="L2087" title="1 of 2 branches missed.">            if (result != null)</span>
+<span class="fc" id="L2088">                result.close();</span>
+<span class="fc" id="L2089">        }</span>
+    }
+
+    private static class RangeCommandIterator extends AbstractIterator&lt;RowIterator&gt; implements PartitionIterator
+    {
+        private final Iterator&lt;RangeForQuery&gt; ranges;
+        private final int totalRangeCount;
+        private final PartitionRangeReadCommand command;
+        private final Keyspace keyspace;
+        private final ConsistencyLevel consistency;
+        private final boolean enforceStrictLiveness;
+
+        private final long startTime;
+        private final long queryStartNanoTime;
+        private DataLimits.Counter counter;
+        private PartitionIterator sentQueryIterator;
+
+        private int concurrencyFactor;
+        // The two following &quot;metric&quot; are maintained to improve the concurrencyFactor
+        // when it was not good enough initially.
+        private int liveReturned;
+        private int rangesQueried;
+
+        public RangeCommandIterator(RangeIterator ranges, PartitionRangeReadCommand command, int concurrencyFactor, Keyspace keyspace, ConsistencyLevel consistency, long queryStartNanoTime)
+<span class="fc" id="L2113">        {</span>
+<span class="fc" id="L2114">            this.command = command;</span>
+<span class="fc" id="L2115">            this.concurrencyFactor = concurrencyFactor;</span>
+<span class="fc" id="L2116">            this.startTime = System.nanoTime();</span>
+<span class="fc" id="L2117">            this.ranges = new RangeMerger(ranges, keyspace, consistency);</span>
+<span class="fc" id="L2118">            this.totalRangeCount = ranges.rangeCount();</span>
+<span class="fc" id="L2119">            this.consistency = consistency;</span>
+<span class="fc" id="L2120">            this.keyspace = keyspace;</span>
+<span class="fc" id="L2121">            this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L2122">            this.enforceStrictLiveness = command.metadata().enforceStrictLiveness();</span>
+<span class="fc" id="L2123">        }</span>
+
+        public RowIterator computeNext()
+        {
+            try
+            {
+<span class="pc bpc" id="L2129" title="1 of 4 branches missed.">                while (sentQueryIterator == null || !sentQueryIterator.hasNext())</span>
+                {
+                    // If we don't have more range to handle, we're done
+<span class="fc bfc" id="L2132" title="All 2 branches covered.">                    if (!ranges.hasNext())</span>
+<span class="fc" id="L2133">                        return endOfData();</span>
+
+                    // else, sends the next batch of concurrent queries (after having close the previous iterator)
+<span class="fc bfc" id="L2136" title="All 2 branches covered.">                    if (sentQueryIterator != null)</span>
+                    {
+<span class="fc" id="L2138">                        liveReturned += counter.counted();</span>
+<span class="fc" id="L2139">                        sentQueryIterator.close();</span>
+
+                        // It's not the first batch of queries and we're not done, so we we can use what has been
+                        // returned so far to improve our rows-per-range estimate and update the concurrency accordingly
+<span class="fc" id="L2143">                        updateConcurrencyFactor();</span>
+                    }
+<span class="fc" id="L2145">                    sentQueryIterator = sendNextRequests();</span>
+                }
+
+<span class="nc" id="L2148">                return sentQueryIterator.next();</span>
+            }
+<span class="nc" id="L2150">            catch (UnavailableException e)</span>
+            {
+<span class="nc" id="L2152">                rangeMetrics.unavailables.mark();</span>
+<span class="nc" id="L2153">                throw e;</span>
+            }
+<span class="nc" id="L2155">            catch (ReadTimeoutException e)</span>
+            {
+<span class="nc" id="L2157">                rangeMetrics.timeouts.mark();</span>
+<span class="nc" id="L2158">                throw e;</span>
+            }
+<span class="nc" id="L2160">            catch (ReadFailureException e)</span>
+            {
+<span class="nc" id="L2162">                rangeMetrics.failures.mark();</span>
+<span class="nc" id="L2163">                throw e;</span>
+            }
+        }
+
+        private void updateConcurrencyFactor()
+        {
+<span class="pc bpc" id="L2169" title="1 of 2 branches missed.">            if (liveReturned == 0)</span>
+            {
+                // we haven't actually gotten any results, so query all remaining ranges at once
+<span class="fc" id="L2172">                concurrencyFactor = totalRangeCount - rangesQueried;</span>
+<span class="fc" id="L2173">                return;</span>
+            }
+
+            // Otherwise, compute how many rows per range we got on average and pick a concurrency factor
+            // that should allow us to fetch all remaining rows with the next batch of (concurrent) queries.
+<span class="nc" id="L2178">            int remainingRows = command.limits().count() - liveReturned;</span>
+<span class="nc" id="L2179">            float rowsPerRange = (float)liveReturned / (float)rangesQueried;</span>
+<span class="nc" id="L2180">            concurrencyFactor = Math.max(1, Math.min(totalRangeCount - rangesQueried, Math.round(remainingRows / rowsPerRange)));</span>
+<span class="nc" id="L2181">            logger.trace(&quot;Didn't get enough response rows; actual rows per range: {}; remaining rows: {}, new concurrent requests: {}&quot;,</span>
+<span class="nc" id="L2182">                         rowsPerRange, remainingRows, concurrencyFactor);</span>
+<span class="nc" id="L2183">        }</span>
+
+        /**
+         * Queries the provided sub-range.
+         *
+         * @param toQuery the subRange to query.
+         * @param isFirst in the case where multiple queries are sent in parallel, whether that's the first query on
+         * that batch or not. The reason it matters is that whe paging queries, the command (more specifically the
+         * {@code DataLimits}) may have &quot;state&quot; information and that state may only be valid for the first query (in
+         * that it's the query that &quot;continues&quot; whatever we're previously queried).
+         */
+        private SingleRangeResponse query(RangeForQuery toQuery, boolean isFirst)
+        {
+<span class="fc" id="L2196">            PartitionRangeReadCommand rangeCommand = command.forSubRange(toQuery.range, isFirst);</span>
+
+<span class="fc" id="L2198">            DataResolver resolver = new DataResolver(keyspace, rangeCommand, consistency, toQuery.filteredEndpoints.size(), queryStartNanoTime);</span>
+
+<span class="fc" id="L2200">            int blockFor = consistency.blockFor(keyspace);</span>
+<span class="fc" id="L2201">            int minResponses = Math.min(toQuery.filteredEndpoints.size(), blockFor);</span>
+<span class="fc" id="L2202">            List&lt;InetAddress&gt; minimalEndpoints = toQuery.filteredEndpoints.subList(0, minResponses);</span>
+<span class="fc" id="L2203">            ReadCallback handler = new ReadCallback(resolver, consistency, rangeCommand, minimalEndpoints, queryStartNanoTime);</span>
+
+<span class="fc" id="L2205">            handler.assureSufficientLiveNodes();</span>
+
+<span class="pc bpc" id="L2207" title="1 of 4 branches missed.">            if (toQuery.filteredEndpoints.size() == 1 &amp;&amp; canDoLocalRequest(toQuery.filteredEndpoints.get(0)))</span>
+            {
+<span class="fc" id="L2209">                StageManager.getStage(Stage.READ).execute(new LocalReadRunnable(rangeCommand, handler));</span>
+            }
+            else
+            {
+<span class="fc bfc" id="L2213" title="All 2 branches covered.">                for (InetAddress endpoint : toQuery.filteredEndpoints)</span>
+                {
+<span class="fc" id="L2215">                    MessageOut&lt;ReadCommand&gt; message = rangeCommand.createMessage(MessagingService.instance().getVersion(endpoint));</span>
+<span class="fc" id="L2216">                    Tracing.trace(&quot;Enqueuing request to {}&quot;, endpoint);</span>
+<span class="fc" id="L2217">                    MessagingService.instance().sendRRWithFailure(message, endpoint, handler);</span>
+<span class="fc" id="L2218">                }</span>
+            }
+
+<span class="fc" id="L2221">            return new SingleRangeResponse(handler);</span>
+        }
+
+        private PartitionIterator sendNextRequests()
+        {
+<span class="fc" id="L2226">            List&lt;PartitionIterator&gt; concurrentQueries = new ArrayList&lt;&gt;(concurrencyFactor);</span>
+<span class="pc bpc" id="L2227" title="1 of 4 branches missed.">            for (int i = 0; i &lt; concurrencyFactor &amp;&amp; ranges.hasNext(); i++)</span>
+            {
+<span class="pc bpc" id="L2229" title="1 of 2 branches missed.">                concurrentQueries.add(query(ranges.next(), i == 0));</span>
+<span class="fc" id="L2230">                ++rangesQueried;</span>
+            }
+
+<span class="fc" id="L2233">            Tracing.trace(&quot;Submitted {} concurrent range requests&quot;, concurrentQueries.size());</span>
+            // We want to count the results for the sake of updating the concurrency factor (see updateConcurrencyFactor) but we don't want to
+            // enforce any particular limit at this point (this could break code than rely on postReconciliationProcessing), hence the DataLimits.NONE.
+<span class="fc" id="L2236">            counter = DataLimits.NONE.newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);</span>
+<span class="fc" id="L2237">            return counter.applyTo(PartitionIterators.concat(concurrentQueries));</span>
+        }
+
+        public void close()
+        {
+            try
+            {
+<span class="pc bpc" id="L2244" title="1 of 2 branches missed.">                if (sentQueryIterator != null)</span>
+<span class="fc" id="L2245">                    sentQueryIterator.close();</span>
+            }
+            finally
+            {
+<span class="fc" id="L2249">                long latency = System.nanoTime() - startTime;</span>
+<span class="fc" id="L2250">                rangeMetrics.addNano(latency);</span>
+<span class="fc" id="L2251">                Keyspace.openAndGetStore(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);</span>
+            }
+<span class="fc" id="L2253">        }</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public static PartitionIterator getRangeSlice(PartitionRangeReadCommand command, ConsistencyLevel consistencyLevel, long queryStartNanoTime)
+    {
+<span class="fc" id="L2259">        Tracing.trace(&quot;Computing ranges to query&quot;);</span>
+
+<span class="fc" id="L2261">        Keyspace keyspace = Keyspace.open(command.metadata().ksName);</span>
+<span class="fc" id="L2262">        RangeIterator ranges = new RangeIterator(command, keyspace, consistencyLevel);</span>
+
+        // our estimate of how many result rows there will be per-range
+<span class="fc" id="L2265">        float resultsPerRange = estimateResultsPerRange(command, keyspace);</span>
+        // underestimate how many rows we will get per-range in order to increase the likelihood that we'll
+        // fetch enough rows in the first round
+<span class="fc" id="L2268">        resultsPerRange -= resultsPerRange * CONCURRENT_SUBREQUESTS_MARGIN;</span>
+<span class="pc bpc" id="L2269" title="1 of 2 branches missed.">        int concurrencyFactor = resultsPerRange == 0.0</span>
+                              ? 1
+<span class="pc" id="L2271">                              : Math.max(1, Math.min(ranges.rangeCount(), (int) Math.ceil(command.limits().count() / resultsPerRange)));</span>
+<span class="fc" id="L2272">        logger.trace(&quot;Estimated result rows per range: {}; requested rows: {}, ranges.size(): {}; concurrent range requests: {}&quot;,</span>
+<span class="fc" id="L2273">                     resultsPerRange, command.limits().count(), ranges.rangeCount(), concurrencyFactor);</span>
+<span class="fc" id="L2274">        Tracing.trace(&quot;Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)&quot;, ranges.rangeCount(), concurrencyFactor, resultsPerRange);</span>
+
+        // Note that in general, a RangeCommandIterator will honor the command limit for each range, but will not enforce it globally.
+
+<span class="fc" id="L2278">        return command.limits().filter(command.postReconciliationProcessing(new RangeCommandIterator(ranges, command, concurrencyFactor, keyspace, consistencyLevel, queryStartNanoTime)),</span>
+<span class="fc" id="L2279">                                       command.nowInSec(),</span>
+<span class="fc" id="L2280">                                       command.selectsFullPartition(),</span>
+<span class="fc" id="L2281">                                       command.metadata().enforceStrictLiveness());</span>
+    }
+
+    public Map&lt;String, List&lt;String&gt;&gt; getSchemaVersions()
+    {
+<span class="nc" id="L2286">        return describeSchemaVersions();</span>
+    }
+
+    /**
+     * initiate a request/response session with each live node to check whether or not everybody is using the same
+     * migration id. This is useful for determining if a schema change has propagated through the cluster. Disagreement
+     * is assumed if any node fails to respond.
+     */
+    public static Map&lt;String, List&lt;String&gt;&gt; describeSchemaVersions()
+    {
+<span class="nc" id="L2296">        final String myVersion = Schema.instance.getVersion().toString();</span>
+<span class="nc" id="L2297">        final Map&lt;InetAddress, UUID&gt; versions = new ConcurrentHashMap&lt;InetAddress, UUID&gt;();</span>
+<span class="nc" id="L2298">        final Set&lt;InetAddress&gt; liveHosts = Gossiper.instance.getLiveMembers();</span>
+<span class="nc" id="L2299">        final CountDownLatch latch = new CountDownLatch(liveHosts.size());</span>
+
+<span class="nc" id="L2301">        IAsyncCallback&lt;UUID&gt; cb = new IAsyncCallback&lt;UUID&gt;()</span>
+<span class="nc" id="L2302">        {</span>
+            public void response(MessageIn&lt;UUID&gt; message)
+            {
+                // record the response from the remote node.
+<span class="nc" id="L2306">                versions.put(message.from, message.payload);</span>
+<span class="nc" id="L2307">                latch.countDown();</span>
+<span class="nc" id="L2308">            }</span>
+
+            public boolean isLatencyForSnitch()
+            {
+<span class="nc" id="L2312">                return false;</span>
+            }
+        };
+        // an empty message acts as a request to the SchemaCheckVerbHandler.
+<span class="nc" id="L2316">        MessageOut message = new MessageOut(MessagingService.Verb.SCHEMA_CHECK);</span>
+<span class="nc bnc" id="L2317" title="All 2 branches missed.">        for (InetAddress endpoint : liveHosts)</span>
+<span class="nc" id="L2318">            MessagingService.instance().sendRR(message, endpoint, cb);</span>
+
+        try
+        {
+            // wait for as long as possible. timeout-1s if possible.
+<span class="nc" id="L2323">            latch.await(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);</span>
+        }
+<span class="nc" id="L2325">        catch (InterruptedException ex)</span>
+        {
+<span class="nc" id="L2327">            throw new AssertionError(&quot;This latch shouldn't have been interrupted.&quot;);</span>
+<span class="nc" id="L2328">        }</span>
+
+        // maps versions to hosts that are on that version.
+<span class="nc" id="L2331">        Map&lt;String, List&lt;String&gt;&gt; results = new HashMap&lt;String, List&lt;String&gt;&gt;();</span>
+<span class="nc" id="L2332">        Iterable&lt;InetAddress&gt; allHosts = Iterables.concat(Gossiper.instance.getLiveMembers(), Gossiper.instance.getUnreachableMembers());</span>
+<span class="nc bnc" id="L2333" title="All 2 branches missed.">        for (InetAddress host : allHosts)</span>
+        {
+<span class="nc" id="L2335">            UUID version = versions.get(host);</span>
+<span class="nc bnc" id="L2336" title="All 2 branches missed.">            String stringVersion = version == null ? UNREACHABLE : version.toString();</span>
+<span class="nc" id="L2337">            List&lt;String&gt; hosts = results.get(stringVersion);</span>
+<span class="nc bnc" id="L2338" title="All 2 branches missed.">            if (hosts == null)</span>
+            {
+<span class="nc" id="L2340">                hosts = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L2341">                results.put(stringVersion, hosts);</span>
+            }
+<span class="nc" id="L2343">            hosts.add(host.getHostAddress());</span>
+<span class="nc" id="L2344">        }</span>
+
+        // we're done: the results map is ready to return to the client.  the rest is just debug logging:
+<span class="nc bnc" id="L2347" title="All 2 branches missed.">        if (results.get(UNREACHABLE) != null)</span>
+<span class="nc" id="L2348">            logger.debug(&quot;Hosts not in agreement. Didn't get a response from everybody: {}&quot;, StringUtils.join(results.get(UNREACHABLE), &quot;,&quot;));</span>
+<span class="nc bnc" id="L2349" title="All 2 branches missed.">        for (Map.Entry&lt;String, List&lt;String&gt;&gt; entry : results.entrySet())</span>
+        {
+            // check for version disagreement. log the hosts that don't agree.
+<span class="nc bnc" id="L2352" title="All 4 branches missed.">            if (entry.getKey().equals(UNREACHABLE) || entry.getKey().equals(myVersion))</span>
+<span class="nc" id="L2353">                continue;</span>
+<span class="nc bnc" id="L2354" title="All 2 branches missed.">            for (String host : entry.getValue())</span>
+<span class="nc" id="L2355">                logger.debug(&quot;{} disagrees ({})&quot;, host, entry.getKey());</span>
+<span class="nc" id="L2356">        }</span>
+<span class="nc bnc" id="L2357" title="All 2 branches missed.">        if (results.size() == 1)</span>
+<span class="nc" id="L2358">            logger.debug(&quot;Schemas are in agreement.&quot;);</span>
+
+<span class="nc" id="L2360">        return results;</span>
+    }
+
+    /**
+     * Compute all ranges we're going to query, in sorted order. Nodes can be replica destinations for many ranges,
+     * so we need to restrict each scan to the specific range we want, or else we'd get duplicate results.
+     */
+    static &lt;T extends RingPosition&lt;T&gt;&gt; List&lt;AbstractBounds&lt;T&gt;&gt; getRestrictedRanges(final AbstractBounds&lt;T&gt; queryRange)
+    {
+        // special case for bounds containing exactly 1 (non-minimum) token
+<span class="pc bpc" id="L2370" title="5 of 6 branches missed.">        if (queryRange instanceof Bounds &amp;&amp; queryRange.left.equals(queryRange.right) &amp;&amp; !queryRange.left.isMinimum())</span>
+        {
+<span class="nc" id="L2372">            return Collections.singletonList(queryRange);</span>
+        }
+
+<span class="fc" id="L2375">        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();</span>
+
+<span class="fc" id="L2377">        List&lt;AbstractBounds&lt;T&gt;&gt; ranges = new ArrayList&lt;AbstractBounds&lt;T&gt;&gt;();</span>
+        // divide the queryRange into pieces delimited by the ring and minimum tokens
+<span class="fc" id="L2379">        Iterator&lt;Token&gt; ringIter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), queryRange.left.getToken(), true);</span>
+<span class="fc" id="L2380">        AbstractBounds&lt;T&gt; remainder = queryRange;</span>
+<span class="fc bfc" id="L2381" title="All 2 branches covered.">        while (ringIter.hasNext())</span>
+        {
+            /*
+             * remainder can be a range/bounds of token _or_ keys and we want to split it with a token:
+             *   - if remainder is tokens, then we'll just split using the provided token.
+             *   - if remainder is keys, we want to split using token.upperBoundKey. For instance, if remainder
+             *     is [DK(10, 'foo'), DK(20, 'bar')], and we have 3 nodes with tokens 0, 15, 30. We want to
+             *     split remainder to A=[DK(10, 'foo'), 15] and B=(15, DK(20, 'bar')]. But since we can't mix
+             *     tokens and keys at the same time in a range, we uses 15.upperBoundKey() to have A include all
+             *     keys having 15 as token and B include none of those (since that is what our node owns).
+             * asSplitValue() abstracts that choice.
+             */
+<span class="fc" id="L2393">            Token upperBoundToken = ringIter.next();</span>
+<span class="fc" id="L2394">            T upperBound = (T)upperBoundToken.upperBound(queryRange.left.getClass());</span>
+<span class="pc bpc" id="L2395" title="1 of 4 branches missed.">            if (!remainder.left.equals(upperBound) &amp;&amp; !remainder.contains(upperBound))</span>
+                // no more splits
+<span class="nc" id="L2397">                break;</span>
+<span class="fc" id="L2398">            Pair&lt;AbstractBounds&lt;T&gt;,AbstractBounds&lt;T&gt;&gt; splits = remainder.split(upperBound);</span>
+<span class="fc bfc" id="L2399" title="All 2 branches covered.">            if (splits == null)</span>
+<span class="fc" id="L2400">                continue;</span>
+
+<span class="fc" id="L2402">            ranges.add(splits.left);</span>
+<span class="fc" id="L2403">            remainder = splits.right;</span>
+<span class="fc" id="L2404">        }</span>
+<span class="fc" id="L2405">        ranges.add(remainder);</span>
+
+<span class="fc" id="L2407">        return ranges;</span>
+    }
+
+    public boolean getHintedHandoffEnabled()
+    {
+<span class="nc" id="L2412">        return DatabaseDescriptor.hintedHandoffEnabled();</span>
+    }
+
+    public void setHintedHandoffEnabled(boolean b)
+    {
+<span class="nc" id="L2417">        synchronized (StorageService.instance)</span>
+        {
+<span class="nc bnc" id="L2419" title="All 2 branches missed.">            if (b)</span>
+<span class="nc" id="L2420">                StorageService.instance.checkServiceAllowedToStart(&quot;hinted handoff&quot;);</span>
+
+<span class="nc" id="L2422">            DatabaseDescriptor.setHintedHandoffEnabled(b);</span>
+<span class="nc" id="L2423">        }</span>
+<span class="nc" id="L2424">    }</span>
+
+    public void enableHintsForDC(String dc)
+    {
+<span class="nc" id="L2428">        DatabaseDescriptor.enableHintsForDC(dc);</span>
+<span class="nc" id="L2429">    }</span>
+
+    public void disableHintsForDC(String dc)
+    {
+<span class="nc" id="L2433">        DatabaseDescriptor.disableHintsForDC(dc);</span>
+<span class="nc" id="L2434">    }</span>
+
+    public Set&lt;String&gt; getHintedHandoffDisabledDCs()
+    {
+<span class="nc" id="L2438">        return DatabaseDescriptor.hintedHandoffDisabledDCs();</span>
+    }
+
+    public int getMaxHintWindow()
+    {
+<span class="nc" id="L2443">        return DatabaseDescriptor.getMaxHintWindow();</span>
+    }
+
+    public void setMaxHintWindow(int ms)
+    {
+<span class="nc" id="L2448">        DatabaseDescriptor.setMaxHintWindow(ms);</span>
+<span class="nc" id="L2449">    }</span>
+
+    public static boolean shouldHint(InetAddress ep)
+    {
+<span class="nc bnc" id="L2453" title="All 2 branches missed.">        if (DatabaseDescriptor.hintedHandoffEnabled())</span>
+        {
+<span class="nc" id="L2455">            Set&lt;String&gt; disabledDCs = DatabaseDescriptor.hintedHandoffDisabledDCs();</span>
+<span class="nc bnc" id="L2456" title="All 2 branches missed.">            if (!disabledDCs.isEmpty())</span>
+            {
+<span class="nc" id="L2458">                final String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(ep);</span>
+<span class="nc bnc" id="L2459" title="All 2 branches missed.">                if (disabledDCs.contains(dc))</span>
+                {
+<span class="nc" id="L2461">                    Tracing.trace(&quot;Not hinting {} since its data center {} has been disabled {}&quot;, ep, dc, disabledDCs);</span>
+<span class="nc" id="L2462">                    return false;</span>
+                }
+            }
+<span class="nc bnc" id="L2465" title="All 2 branches missed.">            boolean hintWindowExpired = Gossiper.instance.getEndpointDowntime(ep) &gt; DatabaseDescriptor.getMaxHintWindow();</span>
+<span class="nc bnc" id="L2466" title="All 2 branches missed.">            if (hintWindowExpired)</span>
+            {
+<span class="nc" id="L2468">                HintsService.instance.metrics.incrPastWindow(ep);</span>
+<span class="nc" id="L2469">                Tracing.trace(&quot;Not hinting {} which has been down {} ms&quot;, ep, Gossiper.instance.getEndpointDowntime(ep));</span>
+            }
+<span class="nc bnc" id="L2471" title="All 2 branches missed.">            return !hintWindowExpired;</span>
+        }
+        else
+        {
+<span class="nc" id="L2475">            return false;</span>
+        }
+    }
+
+    /**
+     * Performs the truncate operatoin, which effectively deletes all data from
+     * the column family cfname
+     * @param keyspace
+     * @param cfname
+     * @throws UnavailableException If some of the hosts in the ring are down.
+     * @throws TimeoutException
+     */
+    public static void truncateBlocking(String keyspace, String cfname) throws UnavailableException, TimeoutException
+    {
+<span class="nc" id="L2489">        logger.debug(&quot;Starting a blocking truncate operation on keyspace {}, CF {}&quot;, keyspace, cfname);</span>
+<span class="nc bnc" id="L2490" title="All 2 branches missed.">        if (isAnyStorageHostDown())</span>
+        {
+<span class="nc" id="L2492">            logger.info(&quot;Cannot perform truncate, some hosts are down&quot;);</span>
+            // Since the truncate operation is so aggressive and is typically only
+            // invoked by an admin, for simplicity we require that all nodes are up
+            // to perform the operation.
+<span class="nc" id="L2496">            int liveMembers = Gossiper.instance.getLiveMembers().size();</span>
+<span class="nc" id="L2497">            throw new UnavailableException(ConsistencyLevel.ALL, liveMembers + Gossiper.instance.getUnreachableMembers().size(), liveMembers);</span>
+        }
+
+<span class="nc" id="L2500">        Set&lt;InetAddress&gt; allEndpoints = StorageService.instance.getLiveRingMembers(true);</span>
+
+<span class="nc" id="L2502">        int blockFor = allEndpoints.size();</span>
+<span class="nc" id="L2503">        final TruncateResponseHandler responseHandler = new TruncateResponseHandler(blockFor);</span>
+
+        // Send out the truncate calls and track the responses with the callbacks.
+<span class="nc" id="L2506">        Tracing.trace(&quot;Enqueuing truncate messages to hosts {}&quot;, allEndpoints);</span>
+<span class="nc" id="L2507">        final Truncation truncation = new Truncation(keyspace, cfname);</span>
+<span class="nc" id="L2508">        MessageOut&lt;Truncation&gt; message = truncation.createMessage();</span>
+<span class="nc bnc" id="L2509" title="All 2 branches missed.">        for (InetAddress endpoint : allEndpoints)</span>
+<span class="nc" id="L2510">            MessagingService.instance().sendRR(message, endpoint, responseHandler);</span>
+
+        // Wait for all
+        try
+        {
+<span class="nc" id="L2515">            responseHandler.get();</span>
+        }
+<span class="nc" id="L2517">        catch (TimeoutException e)</span>
+        {
+<span class="nc" id="L2519">            Tracing.trace(&quot;Timed out&quot;);</span>
+<span class="nc" id="L2520">            throw e;</span>
+<span class="nc" id="L2521">        }</span>
+<span class="nc" id="L2522">    }</span>
+
+    /**
+     * Asks the gossiper if there are any nodes that are currently down.
+     * @return true if the gossiper thinks all nodes are up.
+     */
+    private static boolean isAnyStorageHostDown()
+    {
+<span class="nc bnc" id="L2530" title="All 2 branches missed.">        return !Gossiper.instance.getUnreachableTokenOwners().isEmpty();</span>
+    }
+
+    public interface WritePerformer
+    {
+        public void apply(IMutation mutation,
+                          Iterable&lt;InetAddress&gt; targets,
+                          AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler,
+                          String localDataCenter,
+                          ConsistencyLevel consistencyLevel) throws OverloadedException;
+    }
+
+    /**
+     * This class captures metrics for views writes.
+     */
+    private static class ViewWriteMetricsWrapped extends BatchlogResponseHandler&lt;IMutation&gt;
+    {
+        public ViewWriteMetricsWrapped(AbstractWriteResponseHandler&lt;IMutation&gt; writeHandler, int i, BatchlogCleanup cleanup, long queryStartNanoTime)
+        {
+<span class="nc" id="L2549">            super(writeHandler, i, cleanup, queryStartNanoTime);</span>
+<span class="nc" id="L2550">            viewWriteMetrics.viewReplicasAttempted.inc(totalEndpoints());</span>
+<span class="nc" id="L2551">        }</span>
+
+        public void response(MessageIn&lt;IMutation&gt; msg)
+        {
+<span class="nc" id="L2555">            super.response(msg);</span>
+<span class="nc" id="L2556">            viewWriteMetrics.viewReplicasSuccess.inc();</span>
+<span class="nc" id="L2557">        }</span>
+    }
+
+    /**
+     * A Runnable that aborts if it doesn't start running before it times out
+     */
+    private static abstract class DroppableRunnable implements Runnable
+    {
+        final long constructionTime;
+        final MessagingService.Verb verb;
+
+        public DroppableRunnable(MessagingService.Verb verb)
+<span class="fc" id="L2569">        {</span>
+<span class="fc" id="L2570">            this.constructionTime = System.currentTimeMillis();</span>
+<span class="fc" id="L2571">            this.verb = verb;</span>
+<span class="fc" id="L2572">        }</span>
+
+        public final void run()
+        {
+<span class="fc" id="L2576">            long timeTaken = System.currentTimeMillis() - constructionTime;</span>
+<span class="pc bpc" id="L2577" title="1 of 2 branches missed.">            if (timeTaken &gt; verb.getTimeout())</span>
+            {
+<span class="nc" id="L2579">                MessagingService.instance().incrementDroppedMessages(verb, timeTaken);</span>
+<span class="nc" id="L2580">                return;</span>
+            }
+            try
+            {
+<span class="fc" id="L2584">                runMayThrow();</span>
+            }
+<span class="nc" id="L2586">            catch (Exception e)</span>
+            {
+<span class="nc" id="L2588">                throw new RuntimeException(e);</span>
+<span class="fc" id="L2589">            }</span>
+<span class="fc" id="L2590">        }</span>
+
+        abstract protected void runMayThrow() throws Exception;
+    }
+
+    /**
+     * Like DroppableRunnable, but if it aborts, it will rerun (on the mutation stage) after
+     * marking itself as a hint in progress so that the hint backpressure mechanism can function.
+     */
+    private static abstract class LocalMutationRunnable implements Runnable
+    {
+<span class="pc" id="L2601">        private final long constructionTime = System.currentTimeMillis();</span>
+
+        private final Optional&lt;IMutation&gt; mutationOpt;
+
+        public LocalMutationRunnable(Optional&lt;IMutation&gt; mutationOpt)
+<span class="fc" id="L2606">        {</span>
+<span class="fc" id="L2607">            this.mutationOpt = mutationOpt;</span>
+<span class="fc" id="L2608">        }</span>
+
+        public LocalMutationRunnable()
+<span class="nc" id="L2611">        {</span>
+<span class="nc" id="L2612">            this.mutationOpt = Optional.empty();</span>
+<span class="nc" id="L2613">        }</span>
+
+        public final void run()
+        {
+<span class="fc" id="L2617">            final MessagingService.Verb verb = verb();</span>
+<span class="fc" id="L2618">            long mutationTimeout = verb.getTimeout();</span>
+<span class="fc" id="L2619">            long timeTaken = System.currentTimeMillis() - constructionTime;</span>
+<span class="pc bpc" id="L2620" title="1 of 2 branches missed.">            if (timeTaken &gt; mutationTimeout)</span>
+            {
+<span class="nc bnc" id="L2622" title="All 2 branches missed.">                if (MessagingService.DROPPABLE_VERBS.contains(verb))</span>
+<span class="nc" id="L2623">                    MessagingService.instance().incrementDroppedMutations(mutationOpt, timeTaken);</span>
+<span class="nc" id="L2624">                HintRunnable runnable = new HintRunnable(Collections.singleton(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc" id="L2625">                {</span>
+                    protected void runMayThrow() throws Exception
+                    {
+<span class="nc" id="L2628">                        LocalMutationRunnable.this.runMayThrow();</span>
+<span class="nc" id="L2629">                    }</span>
+                };
+<span class="nc" id="L2631">                submitHint(runnable);</span>
+<span class="nc" id="L2632">                return;</span>
+            }
+
+            try
+            {
+<span class="fc" id="L2637">                runMayThrow();</span>
+            }
+<span class="nc" id="L2639">            catch (Exception e)</span>
+            {
+<span class="nc" id="L2641">                throw new RuntimeException(e);</span>
+<span class="fc" id="L2642">            }</span>
+<span class="fc" id="L2643">        }</span>
+
+        abstract protected MessagingService.Verb verb();
+        abstract protected void runMayThrow() throws Exception;
+    }
+
+    /**
+     * HintRunnable will decrease totalHintsInProgress and targetHints when finished.
+     * It is the caller's responsibility to increment them initially.
+     */
+    private abstract static class HintRunnable implements Runnable
+    {
+        public final Collection&lt;InetAddress&gt; targets;
+
+        protected HintRunnable(Collection&lt;InetAddress&gt; targets)
+<span class="nc" id="L2658">        {</span>
+<span class="nc" id="L2659">            this.targets = targets;</span>
+<span class="nc" id="L2660">        }</span>
+
+        public void run()
+        {
+            try
+            {
+<span class="nc" id="L2666">                runMayThrow();</span>
+            }
+<span class="nc" id="L2668">            catch (Exception e)</span>
+            {
+<span class="nc" id="L2670">                throw new RuntimeException(e);</span>
+            }
+            finally
+            {
+<span class="nc" id="L2674">                StorageMetrics.totalHintsInProgress.dec(targets.size());</span>
+<span class="nc bnc" id="L2675" title="All 2 branches missed.">                for (InetAddress target : targets)</span>
+<span class="nc" id="L2676">                    getHintsInProgressFor(target).decrementAndGet();</span>
+            }
+<span class="nc" id="L2678">        }</span>
+
+        abstract protected void runMayThrow() throws Exception;
+    }
+
+    public long getTotalHints()
+    {
+<span class="nc" id="L2685">        return StorageMetrics.totalHints.getCount();</span>
+    }
+
+    public int getMaxHintsInProgress()
+    {
+<span class="nc" id="L2690">        return maxHintsInProgress;</span>
+    }
+
+    public void setMaxHintsInProgress(int qs)
+    {
+<span class="nc" id="L2695">        maxHintsInProgress = qs;</span>
+<span class="nc" id="L2696">    }</span>
+
+    public int getHintsInProgress()
+    {
+<span class="nc" id="L2700">        return (int) StorageMetrics.totalHintsInProgress.getCount();</span>
+    }
+
+    public void verifyNoHintsInProgress()
+    {
+<span class="nc bnc" id="L2705" title="All 2 branches missed.">        if (getHintsInProgress() &gt; 0)</span>
+<span class="nc" id="L2706">            logger.warn(&quot;Some hints were not written before shutdown.  This is not supposed to happen.  You should (a) run repair, and (b) file a bug report&quot;);</span>
+<span class="nc" id="L2707">    }</span>
+
+    private static AtomicInteger getHintsInProgressFor(InetAddress destination)
+    {
+        try
+        {
+<span class="nc" id="L2713">            return hintsInProgress.load(destination);</span>
+        }
+<span class="nc" id="L2715">        catch (Exception e)</span>
+        {
+<span class="nc" id="L2717">            throw new AssertionError(e);</span>
+        }
+    }
+
+    public static Future&lt;Void&gt; submitHint(Mutation mutation, InetAddress target, AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler)
+    {
+<span class="nc" id="L2723">        return submitHint(mutation, Collections.singleton(target), responseHandler);</span>
+    }
+
+    public static Future&lt;Void&gt; submitHint(Mutation mutation,
+                                          Collection&lt;InetAddress&gt; targets,
+                                          AbstractWriteResponseHandler&lt;IMutation&gt; responseHandler)
+    {
+<span class="nc" id="L2730">        HintRunnable runnable = new HintRunnable(targets)</span>
+<span class="nc" id="L2731">        {</span>
+            public void runMayThrow()
+            {
+<span class="nc" id="L2734">                Set&lt;InetAddress&gt; validTargets = new HashSet&lt;&gt;(targets.size());</span>
+<span class="nc" id="L2735">                Set&lt;UUID&gt; hostIds = new HashSet&lt;&gt;(targets.size());</span>
+<span class="nc bnc" id="L2736" title="All 2 branches missed.">                for (InetAddress target : targets)</span>
+                {
+<span class="nc" id="L2738">                    UUID hostId = StorageService.instance.getHostIdForEndpoint(target);</span>
+<span class="nc bnc" id="L2739" title="All 2 branches missed.">                    if (hostId != null)</span>
+                    {
+<span class="nc" id="L2741">                        hostIds.add(hostId);</span>
+<span class="nc" id="L2742">                        validTargets.add(target);</span>
+                    }
+                    else
+<span class="nc" id="L2745">                        logger.debug(&quot;Discarding hint for endpoint not part of ring: {}&quot;, target);</span>
+<span class="nc" id="L2746">                }</span>
+<span class="nc" id="L2747">                logger.trace(&quot;Adding hints for {}&quot;, validTargets);</span>
+<span class="nc" id="L2748">                HintsService.instance.write(hostIds, Hint.create(mutation, System.currentTimeMillis()));</span>
+<span class="nc" id="L2749">                validTargets.forEach(HintsService.instance.metrics::incrCreatedHints);</span>
+                // Notify the handler only for CL == ANY
+<span class="nc bnc" id="L2751" title="All 4 branches missed.">                if (responseHandler != null &amp;&amp; responseHandler.consistencyLevel == ConsistencyLevel.ANY)</span>
+<span class="nc" id="L2752">                    responseHandler.response(null);</span>
+<span class="nc" id="L2753">            }</span>
+        };
+
+<span class="nc" id="L2756">        return submitHint(runnable);</span>
+    }
+
+    private static Future&lt;Void&gt; submitHint(HintRunnable runnable)
+    {
+<span class="nc" id="L2761">        StorageMetrics.totalHintsInProgress.inc(runnable.targets.size());</span>
+<span class="nc bnc" id="L2762" title="All 2 branches missed.">        for (InetAddress target : runnable.targets)</span>
+<span class="nc" id="L2763">            getHintsInProgressFor(target).incrementAndGet();</span>
+<span class="nc" id="L2764">        return (Future&lt;Void&gt;) StageManager.getStage(Stage.MUTATION).submit(runnable);</span>
+    }
+
+<span class="nc" id="L2767">    public Long getRpcTimeout() { return DatabaseDescriptor.getRpcTimeout(); }</span>
+<span class="nc" id="L2768">    public void setRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2770">    public Long getReadRpcTimeout() { return DatabaseDescriptor.getReadRpcTimeout(); }</span>
+<span class="nc" id="L2771">    public void setReadRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setReadRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2773">    public Long getWriteRpcTimeout() { return DatabaseDescriptor.getWriteRpcTimeout(); }</span>
+<span class="nc" id="L2774">    public void setWriteRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setWriteRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2776">    public Long getCounterWriteRpcTimeout() { return DatabaseDescriptor.getCounterWriteRpcTimeout(); }</span>
+<span class="nc" id="L2777">    public void setCounterWriteRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setCounterWriteRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2779">    public Long getCasContentionTimeout() { return DatabaseDescriptor.getCasContentionTimeout(); }</span>
+<span class="nc" id="L2780">    public void setCasContentionTimeout(Long timeoutInMillis) { DatabaseDescriptor.setCasContentionTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2782">    public Long getRangeRpcTimeout() { return DatabaseDescriptor.getRangeRpcTimeout(); }</span>
+<span class="nc" id="L2783">    public void setRangeRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setRangeRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2785">    public Long getTruncateRpcTimeout() { return DatabaseDescriptor.getTruncateRpcTimeout(); }</span>
+<span class="nc" id="L2786">    public void setTruncateRpcTimeout(Long timeoutInMillis) { DatabaseDescriptor.setTruncateRpcTimeout(timeoutInMillis); }</span>
+
+<span class="nc" id="L2788">    public Long getNativeTransportMaxConcurrentConnections() { return DatabaseDescriptor.getNativeTransportMaxConcurrentConnections(); }</span>
+<span class="nc" id="L2789">    public void setNativeTransportMaxConcurrentConnections(Long nativeTransportMaxConcurrentConnections) { DatabaseDescriptor.setNativeTransportMaxConcurrentConnections(nativeTransportMaxConcurrentConnections); }</span>
+
+<span class="nc" id="L2791">    public Long getNativeTransportMaxConcurrentConnectionsPerIp() { return DatabaseDescriptor.getNativeTransportMaxConcurrentConnectionsPerIp(); }</span>
+<span class="nc" id="L2792">    public void setNativeTransportMaxConcurrentConnectionsPerIp(Long nativeTransportMaxConcurrentConnections) { DatabaseDescriptor.setNativeTransportMaxConcurrentConnectionsPerIp(nativeTransportMaxConcurrentConnections); }</span>
+
+<span class="nc" id="L2794">    public void reloadTriggerClasses() { TriggerExecutor.instance.reloadClasses(); }</span>
+
+    public long getReadRepairAttempted()
+    {
+<span class="nc" id="L2798">        return ReadRepairMetrics.attempted.getCount();</span>
+    }
+
+    public long getReadRepairRepairedBlocking()
+    {
+<span class="nc" id="L2803">        return ReadRepairMetrics.repairedBlocking.getCount();</span>
+    }
+
+    public long getReadRepairRepairedBackground()
+    {
+<span class="nc" id="L2808">        return ReadRepairMetrics.repairedBackground.getCount();</span>
+    }
+
+    public int getNumberOfTables()
+    {
+<span class="nc" id="L2813">        return Schema.instance.getNumberOfTables();</span>
+    }
+
+    public int getOtcBacklogExpirationInterval() {
+<span class="nc" id="L2817">        return DatabaseDescriptor.getOtcBacklogExpirationInterval();</span>
+    }
+
+    public void setOtcBacklogExpirationInterval(int intervalInMillis) {
+<span class="nc" id="L2821">        DatabaseDescriptor.setOtcBacklogExpirationInterval(intervalInMillis);</span>
+<span class="nc" id="L2822">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

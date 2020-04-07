@@ -1,0 +1,499 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogFile.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.lifecycle</a> &gt; <span class="el_source">LogFile.java</span></div><h1>LogFile.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.db.lifecycle;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LogRecord.Type;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.utils.Throwables;
+
+import static org.apache.cassandra.utils.Throwables.merge;
+
+/**
+ * A transaction log file. We store transaction records into a log file, which is
+ * copied into multiple identical replicas on different disks, @see LogFileReplica.
+ *
+ * This class supports the transactional logic of LogTransaction and the removing
+ * of unfinished leftovers when a transaction is completed, or aborted, or when
+ * we clean up on start-up.
+ *
+ * @see LogTransaction
+ */
+<span class="pc bpc" id="L56" title="1 of 2 branches missed.">final class LogFile implements AutoCloseable</span>
+{
+<span class="fc" id="L58">    private static final Logger logger = LoggerFactory.getLogger(LogFile.class);</span>
+
+<span class="fc" id="L60">    static String EXT = &quot;.log&quot;;</span>
+<span class="fc" id="L61">    static char SEP = '_';</span>
+    // cc_txn_opname_id.log (where cc is one of the sstable versions defined in BigVersion)
+<span class="fc" id="L63">    static Pattern FILE_REGEX = Pattern.compile(String.format(&quot;^(.{2})_txn_(.*)_(.*)%s$&quot;, EXT));</span>
+
+    // A set of physical files on disk, each file is an identical replica
+<span class="fc" id="L66">    private final LogReplicaSet replicas = new LogReplicaSet();</span>
+
+    // The transaction records, this set must be ORDER PRESERVING
+<span class="fc" id="L69">    private final LinkedHashSet&lt;LogRecord&gt; records = new LinkedHashSet&lt;&gt;();</span>
+
+    // The type of the transaction
+    private final OperationType type;
+
+    // The unique id of the transaction
+    private final UUID id;
+
+    static LogFile make(File logReplica)
+    {
+<span class="nc" id="L79">        return make(logReplica.getName(), Collections.singletonList(logReplica));</span>
+    }
+
+    static LogFile make(String fileName, List&lt;File&gt; logReplicas)
+    {
+<span class="nc" id="L84">        Matcher matcher = LogFile.FILE_REGEX.matcher(fileName);</span>
+<span class="nc" id="L85">        boolean matched = matcher.matches();</span>
+<span class="nc bnc" id="L86" title="All 6 branches missed.">        assert matched &amp;&amp; matcher.groupCount() == 3;</span>
+
+        // For now we don't need this but it is there in case we need to change
+        // file format later on, the version is the sstable version as defined in BigFormat
+        //String version = matcher.group(1);
+
+<span class="nc" id="L92">        OperationType operationType = OperationType.fromFileName(matcher.group(2));</span>
+<span class="nc" id="L93">        UUID id = UUID.fromString(matcher.group(3));</span>
+
+<span class="nc" id="L95">        return new LogFile(operationType, id, logReplicas);</span>
+    }
+
+    Throwable syncDirectory(Throwable accumulate)
+    {
+<span class="fc" id="L100">        return replicas.syncDirectory(accumulate);</span>
+    }
+
+    OperationType type()
+    {
+<span class="fc" id="L105">        return type;</span>
+    }
+
+    UUID id()
+    {
+<span class="fc" id="L110">        return id;</span>
+    }
+
+    Throwable removeUnfinishedLeftovers(Throwable accumulate)
+    {
+        try
+        {
+            // we sync the parent directories before content deletion to ensure
+            // any previously deleted files (see SSTableTider) are not
+            // incorrectly picked up by record.getExistingFiles() in
+            // deleteRecordFiles(), see CASSANDRA-12261
+<span class="fc" id="L121">            Throwables.maybeFail(syncDirectory(accumulate));</span>
+
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            deleteFilesForRecordsOfType(committed() ? Type.REMOVE : Type.ADD);</span>
+
+            // we sync the parent directories between contents and log deletion
+            // to ensure there is a happens before edge between them
+<span class="fc" id="L127">            Throwables.maybeFail(syncDirectory(accumulate));</span>
+
+<span class="fc" id="L129">            accumulate = replicas.delete(accumulate);</span>
+        }
+<span class="nc" id="L131">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L133">            accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L134">        }</span>
+
+<span class="fc" id="L136">        return accumulate;</span>
+    }
+
+    static boolean isLogFile(File file)
+    {
+<span class="fc" id="L141">        return LogFile.FILE_REGEX.matcher(file.getName()).matches();</span>
+    }
+
+    LogFile(OperationType type, UUID id, List&lt;File&gt; replicas)
+    {
+<span class="nc" id="L146">        this(type, id);</span>
+<span class="nc" id="L147">        this.replicas.addReplicas(replicas);</span>
+<span class="nc" id="L148">    }</span>
+
+    LogFile(OperationType type, UUID id)
+<span class="fc" id="L151">    {</span>
+<span class="fc" id="L152">        this.type = type;</span>
+<span class="fc" id="L153">        this.id = id;</span>
+<span class="fc" id="L154">    }</span>
+
+    boolean verify()
+    {
+<span class="nc" id="L158">        records.clear();</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (!replicas.readRecords(records))</span>
+        {
+<span class="nc" id="L161">            logger.error(&quot;Failed to read records for transaction log {}&quot;, this);</span>
+<span class="nc" id="L162">            return false;</span>
+        }
+
+<span class="nc" id="L165">        Set&lt;String&gt; absolutePaths = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        for (LogRecord record : records)</span>
+<span class="nc" id="L167">            record.absolutePath.ifPresent(absolutePaths::add);</span>
+
+<span class="nc" id="L169">        Map&lt;String, List&lt;File&gt;&gt; recordFiles = LogRecord.getExistingFiles(absolutePaths);</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        for (LogRecord record : records)</span>
+        {
+<span class="nc" id="L172">            List&lt;File&gt; existingFiles = Collections.emptyList();</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">            if (record.absolutePath.isPresent())</span>
+            {
+<span class="nc" id="L175">                String key = record.absolutePath.get();</span>
+<span class="nc" id="L176">                existingFiles = recordFiles.getOrDefault(key, Collections.emptyList());</span>
+            }
+<span class="nc" id="L178">            LogFile.verifyRecord(record, existingFiles);</span>
+<span class="nc" id="L179">        }</span>
+
+<span class="nc" id="L181">        Optional&lt;LogRecord&gt; firstInvalid = records.stream().filter(LogRecord::isInvalidOrPartial).findFirst();</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (!firstInvalid.isPresent())</span>
+<span class="nc" id="L183">            return true;</span>
+
+<span class="nc" id="L185">        LogRecord failedOn = firstInvalid.get();</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (getLastRecord() != failedOn)</span>
+        {
+<span class="nc" id="L188">            setErrorInReplicas(failedOn);</span>
+<span class="nc" id="L189">            return false;</span>
+        }
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        records.stream().filter((r) -&gt; r != failedOn).forEach(LogFile::verifyRecordWithCorruptedLastRecord);</span>
+<span class="nc" id="L193">        if (records.stream()</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                   .filter((r) -&gt; r != failedOn)</span>
+<span class="nc" id="L195">                   .filter(LogRecord::isInvalid)</span>
+<span class="nc" id="L196">                   .map(this::setErrorInReplicas)</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                   .findFirst().isPresent())</span>
+        {
+<span class="nc" id="L199">            setErrorInReplicas(failedOn);</span>
+<span class="nc" id="L200">            return false;</span>
+        }
+
+        // if only the last record is corrupt and all other records have matching files on disk, @see verifyRecord,
+        // then we simply exited whilst serializing the last record and we carry on
+<span class="nc" id="L205">        logger.warn(&quot;Last record of transaction {} is corrupt or incomplete [{}], &quot; +</span>
+                    &quot;but all previous records match state on disk; continuing&quot;,
+<span class="nc" id="L207">                    id, failedOn.error());</span>
+<span class="nc" id="L208">        return true;</span>
+    }
+
+    LogRecord setErrorInReplicas(LogRecord record)
+    {
+<span class="nc" id="L213">        replicas.setErrorInReplicas(record);</span>
+<span class="nc" id="L214">        return record;</span>
+    }
+
+    static void verifyRecord(LogRecord record, List&lt;File&gt; existingFiles)
+    {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (record.checksum != record.computeChecksum())</span>
+        {
+<span class="nc" id="L221">            record.setError(String.format(&quot;Invalid checksum for sstable [%s]: [%d] should have been [%d]&quot;,</span>
+<span class="nc" id="L222">                                          record.fileName(),</span>
+<span class="nc" id="L223">                                          record.checksum,</span>
+<span class="nc" id="L224">                                          record.computeChecksum()));</span>
+<span class="nc" id="L225">            return;</span>
+        }
+
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (record.type != Type.REMOVE)</span>
+<span class="nc" id="L229">            return;</span>
+
+        // Paranoid sanity checks: we create another record by looking at the files as they are
+        // on disk right now and make sure the information still matches. We don't want to delete
+        // files by mistake if the user has copied them from backup and forgot to remove a txn log
+        // file that obsoleted the very same files. So we check the latest update time and make sure
+        // it matches. Because we delete files from oldest to newest, the latest update time should
+        // always match.
+<span class="nc" id="L237">        record.status.onDiskRecord = record.withExistingFiles(existingFiles);</span>
+<span class="nc bnc" id="L238" title="All 4 branches missed.">        if (record.updateTime != record.status.onDiskRecord.updateTime &amp;&amp; record.status.onDiskRecord.updateTime &gt; 0)</span>
+        {
+<span class="nc" id="L240">            record.setError(String.format(&quot;Unexpected files detected for sstable [%s]: &quot; +</span>
+                                          &quot;last update time [%tT] should have been [%tT]&quot;,
+<span class="nc" id="L242">                                          record.fileName(),</span>
+<span class="nc" id="L243">                                          record.status.onDiskRecord.updateTime,</span>
+<span class="nc" id="L244">                                          record.updateTime));</span>
+
+        }
+<span class="nc" id="L247">    }</span>
+
+    static void verifyRecordWithCorruptedLastRecord(LogRecord record)
+    {
+<span class="nc bnc" id="L251" title="All 4 branches missed.">        if (record.type == Type.REMOVE &amp;&amp; record.status.onDiskRecord.numFiles &lt; record.numFiles)</span>
+        { // if we found a corruption in the last record, then we continue only
+          // if the number of files matches exactly for all previous records.
+<span class="nc" id="L254">            record.setError(String.format(&quot;Incomplete fileset detected for sstable [%s]: &quot; +</span>
+                                          &quot;number of files [%d] should have been [%d].&quot;,
+<span class="nc" id="L256">                                          record.fileName(),</span>
+<span class="nc" id="L257">                                          record.status.onDiskRecord.numFiles,</span>
+<span class="nc" id="L258">                                          record.numFiles));</span>
+        }
+<span class="nc" id="L260">    }</span>
+
+    void commit()
+    {
+<span class="fc" id="L264">        addRecord(LogRecord.makeCommit(System.currentTimeMillis()));</span>
+<span class="fc" id="L265">    }</span>
+
+    void abort()
+    {
+<span class="nc" id="L269">        addRecord(LogRecord.makeAbort(System.currentTimeMillis()));</span>
+<span class="nc" id="L270">    }</span>
+
+    private boolean isLastRecordValidWithType(Type type)
+    {
+<span class="fc" id="L274">        LogRecord lastRecord = getLastRecord();</span>
+<span class="fc bfc" id="L275" title="All 4 branches covered.">        return lastRecord != null &amp;&amp;</span>
+               lastRecord.type == type &amp;&amp;
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">               lastRecord.isValid();</span>
+    }
+
+    boolean committed()
+    {
+<span class="fc" id="L282">        return isLastRecordValidWithType(Type.COMMIT);</span>
+    }
+
+    boolean aborted()
+    {
+<span class="fc" id="L287">        return isLastRecordValidWithType(Type.ABORT);</span>
+    }
+
+    boolean completed()
+    {
+<span class="pc bpc" id="L292" title="1 of 4 branches missed.">        return committed() || aborted();</span>
+    }
+
+    void add(SSTable table)
+    {
+<span class="fc" id="L297">        addRecord(makeAddRecord(table));</span>
+<span class="fc" id="L298">    }</span>
+
+    public void addAll(Type type, Iterable&lt;SSTableReader&gt; toBulkAdd)
+    {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        for (LogRecord record : makeRecords(type, toBulkAdd).values())</span>
+<span class="nc" id="L303">            addRecord(record);</span>
+<span class="nc" id="L304">    }</span>
+
+    Map&lt;SSTable, LogRecord&gt; makeRecords(Type type, Iterable&lt;SSTableReader&gt; tables)
+    {
+<span class="pc bpc" id="L308" title="3 of 6 branches missed.">        assert type == Type.ADD || type == Type.REMOVE;</span>
+
+<span class="fc bfc" id="L310" title="All 2 branches covered.">        for (SSTableReader sstable : tables)</span>
+        {
+<span class="fc" id="L312">            File directory = sstable.descriptor.directory;</span>
+<span class="fc" id="L313">            String fileName = StringUtils.join(directory, File.separator, getFileName());</span>
+<span class="fc" id="L314">            replicas.maybeCreateReplica(directory, fileName, records);</span>
+<span class="fc" id="L315">        }</span>
+<span class="fc" id="L316">        return LogRecord.make(type, tables);</span>
+    }
+
+    private LogRecord makeAddRecord(SSTable table)
+    {
+<span class="fc" id="L321">        File directory = table.descriptor.directory;</span>
+<span class="fc" id="L322">        String fileName = StringUtils.join(directory, File.separator, getFileName());</span>
+<span class="fc" id="L323">        replicas.maybeCreateReplica(directory, fileName, records);</span>
+<span class="fc" id="L324">        return LogRecord.make(Type.ADD, table);</span>
+    }
+
+    /**
+     * this version of makeRecord takes an existing LogRecord and converts it to a
+     * record with the given type. This avoids listing the directory and if the
+     * LogRecord already exists, we have all components for the sstable
+     */
+    private LogRecord makeRecord(Type type, SSTable table, LogRecord record)
+    {
+<span class="pc bpc" id="L334" title="4 of 6 branches missed.">        assert type == Type.ADD || type == Type.REMOVE;</span>
+
+<span class="fc" id="L336">        File directory = table.descriptor.directory;</span>
+<span class="fc" id="L337">        String fileName = StringUtils.join(directory, File.separator, getFileName());</span>
+<span class="fc" id="L338">        replicas.maybeCreateReplica(directory, fileName, records);</span>
+<span class="fc" id="L339">        return record.asType(type);</span>
+    }
+
+    void addRecord(LogRecord record)
+    {
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">        if (completed())</span>
+<span class="nc" id="L345">            throw new IllegalStateException(&quot;Transaction already completed&quot;);</span>
+
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">        if (records.contains(record))</span>
+<span class="nc" id="L348">            throw new IllegalStateException(&quot;Record already exists&quot;);</span>
+
+<span class="fc" id="L350">        replicas.append(record);</span>
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        if (!records.add(record))</span>
+<span class="nc" id="L352">            throw new IllegalStateException(&quot;Failed to add record&quot;);</span>
+<span class="fc" id="L353">    }</span>
+
+    void remove(SSTable table)
+    {
+<span class="nc" id="L357">        LogRecord record = makeAddRecord(table);</span>
+<span class="nc bnc" id="L358" title="All 4 branches missed.">        assert records.contains(record) : String.format(&quot;[%s] is not tracked by %s&quot;, record, id);</span>
+<span class="nc bnc" id="L359" title="All 4 branches missed.">        assert record.absolutePath.isPresent();</span>
+<span class="nc" id="L360">        deleteRecordFiles(LogRecord.getExistingFiles(record.absolutePath.get()));</span>
+<span class="nc" id="L361">        records.remove(record);</span>
+<span class="nc" id="L362">    }</span>
+
+    boolean contains(Type type, SSTable sstable, LogRecord record)
+    {
+<span class="fc" id="L366">        return contains(makeRecord(type, sstable, record));</span>
+    }
+
+    private boolean contains(LogRecord record)
+    {
+<span class="fc" id="L371">        return records.contains(record);</span>
+    }
+
+    void deleteFilesForRecordsOfType(Type type)
+    {
+<span class="pc bpc" id="L376" title="4 of 6 branches missed.">        assert type == Type.REMOVE || type == Type.ADD;</span>
+<span class="fc" id="L377">        Set&lt;String&gt; absolutePaths = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L378" title="All 2 branches covered.">        for (LogRecord record : records)</span>
+        {
+<span class="fc bfc" id="L380" title="All 2 branches covered.">            if (type.matches(record))</span>
+            {
+<span class="pc bpc" id="L382" title="2 of 4 branches missed.">                assert record.absolutePath.isPresent() : &quot;type is either REMOVE or ADD, record should always have an absolutePath: &quot; + record;</span>
+<span class="fc" id="L383">                absolutePaths.add(record.absolutePath.get());</span>
+            }
+<span class="fc" id="L385">        }</span>
+
+<span class="fc" id="L387">        Map&lt;String, List&lt;File&gt;&gt; existingFiles = LogRecord.getExistingFiles(absolutePaths);</span>
+
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">        for (List&lt;File&gt; toDelete : existingFiles.values())</span>
+<span class="nc" id="L390">            LogFile.deleteRecordFiles(toDelete);</span>
+
+<span class="fc" id="L392">        records.clear();</span>
+<span class="fc" id="L393">    }</span>
+
+    private static void deleteRecordFiles(List&lt;File&gt; existingFiles)
+    {
+        // we sort the files in ascending update time order so that the last update time
+        // stays the same even if we only partially delete files, see comment in isInvalid()
+<span class="nc" id="L399">        existingFiles.sort(Comparator.comparingLong(File::lastModified));</span>
+<span class="nc" id="L400">        existingFiles.forEach(LogTransaction::delete);</span>
+<span class="nc" id="L401">    }</span>
+
+    /**
+     * Extract from the files passed in all those that are of the given type.
+     *
+     * Scan all records and select those that are of the given type, valid, and
+     * located in the same folder. For each such record extract from the files passed in
+     * those that belong to this record.
+     *
+     * @return a map linking each mapped record to its files, where the files where passed in as parameters.
+     */
+    Map&lt;LogRecord, Set&lt;File&gt;&gt; getFilesOfType(Path folder, NavigableSet&lt;File&gt; files, Type type)
+    {
+<span class="nc" id="L414">        Map&lt;LogRecord, Set&lt;File&gt;&gt; ret = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L416">        records.stream()</span>
+<span class="nc" id="L417">               .filter(type::matches)</span>
+<span class="nc" id="L418">               .filter(LogRecord::isValid)</span>
+<span class="nc" id="L419">               .filter(r -&gt; r.isInFolder(folder))</span>
+<span class="nc" id="L420">               .forEach((r) -&gt; ret.put(r, getRecordFiles(files, r)));</span>
+
+<span class="nc" id="L422">        return ret;</span>
+    }
+
+    LogRecord getLastRecord()
+    {
+<span class="fc" id="L427">        return Iterables.getLast(records, null);</span>
+    }
+
+    private static Set&lt;File&gt; getRecordFiles(NavigableSet&lt;File&gt; files, LogRecord record)
+    {
+<span class="nc" id="L432">        String fileName = record.fileName();</span>
+<span class="nc" id="L433">        return files.stream().filter(f -&gt; f.getName().startsWith(fileName)).collect(Collectors.toSet());</span>
+    }
+
+    boolean exists()
+    {
+<span class="nc" id="L438">        return replicas.exists();</span>
+    }
+
+    public void close()
+    {
+<span class="fc" id="L443">        replicas.close();</span>
+<span class="fc" id="L444">    }</span>
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L449">        return toString(false);</span>
+    }
+
+    public String toString(boolean showContents)
+    {
+<span class="nc" id="L454">        StringBuilder str = new StringBuilder();</span>
+<span class="nc" id="L455">        str.append('[');</span>
+<span class="nc" id="L456">        str.append(getFileName());</span>
+<span class="nc" id="L457">        str.append(&quot; in &quot;);</span>
+<span class="nc" id="L458">        str.append(replicas.getDirectories());</span>
+<span class="nc" id="L459">        str.append(']');</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (showContents)</span>
+        {
+<span class="nc" id="L462">            str.append(System.lineSeparator());</span>
+<span class="nc" id="L463">            str.append(&quot;Files and contents follow:&quot;);</span>
+<span class="nc" id="L464">            str.append(System.lineSeparator());</span>
+<span class="nc" id="L465">            replicas.printContentsWithAnyErrors(str);</span>
+        }
+<span class="nc" id="L467">        return str.toString();</span>
+    }
+
+    @VisibleForTesting
+    List&lt;File&gt; getFiles()
+    {
+<span class="nc" id="L473">        return replicas.getFiles();</span>
+    }
+
+    @VisibleForTesting
+    List&lt;String&gt; getFilePaths()
+    {
+<span class="nc" id="L479">        return replicas.getFilePaths();</span>
+    }
+
+    private String getFileName()
+    {
+<span class="fc" id="L484">        return StringUtils.join(BigFormat.latestVersion,</span>
+<span class="fc" id="L485">                                LogFile.SEP,</span>
+                                &quot;txn&quot;,
+<span class="fc" id="L487">                                LogFile.SEP,</span>
+                                type.fileName,
+<span class="fc" id="L489">                                LogFile.SEP,</span>
+<span class="fc" id="L490">                                id.toString(),</span>
+                                LogFile.EXT);
+    }
+
+    public boolean isEmpty()
+    {
+<span class="nc" id="L496">        return records.isEmpty();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

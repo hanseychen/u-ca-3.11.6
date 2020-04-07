@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PrepareCallback.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PrepareCallback.java</span></div><h1>PrepareCallback.java</h1><pre class="source lang-java linenums">package org.apache.cassandra.service.paxos;
+/*
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
+ */
+
+
+import java.net.InetAddress;
+import java.util.Collections;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.utils.UUIDGen;
+
+public class PrepareCallback extends AbstractPaxosCallback&lt;PrepareResponse&gt;
+{
+<span class="nc" id="L43">    private static final Logger logger = LoggerFactory.getLogger(PrepareCallback.class);</span>
+
+<span class="nc" id="L45">    public boolean promised = true;</span>
+    public Commit mostRecentCommit;
+    public Commit mostRecentInProgressCommit;
+    public Commit mostRecentInProgressCommitWithUpdate;
+
+<span class="nc" id="L50">    private final Map&lt;InetAddress, Commit&gt; commitsByReplica = new ConcurrentHashMap&lt;InetAddress, Commit&gt;();</span>
+
+    public PrepareCallback(DecoratedKey key, CFMetaData metadata, int targets, ConsistencyLevel consistency, long queryStartNanoTime)
+    {
+<span class="nc" id="L54">        super(targets, consistency, queryStartNanoTime);</span>
+        // need to inject the right key in the empty commit so comparing with empty commits in the reply works as expected
+<span class="nc" id="L56">        mostRecentCommit = Commit.emptyCommit(key, metadata);</span>
+<span class="nc" id="L57">        mostRecentInProgressCommit = Commit.emptyCommit(key, metadata);</span>
+<span class="nc" id="L58">        mostRecentInProgressCommitWithUpdate = Commit.emptyCommit(key, metadata);</span>
+<span class="nc" id="L59">    }</span>
+
+    public synchronized void response(MessageIn&lt;PrepareResponse&gt; message)
+    {
+<span class="nc" id="L63">        PrepareResponse response = message.payload;</span>
+<span class="nc" id="L64">        logger.trace(&quot;Prepare response {} from {}&quot;, response, message.from);</span>
+
+        // In case of clock skew, another node could be proposing with ballot that are quite a bit
+        // older than our own. In that case, we record the more recent commit we've received to make
+        // sure we re-prepare on an older ballot.
+<span class="nc bnc" id="L69" title="All 2 branches missed.">        if (response.inProgressCommit.isAfter(mostRecentInProgressCommit))</span>
+<span class="nc" id="L70">            mostRecentInProgressCommit = response.inProgressCommit;</span>
+
+<span class="nc bnc" id="L72" title="All 2 branches missed.">        if (!response.promised)</span>
+        {
+<span class="nc" id="L74">            promised = false;</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">            while (latch.getCount() &gt; 0)</span>
+<span class="nc" id="L76">                latch.countDown();</span>
+<span class="nc" id="L77">            return;</span>
+        }
+
+<span class="nc" id="L80">        commitsByReplica.put(message.from, response.mostRecentCommit);</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">        if (response.mostRecentCommit.isAfter(mostRecentCommit))</span>
+<span class="nc" id="L82">            mostRecentCommit = response.mostRecentCommit;</span>
+
+        // If some response has an update, then we should replay the update with the highest ballot. So find
+        // the the highest commit that actually have an update
+<span class="nc bnc" id="L86" title="All 4 branches missed.">        if (response.inProgressCommit.isAfter(mostRecentInProgressCommitWithUpdate) &amp;&amp; !response.inProgressCommit.update.isEmpty())</span>
+<span class="nc" id="L87">            mostRecentInProgressCommitWithUpdate = response.inProgressCommit;</span>
+
+<span class="nc" id="L89">        latch.countDown();</span>
+<span class="nc" id="L90">    }</span>
+
+    public Iterable&lt;InetAddress&gt; replicasMissingMostRecentCommit(CFMetaData metadata, int nowInSec)
+    {
+        // In general, we need every replicas that have answered to the prepare (a quorum) to agree on the MRC (see
+        // coment in StorageProxy.beginAndRepairPaxos(), but basically we need to make sure at least a quorum of nodes
+        // have learn a commit before commit a new one otherwise that previous commit is not guaranteed to have reach a
+        // quorum and further commit may proceed on incomplete information).
+        // However, if that commit is too hold, it may have been expired from some of the replicas paxos table (we don't
+        // keep the paxos state forever or that could grow unchecked), and we could end up in some infinite loop as
+        // explained on CASSANDRA-12043. To avoid that, we ignore a MRC that is too old, i.e. older than the TTL we set
+        // on paxos tables. For such old commit, we rely on hints and repair to ensure the commit has indeed be
+        // propagated to all nodes.
+<span class="nc" id="L103">        long paxosTtlSec = SystemKeyspace.paxosTtlSec(metadata);</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (UUIDGen.unixTimestampInSec(mostRecentCommit.ballot) + paxosTtlSec &lt; nowInSec)</span>
+<span class="nc" id="L105">            return Collections.emptySet();</span>
+
+<span class="nc" id="L107">        return Iterables.filter(commitsByReplica.keySet(), new Predicate&lt;InetAddress&gt;()</span>
+<span class="nc" id="L108">        {</span>
+            public boolean apply(InetAddress inetAddress)
+            {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                return (!commitsByReplica.get(inetAddress).ballot.equals(mostRecentCommit.ballot));</span>
+            }
+        });
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

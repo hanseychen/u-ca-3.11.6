@@ -1,0 +1,423 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitLogReplayer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">CommitLogReplayer.java</span></div><h1>CommitLogReplayer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.collect.*;
+import org.apache.commons.lang3.StringUtils;
+import org.cliffc.high_scale_lib.NonBlockingHashSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+public class CommitLogReplayer implements CommitLogReadHandler
+{
+    @VisibleForTesting
+<span class="nc" id="L53">    public static long MAX_OUTSTANDING_REPLAY_BYTES = Long.getLong(&quot;cassandra.commitlog_max_outstanding_replay_bytes&quot;, 1024 * 1024 * 64);</span>
+    @VisibleForTesting
+<span class="nc" id="L55">    public static MutationInitiator mutationInitiator = new MutationInitiator();</span>
+    static final String IGNORE_REPLAY_ERRORS_PROPERTY = Config.PROPERTY_PREFIX + &quot;commitlog.ignorereplayerrors&quot;;
+<span class="nc" id="L57">    private static final Logger logger = LoggerFactory.getLogger(CommitLogReplayer.class);</span>
+<span class="nc" id="L58">    private static final int MAX_OUTSTANDING_REPLAY_COUNT = Integer.getInteger(Config.PROPERTY_PREFIX + &quot;commitlog_max_outstanding_replay_count&quot;, 1024);</span>
+
+    private final Set&lt;Keyspace&gt; keyspacesReplayed;
+    private final Queue&lt;Future&lt;Integer&gt;&gt; futures;
+
+    private final AtomicInteger replayedCount;
+    private final Map&lt;UUID, IntervalSet&lt;CommitLogPosition&gt;&gt; cfPersisted;
+    private final CommitLogPosition globalPosition;
+
+    // Used to throttle speed of replay of mutations if we pass the max outstanding count
+<span class="nc" id="L68">    private long pendingMutationBytes = 0;</span>
+
+    private final ReplayFilter replayFilter;
+    private final CommitLogArchiver archiver;
+
+    @VisibleForTesting
+    protected CommitLogReader commitLogReader;
+
+    CommitLogReplayer(CommitLog commitLog,
+                      CommitLogPosition globalPosition,
+                      Map&lt;UUID, IntervalSet&lt;CommitLogPosition&gt;&gt; cfPersisted,
+                      ReplayFilter replayFilter)
+<span class="nc" id="L80">    {</span>
+<span class="nc" id="L81">        this.keyspacesReplayed = new NonBlockingHashSet&lt;Keyspace&gt;();</span>
+<span class="nc" id="L82">        this.futures = new ArrayDeque&lt;Future&lt;Integer&gt;&gt;();</span>
+        // count the number of replayed mutation. We don't really care about atomicity, but we need it to be a reference.
+<span class="nc" id="L84">        this.replayedCount = new AtomicInteger();</span>
+<span class="nc" id="L85">        this.cfPersisted = cfPersisted;</span>
+<span class="nc" id="L86">        this.globalPosition = globalPosition;</span>
+<span class="nc" id="L87">        this.replayFilter = replayFilter;</span>
+<span class="nc" id="L88">        this.archiver = commitLog.archiver;</span>
+<span class="nc" id="L89">        this.commitLogReader = new CommitLogReader();</span>
+<span class="nc" id="L90">    }</span>
+
+    public static CommitLogReplayer construct(CommitLog commitLog)
+    {
+        // compute per-CF and global replay intervals
+<span class="nc" id="L95">        Map&lt;UUID, IntervalSet&lt;CommitLogPosition&gt;&gt; cfPersisted = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L96">        ReplayFilter replayFilter = ReplayFilter.create();</span>
+
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : ColumnFamilyStore.all())</span>
+        {
+            // but, if we've truncated the cf in question, then we need to need to start replay after the truncation
+<span class="nc" id="L101">            CommitLogPosition truncatedAt = SystemKeyspace.getTruncatedPosition(cfs.metadata.cfId);</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            if (truncatedAt != null)</span>
+            {
+                // Point in time restore is taken to mean that the tables need to be replayed even if they were
+                // deleted at a later point in time. Any truncation record after that point must thus be cleared prior
+                // to replay (CASSANDRA-9195).
+<span class="nc" id="L107">                long restoreTime = commitLog.archiver.restorePointInTime;</span>
+<span class="nc" id="L108">                long truncatedTime = SystemKeyspace.getTruncatedAt(cfs.metadata.cfId);</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">                if (truncatedTime &gt; restoreTime)</span>
+                {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                    if (replayFilter.includes(cfs.metadata))</span>
+                    {
+<span class="nc" id="L113">                        logger.info(&quot;Restore point in time is before latest truncation of table {}.{}. Clearing truncation record.&quot;,</span>
+                                    cfs.metadata.ksName,
+                                    cfs.metadata.cfName);
+<span class="nc" id="L116">                        SystemKeyspace.removeTruncationRecord(cfs.metadata.cfId);</span>
+<span class="nc" id="L117">                        truncatedAt = null;</span>
+                    }
+                }
+            }
+
+<span class="nc" id="L122">            IntervalSet&lt;CommitLogPosition&gt; filter = persistedIntervals(cfs.getLiveSSTables(), truncatedAt);</span>
+<span class="nc" id="L123">            cfPersisted.put(cfs.metadata.cfId, filter);</span>
+<span class="nc" id="L124">        }</span>
+<span class="nc" id="L125">        CommitLogPosition globalPosition = firstNotCovered(cfPersisted.values());</span>
+<span class="nc" id="L126">        logger.debug(&quot;Global replay position is {} from columnfamilies {}&quot;, globalPosition, FBUtilities.toString(cfPersisted));</span>
+<span class="nc" id="L127">        return new CommitLogReplayer(commitLog, globalPosition, cfPersisted, replayFilter);</span>
+    }
+
+    public void replayPath(File file, boolean tolerateTruncation) throws IOException
+    {
+<span class="nc" id="L132">        commitLogReader.readCommitLogSegment(this, file, globalPosition, CommitLogReader.ALL_MUTATIONS, tolerateTruncation);</span>
+<span class="nc" id="L133">    }</span>
+
+    public void replayFiles(File[] clogs) throws IOException
+    {
+<span class="nc" id="L137">        commitLogReader.readAllFiles(this, clogs, globalPosition);</span>
+<span class="nc" id="L138">    }</span>
+
+    /**
+     * Flushes all keyspaces associated with this replayer in parallel, blocking until their flushes are complete.
+     * @return the number of mutations replayed
+     */
+    public int blockForWrites()
+    {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        for (Map.Entry&lt;UUID, AtomicInteger&gt; entry : commitLogReader.getInvalidMutations())</span>
+<span class="nc" id="L147">            logger.warn(&quot;Skipped {} mutations from unknown (probably removed) CF with id {}&quot;, entry.getValue(), entry.getKey());</span>
+
+        // wait for all the writes to finish on the mutation stage
+<span class="nc" id="L150">        FBUtilities.waitOnFutures(futures);</span>
+<span class="nc" id="L151">        logger.trace(&quot;Finished waiting on mutations from recovery&quot;);</span>
+
+        // flush replayed keyspaces
+<span class="nc" id="L154">        futures.clear();</span>
+<span class="nc" id="L155">        boolean flushingSystem = false;</span>
+
+<span class="nc" id="L157">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;Future&lt;?&gt;&gt;();</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        for (Keyspace keyspace : keyspacesReplayed)</span>
+        {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (keyspace.getName().equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))</span>
+<span class="nc" id="L161">                flushingSystem = true;</span>
+
+<span class="nc" id="L163">            futures.addAll(keyspace.flush());</span>
+<span class="nc" id="L164">        }</span>
+
+        // also flush batchlog incase of any MV updates
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (!flushingSystem)</span>
+<span class="nc" id="L168">            futures.add(Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.BATCHES).forceFlush());</span>
+
+<span class="nc" id="L170">        FBUtilities.waitOnFutures(futures);</span>
+
+<span class="nc" id="L172">        return replayedCount.get();</span>
+    }
+
+    /*
+     * Wrapper around initiating mutations read from the log to make it possible
+     * to spy on initiated mutations for test
+     */
+    @VisibleForTesting
+<span class="nc" id="L180">    public static class MutationInitiator</span>
+    {
+        protected Future&lt;Integer&gt; initiateMutation(final Mutation mutation,
+                                                   final long segmentId,
+                                                   final int serializedSize,
+                                                   final int entryLocation,
+                                                   final CommitLogReplayer commitLogReplayer)
+        {
+<span class="nc" id="L188">            Runnable runnable = new WrappedRunnable()</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            {</span>
+                public void runMayThrow()
+                {
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                    if (Schema.instance.getKSMetaData(mutation.getKeyspaceName()) == null)</span>
+<span class="nc" id="L193">                        return;</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                    if (commitLogReplayer.pointInTimeExceeded(mutation))</span>
+<span class="nc" id="L195">                        return;</span>
+
+<span class="nc" id="L197">                    final Keyspace keyspace = Keyspace.open(mutation.getKeyspaceName());</span>
+
+                    // Rebuild the mutation, omitting column families that
+                    //    a) the user has requested that we ignore,
+                    //    b) have already been flushed,
+                    // or c) are part of a cf that was dropped.
+                    // Keep in mind that the cf.name() is suspect. do every thing based on the cfid instead.
+<span class="nc" id="L204">                    Mutation newMutation = null;</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                    for (PartitionUpdate update : commitLogReplayer.replayFilter.filter(mutation))</span>
+                    {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                        if (Schema.instance.getCF(update.metadata().cfId) == null)</span>
+<span class="nc" id="L208">                            continue; // dropped</span>
+
+                        // replay if current segment is newer than last flushed one or,
+                        // if it is the last known segment, if we are after the commit log segment position
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                        if (commitLogReplayer.shouldReplay(update.metadata().cfId, new CommitLogPosition(segmentId, entryLocation)))</span>
+                        {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                            if (newMutation == null)</span>
+<span class="nc" id="L215">                                newMutation = new Mutation(mutation.getKeyspaceName(), mutation.key());</span>
+<span class="nc" id="L216">                            newMutation.add(update);</span>
+<span class="nc" id="L217">                            commitLogReplayer.replayedCount.incrementAndGet();</span>
+                        }
+<span class="nc" id="L219">                    }</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                    if (newMutation != null)</span>
+                    {
+<span class="nc bnc" id="L222" title="All 4 branches missed.">                        assert !newMutation.isEmpty();</span>
+
+<span class="nc" id="L224">                        Keyspace.open(newMutation.getKeyspaceName()).apply(newMutation, false, true, false);</span>
+<span class="nc" id="L225">                        commitLogReplayer.keyspacesReplayed.add(keyspace);</span>
+                    }
+<span class="nc" id="L227">                }</span>
+            };
+<span class="nc" id="L229">            return StageManager.getStage(Stage.MUTATION).submit(runnable, serializedSize);</span>
+        }
+    }
+
+    /**
+     * A set of known safe-to-discard commit log replay positions, based on
+     * the range covered by on disk sstables and those prior to the most recent truncation record
+     */
+    public static IntervalSet&lt;CommitLogPosition&gt; persistedIntervals(Iterable&lt;SSTableReader&gt; onDisk, CommitLogPosition truncatedAt)
+    {
+<span class="nc" id="L239">        IntervalSet.Builder&lt;CommitLogPosition&gt; builder = new IntervalSet.Builder&lt;&gt;();</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (SSTableReader reader : onDisk)</span>
+<span class="nc" id="L241">            builder.addAll(reader.getSSTableMetadata().commitLogIntervals);</span>
+
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (truncatedAt != null)</span>
+<span class="nc" id="L244">            builder.add(CommitLogPosition.NONE, truncatedAt);</span>
+<span class="nc" id="L245">        return builder.build();</span>
+    }
+
+    /**
+     * Find the earliest commit log position that is not covered by the known flushed ranges for some table.
+     *
+     * For efficiency this assumes that the first contiguously flushed interval we know of contains the moment that the
+     * given table was constructed* and hence we can start replay from the end of that interval.
+     *
+     * If such an interval is not known, we must replay from the beginning.
+     *
+     * * This is not true only until if the very first flush of a table stalled or failed, while the second or latter
+     *   succeeded. The chances of this happening are at most very low, and if the assumption does prove to be
+     *   incorrect during replay there is little chance that the affected deployment is in production.
+     */
+    public static CommitLogPosition firstNotCovered(Collection&lt;IntervalSet&lt;CommitLogPosition&gt;&gt; ranges)
+    {
+<span class="nc" id="L262">        return ranges.stream()</span>
+<span class="nc" id="L263">                .map(intervals -&gt; Iterables.getFirst(intervals.ends(), CommitLogPosition.NONE))</span>
+<span class="nc" id="L264">                .min(Ordering.natural())</span>
+<span class="nc" id="L265">                .get(); // iteration is per known-CF, there must be at least one.</span>
+    }
+
+<span class="nc" id="L268">    abstract static class ReplayFilter</span>
+    {
+        public abstract Iterable&lt;PartitionUpdate&gt; filter(Mutation mutation);
+
+        public abstract boolean includes(CFMetaData metadata);
+
+        public static ReplayFilter create()
+        {
+            // If no replaylist is supplied an empty array of strings is used to replay everything.
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (System.getProperty(&quot;cassandra.replayList&quot;) == null)</span>
+<span class="nc" id="L278">                return new AlwaysReplayFilter();</span>
+
+<span class="nc" id="L280">            Multimap&lt;String, String&gt; toReplay = HashMultimap.create();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            for (String rawPair : System.getProperty(&quot;cassandra.replayList&quot;).split(&quot;,&quot;))</span>
+            {
+<span class="nc" id="L283">                String[] pair = StringUtils.split(rawPair.trim(), '.');</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (pair.length != 2)</span>
+<span class="nc" id="L285">                    throw new IllegalArgumentException(&quot;Each table to be replayed must be fully qualified with keyspace name, e.g., 'system.peers'&quot;);</span>
+
+<span class="nc" id="L287">                Keyspace ks = Schema.instance.getKeyspaceInstance(pair[0]);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if (ks == null)</span>
+<span class="nc" id="L289">                    throw new IllegalArgumentException(&quot;Unknown keyspace &quot; + pair[0]);</span>
+<span class="nc" id="L290">                ColumnFamilyStore cfs = ks.getColumnFamilyStore(pair[1]);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                if (cfs == null)</span>
+<span class="nc" id="L292">                    throw new IllegalArgumentException(String.format(&quot;Unknown table %s.%s&quot;, pair[0], pair[1]));</span>
+
+<span class="nc" id="L294">                toReplay.put(pair[0], pair[1]);</span>
+            }
+<span class="nc" id="L296">            return new CustomReplayFilter(toReplay);</span>
+        }
+    }
+
+    private static class AlwaysReplayFilter extends ReplayFilter
+    {
+        public Iterable&lt;PartitionUpdate&gt; filter(Mutation mutation)
+        {
+<span class="nc" id="L304">            return mutation.getPartitionUpdates();</span>
+        }
+
+        public boolean includes(CFMetaData metadata)
+        {
+<span class="nc" id="L309">            return true;</span>
+        }
+    }
+
+    private static class CustomReplayFilter extends ReplayFilter
+    {
+        private Multimap&lt;String, String&gt; toReplay;
+
+        public CustomReplayFilter(Multimap&lt;String, String&gt; toReplay)
+<span class="nc" id="L318">        {</span>
+<span class="nc" id="L319">            this.toReplay = toReplay;</span>
+<span class="nc" id="L320">        }</span>
+
+        public Iterable&lt;PartitionUpdate&gt; filter(Mutation mutation)
+        {
+<span class="nc" id="L324">            final Collection&lt;String&gt; cfNames = toReplay.get(mutation.getKeyspaceName());</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (cfNames == null)</span>
+<span class="nc" id="L326">                return Collections.emptySet();</span>
+
+<span class="nc" id="L328">            return Iterables.filter(mutation.getPartitionUpdates(), new Predicate&lt;PartitionUpdate&gt;()</span>
+<span class="nc" id="L329">            {</span>
+                public boolean apply(PartitionUpdate upd)
+                {
+<span class="nc" id="L332">                    return cfNames.contains(upd.metadata().cfName);</span>
+                }
+            });
+        }
+
+        public boolean includes(CFMetaData metadata)
+        {
+<span class="nc" id="L339">            return toReplay.containsEntry(metadata.ksName, metadata.cfName);</span>
+        }
+    }
+
+    /**
+     * consult the known-persisted ranges for our sstables;
+     * if the position is covered by one of them it does not need to be replayed
+     *
+     * @return true iff replay is necessary
+     */
+    private boolean shouldReplay(UUID cfId, CommitLogPosition position)
+    {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        return !cfPersisted.get(cfId).contains(position);</span>
+    }
+
+    protected boolean pointInTimeExceeded(Mutation fm)
+    {
+<span class="nc" id="L356">        long restoreTarget = archiver.restorePointInTime;</span>
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        for (PartitionUpdate upd : fm.getPartitionUpdates())</span>
+        {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            if (archiver.precision.toMillis(upd.maxTimestamp()) &gt; restoreTarget)</span>
+<span class="nc" id="L361">                return true;</span>
+<span class="nc" id="L362">        }</span>
+<span class="nc" id="L363">        return false;</span>
+    }
+
+    public void handleMutation(Mutation m, int size, int entryLocation, CommitLogDescriptor desc)
+    {
+<span class="nc" id="L368">        pendingMutationBytes += size;</span>
+<span class="nc" id="L369">        futures.offer(mutationInitiator.initiateMutation(m,</span>
+                                                         desc.id,
+                                                         size,
+                                                         entryLocation,
+                                                         this));
+        // If there are finished mutations, or too many outstanding bytes/mutations
+        // drain the futures in the queue
+<span class="nc bnc" id="L376" title="All 4 branches missed.">        while (futures.size() &gt; MAX_OUTSTANDING_REPLAY_COUNT</span>
+               || pendingMutationBytes &gt; MAX_OUTSTANDING_REPLAY_BYTES
+<span class="nc bnc" id="L378" title="All 4 branches missed.">               || (!futures.isEmpty() &amp;&amp; futures.peek().isDone()))</span>
+        {
+<span class="nc" id="L380">            pendingMutationBytes -= FBUtilities.waitOnFuture(futures.poll());</span>
+        }
+<span class="nc" id="L382">    }</span>
+
+    public boolean shouldSkipSegmentOnError(CommitLogReadException exception) throws IOException
+    {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (exception.permissible)</span>
+<span class="nc" id="L387">            logger.error(&quot;Ignoring commit log replay error likely due to incomplete flush to disk&quot;, exception);</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        else if (Boolean.getBoolean(IGNORE_REPLAY_ERRORS_PROPERTY))</span>
+<span class="nc" id="L389">            logger.error(&quot;Ignoring commit log replay error&quot;, exception);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        else if (!CommitLog.handleCommitError(&quot;Failed commit log replay&quot;, exception))</span>
+        {
+<span class="nc" id="L392">            logger.error(&quot;Replay stopped. If you wish to override this error and continue starting the node ignoring &quot; +</span>
+                         &quot;commit log replay problems, specify -D&quot; + IGNORE_REPLAY_ERRORS_PROPERTY + &quot;=true &quot; +
+                         &quot;on the command line&quot;);
+<span class="nc" id="L395">            throw new CommitLogReplayException(exception.getMessage(), exception);</span>
+        }
+<span class="nc" id="L397">        return false;</span>
+    }
+
+    /**
+     * The logic for whether or not we throw on an error is identical for the replayer between recoverable or non.
+     */
+    public void handleUnrecoverableError(CommitLogReadException exception) throws IOException
+    {
+        // Don't care about return value, use this simply to throw exception as appropriate.
+<span class="nc" id="L406">        shouldSkipSegmentOnError(exception);</span>
+<span class="nc" id="L407">    }</span>
+
+    @SuppressWarnings(&quot;serial&quot;)
+    public static class CommitLogReplayException extends IOException
+    {
+        public CommitLogReplayException(String message, Throwable cause)
+        {
+<span class="nc" id="L414">            super(message, cause);</span>
+<span class="nc" id="L415">        }</span>
+
+        public CommitLogReplayException(String message)
+        {
+<span class="nc" id="L419">            super(message);</span>
+<span class="nc" id="L420">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

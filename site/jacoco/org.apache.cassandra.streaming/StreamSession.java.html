@@ -1,0 +1,850 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamSession.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamSession.java</span></div><h1>StreamSession.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+
+import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.*;
+import org.apache.cassandra.metrics.StreamingMetrics;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.streaming.messages.*;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+/**
+ * Handles the streaming a one or more section of one of more sstables to and from a specific
+ * remote node.
+ *
+ * Both this node and the remote one will create a similar symmetrical StreamSession. A streaming
+ * session has the following life-cycle:
+ *
+ * 1. Connections Initialization
+ *
+ *   (a) A node (the initiator in the following) create a new StreamSession, initialize it (init())
+ *       and then start it (start()). Start will create a {@link ConnectionHandler} that will create
+ *       two connections to the remote node (the follower in the following) with whom to stream and send
+ *       a StreamInit message. The first connection will be the incoming connection for the
+ *       initiator, and the second connection will be the outgoing.
+ *   (b) Upon reception of that StreamInit message, the follower creates its own StreamSession,
+ *       initialize it if it still does not exist, and attach connecting socket to its ConnectionHandler
+ *       according to StreamInit message's isForOutgoing flag.
+ *   (d) When the both incoming and outgoing connections are established, StreamSession calls
+ *       StreamSession#onInitializationComplete method to start the streaming prepare phase
+ *       (StreamResultFuture.startStreaming()).
+ *
+ * 2. Streaming preparation phase
+ *
+ *   (a) This phase is started when the initiator onInitializationComplete() method is called. This method sends a
+ *       PrepareMessage that includes what files/sections this node will stream to the follower
+ *       (stored in a StreamTransferTask, each column family has it's own transfer task) and what
+ *       the follower needs to stream back (StreamReceiveTask, same as above). If the initiator has
+ *       nothing to receive from the follower, it goes directly to its Streaming phase. Otherwise,
+ *       it waits for the follower PrepareMessage.
+ *   (b) Upon reception of the PrepareMessage, the follower records which files/sections it will receive
+ *       and send back its own PrepareMessage with a summary of the files/sections that will be sent to
+ *       the initiator (prepare()). After having sent that message, the follower goes to its Streamning
+ *       phase.
+ *   (c) When the initiator receives the follower PrepareMessage, it records which files/sections it will
+ *       receive and then goes to his own Streaming phase.
+ *
+ * 3. Streaming phase
+ *
+ *   (a) The streaming phase is started by each node (the sender in the follower, but note that each side
+ *       of the StreamSession may be sender for some of the files) involved by calling startStreamingFiles().
+ *       This will sequentially send a FileMessage for each file of each SteamTransferTask. Each FileMessage
+ *       consists of a FileMessageHeader that indicates which file is coming and then start streaming the
+ *       content for that file (StreamWriter in FileMessage.serialize()). When a file is fully sent, the
+ *       fileSent() method is called for that file. If all the files for a StreamTransferTask are sent
+ *       (StreamTransferTask.complete()), the task is marked complete (taskCompleted()).
+ *   (b) On the receiving side, a SSTable will be written for the incoming file (StreamReader in
+ *       FileMessage.deserialize()) and once the FileMessage is fully received, the file will be marked as
+ *       complete (received()). When all files for the StreamReceiveTask have been received, the sstables
+ *       are added to the CFS (and 2ndary index are built, StreamReceiveTask.complete()) and the task
+ *       is marked complete (taskCompleted())
+ *   (b) If during the streaming of a particular file an error occurs on the receiving end of a stream
+ *       (FileMessage.deserialize), the node will send a SessionFailedMessage to the sender and close the stream session.
+ *   (c) When all transfer and receive tasks for a session are complete, the move to the Completion phase
+ *       (maybeCompleted()).
+ *
+ * 4. Completion phase
+ *
+ *   (a) When a node has finished all transfer and receive task, it enter the completion phase (maybeCompleted()).
+ *       If it had already received a CompleteMessage from the other side (it is in the WAIT_COMPLETE state), that
+ *       session is done is is closed (closeSession()). Otherwise, the node switch to the WAIT_COMPLETE state and
+ *       send a CompleteMessage to the other side.
+ */
+<span class="nc bnc" id="L120" title="All 2 branches missed.">public class StreamSession implements IEndpointStateChangeSubscriber</span>
+{
+
+    /**
+     * Version where keep-alive support was added
+     */
+<span class="nc" id="L126">    private static final CassandraVersion STREAM_KEEP_ALIVE = new CassandraVersion(&quot;3.10&quot;);</span>
+<span class="nc" id="L127">    private static final Logger logger = LoggerFactory.getLogger(StreamSession.class);</span>
+<span class="nc" id="L128">    private static final DebuggableScheduledThreadPoolExecutor keepAliveExecutor = new DebuggableScheduledThreadPoolExecutor(&quot;StreamKeepAliveExecutor&quot;);</span>
+    static {
+        // Immediately remove keep-alive task when cancelled.
+<span class="nc" id="L131">        keepAliveExecutor.setRemoveOnCancelPolicy(true);</span>
+<span class="nc" id="L132">    }</span>
+
+    /**
+     * Streaming endpoint.
+     *
+     * Each {@code StreamSession} is identified by this InetAddress which is broadcast address of the node streaming.
+     */
+    public final InetAddress peer;
+    private final int index;
+    /** Actual connecting address. Can be the same as {@linkplain #peer}. */
+    public final InetAddress connecting;
+
+    // should not be null when session is started
+    private StreamResultFuture streamResult;
+
+    // stream requests to send to the peer
+<span class="nc" id="L148">    protected final Set&lt;StreamRequest&gt; requests = Sets.newConcurrentHashSet();</span>
+    // streaming tasks are created and managed per ColumnFamily ID
+<span class="nc" id="L150">    @VisibleForTesting</span>
+    protected final ConcurrentHashMap&lt;UUID, StreamTransferTask&gt; transfers = new ConcurrentHashMap&lt;&gt;();
+    // data receivers, filled after receiving prepare message
+<span class="nc" id="L153">    private final Map&lt;UUID, StreamReceiveTask&gt; receivers = new ConcurrentHashMap&lt;&gt;();</span>
+    private final StreamingMetrics metrics;
+    /* can be null when session is created in remote */
+    private final StreamConnectionFactory factory;
+
+<span class="nc" id="L158">    public final Map&lt;String, Set&lt;Range&lt;Token&gt;&gt;&gt; transferredRangesPerKeyspace = new HashMap&lt;&gt;();</span>
+
+    public final ConnectionHandler handler;
+
+<span class="nc" id="L162">    private AtomicBoolean isAborted = new AtomicBoolean(false);</span>
+    private final boolean keepSSTableLevel;
+    private final boolean isIncremental;
+<span class="nc" id="L165">    private ScheduledFuture&lt;?&gt; keepAliveFuture = null;</span>
+
+<span class="nc" id="L167">    public static enum State</span>
+    {
+<span class="nc" id="L169">        INITIALIZED,</span>
+<span class="nc" id="L170">        PREPARING,</span>
+<span class="nc" id="L171">        STREAMING,</span>
+<span class="nc" id="L172">        WAIT_COMPLETE,</span>
+<span class="nc" id="L173">        COMPLETE,</span>
+<span class="nc" id="L174">        FAILED,</span>
+    }
+
+<span class="nc" id="L177">    private volatile State state = State.INITIALIZED;</span>
+<span class="nc" id="L178">    private volatile boolean completeSent = false;</span>
+
+    /**
+     * Create new streaming session with the peer.
+     *
+     * @param peer Address of streaming peer
+     * @param connecting Actual connecting address
+     * @param factory is used for establishing connection
+     */
+    public StreamSession(InetAddress peer, InetAddress connecting, StreamConnectionFactory factory, int index, boolean keepSSTableLevel, boolean isIncremental)
+<span class="nc" id="L188">    {</span>
+<span class="nc" id="L189">        this.peer = peer;</span>
+<span class="nc" id="L190">        this.connecting = connecting;</span>
+<span class="nc" id="L191">        this.index = index;</span>
+<span class="nc" id="L192">        this.factory = factory;</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        this.handler = new ConnectionHandler(this, isKeepAliveSupported()?</span>
+<span class="nc" id="L194">                                                   (int)TimeUnit.SECONDS.toMillis(2 * DatabaseDescriptor.getStreamingKeepAlivePeriod()) :</span>
+<span class="nc" id="L195">                                                   DatabaseDescriptor.getStreamingSocketTimeout());</span>
+<span class="nc" id="L196">        this.metrics = StreamingMetrics.get(connecting);</span>
+<span class="nc" id="L197">        this.keepSSTableLevel = keepSSTableLevel;</span>
+<span class="nc" id="L198">        this.isIncremental = isIncremental;</span>
+<span class="nc" id="L199">    }</span>
+
+    public UUID planId()
+    {
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        return streamResult == null ? null : streamResult.planId;</span>
+    }
+
+    public int sessionIndex()
+    {
+<span class="nc" id="L208">        return index;</span>
+    }
+
+    public String description()
+    {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        return streamResult == null ? null : streamResult.description;</span>
+    }
+
+    public boolean keepSSTableLevel()
+    {
+<span class="nc" id="L218">        return keepSSTableLevel;</span>
+    }
+
+    public boolean isIncremental()
+    {
+<span class="nc" id="L223">        return isIncremental;</span>
+    }
+
+
+    StreamReceiveTask getReceivingTask(UUID cfId)
+    {
+<span class="nc bnc" id="L229" title="All 4 branches missed.">        assert receivers.containsKey(cfId);</span>
+<span class="nc" id="L230">        return receivers.get(cfId);</span>
+    }
+
+    private boolean isKeepAliveSupported()
+    {
+<span class="nc" id="L235">        CassandraVersion peerVersion = Gossiper.instance.getReleaseVersion(peer);</span>
+<span class="nc" id="L236">        return STREAM_KEEP_ALIVE.isSupportedBy(peerVersion);</span>
+    }
+
+    /**
+     * Bind this session to report to specific {@link StreamResultFuture} and
+     * perform pre-streaming initialization.
+     *
+     * @param streamResult result to report to
+     */
+    public void init(StreamResultFuture streamResult)
+    {
+<span class="nc" id="L247">        this.streamResult = streamResult;</span>
+<span class="nc" id="L248">        StreamHook.instance.reportStreamFuture(this, streamResult);</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (isKeepAliveSupported())</span>
+<span class="nc" id="L251">            scheduleKeepAliveTask();</span>
+        else
+<span class="nc" id="L253">            logger.debug(&quot;Peer {} does not support keep-alive.&quot;, peer);</span>
+<span class="nc" id="L254">    }</span>
+
+    public void start()
+    {
+<span class="nc bnc" id="L258" title="All 4 branches missed.">        if (requests.isEmpty() &amp;&amp; transfers.isEmpty())</span>
+        {
+<span class="nc" id="L260">            logger.info(&quot;[Stream #{}] Session does not have any tasks.&quot;, planId());</span>
+<span class="nc" id="L261">            closeSession(State.COMPLETE);</span>
+<span class="nc" id="L262">            return;</span>
+        }
+
+        try
+        {
+<span class="nc" id="L267">            logger.info(&quot;[Stream #{}] Starting streaming to {}{}&quot;, planId(),</span>
+                                                                   peer,
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                                                                   peer.equals(connecting) ? &quot;&quot; : &quot; through &quot; + connecting);</span>
+<span class="nc" id="L270">            handler.initiate();</span>
+<span class="nc" id="L271">            onInitializationComplete();</span>
+        }
+<span class="nc" id="L273">        catch (Exception e)</span>
+        {
+<span class="nc" id="L275">            JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L276">            onError(e);</span>
+<span class="nc" id="L277">        }</span>
+<span class="nc" id="L278">    }</span>
+
+    public Socket createConnection() throws IOException
+    {
+<span class="nc bnc" id="L282" title="All 4 branches missed.">        assert factory != null;</span>
+<span class="nc" id="L283">        return factory.createConnection(connecting);</span>
+    }
+
+    /**
+     * Request data fetch task to this session.
+     *
+     * @param keyspace Requesting keyspace
+     * @param ranges Ranges to retrieve data
+     * @param columnFamilies ColumnFamily names. Can be empty if requesting all CF under the keyspace.
+     */
+    public void addStreamRequest(String keyspace, Collection&lt;Range&lt;Token&gt;&gt; ranges, Collection&lt;String&gt; columnFamilies, long repairedAt)
+    {
+<span class="nc" id="L295">        requests.add(new StreamRequest(keyspace, ranges, columnFamilies, repairedAt));</span>
+<span class="nc" id="L296">    }</span>
+
+    /**
+     * Set up transfer for specific keyspace/ranges/CFs
+     *
+     * Used in repair - a streamed sstable in repair will be marked with the given repairedAt time
+     *
+     * @param keyspace Transfer keyspace
+     * @param ranges Transfer ranges
+     * @param columnFamilies Transfer ColumnFamilies
+     * @param flushTables flush tables?
+     * @param repairedAt the time the repair started.
+     */
+    public synchronized void addTransferRanges(String keyspace, Collection&lt;Range&lt;Token&gt;&gt; ranges, Collection&lt;String&gt; columnFamilies, boolean flushTables, long repairedAt)
+    {
+<span class="nc" id="L311">        failIfFinished();</span>
+<span class="nc" id="L312">        Collection&lt;ColumnFamilyStore&gt; stores = getColumnFamilyStores(keyspace, columnFamilies);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (flushTables)</span>
+<span class="nc" id="L314">            flushSSTables(stores);</span>
+
+<span class="nc" id="L316">        List&lt;Range&lt;Token&gt;&gt; normalizedRanges = Range.normalize(ranges);</span>
+<span class="nc" id="L317">        List&lt;SSTableStreamingSections&gt; sections = getSSTableSectionsForRanges(normalizedRanges, stores, repairedAt, isIncremental);</span>
+        try
+        {
+<span class="nc" id="L320">            addTransferFiles(sections);</span>
+<span class="nc" id="L321">            Set&lt;Range&lt;Token&gt;&gt; toBeUpdated = transferredRangesPerKeyspace.get(keyspace);</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (toBeUpdated == null)</span>
+            {
+<span class="nc" id="L324">                toBeUpdated = new HashSet&lt;&gt;();</span>
+            }
+<span class="nc" id="L326">            toBeUpdated.addAll(ranges);</span>
+<span class="nc" id="L327">            transferredRangesPerKeyspace.put(keyspace, toBeUpdated);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            for (SSTableStreamingSections release : sections)</span>
+<span class="nc" id="L332">                release.ref.release();</span>
+        }
+<span class="nc" id="L334">    }</span>
+
+    private void failIfFinished()
+    {
+<span class="nc bnc" id="L338" title="All 4 branches missed.">        if (state() == State.COMPLETE || state() == State.FAILED)</span>
+<span class="nc" id="L339">            throw new RuntimeException(String.format(&quot;Stream %s is finished with state %s&quot;, planId(), state().name()));</span>
+<span class="nc" id="L340">    }</span>
+
+    private Collection&lt;ColumnFamilyStore&gt; getColumnFamilyStores(String keyspace, Collection&lt;String&gt; columnFamilies)
+    {
+<span class="nc" id="L344">        Collection&lt;ColumnFamilyStore&gt; stores = new HashSet&lt;&gt;();</span>
+        // if columnfamilies are not specified, we add all cf under the keyspace
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (columnFamilies.isEmpty())</span>
+        {
+<span class="nc" id="L348">            stores.addAll(Keyspace.open(keyspace).getColumnFamilyStores());</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            for (String cf : columnFamilies)</span>
+<span class="nc" id="L353">                stores.add(Keyspace.open(keyspace).getColumnFamilyStore(cf));</span>
+        }
+<span class="nc" id="L355">        return stores;</span>
+    }
+
+    @VisibleForTesting
+    public static List&lt;SSTableStreamingSections&gt; getSSTableSectionsForRanges(Collection&lt;Range&lt;Token&gt;&gt; ranges, Collection&lt;ColumnFamilyStore&gt; stores, long overriddenRepairedAt, final boolean isIncremental)
+    {
+<span class="nc" id="L361">        Refs&lt;SSTableReader&gt; refs = new Refs&lt;&gt;();</span>
+        try
+        {
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            for (ColumnFamilyStore cfStore : stores)</span>
+            {
+<span class="nc" id="L366">                final List&lt;Range&lt;PartitionPosition&gt;&gt; keyRanges = new ArrayList&lt;&gt;(ranges.size());</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                for (Range&lt;Token&gt; range : ranges)</span>
+<span class="nc" id="L368">                    keyRanges.add(Range.makeRowRange(range));</span>
+<span class="nc" id="L369">                refs.addAll(cfStore.selectAndReference(view -&gt; {</span>
+<span class="nc" id="L370">                    Set&lt;SSTableReader&gt; sstables = Sets.newHashSet();</span>
+<span class="nc" id="L371">                    SSTableIntervalTree intervalTree = SSTableIntervalTree.build(view.select(SSTableSet.CANONICAL));</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                    for (Range&lt;PartitionPosition&gt; keyRange : keyRanges)</span>
+                    {
+                        // keyRange excludes its start, while sstableInBounds is inclusive (of both start and end).
+                        // This is fine however, because keyRange has been created from a token range through Range.makeRowRange (see above).
+                        // And that later method uses the Token.maxKeyBound() method to creates the range, which return a &quot;fake&quot; key that
+                        // sort after all keys having the token. That &quot;fake&quot; key cannot however be equal to any real key, so that even
+                        // including keyRange.left will still exclude any key having the token of the original token range, and so we're
+                        // still actually selecting what we wanted.
+<span class="nc bnc" id="L380" title="All 2 branches missed.">                        for (SSTableReader sstable : View.sstablesInBounds(keyRange.left, keyRange.right, intervalTree))</span>
+                        {
+<span class="nc bnc" id="L382" title="All 4 branches missed.">                            if (!isIncremental || !sstable.isRepaired())</span>
+<span class="nc" id="L383">                                sstables.add(sstable);</span>
+<span class="nc" id="L384">                        }</span>
+<span class="nc" id="L385">                    }</span>
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                    if (logger.isDebugEnabled())</span>
+<span class="nc" id="L388">                        logger.debug(&quot;ViewFilter for {}/{} sstables&quot;, sstables.size(), Iterables.size(view.select(SSTableSet.CANONICAL)));</span>
+<span class="nc" id="L389">                    return sstables;</span>
+                }).refs);
+<span class="nc" id="L391">            }</span>
+
+<span class="nc" id="L393">            List&lt;SSTableStreamingSections&gt; sections = new ArrayList&lt;&gt;(refs.size());</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            for (SSTableReader sstable : refs)</span>
+            {
+<span class="nc" id="L396">                long repairedAt = overriddenRepairedAt;</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">                if (overriddenRepairedAt == ActiveRepairService.UNREPAIRED_SSTABLE)</span>
+<span class="nc" id="L398">                    repairedAt = sstable.getSSTableMetadata().repairedAt;</span>
+<span class="nc" id="L399">                sections.add(new SSTableStreamingSections(refs.get(sstable),</span>
+<span class="nc" id="L400">                                                          sstable.getPositionsForRanges(ranges),</span>
+<span class="nc" id="L401">                                                          sstable.estimatedKeysForRanges(ranges),</span>
+                                                          repairedAt));
+<span class="nc" id="L403">            }</span>
+<span class="nc" id="L404">            return sections;</span>
+        }
+<span class="nc" id="L406">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L408">            refs.release();</span>
+<span class="nc" id="L409">            throw t;</span>
+        }
+    }
+
+    public synchronized void addTransferFiles(Collection&lt;SSTableStreamingSections&gt; sstableDetails)
+    {
+<span class="nc" id="L415">        failIfFinished();</span>
+<span class="nc" id="L416">        Iterator&lt;SSTableStreamingSections&gt; iter = sstableDetails.iterator();</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L419">            SSTableStreamingSections details = iter.next();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (details.sections.isEmpty())</span>
+            {
+                // A reference was acquired on the sstable and we won't stream it
+<span class="nc" id="L423">                details.ref.release();</span>
+<span class="nc" id="L424">                iter.remove();</span>
+<span class="nc" id="L425">                continue;</span>
+            }
+
+<span class="nc" id="L428">            UUID cfId = details.ref.get().metadata.cfId;</span>
+<span class="nc" id="L429">            StreamTransferTask task = transfers.get(cfId);</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            if (task == null)</span>
+            {
+                //guarantee atomicity
+<span class="nc" id="L433">                StreamTransferTask newTask = new StreamTransferTask(this, cfId);</span>
+<span class="nc" id="L434">                task = transfers.putIfAbsent(cfId, newTask);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">                if (task == null)</span>
+<span class="nc" id="L436">                    task = newTask;</span>
+            }
+<span class="nc" id="L438">            task.addTransferFile(details.ref, details.estimatedKeys, details.sections, details.repairedAt);</span>
+<span class="nc" id="L439">            iter.remove();</span>
+<span class="nc" id="L440">        }</span>
+<span class="nc" id="L441">    }</span>
+
+    public static class SSTableStreamingSections
+    {
+        public final Ref&lt;SSTableReader&gt; ref;
+        public final List&lt;Pair&lt;Long, Long&gt;&gt; sections;
+        public final long estimatedKeys;
+        public final long repairedAt;
+
+        public SSTableStreamingSections(Ref&lt;SSTableReader&gt; ref, List&lt;Pair&lt;Long, Long&gt;&gt; sections, long estimatedKeys, long repairedAt)
+<span class="nc" id="L451">        {</span>
+<span class="nc" id="L452">            this.ref = ref;</span>
+<span class="nc" id="L453">            this.sections = sections;</span>
+<span class="nc" id="L454">            this.estimatedKeys = estimatedKeys;</span>
+<span class="nc" id="L455">            this.repairedAt = repairedAt;</span>
+<span class="nc" id="L456">        }</span>
+    }
+
+    private synchronized void closeSession(State finalState)
+    {
+<span class="nc bnc" id="L461" title="All 2 branches missed.">        if (isAborted.compareAndSet(false, true))</span>
+        {
+<span class="nc" id="L463">            state(finalState);</span>
+
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (finalState == State.FAILED)</span>
+            {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                for (StreamTask task : Iterables.concat(receivers.values(), transfers.values()))</span>
+<span class="nc" id="L468">                    task.abort();</span>
+            }
+
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (keepAliveFuture != null)</span>
+            {
+<span class="nc" id="L473">                logger.debug(&quot;[Stream #{}] Finishing keep-alive task.&quot;, planId());</span>
+<span class="nc" id="L474">                keepAliveFuture.cancel(false);</span>
+<span class="nc" id="L475">                keepAliveFuture = null;</span>
+            }
+
+            // Note that we shouldn't block on this close because this method is called on the handler
+            // incoming thread (so we would deadlock).
+<span class="nc" id="L480">            handler.close();</span>
+
+<span class="nc" id="L482">            streamResult.handleSessionComplete(this);</span>
+        }
+<span class="nc" id="L484">    }</span>
+
+    /**
+     * Set current state to {@code newState}.
+     *
+     * @param newState new state to set
+     */
+    public void state(State newState)
+    {
+<span class="nc" id="L493">        state = newState;</span>
+<span class="nc" id="L494">    }</span>
+
+    /**
+     * @return current state
+     */
+    public State state()
+    {
+<span class="nc" id="L501">        return state;</span>
+    }
+
+    /**
+     * Return if this session completed successfully.
+     *
+     * @return true if session completed successfully.
+     */
+    public boolean isSuccess()
+    {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        return state == State.COMPLETE;</span>
+    }
+
+    public void messageReceived(StreamMessage message)
+    {
+<span class="nc bnc" id="L516" title="All 6 branches missed.">        switch (message.type)</span>
+        {
+            case PREPARE:
+<span class="nc" id="L519">                PrepareMessage msg = (PrepareMessage) message;</span>
+<span class="nc" id="L520">                prepare(msg.requests, msg.summaries);</span>
+<span class="nc" id="L521">                break;</span>
+
+            case FILE:
+<span class="nc" id="L524">                receive((IncomingFileMessage) message);</span>
+<span class="nc" id="L525">                break;</span>
+
+            case RECEIVED:
+<span class="nc" id="L528">                ReceivedMessage received = (ReceivedMessage) message;</span>
+<span class="nc" id="L529">                received(received.cfId, received.sequenceNumber);</span>
+<span class="nc" id="L530">                break;</span>
+
+            case COMPLETE:
+<span class="nc" id="L533">                complete();</span>
+<span class="nc" id="L534">                break;</span>
+
+            case SESSION_FAILED:
+<span class="nc" id="L537">                sessionFailed();</span>
+                break;
+        }
+<span class="nc" id="L540">    }</span>
+
+    /**
+     * Call back when connection initialization is complete to start the prepare phase.
+     */
+    public void onInitializationComplete()
+    {
+        // send prepare message
+<span class="nc" id="L548">        state(State.PREPARING);</span>
+<span class="nc" id="L549">        PrepareMessage prepare = new PrepareMessage();</span>
+<span class="nc" id="L550">        prepare.requests.addAll(requests);</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        for (StreamTransferTask task : transfers.values())</span>
+<span class="nc" id="L552">            prepare.summaries.add(task.getSummary());</span>
+<span class="nc" id="L553">        handler.sendMessage(prepare);</span>
+
+        // if we don't need to prepare for receiving stream, start sending files immediately
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (requests.isEmpty())</span>
+<span class="nc" id="L557">            startStreamingFiles();</span>
+<span class="nc" id="L558">    }</span>
+
+    /**l
+     * Call back for handling exception during streaming.
+     *
+     * @param e thrown exception
+     */
+    public void onError(Throwable e)
+    {
+<span class="nc" id="L567">        logError(e);</span>
+        // send session failure message
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (handler.isOutgoingConnected())</span>
+<span class="nc" id="L570">            handler.sendMessage(new SessionFailedMessage());</span>
+        // fail session
+<span class="nc" id="L572">        closeSession(State.FAILED);</span>
+<span class="nc" id="L573">    }</span>
+
+    private void logError(Throwable e)
+    {
+<span class="nc bnc" id="L577" title="All 2 branches missed.">        if (e instanceof SocketTimeoutException)</span>
+        {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (isKeepAliveSupported())</span>
+<span class="nc" id="L580">                logger.error(&quot;[Stream #{}] Did not receive response from peer {}{} for {} secs. Is peer down? &quot; +</span>
+<span class="nc" id="L581">                             &quot;If not, maybe try increasing streaming_keep_alive_period_in_secs.&quot;, planId(),</span>
+<span class="nc" id="L582">                             peer.getHostAddress(),</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">                             peer.equals(connecting) ? &quot;&quot; : &quot; through &quot; + connecting.getHostAddress(),</span>
+<span class="nc" id="L584">                             2 * DatabaseDescriptor.getStreamingKeepAlivePeriod(),</span>
+                             e);
+            else
+<span class="nc" id="L587">                logger.error(&quot;[Stream #{}] Streaming socket timed out. This means the session peer stopped responding or &quot; +</span>
+                             &quot;is still processing received data. If there is no sign of failure in the other end or a very &quot; +
+                             &quot;dense table is being transferred you may want to increase streaming_socket_timeout_in_ms &quot; +
+<span class="nc" id="L590">                             &quot;property. Current value is {}ms.&quot;, planId(), DatabaseDescriptor.getStreamingSocketTimeout(), e);</span>
+        }
+        else
+        {
+<span class="nc" id="L594">            logger.error(&quot;[Stream #{}] Streaming error occurred on session with peer {}{}&quot;, planId(),</span>
+<span class="nc" id="L595">                                                                                            peer.getHostAddress(),</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                                                                                            peer.equals(connecting) ? &quot;&quot; : &quot; through &quot; + connecting.getHostAddress(),</span>
+                                                                                            e);
+        }
+<span class="nc" id="L599">    }</span>
+
+    /**
+     * Prepare this session for sending/receiving files.
+     */
+    public void prepare(Collection&lt;StreamRequest&gt; requests, Collection&lt;StreamSummary&gt; summaries)
+    {
+        // prepare tasks
+<span class="nc" id="L607">        state(State.PREPARING);</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">        for (StreamRequest request : requests)</span>
+<span class="nc" id="L609">            addTransferRanges(request.keyspace, request.ranges, request.columnFamilies, true, request.repairedAt); // always flush on stream request</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        for (StreamSummary summary : summaries)</span>
+<span class="nc" id="L611">            prepareReceiving(summary);</span>
+
+        // send back prepare message if prepare message contains stream request
+<span class="nc bnc" id="L614" title="All 2 branches missed.">        if (!requests.isEmpty())</span>
+        {
+<span class="nc" id="L616">            PrepareMessage prepare = new PrepareMessage();</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            for (StreamTransferTask task : transfers.values())</span>
+<span class="nc" id="L618">                prepare.summaries.add(task.getSummary());</span>
+<span class="nc" id="L619">            handler.sendMessage(prepare);</span>
+        }
+
+        // if there are files to stream
+<span class="nc bnc" id="L623" title="All 2 branches missed.">        if (!maybeCompleted())</span>
+<span class="nc" id="L624">            startStreamingFiles();</span>
+<span class="nc" id="L625">    }</span>
+
+    /**
+     * Call back after sending FileMessageHeader.
+     *
+     * @param header sent header
+     */
+    public void fileSent(FileMessageHeader header)
+    {
+<span class="nc" id="L634">        long headerSize = header.size();</span>
+<span class="nc" id="L635">        StreamingMetrics.totalOutgoingBytes.inc(headerSize);</span>
+<span class="nc" id="L636">        metrics.outgoingBytes.inc(headerSize);</span>
+        // schedule timeout for receiving ACK
+<span class="nc" id="L638">        StreamTransferTask task = transfers.get(header.cfId);</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (task != null)</span>
+        {
+<span class="nc" id="L641">            task.scheduleTimeout(header.sequenceNumber, 12, TimeUnit.HOURS);</span>
+        }
+<span class="nc" id="L643">    }</span>
+
+    /**
+     * Call back after receiving FileMessageHeader.
+     *
+     * @param message received file
+     */
+    public void receive(IncomingFileMessage message)
+    {
+<span class="nc" id="L652">        long headerSize = message.header.size();</span>
+<span class="nc" id="L653">        StreamingMetrics.totalIncomingBytes.inc(headerSize);</span>
+<span class="nc" id="L654">        metrics.incomingBytes.inc(headerSize);</span>
+        // send back file received message
+<span class="nc" id="L656">        handler.sendMessage(new ReceivedMessage(message.header.cfId, message.header.sequenceNumber));</span>
+<span class="nc" id="L657">        receivers.get(message.header.cfId).received(message.sstable);</span>
+<span class="nc" id="L658">    }</span>
+
+    public void progress(String filename, ProgressInfo.Direction direction, long bytes, long total)
+    {
+<span class="nc" id="L662">        ProgressInfo progress = new ProgressInfo(peer, index, filename, direction, bytes, total);</span>
+<span class="nc" id="L663">        streamResult.handleProgress(progress);</span>
+<span class="nc" id="L664">    }</span>
+
+    public void received(UUID cfId, int sequenceNumber)
+    {
+<span class="nc" id="L668">        transfers.get(cfId).complete(sequenceNumber);</span>
+<span class="nc" id="L669">    }</span>
+
+    /**
+     * Check if session is completed on receiving {@code StreamMessage.Type.COMPLETE} message.
+     */
+    public synchronized void complete()
+    {
+<span class="nc bnc" id="L676" title="All 2 branches missed.">        if (state == State.WAIT_COMPLETE)</span>
+        {
+<span class="nc bnc" id="L678" title="All 2 branches missed.">            if (!completeSent)</span>
+            {
+<span class="nc" id="L680">                handler.sendMessage(new CompleteMessage());</span>
+<span class="nc" id="L681">                completeSent = true;</span>
+            }
+<span class="nc" id="L683">            closeSession(State.COMPLETE);</span>
+        }
+        else
+        {
+<span class="nc" id="L687">            state(State.WAIT_COMPLETE);</span>
+<span class="nc" id="L688">            handler.closeIncoming();</span>
+        }
+<span class="nc" id="L690">    }</span>
+
+    private synchronized void scheduleKeepAliveTask()
+    {
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        if (keepAliveFuture == null)</span>
+        {
+<span class="nc" id="L696">            int keepAlivePeriod = DatabaseDescriptor.getStreamingKeepAlivePeriod();</span>
+<span class="nc" id="L697">            logger.debug(&quot;[Stream #{}] Scheduling keep-alive task with {}s period.&quot;, planId(), keepAlivePeriod);</span>
+<span class="nc" id="L698">            keepAliveFuture = keepAliveExecutor.scheduleAtFixedRate(new KeepAliveTask(), 0, keepAlivePeriod, TimeUnit.SECONDS);</span>
+        }
+<span class="nc" id="L700">    }</span>
+
+    /**
+     * Call back on receiving {@code StreamMessage.Type.SESSION_FAILED} message.
+     */
+    public synchronized void sessionFailed()
+    {
+<span class="nc" id="L707">        logger.error(&quot;[Stream #{}] Remote peer {} failed stream session.&quot;, planId(), peer.getHostAddress());</span>
+<span class="nc" id="L708">        closeSession(State.FAILED);</span>
+<span class="nc" id="L709">    }</span>
+
+    /**
+     * @return Current snapshot of this session info.
+     */
+    public SessionInfo getSessionInfo()
+    {
+<span class="nc" id="L716">        List&lt;StreamSummary&gt; receivingSummaries = Lists.newArrayList();</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        for (StreamTask receiver : receivers.values())</span>
+<span class="nc" id="L718">            receivingSummaries.add(receiver.getSummary());</span>
+<span class="nc" id="L719">        List&lt;StreamSummary&gt; transferSummaries = Lists.newArrayList();</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        for (StreamTask transfer : transfers.values())</span>
+<span class="nc" id="L721">            transferSummaries.add(transfer.getSummary());</span>
+<span class="nc" id="L722">        return new SessionInfo(peer, index, connecting, receivingSummaries, transferSummaries, state);</span>
+    }
+
+    public synchronized void taskCompleted(StreamReceiveTask completedTask)
+    {
+<span class="nc" id="L727">        receivers.remove(completedTask.cfId);</span>
+<span class="nc" id="L728">        maybeCompleted();</span>
+<span class="nc" id="L729">    }</span>
+
+    public synchronized void taskCompleted(StreamTransferTask completedTask)
+    {
+<span class="nc" id="L733">        transfers.remove(completedTask.cfId);</span>
+<span class="nc" id="L734">        maybeCompleted();</span>
+<span class="nc" id="L735">    }</span>
+
+<span class="nc" id="L737">    public void onJoin(InetAddress endpoint, EndpointState epState) {}</span>
+<span class="nc" id="L738">    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}</span>
+<span class="nc" id="L739">    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}</span>
+<span class="nc" id="L740">    public void onAlive(InetAddress endpoint, EndpointState state) {}</span>
+<span class="nc" id="L741">    public void onDead(InetAddress endpoint, EndpointState state) {}</span>
+
+    public void onRemove(InetAddress endpoint)
+    {
+<span class="nc" id="L745">        logger.error(&quot;[Stream #{}] Session failed because remote peer {} has left.&quot;, planId(), peer.getHostAddress());</span>
+<span class="nc" id="L746">        closeSession(State.FAILED);</span>
+<span class="nc" id="L747">    }</span>
+
+    public void onRestart(InetAddress endpoint, EndpointState epState)
+    {
+<span class="nc" id="L751">        logger.error(&quot;[Stream #{}] Session failed because remote peer {} was restarted.&quot;, planId(), peer.getHostAddress());</span>
+<span class="nc" id="L752">        closeSession(State.FAILED);</span>
+<span class="nc" id="L753">    }</span>
+
+    private boolean maybeCompleted()
+    {
+<span class="nc bnc" id="L757" title="All 4 branches missed.">        boolean completed = receivers.isEmpty() &amp;&amp; transfers.isEmpty();</span>
+<span class="nc bnc" id="L758" title="All 2 branches missed.">        if (completed)</span>
+        {
+<span class="nc bnc" id="L760" title="All 2 branches missed.">            if (state == State.WAIT_COMPLETE)</span>
+            {
+<span class="nc bnc" id="L762" title="All 2 branches missed.">                if (!completeSent)</span>
+                {
+<span class="nc" id="L764">                    handler.sendMessage(new CompleteMessage());</span>
+<span class="nc" id="L765">                    completeSent = true;</span>
+                }
+<span class="nc" id="L767">                closeSession(State.COMPLETE);</span>
+            }
+            else
+            {
+                // notify peer that this session is completed
+<span class="nc" id="L772">                handler.sendMessage(new CompleteMessage());</span>
+<span class="nc" id="L773">                completeSent = true;</span>
+<span class="nc" id="L774">                state(State.WAIT_COMPLETE);</span>
+<span class="nc" id="L775">                handler.closeOutgoing();</span>
+            }
+        }
+<span class="nc" id="L778">        return completed;</span>
+    }
+
+    /**
+     * Flushes matching column families from the given keyspace, or all columnFamilies
+     * if the cf list is empty.
+     */
+    private void flushSSTables(Iterable&lt;ColumnFamilyStore&gt; stores)
+    {
+<span class="nc" id="L787">        List&lt;Future&lt;?&gt;&gt; flushes = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : stores)</span>
+<span class="nc" id="L789">            flushes.add(cfs.forceFlush());</span>
+<span class="nc" id="L790">        FBUtilities.waitOnFutures(flushes);</span>
+<span class="nc" id="L791">    }</span>
+
+    private synchronized void prepareReceiving(StreamSummary summary)
+    {
+<span class="nc" id="L795">        failIfFinished();</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (summary.files &gt; 0)</span>
+<span class="nc" id="L797">            receivers.put(summary.cfId, new StreamReceiveTask(this, summary.cfId, summary.files, summary.totalSize));</span>
+<span class="nc" id="L798">    }</span>
+
+    private void startStreamingFiles()
+    {
+<span class="nc" id="L802">        streamResult.handleSessionPrepared(this);</span>
+
+<span class="nc" id="L804">        state(State.STREAMING);</span>
+<span class="nc bnc" id="L805" title="All 2 branches missed.">        for (StreamTransferTask task : transfers.values())</span>
+        {
+<span class="nc" id="L807">            Collection&lt;OutgoingFileMessage&gt; messages = task.getFileMessages();</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">            if (messages.size() &gt; 0)</span>
+<span class="nc" id="L809">                handler.sendMessages(messages);</span>
+            else
+<span class="nc" id="L811">                taskCompleted(task); // there is no file to send</span>
+<span class="nc" id="L812">        }</span>
+<span class="nc" id="L813">    }</span>
+
+<span class="nc" id="L815">    class KeepAliveTask implements Runnable</span>
+    {
+<span class="nc" id="L817">        private KeepAliveMessage last = null;</span>
+
+        public void run()
+        {
+            //to avoid jamming the message queue, we only send if the last one was sent
+<span class="nc bnc" id="L822" title="All 4 branches missed.">            if (last == null || last.wasSent())</span>
+            {
+<span class="nc" id="L824">                logger.trace(&quot;[Stream #{}] Sending keep-alive to {}.&quot;, planId(), peer);</span>
+<span class="nc" id="L825">                last = new KeepAliveMessage();</span>
+                try
+                {
+<span class="nc" id="L828">                    handler.sendMessage(last);</span>
+                }
+<span class="nc" id="L830">                catch (RuntimeException e) //connection handler is closed</span>
+                {
+<span class="nc" id="L832">                    logger.debug(&quot;[Stream #{}] Could not send keep-alive message (perhaps stream session is finished?).&quot;, planId(), e);</span>
+<span class="nc" id="L833">                }</span>
+            }
+            else
+            {
+<span class="nc" id="L837">                logger.trace(&quot;[Stream #{}] Skip sending keep-alive to {} (previous was not yet sent).&quot;, planId(), peer);</span>
+            }
+<span class="nc" id="L839">        }</span>
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L845">        List&lt;ExecutorService&gt; executors = ImmutableList.of(keepAliveExecutor);</span>
+<span class="nc" id="L846">        ExecutorUtils.shutdownNow(executors);</span>
+<span class="nc" id="L847">        ExecutorUtils.awaitTermination(timeout, unit, executors);</span>
+<span class="nc" id="L848">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,762 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeTombstoneList.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">RangeTombstoneList.java</span></div><h1>RangeTombstoneList.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+
+import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Iterators;
+
+import org.apache.cassandra.cache.IMeasurableMemory;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.memory.AbstractAllocator;
+
+/**
+ * Data structure holding the range tombstones of a ColumnFamily.
+ * &lt;p&gt;
+ * This is essentially a sorted list of non-overlapping (tombstone) ranges.
+ * &lt;p&gt;
+ * A range tombstone has 4 elements: the start and end of the range covered,
+ * and the deletion infos (markedAt timestamp and local deletion time). The
+ * markedAt timestamp is what define the priority of 2 overlapping tombstones.
+ * That is, given 2 tombstones {@code [0, 10]@t1 and [5, 15]@t2, then if t2 &gt; t1} (and
+ * are the tombstones markedAt values), the 2nd tombstone take precedence over
+ * the first one on [5, 10]. If such tombstones are added to a RangeTombstoneList,
+ * the range tombstone list will store them as [[0, 5]@t1, [5, 15]@t2].
+ * &lt;p&gt;
+ * The only use of the local deletion time is to know when a given tombstone can
+ * be purged, which will be done by the purge() method.
+ */
+<span class="pc bpc" id="L49" title="1 of 2 branches missed.">public class RangeTombstoneList implements Iterable&lt;RangeTombstone&gt;, IMeasurableMemory</span>
+{
+<span class="fc" id="L51">    private static long EMPTY_SIZE = ObjectSizes.measure(new RangeTombstoneList(null, 0));</span>
+
+    private final ClusteringComparator comparator;
+
+    // Note: we don't want to use a List for the markedAts and delTimes to avoid boxing. We could
+    // use a List for starts and ends, but having arrays everywhere is almost simpler.
+    private ClusteringBound[] starts;
+    private ClusteringBound[] ends;
+    private long[] markedAts;
+    private int[] delTimes;
+
+    private long boundaryHeapSize;
+    private int size;
+
+    private RangeTombstoneList(ClusteringComparator comparator, ClusteringBound[] starts, ClusteringBound[] ends, long[] markedAts, int[] delTimes, long boundaryHeapSize, int size)
+<span class="fc" id="L66">    {</span>
+<span class="pc bpc" id="L67" title="4 of 8 branches missed.">        assert starts.length == ends.length &amp;&amp; starts.length == markedAts.length &amp;&amp; starts.length == delTimes.length;</span>
+<span class="fc" id="L68">        this.comparator = comparator;</span>
+<span class="fc" id="L69">        this.starts = starts;</span>
+<span class="fc" id="L70">        this.ends = ends;</span>
+<span class="fc" id="L71">        this.markedAts = markedAts;</span>
+<span class="fc" id="L72">        this.delTimes = delTimes;</span>
+<span class="fc" id="L73">        this.size = size;</span>
+<span class="fc" id="L74">        this.boundaryHeapSize = boundaryHeapSize;</span>
+<span class="fc" id="L75">    }</span>
+
+    public RangeTombstoneList(ClusteringComparator comparator, int capacity)
+    {
+<span class="fc" id="L79">        this(comparator, new ClusteringBound[capacity], new ClusteringBound[capacity], new long[capacity], new int[capacity], 0, 0);</span>
+<span class="fc" id="L80">    }</span>
+
+    public boolean isEmpty()
+    {
+<span class="fc bfc" id="L84" title="All 2 branches covered.">        return size == 0;</span>
+    }
+
+    public int size()
+    {
+<span class="fc" id="L89">        return size;</span>
+    }
+
+    public ClusteringComparator comparator()
+    {
+<span class="nc" id="L94">        return comparator;</span>
+    }
+
+    public RangeTombstoneList copy()
+    {
+<span class="fc" id="L99">        return new RangeTombstoneList(comparator,</span>
+<span class="fc" id="L100">                                      Arrays.copyOf(starts, size),</span>
+<span class="fc" id="L101">                                      Arrays.copyOf(ends, size),</span>
+<span class="fc" id="L102">                                      Arrays.copyOf(markedAts, size),</span>
+<span class="fc" id="L103">                                      Arrays.copyOf(delTimes, size),</span>
+                                      boundaryHeapSize, size);
+    }
+
+    public RangeTombstoneList copy(AbstractAllocator allocator)
+    {
+<span class="fc" id="L109">        RangeTombstoneList copy =  new RangeTombstoneList(comparator,</span>
+                                                          new ClusteringBound[size],
+                                                          new ClusteringBound[size],
+<span class="fc" id="L112">                                                          Arrays.copyOf(markedAts, size),</span>
+<span class="fc" id="L113">                                                          Arrays.copyOf(delTimes, size),</span>
+                                                          boundaryHeapSize, size);
+
+
+<span class="fc bfc" id="L117" title="All 2 branches covered.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="fc" id="L119">            copy.starts[i] = clone(starts[i], allocator);</span>
+<span class="fc" id="L120">            copy.ends[i] = clone(ends[i], allocator);</span>
+        }
+
+<span class="fc" id="L123">        return copy;</span>
+    }
+
+    private static ClusteringBound clone(ClusteringBound bound, AbstractAllocator allocator)
+    {
+<span class="fc" id="L128">        ByteBuffer[] values = new ByteBuffer[bound.size()];</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        for (int i = 0; i &lt; values.length; i++)</span>
+<span class="fc" id="L130">            values[i] = allocator.clone(bound.get(i));</span>
+<span class="fc" id="L131">        return new ClusteringBound(bound.kind(), values);</span>
+    }
+
+    public void add(RangeTombstone tombstone)
+    {
+<span class="fc" id="L136">        add(tombstone.deletedSlice().start(),</span>
+<span class="fc" id="L137">            tombstone.deletedSlice().end(),</span>
+<span class="fc" id="L138">            tombstone.deletionTime().markedForDeleteAt(),</span>
+<span class="fc" id="L139">            tombstone.deletionTime().localDeletionTime());</span>
+<span class="fc" id="L140">    }</span>
+
+    /**
+     * Adds a new range tombstone.
+     *
+     * This method will be faster if the new tombstone sort after all the currently existing ones (this is a common use case),
+     * but it doesn't assume it.
+     */
+    public void add(ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    {
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        if (isEmpty())</span>
+        {
+<span class="fc" id="L152">            addInternal(0, start, end, markedAt, delTime);</span>
+<span class="fc" id="L153">            return;</span>
+        }
+
+<span class="nc" id="L156">        int c = comparator.compare(ends[size-1], start);</span>
+
+        // Fast path if we add in sorted order
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (c &lt;= 0)</span>
+        {
+<span class="nc" id="L161">            addInternal(size, start, end, markedAt, delTime);</span>
+        }
+        else
+        {
+            // Note: insertFrom expect i to be the insertion point in term of interval ends
+<span class="nc" id="L166">            int pos = Arrays.binarySearch(ends, 0, size, start, comparator);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            insertFrom((pos &gt;= 0 ? pos+1 : -pos-1), start, end, markedAt, delTime);</span>
+        }
+<span class="nc" id="L169">        boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();</span>
+<span class="nc" id="L170">    }</span>
+
+    /**
+     * Adds all the range tombstones of {@code tombstones} to this RangeTombstoneList.
+     */
+    public void addAll(RangeTombstoneList tombstones)
+    {
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        if (tombstones.isEmpty())</span>
+<span class="nc" id="L178">            return;</span>
+
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">        if (isEmpty())</span>
+        {
+<span class="nc" id="L182">            copyArrays(tombstones, this);</span>
+<span class="nc" id="L183">            return;</span>
+        }
+
+        /*
+         * We basically have 2 techniques we can use here: either we repeatedly call add() on tombstones values,
+         * or we do a merge of both (sorted) lists. If this lists is bigger enough than the one we add, then
+         * calling add() will be faster, otherwise it's merging that will be faster.
+         *
+         * Let's note that during memtables updates, it might not be uncommon that a new update has only a few range
+         * tombstones, while the CF we're adding it to (the one in the memtable) has many. In that case, using add() is
+         * likely going to be faster.
+         *
+         * In other cases however, like when diffing responses from multiple nodes, the tombstone lists we &quot;merge&quot; will
+         * be likely sized, so using add() might be a bit inefficient.
+         *
+         * Roughly speaking (this ignore the fact that updating an element is not exactly constant but that's not a big
+         * deal), if n is the size of this list and m is tombstones size, merging is O(n+m) while using add() is O(m*log(n)).
+         *
+         * But let's not crank up a logarithm computation for that. Long story short, merging will be a bad choice only
+         * if this list size is lot bigger that the other one, so let's keep it simple.
+         */
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">        if (size &gt; 10 * tombstones.size)</span>
+        {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            for (int i = 0; i &lt; tombstones.size; i++)</span>
+<span class="nc" id="L207">                add(tombstones.starts[i], tombstones.ends[i], tombstones.markedAts[i], tombstones.delTimes[i]);</span>
+        }
+        else
+        {
+<span class="fc" id="L211">            int i = 0;</span>
+<span class="fc" id="L212">            int j = 0;</span>
+<span class="fc bfc" id="L213" title="All 4 branches covered.">            while (i &lt; size &amp;&amp; j &lt; tombstones.size)</span>
+            {
+<span class="fc bfc" id="L215" title="All 2 branches covered.">                if (comparator.compare(tombstones.starts[j], ends[i]) &lt; 0)</span>
+                {
+<span class="fc" id="L217">                    insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);</span>
+<span class="fc" id="L218">                    j++;</span>
+                }
+                else
+                {
+<span class="fc" id="L222">                    i++;</span>
+                }
+            }
+            // Addds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
+<span class="fc bfc" id="L226" title="All 2 branches covered.">            for (; j &lt; tombstones.size; j++)</span>
+<span class="fc" id="L227">                addInternal(size, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);</span>
+        }
+<span class="fc" id="L229">    }</span>
+
+    /**
+     * Returns whether the given name/timestamp pair is deleted by one of the tombstone
+     * of this RangeTombstoneList.
+     */
+    public boolean isDeleted(Clustering clustering, Cell cell)
+    {
+<span class="nc" id="L237">        int idx = searchInternal(clustering, 0, size);</span>
+        // No matter what the counter cell's timestamp is, a tombstone always takes precedence. See CASSANDRA-7346.
+<span class="nc bnc" id="L239" title="All 6 branches missed.">        return idx &gt;= 0 &amp;&amp; (cell.isCounterCell() || markedAts[idx] &gt;= cell.timestamp());</span>
+    }
+
+    /**
+     * Returns the DeletionTime for the tombstone overlapping {@code name} (there can't be more than one),
+     * or null if {@code name} is not covered by any tombstone.
+     */
+    public DeletionTime searchDeletionTime(Clustering name)
+    {
+<span class="nc" id="L248">        int idx = searchInternal(name, 0, size);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        return idx &lt; 0 ? null : new DeletionTime(markedAts[idx], delTimes[idx]);</span>
+    }
+
+    public RangeTombstone search(Clustering name)
+    {
+<span class="nc" id="L254">        int idx = searchInternal(name, 0, size);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        return idx &lt; 0 ? null : rangeTombstone(idx);</span>
+    }
+
+    /*
+     * Return is the index of the range covering name if name is covered. If the return idx is negative,
+     * no range cover name and -idx-1 is the index of the first range whose start is greater than name.
+     *
+     * Note that bounds are not in the range if they fall on its boundary.
+     */
+    private int searchInternal(ClusteringPrefix name, int startIdx, int endIdx)
+    {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (isEmpty())</span>
+<span class="nc" id="L267">            return -1;</span>
+
+<span class="nc" id="L269">        int pos = Arrays.binarySearch(starts, startIdx, endIdx, name, comparator);</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if (pos &gt;= 0)</span>
+        {
+            // Equality only happens for bounds (as used by forward/reverseIterator), and bounds are equal only if they
+            // are the same or complementary, in either case the bound itself is not part of the range.
+<span class="nc" id="L274">            return -pos - 1;</span>
+        }
+        else
+        {
+            // We potentially intersect the range before our &quot;insertion point&quot;
+<span class="nc" id="L279">            int idx = -pos-2;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            if (idx &lt; 0)</span>
+<span class="nc" id="L281">                return -1;</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            return comparator.compare(name, ends[idx]) &lt; 0 ? idx : -idx-2;</span>
+        }
+    }
+
+    public int dataSize()
+    {
+<span class="nc" id="L289">        int dataSize = TypeSizes.sizeof(size);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="nc" id="L292">            dataSize += starts[i].dataSize() + ends[i].dataSize();</span>
+<span class="nc" id="L293">            dataSize += TypeSizes.sizeof(markedAts[i]);</span>
+<span class="nc" id="L294">            dataSize += TypeSizes.sizeof(delTimes[i]);</span>
+        }
+<span class="nc" id="L296">        return dataSize;</span>
+    }
+
+    public long maxMarkedAt()
+    {
+<span class="nc" id="L301">        long max = Long.MIN_VALUE;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+<span class="nc" id="L303">            max = Math.max(max, markedAts[i]);</span>
+<span class="nc" id="L304">        return max;</span>
+    }
+
+    public void collectStats(EncodingStats.Collector collector)
+    {
+<span class="fc bfc" id="L309" title="All 2 branches covered.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="fc" id="L311">            collector.updateTimestamp(markedAts[i]);</span>
+<span class="fc" id="L312">            collector.updateLocalDeletionTime(delTimes[i]);</span>
+        }
+<span class="fc" id="L314">    }</span>
+
+    public void updateAllTimestamp(long timestamp)
+    {
+<span class="nc bnc" id="L318" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+<span class="nc" id="L319">            markedAts[i] = timestamp;</span>
+<span class="nc" id="L320">    }</span>
+
+    private RangeTombstone rangeTombstone(int idx)
+    {
+<span class="fc" id="L324">        return new RangeTombstone(Slice.make(starts[idx], ends[idx]), new DeletionTime(markedAts[idx], delTimes[idx]));</span>
+    }
+
+    private RangeTombstone rangeTombstoneWithNewStart(int idx, ClusteringBound newStart)
+    {
+<span class="nc" id="L329">        return new RangeTombstone(Slice.make(newStart, ends[idx]), new DeletionTime(markedAts[idx], delTimes[idx]));</span>
+    }
+
+    private RangeTombstone rangeTombstoneWithNewEnd(int idx, ClusteringBound newEnd)
+    {
+<span class="nc" id="L334">        return new RangeTombstone(Slice.make(starts[idx], newEnd), new DeletionTime(markedAts[idx], delTimes[idx]));</span>
+    }
+
+    private RangeTombstone rangeTombstoneWithNewBounds(int idx, ClusteringBound newStart, ClusteringBound newEnd)
+    {
+<span class="fc" id="L339">        return new RangeTombstone(Slice.make(newStart, newEnd), new DeletionTime(markedAts[idx], delTimes[idx]));</span>
+    }
+
+    public Iterator&lt;RangeTombstone&gt; iterator()
+    {
+<span class="nc" id="L344">        return iterator(false);</span>
+    }
+
+    public Iterator&lt;RangeTombstone&gt; iterator(boolean reversed)
+    {
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">        return reversed</span>
+             ? new AbstractIterator&lt;RangeTombstone&gt;()
+<span class="nc" id="L351">             {</span>
+<span class="nc" id="L352">                 private int idx = size - 1;</span>
+
+                 protected RangeTombstone computeNext()
+                 {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                     if (idx &lt; 0)</span>
+<span class="nc" id="L357">                         return endOfData();</span>
+
+<span class="nc" id="L359">                     return rangeTombstone(idx--);</span>
+                 }
+             }
+             : new AbstractIterator&lt;RangeTombstone&gt;()
+<span class="fc" id="L363">             {</span>
+                 private int idx;
+
+                 protected RangeTombstone computeNext()
+                 {
+<span class="fc bfc" id="L368" title="All 2 branches covered.">                     if (idx &gt;= size)</span>
+<span class="fc" id="L369">                         return endOfData();</span>
+
+<span class="fc" id="L371">                     return rangeTombstone(idx++);</span>
+                 }
+             };
+    }
+
+    public Iterator&lt;RangeTombstone&gt; iterator(final Slice slice, boolean reversed)
+    {
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">        return reversed ? reverseIterator(slice) : forwardIterator(slice);</span>
+    }
+
+    private Iterator&lt;RangeTombstone&gt; forwardIterator(final Slice slice)
+    {
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">        int startIdx = slice.start() == ClusteringBound.BOTTOM ? 0 : searchInternal(slice.start(), 0, size);</span>
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">        final int start = startIdx &lt; 0 ? -startIdx-1 : startIdx;</span>
+
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">        if (start &gt;= size)</span>
+<span class="nc" id="L387">            return Collections.emptyIterator();</span>
+
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">        int finishIdx = slice.end() == ClusteringBound.TOP ? size - 1 : searchInternal(slice.end(), start, size);</span>
+        // if stopIdx is the first range after 'slice.end()' we care only until the previous range
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">        final int finish = finishIdx &lt; 0 ? -finishIdx-2 : finishIdx;</span>
+
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">        if (start &gt; finish)</span>
+<span class="nc" id="L394">            return Collections.emptyIterator();</span>
+
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">        if (start == finish)</span>
+        {
+            // We want to make sure the range are stricly included within the queried slice as this
+            // make it easier to combine things when iterating over successive slices.
+<span class="pc bpc" id="L400" title="1 of 2 branches missed.">            ClusteringBound s = comparator.compare(starts[start], slice.start()) &lt; 0 ? slice.start() : starts[start];</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">            ClusteringBound e = comparator.compare(slice.end(), ends[start]) &lt; 0 ? slice.end() : ends[start];</span>
+<span class="fc" id="L402">            return Iterators.&lt;RangeTombstone&gt;singletonIterator(rangeTombstoneWithNewBounds(start, s, e));</span>
+        }
+
+<span class="nc" id="L405">        return new AbstractIterator&lt;RangeTombstone&gt;()</span>
+<span class="nc" id="L406">        {</span>
+<span class="nc" id="L407">            private int idx = start;</span>
+
+            protected RangeTombstone computeNext()
+            {
+<span class="nc bnc" id="L411" title="All 4 branches missed.">                if (idx &gt;= size || idx &gt; finish)</span>
+<span class="nc" id="L412">                    return endOfData();</span>
+
+                // We want to make sure the range are stricly included within the queried slice as this
+                // make it easier to combine things when iterating over successive slices. This means that
+                // for the first and last range we might have to &quot;cut&quot; the range returned.
+<span class="nc bnc" id="L417" title="All 4 branches missed.">                if (idx == start &amp;&amp; comparator.compare(starts[idx], slice.start()) &lt; 0)</span>
+<span class="nc" id="L418">                    return rangeTombstoneWithNewStart(idx++, slice.start());</span>
+<span class="nc bnc" id="L419" title="All 4 branches missed.">                if (idx == finish &amp;&amp; comparator.compare(slice.end(), ends[idx]) &lt; 0)</span>
+<span class="nc" id="L420">                    return rangeTombstoneWithNewEnd(idx++, slice.end());</span>
+<span class="nc" id="L421">                return rangeTombstone(idx++);</span>
+            }
+        };
+    }
+
+    private Iterator&lt;RangeTombstone&gt; reverseIterator(final Slice slice)
+    {
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        int startIdx = slice.end() == ClusteringBound.TOP ? size - 1 : searchInternal(slice.end(), 0, size);</span>
+        // if startIdx is the first range after 'slice.end()' we care only until the previous range
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        final int start = startIdx &lt; 0 ? -startIdx-2 : startIdx;</span>
+
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (start &lt; 0)</span>
+<span class="nc" id="L433">            return Collections.emptyIterator();</span>
+
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        int finishIdx = slice.start() == ClusteringBound.BOTTOM ? 0 : searchInternal(slice.start(), 0, start + 1);  // include same as finish</span>
+        // if stopIdx is the first range after 'slice.end()' we care only until the previous range
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        final int finish = finishIdx &lt; 0 ? -finishIdx-1 : finishIdx;</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        if (start &lt; finish)</span>
+<span class="nc" id="L440">            return Collections.emptyIterator();</span>
+
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if (start == finish)</span>
+        {
+            // We want to make sure the range are stricly included within the queried slice as this
+            // make it easier to combine things when iterator over successive slices.
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            ClusteringBound s = comparator.compare(starts[start], slice.start()) &lt; 0 ? slice.start() : starts[start];</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            ClusteringBound e = comparator.compare(slice.end(), ends[start]) &lt; 0 ? slice.end() : ends[start];</span>
+<span class="nc" id="L448">            return Iterators.&lt;RangeTombstone&gt;singletonIterator(rangeTombstoneWithNewBounds(start, s, e));</span>
+        }
+
+<span class="nc" id="L451">        return new AbstractIterator&lt;RangeTombstone&gt;()</span>
+<span class="nc" id="L452">        {</span>
+<span class="nc" id="L453">            private int idx = start;</span>
+
+            protected RangeTombstone computeNext()
+            {
+<span class="nc bnc" id="L457" title="All 4 branches missed.">                if (idx &lt; 0 || idx &lt; finish)</span>
+<span class="nc" id="L458">                    return endOfData();</span>
+                // We want to make sure the range are stricly included within the queried slice as this
+                // make it easier to combine things when iterator over successive slices. This means that
+                // for the first and last range we might have to &quot;cut&quot; the range returned.
+<span class="nc bnc" id="L462" title="All 4 branches missed.">                if (idx == start &amp;&amp; comparator.compare(slice.end(), ends[idx]) &lt; 0)</span>
+<span class="nc" id="L463">                    return rangeTombstoneWithNewEnd(idx--, slice.end());</span>
+<span class="nc bnc" id="L464" title="All 4 branches missed.">                if (idx == finish &amp;&amp; comparator.compare(starts[idx], slice.start()) &lt; 0)</span>
+<span class="nc" id="L465">                    return rangeTombstoneWithNewStart(idx--, slice.start());</span>
+<span class="nc" id="L466">                return rangeTombstone(idx--);</span>
+            }
+        };
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if(!(o instanceof RangeTombstoneList))</span>
+<span class="nc" id="L475">            return false;</span>
+<span class="nc" id="L476">        RangeTombstoneList that = (RangeTombstoneList)o;</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (size != that.size)</span>
+<span class="nc" id="L478">            return false;</span>
+
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            if (!starts[i].equals(that.starts[i]))</span>
+<span class="nc" id="L483">                return false;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (!ends[i].equals(that.ends[i]))</span>
+<span class="nc" id="L485">                return false;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            if (markedAts[i] != that.markedAts[i])</span>
+<span class="nc" id="L487">                return false;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            if (delTimes[i] != that.delTimes[i])</span>
+<span class="nc" id="L489">                return false;</span>
+        }
+<span class="nc" id="L491">        return true;</span>
+    }
+
+    @Override
+    public final int hashCode()
+    {
+<span class="nc" id="L497">        int result = size;</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="nc" id="L500">            result += starts[i].hashCode() + ends[i].hashCode();</span>
+<span class="nc" id="L501">            result += (int)(markedAts[i] ^ (markedAts[i] &gt;&gt;&gt; 32));</span>
+<span class="nc" id="L502">            result += delTimes[i];</span>
+        }
+<span class="nc" id="L504">        return result;</span>
+    }
+
+    private static void copyArrays(RangeTombstoneList src, RangeTombstoneList dst)
+    {
+<span class="nc" id="L509">        dst.grow(src.size);</span>
+<span class="nc" id="L510">        System.arraycopy(src.starts, 0, dst.starts, 0, src.size);</span>
+<span class="nc" id="L511">        System.arraycopy(src.ends, 0, dst.ends, 0, src.size);</span>
+<span class="nc" id="L512">        System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);</span>
+<span class="nc" id="L513">        System.arraycopy(src.delTimes, 0, dst.delTimes, 0, src.size);</span>
+<span class="nc" id="L514">        dst.size = src.size;</span>
+<span class="nc" id="L515">        dst.boundaryHeapSize = src.boundaryHeapSize;</span>
+<span class="nc" id="L516">    }</span>
+
+    /*
+     * Inserts a new element starting at index i. This method assumes that:
+     *    ends[i-1] &lt;= start &lt; ends[i]
+     * (note that start can be equal to ends[i-1] in the case where we have a boundary, i.e. for instance
+     * ends[i-1] is the exclusive end of X and start is the inclusive start of X).
+     *
+     * A RangeTombstoneList is a list of range [s_0, e_0]...[s_n, e_n] such that:
+     *   - s_i is a start bound and e_i is a end bound
+     *   - s_i &lt; e_i
+     *   - e_i &lt;= s_i+1
+     * Basically, range are non overlapping and in order.
+     */
+    private void insertFrom(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    {
+<span class="pc bpc" id="L532" title="1 of 2 branches missed.">        while (i &lt; size)</span>
+        {
+<span class="pc bpc" id="L534" title="3 of 6 branches missed.">            assert start.isStart() &amp;&amp; end.isEnd();</span>
+<span class="pc bpc" id="L535" title="2 of 6 branches missed.">            assert i == 0 || comparator.compare(ends[i-1], start) &lt;= 0;</span>
+<span class="pc bpc" id="L536" title="2 of 4 branches missed.">            assert comparator.compare(start, ends[i]) &lt; 0;</span>
+
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">            if (Slice.isEmpty(comparator, start, end))</span>
+<span class="nc" id="L539">                return;</span>
+
+            // Do we overwrite the current element?
+<span class="fc bfc" id="L542" title="All 2 branches covered.">            if (markedAt &gt; markedAts[i])</span>
+            {
+                // We do overwrite.
+
+                // First deal with what might come before the newly added one.
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">                if (comparator.compare(starts[i], start) &lt; 0)</span>
+                {
+<span class="nc" id="L549">                    ClusteringBound newEnd = start.invert();</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                    if (!Slice.isEmpty(comparator, starts[i], newEnd))</span>
+                    {
+<span class="nc" id="L552">                        addInternal(i, starts[i], newEnd, markedAts[i], delTimes[i]);</span>
+<span class="nc" id="L553">                        i++;</span>
+<span class="nc" id="L554">                        setInternal(i, start, ends[i], markedAts[i], delTimes[i]);</span>
+                    }
+                }
+
+                // now, start &lt;= starts[i]
+
+                // Does the new element stops before the current one,
+<span class="fc" id="L561">                int endCmp = comparator.compare(end, starts[i]);</span>
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">                if (endCmp &lt; 0)</span>
+                {
+                    // Here start &lt;= starts[i] and end &lt; starts[i]
+                    // This means the current element is before the current one.
+<span class="fc" id="L566">                    addInternal(i, start, end, markedAt, delTime);</span>
+<span class="fc" id="L567">                    return;</span>
+                }
+
+                // Do we overwrite the current element fully?
+<span class="nc" id="L571">                int cmp = comparator.compare(ends[i], end);</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                if (cmp &lt;= 0)</span>
+                {
+                    // We do overwrite fully:
+                    // update the current element until it's end and continue on with the next element (with the new inserted start == current end).
+
+                    // If we're on the last element, or if we stop before the next start, we set the current element and are done
+                    // Note that the comparison below is inclusive: if a end equals a start, this means they form a boundary, or
+                    // in other words that they are for the same element but one is inclusive while the other exclusive. In which case we know
+                    // we're good with the next element
+<span class="nc bnc" id="L581" title="All 4 branches missed.">                    if (i == size-1 || comparator.compare(end, starts[i+1]) &lt;= 0)</span>
+                    {
+<span class="nc" id="L583">                        setInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L584">                        return;</span>
+                    }
+
+<span class="nc" id="L587">                    setInternal(i, start, starts[i+1].invert(), markedAt, delTime);</span>
+<span class="nc" id="L588">                    start = starts[i+1];</span>
+<span class="nc" id="L589">                    i++;</span>
+                }
+                else
+                {
+                    // We don't overwrite fully. Insert the new interval, and then update the now next
+                    // one to reflect the not overwritten parts. We're then done.
+<span class="nc" id="L595">                    addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L596">                    i++;</span>
+<span class="nc" id="L597">                    ClusteringBound newStart = end.invert();</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">                    if (!Slice.isEmpty(comparator, newStart, ends[i]))</span>
+                    {
+<span class="nc" id="L600">                        setInternal(i, newStart, ends[i], markedAts[i], delTimes[i]);</span>
+                    }
+<span class="nc" id="L602">                    return;</span>
+                }
+<span class="nc" id="L604">            }</span>
+            else
+            {
+                // we don't overwrite the current element
+
+                // If the new interval starts before the current one, insert that new interval
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">                if (comparator.compare(start, starts[i]) &lt; 0)</span>
+                {
+                    // If we stop before the start of the current element, just insert the new interval and we're done;
+                    // otherwise insert until the beginning of the current element
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">                    if (comparator.compare(end, starts[i]) &lt;= 0)</span>
+                    {
+<span class="fc" id="L616">                        addInternal(i, start, end, markedAt, delTime);</span>
+<span class="fc" id="L617">                        return;</span>
+                    }
+<span class="nc" id="L619">                    ClusteringBound newEnd = starts[i].invert();</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                    if (!Slice.isEmpty(comparator, start, newEnd))</span>
+                    {
+<span class="nc" id="L622">                        addInternal(i, start, newEnd, markedAt, delTime);</span>
+<span class="nc" id="L623">                        i++;</span>
+                    }
+                }
+
+                // After that, we're overwritten on the current element but might have
+                // some residual parts after ...
+
+                // ... unless we don't extend beyond it.
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                if (comparator.compare(end, ends[i]) &lt;= 0)</span>
+<span class="nc" id="L632">                    return;</span>
+
+<span class="nc" id="L634">                start = ends[i].invert();</span>
+<span class="nc" id="L635">                i++;</span>
+            }
+        }
+
+        // If we got there, then just insert the remainder at the end
+<span class="nc" id="L640">        addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L641">    }</span>
+
+    private int capacity()
+    {
+<span class="fc" id="L645">        return starts.length;</span>
+    }
+
+    /*
+     * Adds the new tombstone at index i, growing and/or moving elements to make room for it.
+     */
+    private void addInternal(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    {
+<span class="pc bpc" id="L653" title="2 of 4 branches missed.">        assert i &gt;= 0;</span>
+
+<span class="fc bfc" id="L655" title="All 2 branches covered.">        if (size == capacity())</span>
+<span class="fc" id="L656">            growToFree(i);</span>
+<span class="pc bpc" id="L657" title="1 of 2 branches missed.">        else if (i &lt; size)</span>
+<span class="nc" id="L658">            moveElements(i);</span>
+
+<span class="fc" id="L660">        setInternal(i, start, end, markedAt, delTime);</span>
+<span class="fc" id="L661">        size++;</span>
+<span class="fc" id="L662">    }</span>
+
+    /*
+     * Grow the arrays, leaving index i &quot;free&quot; in the process.
+     */
+    private void growToFree(int i)
+    {
+<span class="fc" id="L669">        int newLength = (capacity() * 3) / 2 + 1;</span>
+<span class="fc" id="L670">        grow(i, newLength);</span>
+<span class="fc" id="L671">    }</span>
+
+    /*
+     * Grow the arrays to match newLength capacity.
+     */
+    private void grow(int newLength)
+    {
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        if (capacity() &lt; newLength)</span>
+<span class="nc" id="L679">            grow(-1, newLength);</span>
+<span class="nc" id="L680">    }</span>
+
+    private void grow(int i, int newLength)
+    {
+<span class="fc" id="L684">        starts = grow(starts, size, newLength, i);</span>
+<span class="fc" id="L685">        ends = grow(ends, size, newLength, i);</span>
+<span class="fc" id="L686">        markedAts = grow(markedAts, size, newLength, i);</span>
+<span class="fc" id="L687">        delTimes = grow(delTimes, size, newLength, i);</span>
+<span class="fc" id="L688">    }</span>
+
+    private static ClusteringBound[] grow(ClusteringBound[] a, int size, int newLength, int i)
+    {
+<span class="pc bpc" id="L692" title="1 of 4 branches missed.">        if (i &lt; 0 || i &gt;= size)</span>
+<span class="fc" id="L693">            return Arrays.copyOf(a, newLength);</span>
+
+<span class="fc" id="L695">        ClusteringBound[] newA = new ClusteringBound[newLength];</span>
+<span class="fc" id="L696">        System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="fc" id="L697">        System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="fc" id="L698">        return newA;</span>
+    }
+
+    private static long[] grow(long[] a, int size, int newLength, int i)
+    {
+<span class="pc bpc" id="L703" title="1 of 4 branches missed.">        if (i &lt; 0 || i &gt;= size)</span>
+<span class="fc" id="L704">            return Arrays.copyOf(a, newLength);</span>
+
+<span class="fc" id="L706">        long[] newA = new long[newLength];</span>
+<span class="fc" id="L707">        System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="fc" id="L708">        System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="fc" id="L709">        return newA;</span>
+    }
+
+    private static int[] grow(int[] a, int size, int newLength, int i)
+    {
+<span class="pc bpc" id="L714" title="1 of 4 branches missed.">        if (i &lt; 0 || i &gt;= size)</span>
+<span class="fc" id="L715">            return Arrays.copyOf(a, newLength);</span>
+
+<span class="fc" id="L717">        int[] newA = new int[newLength];</span>
+<span class="fc" id="L718">        System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="fc" id="L719">        System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="fc" id="L720">        return newA;</span>
+    }
+
+    /*
+     * Move elements so that index i is &quot;free&quot;, assuming the arrays have at least one free slot at the end.
+     */
+    private void moveElements(int i)
+    {
+<span class="nc bnc" id="L728" title="All 2 branches missed.">        if (i &gt;= size)</span>
+<span class="nc" id="L729">            return;</span>
+
+<span class="nc" id="L731">        System.arraycopy(starts, i, starts, i+1, size - i);</span>
+<span class="nc" id="L732">        System.arraycopy(ends, i, ends, i+1, size - i);</span>
+<span class="nc" id="L733">        System.arraycopy(markedAts, i, markedAts, i+1, size - i);</span>
+<span class="nc" id="L734">        System.arraycopy(delTimes, i, delTimes, i+1, size - i);</span>
+        // we set starts[i] to null to indicate the position is now empty, so that we update boundaryHeapSize
+        // when we set it
+<span class="nc" id="L737">        starts[i] = null;</span>
+<span class="nc" id="L738">    }</span>
+
+    private void setInternal(int i, ClusteringBound start, ClusteringBound end, long markedAt, int delTime)
+    {
+<span class="pc bpc" id="L742" title="1 of 2 branches missed.">        if (starts[i] != null)</span>
+<span class="nc" id="L743">            boundaryHeapSize -= starts[i].unsharedHeapSize() + ends[i].unsharedHeapSize();</span>
+<span class="fc" id="L744">        starts[i] = start;</span>
+<span class="fc" id="L745">        ends[i] = end;</span>
+<span class="fc" id="L746">        markedAts[i] = markedAt;</span>
+<span class="fc" id="L747">        delTimes[i] = delTime;</span>
+<span class="fc" id="L748">        boundaryHeapSize += start.unsharedHeapSize() + end.unsharedHeapSize();</span>
+<span class="fc" id="L749">    }</span>
+
+    @Override
+    public long unsharedHeapSize()
+    {
+<span class="fc" id="L754">        return EMPTY_SIZE</span>
+                + boundaryHeapSize
+<span class="fc" id="L756">                + ObjectSizes.sizeOfArray(starts)</span>
+<span class="fc" id="L757">                + ObjectSizes.sizeOfArray(ends)</span>
+<span class="fc" id="L758">                + ObjectSizes.sizeOfArray(markedAts)</span>
+<span class="fc" id="L759">                + ObjectSizes.sizeOfArray(delTimes);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

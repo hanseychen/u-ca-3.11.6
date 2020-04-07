@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamCoordinator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamCoordinator.java</span></div><h1>StreamCoordinator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+
+/**
+ * {@link StreamCoordinator} is a helper class that abstracts away maintaining multiple
+ * StreamSession and ProgressInfo instances per peer.
+ *
+ * This class coordinates multiple SessionStreams per peer in both the outgoing StreamPlan context and on the
+ * inbound StreamResultFuture context.
+ */
+public class StreamCoordinator
+{
+<span class="nc" id="L44">    private static final Logger logger = LoggerFactory.getLogger(StreamCoordinator.class);</span>
+
+    // Executor strictly for establishing the initial connections. Once we're connected to the other end the rest of the
+    // streaming is handled directly by the ConnectionHandler's incoming and outgoing threads.
+<span class="nc" id="L48">    private static final DebuggableThreadPoolExecutor streamExecutor = DebuggableThreadPoolExecutor.createWithFixedPoolSize(&quot;StreamConnectionEstablisher&quot;,</span>
+<span class="nc" id="L49">                                                                                                                            FBUtilities.getAvailableProcessors());</span>
+    private final boolean connectSequentially;
+
+<span class="nc" id="L52">    private Map&lt;InetAddress, HostStreamingData&gt; peerSessions = new HashMap&lt;&gt;();</span>
+    private final int connectionsPerHost;
+    private StreamConnectionFactory factory;
+    private final boolean keepSSTableLevel;
+    private final boolean isIncremental;
+<span class="nc" id="L57">    private Iterator&lt;StreamSession&gt; sessionsToConnect = null;</span>
+
+    public StreamCoordinator(int connectionsPerHost, boolean keepSSTableLevel, boolean isIncremental,
+                             StreamConnectionFactory factory, boolean connectSequentially)
+<span class="nc" id="L61">    {</span>
+<span class="nc" id="L62">        this.connectionsPerHost = connectionsPerHost;</span>
+<span class="nc" id="L63">        this.factory = factory;</span>
+<span class="nc" id="L64">        this.keepSSTableLevel = keepSSTableLevel;</span>
+<span class="nc" id="L65">        this.isIncremental = isIncremental;</span>
+<span class="nc" id="L66">        this.connectSequentially = connectSequentially;</span>
+<span class="nc" id="L67">    }</span>
+
+    public void setConnectionFactory(StreamConnectionFactory factory)
+    {
+<span class="nc" id="L71">        this.factory = factory;</span>
+<span class="nc" id="L72">    }</span>
+
+    /**
+     * @return true if any stream session is active
+     */
+    public synchronized boolean hasActiveSessions()
+    {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        for (HostStreamingData data : peerSessions.values())</span>
+        {
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            if (data.hasActiveSessions())</span>
+<span class="nc" id="L82">                return true;</span>
+<span class="nc" id="L83">        }</span>
+<span class="nc" id="L84">        return false;</span>
+    }
+
+    public synchronized Collection&lt;StreamSession&gt; getAllStreamSessions()
+    {
+<span class="nc" id="L89">        Collection&lt;StreamSession&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        for (HostStreamingData data : peerSessions.values())</span>
+        {
+<span class="nc" id="L92">            results.addAll(data.getAllStreamSessions());</span>
+<span class="nc" id="L93">        }</span>
+<span class="nc" id="L94">        return results;</span>
+    }
+
+    public boolean isReceiving()
+    {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        return connectionsPerHost == 0;</span>
+    }
+
+    public void connect(StreamResultFuture future)
+    {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (this.connectSequentially)</span>
+<span class="nc" id="L105">            connectSequentially(future);</span>
+        else
+<span class="nc" id="L107">            connectAllStreamSessions();</span>
+<span class="nc" id="L108">    }</span>
+
+    private void connectAllStreamSessions()
+    {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        for (HostStreamingData data : peerSessions.values())</span>
+<span class="nc" id="L113">            data.connectAllStreamSessions();</span>
+<span class="nc" id="L114">    }</span>
+
+    private void connectSequentially(StreamResultFuture future)
+    {
+<span class="nc" id="L118">        sessionsToConnect = getAllStreamSessions().iterator();</span>
+<span class="nc" id="L119">        future.addEventListener(new StreamEventHandler()</span>
+<span class="nc" id="L120">        {</span>
+            public void handleStreamEvent(StreamEvent event)
+            {
+<span class="nc bnc" id="L123" title="All 4 branches missed.">                if (event.eventType == StreamEvent.Type.STREAM_PREPARED || event.eventType == StreamEvent.Type.STREAM_COMPLETE)</span>
+<span class="nc" id="L124">                    connectNext();</span>
+<span class="nc" id="L125">            }</span>
+
+            public void onSuccess(StreamState result)
+            {
+
+<span class="nc" id="L130">            }</span>
+
+            public void onFailure(Throwable t)
+            {
+
+<span class="nc" id="L135">            }</span>
+        });
+<span class="nc" id="L137">        connectNext();</span>
+<span class="nc" id="L138">    }</span>
+
+    private void connectNext()
+    {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (sessionsToConnect == null)</span>
+<span class="nc" id="L143">            return;</span>
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (sessionsToConnect.hasNext())</span>
+        {
+<span class="nc" id="L147">            StreamSession next = sessionsToConnect.next();</span>
+<span class="nc" id="L148">            logger.debug(&quot;Connecting next session {} with {}.&quot;, next.planId(), next.peer.getHostAddress());</span>
+<span class="nc" id="L149">            streamExecutor.execute(new StreamSessionConnector(next));</span>
+<span class="nc" id="L150">        }</span>
+        else
+<span class="nc" id="L152">            logger.debug(&quot;Finished connecting all sessions&quot;);</span>
+<span class="nc" id="L153">    }</span>
+
+    public synchronized Set&lt;InetAddress&gt; getPeers()
+    {
+<span class="nc" id="L157">        return new HashSet&lt;&gt;(peerSessions.keySet());</span>
+    }
+
+    public synchronized StreamSession getOrCreateNextSession(InetAddress peer, InetAddress connecting)
+    {
+<span class="nc" id="L162">        return getOrCreateHostData(peer).getOrCreateNextSession(peer, connecting);</span>
+    }
+
+    public synchronized StreamSession getOrCreateSessionById(InetAddress peer, int id, InetAddress connecting)
+    {
+<span class="nc" id="L167">        return getOrCreateHostData(peer).getOrCreateSessionById(peer, id, connecting);</span>
+    }
+
+    public synchronized void updateProgress(ProgressInfo info)
+    {
+<span class="nc" id="L172">        getHostData(info.peer).updateProgress(info);</span>
+<span class="nc" id="L173">    }</span>
+
+    public synchronized void addSessionInfo(SessionInfo session)
+    {
+<span class="nc" id="L177">        HostStreamingData data = getOrCreateHostData(session.peer);</span>
+<span class="nc" id="L178">        data.addSessionInfo(session);</span>
+<span class="nc" id="L179">    }</span>
+
+    public synchronized Set&lt;SessionInfo&gt; getAllSessionInfo()
+    {
+<span class="nc" id="L183">        Set&lt;SessionInfo&gt; result = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        for (HostStreamingData data : peerSessions.values())</span>
+        {
+<span class="nc" id="L186">            result.addAll(data.getAllSessionInfo());</span>
+<span class="nc" id="L187">        }</span>
+<span class="nc" id="L188">        return result;</span>
+    }
+
+    public synchronized void transferFiles(InetAddress to, Collection&lt;StreamSession.SSTableStreamingSections&gt; sstableDetails)
+    {
+<span class="nc" id="L193">        HostStreamingData sessionList = getOrCreateHostData(to);</span>
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (connectionsPerHost &gt; 1)</span>
+        {
+<span class="nc" id="L197">            List&lt;List&lt;StreamSession.SSTableStreamingSections&gt;&gt; buckets = sliceSSTableDetails(sstableDetails);</span>
+
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            for (List&lt;StreamSession.SSTableStreamingSections&gt; subList : buckets)</span>
+            {
+<span class="nc" id="L201">                StreamSession session = sessionList.getOrCreateNextSession(to, to);</span>
+<span class="nc" id="L202">                session.addTransferFiles(subList);</span>
+<span class="nc" id="L203">            }</span>
+<span class="nc" id="L204">        }</span>
+        else
+        {
+<span class="nc" id="L207">            StreamSession session = sessionList.getOrCreateNextSession(to, to);</span>
+<span class="nc" id="L208">            session.addTransferFiles(sstableDetails);</span>
+        }
+<span class="nc" id="L210">    }</span>
+
+    private List&lt;List&lt;StreamSession.SSTableStreamingSections&gt;&gt; sliceSSTableDetails(Collection&lt;StreamSession.SSTableStreamingSections&gt; sstableDetails)
+    {
+        // There's no point in divvying things up into more buckets than we have sstableDetails
+<span class="nc" id="L215">        int targetSlices = Math.min(sstableDetails.size(), connectionsPerHost);</span>
+<span class="nc" id="L216">        int step = Math.round((float) sstableDetails.size() / (float) targetSlices);</span>
+<span class="nc" id="L217">        int index = 0;</span>
+
+<span class="nc" id="L219">        List&lt;List&lt;StreamSession.SSTableStreamingSections&gt;&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L220">        List&lt;StreamSession.SSTableStreamingSections&gt; slice = null;</span>
+<span class="nc" id="L221">        Iterator&lt;StreamSession.SSTableStreamingSections&gt; iter = sstableDetails.iterator();</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L224">            StreamSession.SSTableStreamingSections streamSession = iter.next();</span>
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (index % step == 0)</span>
+            {
+<span class="nc" id="L228">                slice = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L229">                result.add(slice);</span>
+            }
+<span class="nc" id="L231">            slice.add(streamSession);</span>
+<span class="nc" id="L232">            ++index;</span>
+<span class="nc" id="L233">            iter.remove();</span>
+<span class="nc" id="L234">        }</span>
+
+<span class="nc" id="L236">        return result;</span>
+    }
+
+    private HostStreamingData getHostData(InetAddress peer)
+    {
+<span class="nc" id="L241">        HostStreamingData data = peerSessions.get(peer);</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (data == null)</span>
+<span class="nc" id="L243">            throw new IllegalArgumentException(&quot;Unknown peer requested: &quot; + peer);</span>
+<span class="nc" id="L244">        return data;</span>
+    }
+
+    private HostStreamingData getOrCreateHostData(InetAddress peer)
+    {
+<span class="nc" id="L249">        HostStreamingData data = peerSessions.get(peer);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (data == null)</span>
+        {
+<span class="nc" id="L252">            data = new HostStreamingData();</span>
+<span class="nc" id="L253">            peerSessions.put(peer, data);</span>
+        }
+<span class="nc" id="L255">        return data;</span>
+    }
+
+    private static class StreamSessionConnector implements Runnable
+    {
+        private final StreamSession session;
+        public StreamSessionConnector(StreamSession session)
+<span class="nc" id="L262">        {</span>
+<span class="nc" id="L263">            this.session = session;</span>
+<span class="nc" id="L264">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="nc" id="L269">            session.start();</span>
+<span class="nc" id="L270">            logger.info(&quot;[Stream #{}, ID#{}] Beginning stream session with {}&quot;, session.planId(), session.sessionIndex(), session.peer);</span>
+<span class="nc" id="L271">        }</span>
+    }
+
+<span class="nc" id="L274">    private class HostStreamingData</span>
+    {
+<span class="nc" id="L276">        private Map&lt;Integer, StreamSession&gt; streamSessions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L277">        private Map&lt;Integer, SessionInfo&gt; sessionInfos = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L279">        private int lastReturned = -1;</span>
+
+        public boolean hasActiveSessions()
+        {
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            for (StreamSession session : streamSessions.values())</span>
+            {
+<span class="nc" id="L285">                StreamSession.State state = session.state();</span>
+<span class="nc bnc" id="L286" title="All 4 branches missed.">                if (state != StreamSession.State.COMPLETE &amp;&amp; state != StreamSession.State.FAILED)</span>
+<span class="nc" id="L287">                    return true;</span>
+<span class="nc" id="L288">            }</span>
+<span class="nc" id="L289">            return false;</span>
+        }
+
+        public StreamSession getOrCreateNextSession(InetAddress peer, InetAddress connecting)
+        {
+            // create
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (streamSessions.size() &lt; connectionsPerHost)</span>
+            {
+<span class="nc" id="L297">                StreamSession session = new StreamSession(peer, connecting, factory, streamSessions.size(), keepSSTableLevel, isIncremental);</span>
+<span class="nc" id="L298">                streamSessions.put(++lastReturned, session);</span>
+<span class="nc" id="L299">                return session;</span>
+            }
+            // get
+            else
+            {
+<span class="nc bnc" id="L304" title="All 2 branches missed.">                if (lastReturned &gt;= streamSessions.size() - 1)</span>
+<span class="nc" id="L305">                    lastReturned = 0;</span>
+
+<span class="nc" id="L307">                return streamSessions.get(lastReturned++);</span>
+            }
+        }
+
+        public void connectAllStreamSessions()
+        {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            for (StreamSession session : streamSessions.values())</span>
+            {
+<span class="nc" id="L315">                streamExecutor.execute(new StreamSessionConnector(session));</span>
+<span class="nc" id="L316">            }</span>
+<span class="nc" id="L317">        }</span>
+
+        public Collection&lt;StreamSession&gt; getAllStreamSessions()
+        {
+<span class="nc" id="L321">            return Collections.unmodifiableCollection(streamSessions.values());</span>
+        }
+
+        public StreamSession getOrCreateSessionById(InetAddress peer, int id, InetAddress connecting)
+        {
+<span class="nc" id="L326">            StreamSession session = streamSessions.get(id);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (session == null)</span>
+            {
+<span class="nc" id="L329">                session = new StreamSession(peer, connecting, factory, id, keepSSTableLevel, isIncremental);</span>
+<span class="nc" id="L330">                streamSessions.put(id, session);</span>
+            }
+<span class="nc" id="L332">            return session;</span>
+        }
+
+        public void updateProgress(ProgressInfo info)
+        {
+<span class="nc" id="L337">            sessionInfos.get(info.sessionIndex).updateProgress(info);</span>
+<span class="nc" id="L338">        }</span>
+
+        public void addSessionInfo(SessionInfo info)
+        {
+<span class="nc" id="L342">            sessionInfos.put(info.sessionIndex, info);</span>
+<span class="nc" id="L343">        }</span>
+
+        public Collection&lt;SessionInfo&gt; getAllSessionInfo()
+        {
+<span class="nc" id="L347">            return sessionInfos.values();</span>
+        }
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L354">        ExecutorUtils.shutdownAndWait(timeout, unit, streamExecutor);</span>
+<span class="nc" id="L355">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

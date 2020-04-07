@@ -1,0 +1,320 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CqlBulkRecordWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hadoop.cql3</a> &gt; <span class="el_source">CqlBulkRecordWriter.java</span></div><h1>CqlBulkRecordWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hadoop.cql3;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.hadoop.ConfigHelper;
+import org.apache.cassandra.hadoop.HadoopCompat;
+import org.apache.cassandra.io.sstable.CQLSSTableWriter;
+import org.apache.cassandra.io.sstable.SSTableLoader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.utils.NativeSSTableLoaderClient;
+import org.apache.cassandra.utils.OutputHandler;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapreduce.RecordWriter;
+import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.util.Progressable;
+
+/**
+ * The &lt;code&gt;CqlBulkRecordWriter&lt;/code&gt; maps the output &amp;lt;key, value&amp;gt;
+ * pairs to a Cassandra column family. In particular, it applies the binded variables
+ * in the value to the prepared statement, which it associates with the key, and in 
+ * turn the responsible endpoint.
+ *
+ * &lt;p&gt;
+ * Furthermore, this writer groups the cql queries by the endpoint responsible for
+ * the rows being affected. This allows the cql queries to be executed in parallel,
+ * directly to a responsible endpoint.
+ * &lt;/p&gt;
+ *
+ * @see CqlBulkOutputFormat
+ */
+public class CqlBulkRecordWriter extends RecordWriter&lt;Object, List&lt;ByteBuffer&gt;&gt;
+        implements org.apache.hadoop.mapred.RecordWriter&lt;Object, List&lt;ByteBuffer&gt;&gt;
+{
+    public final static String OUTPUT_LOCATION = &quot;mapreduce.output.bulkoutputformat.localdir&quot;;
+    public final static String BUFFER_SIZE_IN_MB = &quot;mapreduce.output.bulkoutputformat.buffersize&quot;;
+    public final static String STREAM_THROTTLE_MBITS = &quot;mapreduce.output.bulkoutputformat.streamthrottlembits&quot;;
+    public final static String MAX_FAILED_HOSTS = &quot;mapreduce.output.bulkoutputformat.maxfailedhosts&quot;;
+    public final static String IGNORE_HOSTS = &quot;mapreduce.output.bulkoutputformat.ignorehosts&quot;;
+
+<span class="nc" id="L73">    private final Logger logger = LoggerFactory.getLogger(CqlBulkRecordWriter.class);</span>
+
+    protected final Configuration conf;
+    protected final int maxFailures;
+    protected final int bufferSize;
+    protected Closeable writer;
+    protected SSTableLoader loader;
+    protected Progressable progress;
+    protected TaskAttemptContext context;
+<span class="nc" id="L82">    protected final Set&lt;InetAddress&gt; ignores = new HashSet&lt;&gt;();</span>
+
+    private String keyspace;
+    private String table;
+    private String schema;
+    private String insertStatement;
+    private File outputDir;
+    private boolean deleteSrc;
+    private IPartitioner partitioner;
+
+    CqlBulkRecordWriter(TaskAttemptContext context) throws IOException
+    {
+<span class="nc" id="L94">        this(HadoopCompat.getConfiguration(context));</span>
+<span class="nc" id="L95">        this.context = context;</span>
+<span class="nc" id="L96">        setConfigs();</span>
+<span class="nc" id="L97">    }</span>
+
+    CqlBulkRecordWriter(Configuration conf, Progressable progress) throws IOException
+    {
+<span class="nc" id="L101">        this(conf);</span>
+<span class="nc" id="L102">        this.progress = progress;</span>
+<span class="nc" id="L103">        setConfigs();</span>
+<span class="nc" id="L104">    }</span>
+
+    CqlBulkRecordWriter(Configuration conf) throws IOException
+<span class="nc" id="L107">    {</span>
+<span class="nc" id="L108">        this.conf = conf;</span>
+<span class="nc" id="L109">        DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(Integer.parseInt(conf.get(STREAM_THROTTLE_MBITS, &quot;0&quot;)));</span>
+<span class="nc" id="L110">        maxFailures = Integer.parseInt(conf.get(MAX_FAILED_HOSTS, &quot;0&quot;));</span>
+<span class="nc" id="L111">        bufferSize = Integer.parseInt(conf.get(BUFFER_SIZE_IN_MB, &quot;64&quot;));</span>
+<span class="nc" id="L112">        setConfigs();</span>
+<span class="nc" id="L113">    }</span>
+    
+    private void setConfigs() throws IOException
+    {
+        // if anything is missing, exceptions will be thrown here, instead of on write()
+<span class="nc" id="L118">        keyspace = ConfigHelper.getOutputKeyspace(conf);</span>
+<span class="nc" id="L119">        table = ConfigHelper.getOutputColumnFamily(conf);</span>
+        
+        // check if table is aliased
+<span class="nc" id="L122">        String aliasedCf = CqlBulkOutputFormat.getTableForAlias(conf, table);</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (aliasedCf != null)</span>
+<span class="nc" id="L124">            table = aliasedCf;</span>
+        
+<span class="nc" id="L126">        schema = CqlBulkOutputFormat.getTableSchema(conf, table);</span>
+<span class="nc" id="L127">        insertStatement = CqlBulkOutputFormat.getTableInsertStatement(conf, table);</span>
+<span class="nc" id="L128">        outputDir = getTableDirectory();</span>
+<span class="nc" id="L129">        deleteSrc = CqlBulkOutputFormat.getDeleteSourceOnSuccess(conf);</span>
+        try
+        {
+<span class="nc" id="L132">            partitioner = ConfigHelper.getInputPartitioner(conf);</span>
+        }
+<span class="nc" id="L134">        catch (Exception e)</span>
+        {
+<span class="nc" id="L136">            partitioner = Murmur3Partitioner.instance;</span>
+<span class="nc" id="L137">        }</span>
+        try
+        {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            for (String hostToIgnore : CqlBulkOutputFormat.getIgnoreHosts(conf))</span>
+<span class="nc" id="L141">                ignores.add(InetAddress.getByName(hostToIgnore));</span>
+        }
+<span class="nc" id="L143">        catch (UnknownHostException e)</span>
+        {
+<span class="nc" id="L145">            throw new RuntimeException((&quot;Unknown host: &quot; + e.getMessage()));</span>
+<span class="nc" id="L146">        }</span>
+<span class="nc" id="L147">    }</span>
+
+    protected String getOutputLocation() throws IOException
+    {
+<span class="nc" id="L151">        String dir = conf.get(OUTPUT_LOCATION, System.getProperty(&quot;java.io.tmpdir&quot;));</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (dir == null)</span>
+<span class="nc" id="L153">            throw new IOException(&quot;Output directory not defined, if hadoop is not setting java.io.tmpdir then define &quot; + OUTPUT_LOCATION);</span>
+<span class="nc" id="L154">        return dir;</span>
+    }
+
+    private void prepareWriter() throws IOException
+    {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (writer == null)</span>
+        {
+<span class="nc" id="L161">            writer = CQLSSTableWriter.builder()</span>
+<span class="nc" id="L162">                                     .forTable(schema)</span>
+<span class="nc" id="L163">                                     .using(insertStatement)</span>
+<span class="nc" id="L164">                                     .withPartitioner(ConfigHelper.getOutputPartitioner(conf))</span>
+<span class="nc" id="L165">                                     .inDirectory(outputDir)</span>
+<span class="nc" id="L166">                                     .withBufferSizeInMB(Integer.parseInt(conf.get(BUFFER_SIZE_IN_MB, &quot;64&quot;)))</span>
+<span class="nc" id="L167">                                     .withPartitioner(partitioner)</span>
+<span class="nc" id="L168">                                     .build();</span>
+        }
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (loader == null)</span>
+        {
+<span class="nc" id="L173">            ExternalClient externalClient = new ExternalClient(conf);</span>
+<span class="nc" id="L174">            externalClient.setTableMetadata(CFMetaData.compile(schema, keyspace));</span>
+
+<span class="nc" id="L176">            loader = new SSTableLoader(outputDir, externalClient, new NullOutputHandler())</span>
+<span class="nc" id="L177">            {</span>
+                @Override
+                public void onSuccess(StreamState finalState)
+                {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">                    if (deleteSrc)</span>
+<span class="nc" id="L182">                        FileUtils.deleteRecursive(outputDir);</span>
+<span class="nc" id="L183">                }</span>
+            };
+        }
+<span class="nc" id="L186">    }</span>
+    
+    /**
+     * &lt;p&gt;
+     * The column values must correspond to the order in which
+     * they appear in the insert stored procedure. 
+     * 
+     * Key is not used, so it can be null or any object.
+     * &lt;/p&gt;
+     *
+     * @param key
+     *            any object or null.
+     * @param values
+     *            the values to write.
+     * @throws IOException
+     */
+    @Override
+    public void write(Object key, List&lt;ByteBuffer&gt; values) throws IOException
+    {
+<span class="nc" id="L205">        prepareWriter();</span>
+        try
+        {
+<span class="nc" id="L208">            ((CQLSSTableWriter) writer).rawAddRow(values);</span>
+            
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (null != progress)</span>
+<span class="nc" id="L211">                progress.progress();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (null != context)</span>
+<span class="nc" id="L213">                HadoopCompat.progress(context);</span>
+        } 
+<span class="nc" id="L215">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L217">            throw new IOException(&quot;Error adding row with key: &quot; + key, e);</span>
+<span class="nc" id="L218">        }</span>
+<span class="nc" id="L219">    }</span>
+    
+    private File getTableDirectory() throws IOException
+    {
+<span class="nc" id="L223">        File dir = new File(String.format(&quot;%s%s%s%s%s-%s&quot;, getOutputLocation(), File.separator, keyspace, File.separator, table, UUID.randomUUID().toString()));</span>
+        
+<span class="nc bnc" id="L225" title="All 4 branches missed.">        if (!dir.exists() &amp;&amp; !dir.mkdirs())</span>
+        {
+<span class="nc" id="L227">            throw new IOException(&quot;Failed to created output directory: &quot; + dir);</span>
+        }
+        
+<span class="nc" id="L230">        return dir;</span>
+    }
+
+    @Override
+    public void close(TaskAttemptContext context) throws IOException, InterruptedException
+    {
+<span class="nc" id="L236">        close();</span>
+<span class="nc" id="L237">    }</span>
+
+    /** Fills the deprecated RecordWriter interface for streaming. */
+    @Deprecated
+    public void close(org.apache.hadoop.mapred.Reporter reporter) throws IOException
+    {
+<span class="nc" id="L243">        close();</span>
+<span class="nc" id="L244">    }</span>
+
+    private void close() throws IOException
+    {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (writer != null)</span>
+        {
+<span class="nc" id="L250">            writer.close();</span>
+<span class="nc" id="L251">            Future&lt;StreamState&gt; future = loader.stream(ignores);</span>
+            while (true)
+            {
+                try
+                {
+<span class="nc" id="L256">                    future.get(1000, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L257">                    break;</span>
+                }
+<span class="nc" id="L259">                catch (ExecutionException | TimeoutException te)</span>
+                {
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                    if (null != progress)</span>
+<span class="nc" id="L262">                        progress.progress();</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">                    if (null != context)</span>
+<span class="nc" id="L264">                        HadoopCompat.progress(context);</span>
+                }
+<span class="nc" id="L266">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L268">                    throw new IOException(e);</span>
+<span class="nc" id="L269">                }</span>
+            }
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (loader.getFailedHosts().size() &gt; 0)</span>
+            {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                if (loader.getFailedHosts().size() &gt; maxFailures)</span>
+<span class="nc" id="L274">                    throw new IOException(&quot;Too many hosts failed: &quot; + loader.getFailedHosts());</span>
+                else
+<span class="nc" id="L276">                    logger.warn(&quot;Some hosts failed: {}&quot;, loader.getFailedHosts());</span>
+            }
+        }
+<span class="nc" id="L279">    }</span>
+    
+    public static class ExternalClient extends NativeSSTableLoaderClient
+    {
+        public ExternalClient(Configuration conf)
+        {
+<span class="nc" id="L285">            super(resolveHostAddresses(conf),</span>
+<span class="nc" id="L286">                  CqlConfigHelper.getOutputNativePort(conf),</span>
+<span class="nc" id="L287">                  ConfigHelper.getOutputKeyspaceUserName(conf),</span>
+<span class="nc" id="L288">                  ConfigHelper.getOutputKeyspacePassword(conf),</span>
+<span class="nc" id="L289">                  CqlConfigHelper.getSSLOptions(conf).orNull());</span>
+<span class="nc" id="L290">        }</span>
+
+        private static Collection&lt;InetAddress&gt; resolveHostAddresses(Configuration conf)
+        {
+<span class="nc" id="L294">            Set&lt;InetAddress&gt; addresses = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            for (String host : ConfigHelper.getOutputInitialAddress(conf).split(&quot;,&quot;))</span>
+            {
+                try
+                {
+<span class="nc" id="L300">                    addresses.add(InetAddress.getByName(host));</span>
+                }
+<span class="nc" id="L302">                catch (UnknownHostException e)</span>
+                {
+<span class="nc" id="L304">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L305">                }</span>
+            }
+
+<span class="nc" id="L308">            return addresses;</span>
+        }
+    }
+
+<span class="nc" id="L312">    public static class NullOutputHandler implements OutputHandler</span>
+    {
+<span class="nc" id="L314">        public void output(String msg) {}</span>
+<span class="nc" id="L315">        public void debug(String msg) {}</span>
+<span class="nc" id="L316">        public void warn(String msg) {}</span>
+<span class="nc" id="L317">        public void warn(String msg, Throwable th) {}</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

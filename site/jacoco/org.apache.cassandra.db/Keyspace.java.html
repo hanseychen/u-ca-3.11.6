@@ -1,0 +1,755 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Keyspace.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">Keyspace.java</span></div><h1>Keyspace.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.view.ViewManager;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.metrics.KeyspaceMetrics;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.ReplicationParams;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+/**
+ * It represents a Keyspace.
+ */
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">public class Keyspace</span>
+{
+<span class="fc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(Keyspace.class);</span>
+
+<span class="fc" id="L62">    private static final String TEST_FAIL_WRITES_KS = System.getProperty(&quot;cassandra.test.fail_writes_ks&quot;, &quot;&quot;);</span>
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">    private static final boolean TEST_FAIL_WRITES = !TEST_FAIL_WRITES_KS.isEmpty();</span>
+<span class="fc" id="L64">    private static int TEST_FAIL_MV_LOCKS_COUNT = Integer.getInteger(&quot;cassandra.test.fail_mv_locks_count&quot;, 0);</span>
+
+    public final KeyspaceMetrics metric;
+
+    // It is possible to call Keyspace.open without a running daemon, so it makes sense to ensure
+    // proper directories here as well as in CassandraDaemon.
+    static
+    {
+<span class="pc bpc" id="L72" title="3 of 4 branches missed.">        if (DatabaseDescriptor.isDaemonInitialized() || DatabaseDescriptor.isToolInitialized())</span>
+<span class="fc" id="L73">            DatabaseDescriptor.createAllDirectories();</span>
+    }
+
+    private volatile KeyspaceMetadata metadata;
+
+    //OpOrder is defined globally since we need to order writes across
+    //Keyspaces in the case of Views (batchlog of view mutations)
+<span class="fc" id="L80">    public static final OpOrder writeOrder = new OpOrder();</span>
+
+    /* ColumnFamilyStore per column family */
+<span class="pc" id="L83">    private final ConcurrentMap&lt;UUID, ColumnFamilyStore&gt; columnFamilyStores = new ConcurrentHashMap&lt;&gt;();</span>
+    private volatile AbstractReplicationStrategy replicationStrategy;
+    public final ViewManager viewManager;
+    private volatile ReplicationParams replicationParams;
+
+<span class="fc" id="L88">    public static final Function&lt;String,Keyspace&gt; keyspaceTransformer = new Function&lt;String, Keyspace&gt;()</span>
+<span class="fc" id="L89">    {</span>
+        public Keyspace apply(String keyspaceName)
+        {
+<span class="fc" id="L92">            return Keyspace.open(keyspaceName);</span>
+        }
+    };
+
+<span class="fc" id="L96">    private static volatile boolean initialized = false;</span>
+
+    public static void setInitialized()
+    {
+<span class="fc" id="L100">        initialized = true;</span>
+<span class="fc" id="L101">    }</span>
+
+    public static Keyspace open(String keyspaceName)
+    {
+<span class="pc bpc" id="L105" title="2 of 6 branches missed.">        assert initialized || SchemaConstants.isLocalSystemKeyspace(keyspaceName);</span>
+<span class="fc" id="L106">        return open(keyspaceName, Schema.instance, true);</span>
+    }
+
+    // to only be used by org.apache.cassandra.tools.Standalone* classes
+    public static Keyspace openWithoutSSTables(String keyspaceName)
+    {
+<span class="nc" id="L112">        return open(keyspaceName, Schema.instance, false);</span>
+    }
+
+    private static Keyspace open(String keyspaceName, Schema schema, boolean loadSSTables)
+    {
+<span class="fc" id="L117">        Keyspace keyspaceInstance = schema.getKeyspaceInstance(keyspaceName);</span>
+
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        if (keyspaceInstance == null)</span>
+        {
+            // instantiate the Keyspace.  we could use putIfAbsent but it's important to making sure it is only done once
+            // per keyspace, so we synchronize and re-check before doing it.
+<span class="fc" id="L123">            synchronized (Keyspace.class)</span>
+            {
+<span class="fc" id="L125">                keyspaceInstance = schema.getKeyspaceInstance(keyspaceName);</span>
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">                if (keyspaceInstance == null)</span>
+                {
+                    // open and store the keyspace
+<span class="fc" id="L129">                    keyspaceInstance = new Keyspace(keyspaceName, loadSSTables);</span>
+<span class="fc" id="L130">                    schema.storeKeyspaceInstance(keyspaceInstance);</span>
+                }
+<span class="fc" id="L132">            }</span>
+        }
+<span class="fc" id="L134">        return keyspaceInstance;</span>
+    }
+
+    public static Keyspace clear(String keyspaceName)
+    {
+<span class="nc" id="L139">        return clear(keyspaceName, Schema.instance);</span>
+    }
+
+    public static Keyspace clear(String keyspaceName, Schema schema)
+    {
+<span class="nc" id="L144">        synchronized (Keyspace.class)</span>
+        {
+<span class="nc" id="L146">            Keyspace t = schema.removeKeyspaceInstance(keyspaceName);</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if (t != null)</span>
+            {
+<span class="nc bnc" id="L149" title="All 2 branches missed.">                for (ColumnFamilyStore cfs : t.getColumnFamilyStores())</span>
+<span class="nc" id="L150">                    t.unloadCf(cfs);</span>
+<span class="nc" id="L151">                t.metric.release();</span>
+            }
+<span class="nc" id="L153">            return t;</span>
+        }
+    }
+
+    public static ColumnFamilyStore openAndGetStore(CFMetaData cfm)
+    {
+<span class="fc" id="L159">        return open(cfm.ksName).getColumnFamilyStore(cfm.cfId);</span>
+    }
+
+    /**
+     * Removes every SSTable in the directory from the appropriate Tracker's view.
+     * @param directory the unreadable directory, possibly with SSTables in it, but not necessarily.
+     */
+    public static void removeUnreadableSSTables(File directory)
+    {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        for (Keyspace keyspace : Keyspace.all())</span>
+        {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            for (ColumnFamilyStore baseCfs : keyspace.getColumnFamilyStores())</span>
+            {
+<span class="nc bnc" id="L172" title="All 2 branches missed.">                for (ColumnFamilyStore cfs : baseCfs.concatWithIndexes())</span>
+<span class="nc" id="L173">                    cfs.maybeRemoveUnreadableSSTables(directory);</span>
+<span class="nc" id="L174">            }</span>
+<span class="nc" id="L175">        }</span>
+<span class="nc" id="L176">    }</span>
+
+    public void setMetadata(KeyspaceMetadata metadata)
+    {
+<span class="fc" id="L180">        this.metadata = metadata;</span>
+<span class="fc" id="L181">        createReplicationStrategy(metadata);</span>
+<span class="fc" id="L182">    }</span>
+
+    public KeyspaceMetadata getMetadata()
+    {
+<span class="fc" id="L186">        return metadata;</span>
+    }
+
+    public Collection&lt;ColumnFamilyStore&gt; getColumnFamilyStores()
+    {
+<span class="fc" id="L191">        return Collections.unmodifiableCollection(columnFamilyStores.values());</span>
+    }
+
+    public ColumnFamilyStore getColumnFamilyStore(String cfName)
+    {
+<span class="fc" id="L196">        UUID id = Schema.instance.getId(getName(), cfName);</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">        if (id == null)</span>
+<span class="nc" id="L198">            throw new IllegalArgumentException(String.format(&quot;Unknown keyspace/cf pair (%s.%s)&quot;, getName(), cfName));</span>
+<span class="fc" id="L199">        return getColumnFamilyStore(id);</span>
+    }
+
+    public ColumnFamilyStore getColumnFamilyStore(UUID id)
+    {
+<span class="fc" id="L204">        ColumnFamilyStore cfs = columnFamilyStores.get(id);</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">        if (cfs == null)</span>
+<span class="nc" id="L206">            throw new IllegalArgumentException(&quot;Unknown CF &quot; + id);</span>
+<span class="fc" id="L207">        return cfs;</span>
+    }
+
+    public boolean hasColumnFamilyStore(UUID id)
+    {
+<span class="nc" id="L212">        return columnFamilyStores.containsKey(id);</span>
+    }
+
+    /**
+     * Take a snapshot of the specific column family, or the entire set of column families
+     * if columnFamily is null with a given timestamp
+     *
+     * @param snapshotName     the tag associated with the name of the snapshot.  This value may not be null
+     * @param columnFamilyName the column family to snapshot or all on null
+     * @param skipFlush Skip blocking flush of memtable
+     * @throws IOException if the column family doesn't exist
+     */
+    public void snapshot(String snapshotName, String columnFamilyName, boolean skipFlush) throws IOException
+    {
+<span class="nc bnc" id="L226" title="All 4 branches missed.">        assert snapshotName != null;</span>
+<span class="nc" id="L227">        boolean tookSnapShot = false;</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        for (ColumnFamilyStore cfStore : columnFamilyStores.values())</span>
+        {
+<span class="nc bnc" id="L230" title="All 4 branches missed.">            if (columnFamilyName == null || cfStore.name.equals(columnFamilyName))</span>
+            {
+<span class="nc" id="L232">                tookSnapShot = true;</span>
+<span class="nc" id="L233">                cfStore.snapshot(snapshotName, skipFlush);</span>
+            }
+<span class="nc" id="L235">        }</span>
+
+<span class="nc bnc" id="L237" title="All 4 branches missed.">        if ((columnFamilyName != null) &amp;&amp; !tookSnapShot)</span>
+<span class="nc" id="L238">            throw new IOException(&quot;Failed taking snapshot. Table &quot; + columnFamilyName + &quot; does not exist.&quot;);</span>
+<span class="nc" id="L239">    }</span>
+
+    /**
+     * Take a snapshot of the specific column family, or the entire set of column families
+     * if columnFamily is null with a given timestamp
+     *
+     * @param snapshotName     the tag associated with the name of the snapshot.  This value may not be null
+     * @param columnFamilyName the column family to snapshot or all on null
+     * @throws IOException if the column family doesn't exist
+     */
+    public void snapshot(String snapshotName, String columnFamilyName) throws IOException
+    {
+<span class="nc" id="L251">        snapshot(snapshotName, columnFamilyName, false);</span>
+<span class="nc" id="L252">    }</span>
+
+    /**
+     * @param clientSuppliedName may be null.
+     * @return the name of the snapshot
+     */
+    public static String getTimestampedSnapshotName(String clientSuppliedName)
+    {
+<span class="nc" id="L260">        String snapshotName = Long.toString(System.currentTimeMillis());</span>
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        if (clientSuppliedName != null &amp;&amp; !clientSuppliedName.equals(&quot;&quot;))</span>
+        {
+<span class="nc" id="L263">            snapshotName = snapshotName + &quot;-&quot; + clientSuppliedName;</span>
+        }
+<span class="nc" id="L265">        return snapshotName;</span>
+    }
+
+    public static String getTimestampedSnapshotNameWithPrefix(String clientSuppliedName, String prefix)
+    {
+<span class="nc" id="L270">        return prefix + &quot;-&quot; + getTimestampedSnapshotName(clientSuppliedName);</span>
+    }
+
+    /**
+     * Check whether snapshots already exists for a given name.
+     *
+     * @param snapshotName the user supplied snapshot name
+     * @return true if the snapshot exists
+     */
+    public boolean snapshotExists(String snapshotName)
+    {
+<span class="nc bnc" id="L281" title="All 4 branches missed.">        assert snapshotName != null;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        for (ColumnFamilyStore cfStore : columnFamilyStores.values())</span>
+        {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (cfStore.snapshotExists(snapshotName))</span>
+<span class="nc" id="L285">                return true;</span>
+<span class="nc" id="L286">        }</span>
+<span class="nc" id="L287">        return false;</span>
+    }
+
+    /**
+     * Clear all the snapshots for a given keyspace.
+     *
+     * @param snapshotName the user supplied snapshot name. It empty or null,
+     *                     all the snapshots will be cleaned
+     */
+    public static void clearSnapshot(String snapshotName, String keyspace)
+    {
+<span class="nc" id="L298">        List&lt;File&gt; snapshotDirs = Directories.getKSChildDirectories(keyspace, ColumnFamilyStore.getInitialDirectories());</span>
+<span class="nc" id="L299">        Directories.clearSnapshot(snapshotName, snapshotDirs);</span>
+<span class="nc" id="L300">    }</span>
+
+    /**
+     * @return A list of open SSTableReaders
+     */
+    public List&lt;SSTableReader&gt; getAllSSTables(SSTableSet sstableSet)
+    {
+<span class="nc" id="L307">        List&lt;SSTableReader&gt; list = new ArrayList&lt;&gt;(columnFamilyStores.size());</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        for (ColumnFamilyStore cfStore : columnFamilyStores.values())</span>
+<span class="nc" id="L309">            Iterables.addAll(list, cfStore.getSSTables(sstableSet));</span>
+<span class="nc" id="L310">        return list;</span>
+    }
+
+    private Keyspace(String keyspaceName, boolean loadSSTables)
+<span class="fc" id="L314">    {</span>
+<span class="fc" id="L315">        metadata = Schema.instance.getKSMetaData(keyspaceName);</span>
+<span class="pc bpc" id="L316" title="2 of 4 branches missed.">        assert metadata != null : &quot;Unknown keyspace &quot; + keyspaceName;</span>
+<span class="fc" id="L317">        createReplicationStrategy(metadata);</span>
+
+<span class="fc" id="L319">        this.metric = new KeyspaceMetrics(this);</span>
+<span class="fc" id="L320">        this.viewManager = new ViewManager(this);</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">        for (CFMetaData cfm : metadata.tablesAndViews())</span>
+        {
+<span class="fc" id="L323">            logger.trace(&quot;Initializing {}.{}&quot;, getName(), cfm.cfName);</span>
+<span class="fc" id="L324">            initCf(cfm, loadSSTables);</span>
+<span class="fc" id="L325">        }</span>
+<span class="fc" id="L326">        this.viewManager.reload();</span>
+<span class="fc" id="L327">    }</span>
+
+    private Keyspace(KeyspaceMetadata metadata)
+<span class="nc" id="L330">    {</span>
+<span class="nc" id="L331">        this.metadata = metadata;</span>
+<span class="nc" id="L332">        createReplicationStrategy(metadata);</span>
+<span class="nc" id="L333">        this.metric = new KeyspaceMetrics(this);</span>
+<span class="nc" id="L334">        this.viewManager = new ViewManager(this);</span>
+<span class="nc" id="L335">    }</span>
+
+    public static Keyspace mockKS(KeyspaceMetadata metadata)
+    {
+<span class="nc" id="L339">        return new Keyspace(metadata);</span>
+    }
+
+    private void createReplicationStrategy(KeyspaceMetadata ksm)
+    {
+<span class="fc" id="L344">        replicationStrategy = AbstractReplicationStrategy.createReplicationStrategy(ksm.name,</span>
+                                                                                    ksm.params.replication.klass,
+<span class="fc" id="L346">                                                                                    StorageService.instance.getTokenMetadata(),</span>
+<span class="fc" id="L347">                                                                                    DatabaseDescriptor.getEndpointSnitch(),</span>
+                                                                                    ksm.params.replication.options);
+<span class="fc bfc" id="L349" title="All 2 branches covered.">        if (!ksm.params.replication.equals(replicationParams))</span>
+        {
+<span class="fc" id="L351">            logger.debug(&quot;New replication settings for keyspace {} - invalidating disk boundary caches&quot;, ksm.name);</span>
+<span class="fc" id="L352">            columnFamilyStores.values().forEach(ColumnFamilyStore::invalidateDiskBoundaries);</span>
+        }
+<span class="fc" id="L354">        replicationParams = ksm.params.replication;</span>
+<span class="fc" id="L355">    }</span>
+
+    // best invoked on the compaction mananger.
+    public void dropCf(UUID cfId)
+    {
+<span class="nc bnc" id="L360" title="All 4 branches missed.">        assert columnFamilyStores.containsKey(cfId);</span>
+<span class="nc" id="L361">        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        if (cfs == null)</span>
+<span class="nc" id="L363">            return;</span>
+
+<span class="nc" id="L365">        cfs.getCompactionStrategyManager().shutdown();</span>
+<span class="nc" id="L366">        CompactionManager.instance.interruptCompactionForCFs(cfs.concatWithIndexes(), true);</span>
+        // wait for any outstanding reads/writes that might affect the CFS
+<span class="nc" id="L368">        cfs.keyspace.writeOrder.awaitNewBarrier();</span>
+<span class="nc" id="L369">        cfs.readOrdering.awaitNewBarrier();</span>
+
+<span class="nc" id="L371">        unloadCf(cfs);</span>
+<span class="nc" id="L372">    }</span>
+
+    // disassociate a cfs from this keyspace instance.
+    private void unloadCf(ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L377">        cfs.forceBlockingFlush();</span>
+<span class="nc" id="L378">        cfs.invalidate();</span>
+<span class="nc" id="L379">    }</span>
+
+    /**
+     * Registers a custom cf instance with this keyspace.
+     * This is required for offline tools what use non-standard directories.
+     */
+    public void initCfCustom(ColumnFamilyStore newCfs)
+    {
+<span class="nc" id="L387">        ColumnFamilyStore cfs = columnFamilyStores.get(newCfs.metadata.cfId);</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (cfs == null)</span>
+        {
+            // CFS being created for the first time, either on server startup or new CF being added.
+            // We don't worry about races here; startup is safe, and adding multiple idential CFs
+            // simultaneously is a &quot;don't do that&quot; scenario.
+<span class="nc" id="L394">            ColumnFamilyStore oldCfs = columnFamilyStores.putIfAbsent(newCfs.metadata.cfId, newCfs);</span>
+            // CFS mbean instantiation will error out before we hit this, but in case that changes...
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            if (oldCfs != null)</span>
+<span class="nc" id="L397">                throw new IllegalStateException(&quot;added multiple mappings for cf id &quot; + newCfs.metadata.cfId);</span>
+<span class="nc" id="L398">        }</span>
+        else
+        {
+<span class="nc" id="L401">            throw new IllegalStateException(&quot;CFS is already initialized: &quot; + cfs.name);</span>
+        }
+<span class="nc" id="L403">    }</span>
+
+    /**
+     * adds a cf to internal structures, ends up creating disk files).
+     */
+    public void initCf(CFMetaData metadata, boolean loadSSTables)
+    {
+<span class="fc" id="L410">        ColumnFamilyStore cfs = columnFamilyStores.get(metadata.cfId);</span>
+
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">        if (cfs == null)</span>
+        {
+            // CFS being created for the first time, either on server startup or new CF being added.
+            // We don't worry about races here; startup is safe, and adding multiple idential CFs
+            // simultaneously is a &quot;don't do that&quot; scenario.
+<span class="fc" id="L417">            ColumnFamilyStore oldCfs = columnFamilyStores.putIfAbsent(metadata.cfId, ColumnFamilyStore.createColumnFamilyStore(this, metadata, loadSSTables));</span>
+            // CFS mbean instantiation will error out before we hit this, but in case that changes...
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">            if (oldCfs != null)</span>
+<span class="nc" id="L420">                throw new IllegalStateException(&quot;added multiple mappings for cf id &quot; + metadata.cfId);</span>
+<span class="fc" id="L421">        }</span>
+        else
+        {
+            // re-initializing an existing CF.  This will happen if you cleared the schema
+            // on this node and it's getting repopulated from the rest of the cluster.
+<span class="nc bnc" id="L426" title="All 4 branches missed.">            assert cfs.name.equals(metadata.cfName);</span>
+<span class="nc" id="L427">            cfs.reload();</span>
+        }
+<span class="fc" id="L429">    }</span>
+
+    public CompletableFuture&lt;?&gt; applyFuture(Mutation mutation, boolean writeCommitLog, boolean updateIndexes)
+    {
+<span class="nc" id="L433">        return applyInternal(mutation, writeCommitLog, updateIndexes, true, true, new CompletableFuture&lt;&gt;());</span>
+    }
+
+    public CompletableFuture&lt;?&gt; applyFuture(Mutation mutation, boolean writeCommitLog, boolean updateIndexes, boolean isDroppable,
+                                            boolean isDeferrable)
+    {
+<span class="nc" id="L439">        return applyInternal(mutation, writeCommitLog, updateIndexes, isDroppable, isDeferrable, new CompletableFuture&lt;&gt;());</span>
+    }
+
+    public void apply(Mutation mutation, boolean writeCommitLog, boolean updateIndexes)
+    {
+<span class="nc" id="L444">        apply(mutation, writeCommitLog, updateIndexes, true);</span>
+<span class="nc" id="L445">    }</span>
+
+    public void apply(final Mutation mutation,
+                      final boolean writeCommitLog)
+    {
+<span class="nc" id="L450">        apply(mutation, writeCommitLog, true, true);</span>
+<span class="nc" id="L451">    }</span>
+
+    /**
+     * If apply is blocking, apply must not be deferred
+     * Otherwise there is a race condition where ALL mutation workers are beeing blocked ending
+     * in a complete deadlock of the mutation stage. See CASSANDRA-12689.
+     *
+     * @param mutation       the row to write.  Must not be modified after calling apply, since commitlog append
+     *                       may happen concurrently, depending on the CL Executor type.
+     * @param writeCommitLog false to disable commitlog append entirely
+     * @param updateIndexes  false to disable index updates (used by CollationController &quot;defragmenting&quot;)
+     * @param isDroppable    true if this should throw WriteTimeoutException if it does not acquire lock within write_request_timeout_in_ms
+     * @throws ExecutionException
+     */
+    public void apply(final Mutation mutation,
+                      final boolean writeCommitLog,
+                      boolean updateIndexes,
+                      boolean isDroppable)
+    {
+<span class="fc" id="L470">        applyInternal(mutation, writeCommitLog, updateIndexes, isDroppable, false, null);</span>
+<span class="fc" id="L471">    }</span>
+
+    /**
+     * This method appends a row to the global CommitLog, then updates memtables and indexes.
+     *
+     * @param mutation       the row to write.  Must not be modified after calling apply, since commitlog append
+     *                       may happen concurrently, depending on the CL Executor type.
+     * @param writeCommitLog false to disable commitlog append entirely
+     * @param updateIndexes  false to disable index updates (used by CollationController &quot;defragmenting&quot;)
+     * @param isDroppable    true if this should throw WriteTimeoutException if it does not acquire lock within write_request_timeout_in_ms
+     * @param isDeferrable   true if caller is not waiting for future to complete, so that future may be deferred
+     */
+    private CompletableFuture&lt;?&gt; applyInternal(final Mutation mutation,
+                                               final boolean writeCommitLog,
+                                               boolean updateIndexes,
+                                               boolean isDroppable,
+                                               boolean isDeferrable,
+                                               CompletableFuture&lt;?&gt; future)
+    {
+<span class="pc bpc" id="L490" title="3 of 4 branches missed.">        if (TEST_FAIL_WRITES &amp;&amp; metadata.name.equals(TEST_FAIL_WRITES_KS))</span>
+<span class="nc" id="L491">            throw new RuntimeException(&quot;Testing write failures&quot;);</span>
+
+<span class="fc" id="L493">        Lock[] locks = null;</span>
+
+<span class="pc bpc" id="L495" title="2 of 4 branches missed.">        boolean requiresViewUpdate = updateIndexes &amp;&amp; viewManager.updatesAffectView(Collections.singleton(mutation), false);</span>
+
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">        if (requiresViewUpdate)</span>
+        {
+<span class="nc" id="L499">            mutation.viewLockAcquireStart.compareAndSet(0L, System.currentTimeMillis());</span>
+
+            // the order of lock acquisition doesn't matter (from a deadlock perspective) because we only use tryLock()
+<span class="nc" id="L502">            Collection&lt;UUID&gt; columnFamilyIds = mutation.getColumnFamilyIds();</span>
+<span class="nc" id="L503">            Iterator&lt;UUID&gt; idIterator = columnFamilyIds.iterator();</span>
+
+<span class="nc" id="L505">            locks = new Lock[columnFamilyIds.size()];</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">            for (int i = 0; i &lt; columnFamilyIds.size(); i++)</span>
+            {
+<span class="nc" id="L508">                UUID cfid = idIterator.next();</span>
+<span class="nc" id="L509">                int lockKey = Objects.hash(mutation.key().getKey(), cfid);</span>
+                while (true)
+                {
+<span class="nc" id="L512">                    Lock lock = null;</span>
+
+<span class="nc bnc" id="L514" title="All 2 branches missed.">                    if (TEST_FAIL_MV_LOCKS_COUNT == 0)</span>
+<span class="nc" id="L515">                        lock = ViewManager.acquireLockFor(lockKey);</span>
+                    else
+<span class="nc" id="L517">                        TEST_FAIL_MV_LOCKS_COUNT--;</span>
+
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                    if (lock == null)</span>
+                    {
+                        //throw WTE only if request is droppable
+<span class="nc bnc" id="L522" title="All 4 branches missed.">                        if (isDroppable &amp;&amp; (System.currentTimeMillis() - mutation.createdAt) &gt; DatabaseDescriptor.getWriteRpcTimeout())</span>
+                        {
+<span class="nc bnc" id="L524" title="All 2 branches missed.">                            for (int j = 0; j &lt; i; j++)</span>
+<span class="nc" id="L525">                                locks[j].unlock();</span>
+
+<span class="nc" id="L527">                            logger.trace(&quot;Could not acquire lock for {} and table {}&quot;, ByteBufferUtil.bytesToHex(mutation.key().getKey()), columnFamilyStores.get(cfid).name);</span>
+<span class="nc" id="L528">                            Tracing.trace(&quot;Could not acquire MV lock&quot;);</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">                            if (future != null)</span>
+                            {
+<span class="nc" id="L531">                                future.completeExceptionally(new WriteTimeoutException(WriteType.VIEW, ConsistencyLevel.LOCAL_ONE, 0, 1));</span>
+<span class="nc" id="L532">                                return future;</span>
+                            }
+                            else
+<span class="nc" id="L535">                                throw new WriteTimeoutException(WriteType.VIEW, ConsistencyLevel.LOCAL_ONE, 0, 1);</span>
+                        }
+<span class="nc bnc" id="L537" title="All 2 branches missed.">                        else if (isDeferrable)</span>
+                        {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                            for (int j = 0; j &lt; i; j++)</span>
+<span class="nc" id="L540">                                locks[j].unlock();</span>
+
+                            // This view update can't happen right now. so rather than keep this thread busy
+                            // we will re-apply ourself to the queue and try again later
+<span class="nc" id="L544">                            final CompletableFuture&lt;?&gt; mark = future;</span>
+<span class="nc" id="L545">                            StageManager.getStage(Stage.MUTATION).execute(() -&gt;</span>
+<span class="nc" id="L546">                                                                          applyInternal(mutation, writeCommitLog, true, isDroppable, true, mark)</span>
+                            );
+<span class="nc" id="L548">                            return future;</span>
+                        }
+                        else
+                        {
+                            // Retry lock on same thread, if mutation is not deferrable.
+                            // Mutation is not deferrable, if applied from MutationStage and caller is waiting for future to finish
+                            // If blocking caller defers future, this may lead to deadlock situation with all MutationStage workers
+                            // being blocked by waiting for futures which will never be processed as all workers are blocked
+                            try
+                            {
+                                // Wait a little bit before retrying to lock
+<span class="nc" id="L559">                                Thread.sleep(10);</span>
+                            }
+<span class="nc" id="L561">                            catch (InterruptedException e)</span>
+                            {
+                                // Just continue
+<span class="nc" id="L564">                            }</span>
+<span class="nc" id="L565">                            continue;</span>
+                        }
+                    }
+                    else
+                    {
+<span class="nc" id="L570">                        locks[i] = lock;</span>
+                    }
+<span class="nc" id="L572">                    break;</span>
+                }
+            }
+
+<span class="nc" id="L576">            long acquireTime = System.currentTimeMillis() - mutation.viewLockAcquireStart.get();</span>
+            // Metrics are only collected for droppable write operations
+            // Bulk non-droppable operations (e.g. commitlog replay, hint delivery) are not measured
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (isDroppable)</span>
+            {
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                for(UUID cfid : columnFamilyIds)</span>
+<span class="nc" id="L582">                    columnFamilyStores.get(cfid).metric.viewLockAcquireTime.update(acquireTime, TimeUnit.MILLISECONDS);</span>
+            }
+        }
+<span class="fc" id="L585">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="fc" id="L586">        try (OpOrder.Group opGroup = writeOrder.start())</span>
+        {
+            // write the mutation to the commitlog and memtables
+<span class="fc" id="L589">            CommitLogPosition commitLogPosition = null;</span>
+<span class="pc bpc" id="L590" title="1 of 2 branches missed.">            if (writeCommitLog)</span>
+            {
+<span class="fc" id="L592">                Tracing.trace(&quot;Appending to commitlog&quot;);</span>
+<span class="fc" id="L593">                commitLogPosition = CommitLog.instance.add(mutation);</span>
+            }
+
+<span class="fc bfc" id="L596" title="All 2 branches covered.">            for (PartitionUpdate upd : mutation.getPartitionUpdates())</span>
+            {
+<span class="fc" id="L598">                ColumnFamilyStore cfs = columnFamilyStores.get(upd.metadata().cfId);</span>
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">                if (cfs == null)</span>
+                {
+<span class="nc" id="L601">                    logger.error(&quot;Attempting to mutate non-existant table {} ({}.{})&quot;, upd.metadata().cfId, upd.metadata().ksName, upd.metadata().cfName);</span>
+<span class="nc" id="L602">                    continue;</span>
+                }
+<span class="fc" id="L604">                AtomicLong baseComplete = new AtomicLong(Long.MAX_VALUE);</span>
+
+<span class="pc bpc" id="L606" title="1 of 2 branches missed.">                if (requiresViewUpdate)</span>
+                {
+                    try
+                    {
+<span class="nc" id="L610">                        Tracing.trace(&quot;Creating materialized view mutations from base table replica&quot;);</span>
+<span class="nc" id="L611">                        viewManager.forTable(upd.metadata()).pushViewReplicaUpdates(upd, writeCommitLog, baseComplete);</span>
+                    }
+<span class="nc" id="L613">                    catch (Throwable t)</span>
+                    {
+<span class="nc" id="L615">                        JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc" id="L616">                        logger.error(String.format(&quot;Unknown exception caught while attempting to update MaterializedView! %s.%s&quot;,</span>
+<span class="nc" id="L617">                                     upd.metadata().ksName, upd.metadata().cfName), t);</span>
+<span class="nc" id="L618">                        throw t;</span>
+<span class="nc" id="L619">                    }</span>
+                }
+
+<span class="fc" id="L622">                Tracing.trace(&quot;Adding to {} memtable&quot;, upd.metadata().cfName);</span>
+<span class="pc bpc" id="L623" title="1 of 2 branches missed.">                UpdateTransaction indexTransaction = updateIndexes</span>
+<span class="pc" id="L624">                                                     ? cfs.indexManager.newUpdateTransaction(upd, opGroup, nowInSec)</span>
+                                                     : UpdateTransaction.NO_OP;
+<span class="fc" id="L626">                cfs.apply(upd, indexTransaction, opGroup, commitLogPosition);</span>
+<span class="pc bpc" id="L627" title="1 of 2 branches missed.">                if (requiresViewUpdate)</span>
+<span class="nc" id="L628">                    baseComplete.set(System.currentTimeMillis());</span>
+<span class="fc" id="L629">            }</span>
+
+<span class="pc bpc" id="L631" title="1 of 2 branches missed.">            if (future != null) {</span>
+<span class="nc" id="L632">                future.complete(null);</span>
+            }
+<span class="fc" id="L634">            return future;</span>
+        }
+        finally
+        {
+<span class="pc bpc" id="L638" title="1 of 2 branches missed.">            if (locks != null)</span>
+            {
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                for (Lock lock : locks)</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                    if (lock != null)</span>
+<span class="nc" id="L642">                        lock.unlock();</span>
+            }
+        }
+    }
+
+    public AbstractReplicationStrategy getReplicationStrategy()
+    {
+<span class="fc" id="L649">        return replicationStrategy;</span>
+    }
+
+    public List&lt;Future&lt;?&gt;&gt; flush()
+    {
+<span class="nc" id="L654">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;(columnFamilyStores.size());</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        for (ColumnFamilyStore cfs : columnFamilyStores.values())</span>
+<span class="nc" id="L656">            futures.add(cfs.forceFlush());</span>
+<span class="nc" id="L657">        return futures;</span>
+    }
+
+    public Iterable&lt;ColumnFamilyStore&gt; getValidColumnFamilies(boolean allowIndexes,
+                                                              boolean autoAddIndexes,
+                                                              String... cfNames) throws IOException
+    {
+<span class="nc" id="L664">        Set&lt;ColumnFamilyStore&gt; valid = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        if (cfNames.length == 0)</span>
+        {
+            // all stores are interesting
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            for (ColumnFamilyStore cfStore : getColumnFamilyStores())</span>
+            {
+<span class="nc" id="L671">                valid.add(cfStore);</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">                if (autoAddIndexes)</span>
+<span class="nc" id="L673">                    valid.addAll(getIndexColumnFamilyStores(cfStore));</span>
+<span class="nc" id="L674">            }</span>
+<span class="nc" id="L675">            return valid;</span>
+        }
+
+        // include the specified stores and possibly the stores of any of their indexes
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        for (String cfName : cfNames)</span>
+        {
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            if (SecondaryIndexManager.isIndexColumnFamily(cfName))</span>
+            {
+<span class="nc bnc" id="L683" title="All 2 branches missed.">                if (!allowIndexes)</span>
+                {
+<span class="nc" id="L685">                    logger.warn(&quot;Operation not allowed on secondary Index table ({})&quot;, cfName);</span>
+<span class="nc" id="L686">                    continue;</span>
+                }
+<span class="nc" id="L688">                String baseName = SecondaryIndexManager.getParentCfsName(cfName);</span>
+<span class="nc" id="L689">                String indexName = SecondaryIndexManager.getIndexName(cfName);</span>
+
+<span class="nc" id="L691">                ColumnFamilyStore baseCfs = getColumnFamilyStore(baseName);</span>
+<span class="nc" id="L692">                Index index = baseCfs.indexManager.getIndexByName(indexName);</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">                if (index == null)</span>
+<span class="nc" id="L694">                    throw new IllegalArgumentException(String.format(&quot;Invalid index specified: %s/%s.&quot;,</span>
+                                                                     baseCfs.metadata.cfName,
+                                                                     indexName));
+
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                if (index.getBackingTable().isPresent())</span>
+<span class="nc" id="L699">                    valid.add(index.getBackingTable().get());</span>
+<span class="nc" id="L700">            }</span>
+            else
+            {
+<span class="nc" id="L703">                ColumnFamilyStore cfStore = getColumnFamilyStore(cfName);</span>
+<span class="nc" id="L704">                valid.add(cfStore);</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                if (autoAddIndexes)</span>
+<span class="nc" id="L706">                    valid.addAll(getIndexColumnFamilyStores(cfStore));</span>
+            }
+        }
+
+<span class="nc" id="L710">        return valid;</span>
+    }
+
+    private Set&lt;ColumnFamilyStore&gt; getIndexColumnFamilyStores(ColumnFamilyStore baseCfs)
+    {
+<span class="nc" id="L715">        Set&lt;ColumnFamilyStore&gt; stores = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">        for (ColumnFamilyStore indexCfs : baseCfs.indexManager.getAllIndexColumnFamilyStores())</span>
+        {
+<span class="nc" id="L718">            logger.info(&quot;adding secondary index table {} to operation&quot;, indexCfs.metadata.cfName);</span>
+<span class="nc" id="L719">            stores.add(indexCfs);</span>
+<span class="nc" id="L720">        }</span>
+<span class="nc" id="L721">        return stores;</span>
+    }
+
+    public static Iterable&lt;Keyspace&gt; all()
+    {
+<span class="fc" id="L726">        return Iterables.transform(Schema.instance.getKeyspaces(), keyspaceTransformer);</span>
+    }
+
+    public static Iterable&lt;Keyspace&gt; nonSystem()
+    {
+<span class="nc" id="L731">        return Iterables.transform(Schema.instance.getNonSystemKeyspaces(), keyspaceTransformer);</span>
+    }
+
+    public static Iterable&lt;Keyspace&gt; nonLocalStrategy()
+    {
+<span class="fc" id="L736">        return Iterables.transform(Schema.instance.getNonLocalStrategyKeyspaces(), keyspaceTransformer);</span>
+    }
+
+    public static Iterable&lt;Keyspace&gt; system()
+    {
+<span class="nc" id="L741">        return Iterables.transform(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES, keyspaceTransformer);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L747">        return getClass().getSimpleName() + &quot;(name='&quot; + getName() + &quot;')&quot;;</span>
+    }
+
+    public String getName()
+    {
+<span class="fc" id="L752">        return metadata.name;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

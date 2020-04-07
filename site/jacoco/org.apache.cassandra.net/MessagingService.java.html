@@ -1,0 +1,1545 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MessagingService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">MessagingService.java</span></div><h1>MessagingService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.*;
+import java.net.*;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.ServerSocketChannel;
+import java.util.*;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+import javax.net.ssl.SSLHandshakeException;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ExecutorLocals;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.concurrent.LocalAwareExecutorService;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.batchlog.Batch;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.BootStrapper;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.EchoMessage;
+import org.apache.cassandra.gms.GossipDigestAck;
+import org.apache.cassandra.gms.GossipDigestAck2;
+import org.apache.cassandra.gms.GossipDigestSyn;
+import org.apache.cassandra.hints.HintMessage;
+import org.apache.cassandra.hints.HintResponse;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.ILatencySubscriber;
+import org.apache.cassandra.metrics.CassandraMetricsRegistry;
+import org.apache.cassandra.metrics.ConnectionMetrics;
+import org.apache.cassandra.metrics.DroppedMessageMetrics;
+import org.apache.cassandra.metrics.MessagingMetrics;
+import org.apache.cassandra.repair.messages.RepairMessage;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.service.*;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PrepareResponse;
+import org.apache.cassandra.tracing.TraceState;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.SimpleCondition;
+
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">public final class MessagingService implements MessagingServiceMBean</span>
+{
+    // Required to allow schema migrations while upgrading within the minor 3.0.x/3.x versions to 3.11+.
+    // See CASSANDRA-13004 for details.
+<span class="fc" id="L88">    public final static boolean FORCE_3_0_PROTOCOL_VERSION = Boolean.getBoolean(&quot;cassandra.force_3_0_protocol_version&quot;);</span>
+
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.net:type=MessagingService&quot;;
+
+    // 8 bits version, so don't waste versions
+    public static final int VERSION_12 = 6;
+    public static final int VERSION_20 = 7;
+    public static final int VERSION_21 = 8;
+    public static final int VERSION_22 = 9;
+    public static final int VERSION_30 = 10;
+    public static final int VERSION_3014 = 11;
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">    public static final int current_version = FORCE_3_0_PROTOCOL_VERSION ? VERSION_30 : VERSION_3014;</span>
+
+    public static final String FAILURE_CALLBACK_PARAM = &quot;CAL_BAC&quot;;
+<span class="fc" id="L102">    public static final byte[] ONE_BYTE = new byte[1];</span>
+    public static final String FAILURE_RESPONSE_PARAM = &quot;FAIL&quot;;
+    public static final String FAILURE_REASON_PARAM = &quot;FAIL_REASON&quot;;
+
+    /**
+     * we preface every message with this number so the recipient can validate the sender is sane
+     */
+    public static final int PROTOCOL_MAGIC = 0xCA552DFA;
+
+<span class="fc" id="L111">    private boolean allNodesAtLeast22 = true;</span>
+<span class="fc" id="L112">    private boolean allNodesAtLeast30 = true;</span>
+
+<span class="fc" id="L114">    public final MessagingMetrics metrics = new MessagingMetrics();</span>
+
+    /* All verb handler identifiers */
+<span class="fc" id="L117">    public enum Verb</span>
+    {
+<span class="fc" id="L119">        MUTATION</span>
+        {
+            public long getTimeout()
+            {
+<span class="fc" id="L123">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L126">        HINT</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L130">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L133">        READ_REPAIR</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L137">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L140">        READ</span>
+        {
+            public long getTimeout()
+            {
+<span class="fc" id="L144">                return DatabaseDescriptor.getReadRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L147">        REQUEST_RESPONSE, // client-initiated reads and writes</span>
+<span class="fc" id="L148">        BATCH_STORE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L152">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },  // was @Deprecated STREAM_INITIATE,
+<span class="fc" id="L155">        BATCH_REMOVE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L159">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        }, // was @Deprecated STREAM_INITIATE_DONE,
+<span class="fc" id="L162">        @Deprecated STREAM_REPLY,</span>
+<span class="fc" id="L163">        @Deprecated STREAM_REQUEST,</span>
+<span class="fc" id="L164">        RANGE_SLICE</span>
+        {
+            public long getTimeout()
+            {
+<span class="fc" id="L168">                return DatabaseDescriptor.getRangeRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L171">        @Deprecated BOOTSTRAP_TOKEN,</span>
+<span class="fc" id="L172">        @Deprecated TREE_REQUEST,</span>
+<span class="fc" id="L173">        @Deprecated TREE_RESPONSE,</span>
+<span class="fc" id="L174">        @Deprecated JOIN,</span>
+<span class="fc" id="L175">        GOSSIP_DIGEST_SYN,</span>
+<span class="fc" id="L176">        GOSSIP_DIGEST_ACK,</span>
+<span class="fc" id="L177">        GOSSIP_DIGEST_ACK2,</span>
+<span class="fc" id="L178">        @Deprecated DEFINITIONS_ANNOUNCE,</span>
+<span class="fc" id="L179">        DEFINITIONS_UPDATE,</span>
+<span class="fc" id="L180">        TRUNCATE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L184">                return DatabaseDescriptor.getTruncateRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L187">        SCHEMA_CHECK,</span>
+<span class="fc" id="L188">        @Deprecated INDEX_SCAN,</span>
+<span class="fc" id="L189">        REPLICATION_FINISHED,</span>
+<span class="fc" id="L190">        INTERNAL_RESPONSE, // responses to internal calls</span>
+<span class="fc" id="L191">        COUNTER_MUTATION</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L195">                return DatabaseDescriptor.getCounterWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L198">        @Deprecated STREAMING_REPAIR_REQUEST,</span>
+<span class="fc" id="L199">        @Deprecated STREAMING_REPAIR_RESPONSE,</span>
+<span class="fc" id="L200">        SNAPSHOT, // Similar to nt snapshot</span>
+<span class="fc" id="L201">        MIGRATION_REQUEST,</span>
+<span class="fc" id="L202">        GOSSIP_SHUTDOWN,</span>
+<span class="fc" id="L203">        _TRACE, // dummy verb so we can use MS.droppedMessagesMap</span>
+<span class="fc" id="L204">        ECHO,</span>
+<span class="fc" id="L205">        REPAIR_MESSAGE,</span>
+<span class="fc" id="L206">        PAXOS_PREPARE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L210">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L213">        PAXOS_PROPOSE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L217">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L220">        PAXOS_COMMIT</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L224">                return DatabaseDescriptor.getWriteRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L227">        @Deprecated PAGED_RANGE</span>
+        {
+            public long getTimeout()
+            {
+<span class="nc" id="L231">                return DatabaseDescriptor.getRangeRpcTimeout();</span>
+            }
+        },
+<span class="fc" id="L234">        PING,</span>
+        // UNUSED verbs were used as padding for backward/forward compatability before 4.0,
+        // but it wasn't quite as bullet/future proof as needed. We still need to keep these entries
+        // around, at least for a major rev or two (post-4.0). see CASSANDRA-13993 for a discussion.
+        // For now, though, the UNUSED are legacy values (placeholders, basically) that should only be used
+        // for correctly adding VERBs that need to be emergency additions to 3.0/3.11.
+        // We can reclaim them (their id's, to be correct) in future versions, if desired, though.
+<span class="fc" id="L241">        UNUSED_2,</span>
+<span class="fc" id="L242">        UNUSED_3,</span>
+<span class="fc" id="L243">        UNUSED_4,</span>
+<span class="fc" id="L244">        UNUSED_5,</span>
+        ;
+        // remember to add new verbs at the end, since we serialize by ordinal
+
+        // This is to support a &quot;late&quot; choice of the verb based on the messaging service version.
+        // See CASSANDRA-12249 for more details.
+        public static Verb convertForMessagingServiceVersion(Verb verb, int version)
+        {
+<span class="pc bpc" id="L252" title="3 of 4 branches missed.">            if (verb == PAGED_RANGE &amp;&amp; version &gt;= VERSION_30)</span>
+<span class="nc" id="L253">                return RANGE_SLICE;</span>
+
+<span class="fc" id="L255">            return verb;</span>
+        }
+
+        public long getTimeout()
+        {
+<span class="fc" id="L260">            return DatabaseDescriptor.getRpcTimeout();</span>
+        }
+    }
+
+<span class="fc" id="L264">    public static final Verb[] verbValues = Verb.values();</span>
+
+<span class="fc" id="L266">    public static final EnumMap&lt;MessagingService.Verb, Stage&gt; verbStages = new EnumMap&lt;MessagingService.Verb, Stage&gt;(MessagingService.Verb.class)</span>
+<span class="fc" id="L267">    {{</span>
+<span class="fc" id="L268">        put(Verb.MUTATION, Stage.MUTATION);</span>
+<span class="fc" id="L269">        put(Verb.COUNTER_MUTATION, Stage.COUNTER_MUTATION);</span>
+<span class="fc" id="L270">        put(Verb.READ_REPAIR, Stage.MUTATION);</span>
+<span class="fc" id="L271">        put(Verb.HINT, Stage.MUTATION);</span>
+<span class="fc" id="L272">        put(Verb.TRUNCATE, Stage.MUTATION);</span>
+<span class="fc" id="L273">        put(Verb.PAXOS_PREPARE, Stage.MUTATION);</span>
+<span class="fc" id="L274">        put(Verb.PAXOS_PROPOSE, Stage.MUTATION);</span>
+<span class="fc" id="L275">        put(Verb.PAXOS_COMMIT, Stage.MUTATION);</span>
+<span class="fc" id="L276">        put(Verb.BATCH_STORE, Stage.MUTATION);</span>
+<span class="fc" id="L277">        put(Verb.BATCH_REMOVE, Stage.MUTATION);</span>
+
+<span class="fc" id="L279">        put(Verb.READ, Stage.READ);</span>
+<span class="fc" id="L280">        put(Verb.RANGE_SLICE, Stage.READ);</span>
+<span class="fc" id="L281">        put(Verb.INDEX_SCAN, Stage.READ);</span>
+<span class="fc" id="L282">        put(Verb.PAGED_RANGE, Stage.READ);</span>
+
+<span class="fc" id="L284">        put(Verb.REQUEST_RESPONSE, Stage.REQUEST_RESPONSE);</span>
+<span class="fc" id="L285">        put(Verb.INTERNAL_RESPONSE, Stage.INTERNAL_RESPONSE);</span>
+
+<span class="fc" id="L287">        put(Verb.STREAM_REPLY, Stage.MISC); // actually handled by FileStreamTask and streamExecutors</span>
+<span class="fc" id="L288">        put(Verb.STREAM_REQUEST, Stage.MISC);</span>
+<span class="fc" id="L289">        put(Verb.REPLICATION_FINISHED, Stage.MISC);</span>
+<span class="fc" id="L290">        put(Verb.SNAPSHOT, Stage.MISC);</span>
+
+<span class="fc" id="L292">        put(Verb.TREE_REQUEST, Stage.ANTI_ENTROPY);</span>
+<span class="fc" id="L293">        put(Verb.TREE_RESPONSE, Stage.ANTI_ENTROPY);</span>
+<span class="fc" id="L294">        put(Verb.STREAMING_REPAIR_REQUEST, Stage.ANTI_ENTROPY);</span>
+<span class="fc" id="L295">        put(Verb.STREAMING_REPAIR_RESPONSE, Stage.ANTI_ENTROPY);</span>
+<span class="fc" id="L296">        put(Verb.REPAIR_MESSAGE, Stage.ANTI_ENTROPY);</span>
+<span class="fc" id="L297">        put(Verb.GOSSIP_DIGEST_ACK, Stage.GOSSIP);</span>
+<span class="fc" id="L298">        put(Verb.GOSSIP_DIGEST_ACK2, Stage.GOSSIP);</span>
+<span class="fc" id="L299">        put(Verb.GOSSIP_DIGEST_SYN, Stage.GOSSIP);</span>
+<span class="fc" id="L300">        put(Verb.GOSSIP_SHUTDOWN, Stage.GOSSIP);</span>
+
+<span class="fc" id="L302">        put(Verb.DEFINITIONS_UPDATE, Stage.MIGRATION);</span>
+<span class="fc" id="L303">        put(Verb.SCHEMA_CHECK, Stage.MIGRATION);</span>
+<span class="fc" id="L304">        put(Verb.MIGRATION_REQUEST, Stage.MIGRATION);</span>
+<span class="fc" id="L305">        put(Verb.INDEX_SCAN, Stage.READ);</span>
+<span class="fc" id="L306">        put(Verb.REPLICATION_FINISHED, Stage.MISC);</span>
+<span class="fc" id="L307">        put(Verb.SNAPSHOT, Stage.MISC);</span>
+<span class="fc" id="L308">        put(Verb.ECHO, Stage.GOSSIP);</span>
+
+<span class="fc" id="L310">        put(Verb.UNUSED_2, Stage.INTERNAL_RESPONSE);</span>
+<span class="fc" id="L311">        put(Verb.UNUSED_3, Stage.INTERNAL_RESPONSE);</span>
+
+<span class="fc" id="L313">        put(Verb.PING, Stage.READ);</span>
+<span class="fc" id="L314">    }};</span>
+
+    /**
+     * Messages we receive in IncomingTcpConnection have a Verb that tells us what kind of message it is.
+     * Most of the time, this is enough to determine how to deserialize the message payload.
+     * The exception is the REQUEST_RESPONSE verb, which just means &quot;a reply to something you told me to do.&quot;
+     * Traditionally, this was fine since each VerbHandler knew what type of payload it expected, and
+     * handled the deserialization itself.  Now that we do that in ITC, to avoid the extra copy to an
+     * intermediary byte[] (See CASSANDRA-3716), we need to wire that up to the CallbackInfo object
+     * (see below).
+     */
+<span class="fc" id="L325">    public final EnumMap&lt;Verb, IVersionedSerializer&lt;?&gt;&gt; verbSerializers = new EnumMap&lt;Verb, IVersionedSerializer&lt;?&gt;&gt;(Verb.class)</span>
+<span class="fc" id="L326">    {{</span>
+<span class="fc" id="L327">        put(Verb.REQUEST_RESPONSE, CallbackDeterminedSerializer.instance);</span>
+<span class="fc" id="L328">        put(Verb.INTERNAL_RESPONSE, CallbackDeterminedSerializer.instance);</span>
+
+<span class="fc" id="L330">        put(Verb.MUTATION, Mutation.serializer);</span>
+<span class="fc" id="L331">        put(Verb.READ_REPAIR, Mutation.serializer);</span>
+<span class="fc" id="L332">        put(Verb.READ, ReadCommand.readSerializer);</span>
+<span class="fc" id="L333">        put(Verb.RANGE_SLICE, ReadCommand.rangeSliceSerializer);</span>
+<span class="fc" id="L334">        put(Verb.PAGED_RANGE, ReadCommand.pagedRangeSerializer);</span>
+<span class="fc" id="L335">        put(Verb.BOOTSTRAP_TOKEN, BootStrapper.StringSerializer.instance);</span>
+<span class="fc" id="L336">        put(Verb.REPAIR_MESSAGE, RepairMessage.serializer);</span>
+<span class="fc" id="L337">        put(Verb.GOSSIP_DIGEST_ACK, GossipDigestAck.serializer);</span>
+<span class="fc" id="L338">        put(Verb.GOSSIP_DIGEST_ACK2, GossipDigestAck2.serializer);</span>
+<span class="fc" id="L339">        put(Verb.GOSSIP_DIGEST_SYN, GossipDigestSyn.serializer);</span>
+<span class="fc" id="L340">        put(Verb.DEFINITIONS_UPDATE, MigrationManager.MigrationsSerializer.instance);</span>
+<span class="fc" id="L341">        put(Verb.TRUNCATE, Truncation.serializer);</span>
+<span class="fc" id="L342">        put(Verb.REPLICATION_FINISHED, null);</span>
+<span class="fc" id="L343">        put(Verb.COUNTER_MUTATION, CounterMutation.serializer);</span>
+<span class="fc" id="L344">        put(Verb.SNAPSHOT, SnapshotCommand.serializer);</span>
+<span class="fc" id="L345">        put(Verb.ECHO, EchoMessage.serializer);</span>
+<span class="fc" id="L346">        put(Verb.PAXOS_PREPARE, Commit.serializer);</span>
+<span class="fc" id="L347">        put(Verb.PAXOS_PROPOSE, Commit.serializer);</span>
+<span class="fc" id="L348">        put(Verb.PAXOS_COMMIT, Commit.serializer);</span>
+<span class="fc" id="L349">        put(Verb.HINT, HintMessage.serializer);</span>
+<span class="fc" id="L350">        put(Verb.BATCH_STORE, Batch.serializer);</span>
+<span class="fc" id="L351">        put(Verb.BATCH_REMOVE, UUIDSerializer.serializer);</span>
+<span class="fc" id="L352">        put(Verb.PING, PingMessage.serializer);</span>
+<span class="fc" id="L353">    }};</span>
+
+    /**
+     * A Map of what kind of serializer to wire up to a REQUEST_RESPONSE callback, based on outbound Verb.
+     */
+<span class="fc" id="L358">    public static final EnumMap&lt;Verb, IVersionedSerializer&lt;?&gt;&gt; callbackDeserializers = new EnumMap&lt;Verb, IVersionedSerializer&lt;?&gt;&gt;(Verb.class)</span>
+<span class="fc" id="L359">    {{</span>
+<span class="fc" id="L360">        put(Verb.MUTATION, WriteResponse.serializer);</span>
+<span class="fc" id="L361">        put(Verb.HINT, HintResponse.serializer);</span>
+<span class="fc" id="L362">        put(Verb.READ_REPAIR, WriteResponse.serializer);</span>
+<span class="fc" id="L363">        put(Verb.COUNTER_MUTATION, WriteResponse.serializer);</span>
+<span class="fc" id="L364">        put(Verb.RANGE_SLICE, ReadResponse.rangeSliceSerializer);</span>
+<span class="fc" id="L365">        put(Verb.PAGED_RANGE, ReadResponse.rangeSliceSerializer);</span>
+<span class="fc" id="L366">        put(Verb.READ, ReadResponse.serializer);</span>
+<span class="fc" id="L367">        put(Verb.TRUNCATE, TruncateResponse.serializer);</span>
+<span class="fc" id="L368">        put(Verb.SNAPSHOT, null);</span>
+
+<span class="fc" id="L370">        put(Verb.MIGRATION_REQUEST, MigrationManager.MigrationsSerializer.instance);</span>
+<span class="fc" id="L371">        put(Verb.SCHEMA_CHECK, UUIDSerializer.serializer);</span>
+<span class="fc" id="L372">        put(Verb.BOOTSTRAP_TOKEN, BootStrapper.StringSerializer.instance);</span>
+<span class="fc" id="L373">        put(Verb.REPLICATION_FINISHED, null);</span>
+
+<span class="fc" id="L375">        put(Verb.PAXOS_PREPARE, PrepareResponse.serializer);</span>
+<span class="fc" id="L376">        put(Verb.PAXOS_PROPOSE, BooleanSerializer.serializer);</span>
+
+<span class="fc" id="L378">        put(Verb.BATCH_STORE, WriteResponse.serializer);</span>
+<span class="fc" id="L379">        put(Verb.BATCH_REMOVE, WriteResponse.serializer);</span>
+<span class="fc" id="L380">    }};</span>
+
+    /* This records all the results mapped by message Id */
+    private final ExpiringMap&lt;Integer, CallbackInfo&gt; callbacks;
+
+    /**
+     * a placeholder class that means &quot;deserialize using the callback.&quot; We can't implement this without
+     * special-case code in InboundTcpConnection because there is no way to pass the message id to IVersionedSerializer.
+     */
+<span class="fc" id="L389">    static class CallbackDeterminedSerializer implements IVersionedSerializer&lt;Object&gt;</span>
+    {
+<span class="fc" id="L391">        public static final CallbackDeterminedSerializer instance = new CallbackDeterminedSerializer();</span>
+
+        public Object deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L395">            throw new UnsupportedOperationException();</span>
+        }
+
+        public void serialize(Object o, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L400">            throw new UnsupportedOperationException();</span>
+        }
+
+        public long serializedSize(Object o, int version)
+        {
+<span class="nc" id="L405">            throw new UnsupportedOperationException();</span>
+        }
+    }
+
+    /* Lookup table for registering message handlers based on the verb. */
+    private final Map&lt;Verb, IVerbHandler&gt; verbHandlers;
+
+<span class="fc" id="L412">    private final ConcurrentMap&lt;InetAddress, OutboundTcpConnectionPool&gt; connectionManagers = new NonBlockingHashMap&lt;&gt;();</span>
+
+<span class="fc" id="L414">    private static final Logger logger = LoggerFactory.getLogger(MessagingService.class);</span>
+    private static final int LOG_DROPPED_INTERVAL_IN_MS = 5000;
+
+<span class="fc" id="L417">    private final List&lt;SocketThread&gt; socketThreads = Lists.newArrayList();</span>
+    private final SimpleCondition listenGate;
+
+    /**
+     * Verbs it's okay to drop if the request has been queued longer than the request timeout.  These
+     * all correspond to client requests or something triggered by them; we don't want to
+     * drop internal messages like bootstrap or repair notifications.
+     */
+<span class="fc" id="L425">    public static final EnumSet&lt;Verb&gt; DROPPABLE_VERBS = EnumSet.of(Verb._TRACE,</span>
+                                                                   Verb.MUTATION,
+                                                                   Verb.COUNTER_MUTATION,
+                                                                   Verb.HINT,
+                                                                   Verb.READ_REPAIR,
+                                                                   Verb.READ,
+                                                                   Verb.RANGE_SLICE,
+                                                                   Verb.PAGED_RANGE,
+                                                                   Verb.REQUEST_RESPONSE,
+                                                                   Verb.BATCH_STORE,
+                                                                   Verb.BATCH_REMOVE);
+
+    private static final class DroppedMessages
+    {
+        final DroppedMessageMetrics metrics;
+        final AtomicInteger droppedInternal;
+        final AtomicInteger droppedCrossNode;
+
+        DroppedMessages(Verb verb)
+        {
+<span class="fc" id="L445">            this(new DroppedMessageMetrics(verb));</span>
+<span class="fc" id="L446">        }</span>
+
+        DroppedMessages(DroppedMessageMetrics metrics)
+<span class="fc" id="L449">        {</span>
+<span class="fc" id="L450">            this.metrics = metrics;</span>
+<span class="fc" id="L451">            this.droppedInternal = new AtomicInteger(0);</span>
+<span class="fc" id="L452">            this.droppedCrossNode = new AtomicInteger(0);</span>
+<span class="fc" id="L453">        }</span>
+    }
+
+    @VisibleForTesting
+    public void resetDroppedMessagesMap(String scope)
+    {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        for (Verb verb : droppedMessagesMap.keySet())</span>
+<span class="nc" id="L460">            droppedMessagesMap.put(verb, new DroppedMessages(new DroppedMessageMetrics(metricName -&gt; {</span>
+<span class="nc" id="L461">                return new CassandraMetricsRegistry.MetricName(&quot;DroppedMessages&quot;, metricName, scope);</span>
+            })));
+<span class="nc" id="L463">    }</span>
+
+    // total dropped message counts for server lifetime
+<span class="fc" id="L466">    private final Map&lt;Verb, DroppedMessages&gt; droppedMessagesMap = new EnumMap&lt;&gt;(Verb.class);</span>
+
+<span class="fc" id="L468">    private final List&lt;ILatencySubscriber&gt; subscribers = new ArrayList&lt;ILatencySubscriber&gt;();</span>
+
+    // protocol versions of the other nodes in the cluster
+<span class="fc" id="L471">    private final ConcurrentMap&lt;InetAddress, Integer&gt; versions = new NonBlockingHashMap&lt;InetAddress, Integer&gt;();</span>
+
+    // message sinks are a testing hook
+<span class="fc" id="L474">    private final Set&lt;IMessageSink&gt; messageSinks = new CopyOnWriteArraySet&lt;&gt;();</span>
+
+    // back-pressure implementation
+<span class="fc" id="L477">    private final BackPressureStrategy backPressure = DatabaseDescriptor.getBackPressureStrategy();</span>
+
+    private static class MSHandle
+    {
+<span class="fc" id="L481">        public static final MessagingService instance = new MessagingService(false);</span>
+    }
+
+    public static MessagingService instance()
+    {
+<span class="fc" id="L486">        return MSHandle.instance;</span>
+    }
+
+    private static class MSTestHandle
+    {
+<span class="nc" id="L491">        public static final MessagingService instance = new MessagingService(true);</span>
+    }
+
+    static MessagingService test()
+    {
+<span class="nc" id="L496">        return MSTestHandle.instance;</span>
+    }
+
+    private MessagingService(boolean testOnly)
+<span class="fc" id="L500">    {</span>
+<span class="fc bfc" id="L501" title="All 2 branches covered.">        for (Verb verb : DROPPABLE_VERBS)</span>
+<span class="fc" id="L502">            droppedMessagesMap.put(verb, new DroppedMessages(verb));</span>
+
+<span class="fc" id="L504">        listenGate = new SimpleCondition();</span>
+<span class="fc" id="L505">        verbHandlers = new EnumMap&lt;&gt;(Verb.class);</span>
+<span class="pc bpc" id="L506" title="1 of 2 branches missed.">        if (!testOnly)</span>
+        {
+<span class="fc" id="L508">            Runnable logDropped = new Runnable()</span>
+<span class="fc" id="L509">            {</span>
+                public void run()
+                {
+<span class="fc" id="L512">                    logDroppedMessages();</span>
+<span class="fc" id="L513">                }</span>
+            };
+<span class="fc" id="L515">            ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(logDropped, LOG_DROPPED_INTERVAL_IN_MS, LOG_DROPPED_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);</span>
+        }
+
+<span class="fc" id="L518">        Function&lt;Pair&lt;Integer, ExpiringMap.CacheableObject&lt;CallbackInfo&gt;&gt;, ?&gt; timeoutReporter = new Function&lt;Pair&lt;Integer, ExpiringMap.CacheableObject&lt;CallbackInfo&gt;&gt;, Object&gt;()</span>
+<span class="fc" id="L519">        {</span>
+            public Object apply(Pair&lt;Integer, ExpiringMap.CacheableObject&lt;CallbackInfo&gt;&gt; pair)
+            {
+<span class="nc" id="L522">                final CallbackInfo expiredCallbackInfo = pair.right.value;</span>
+
+<span class="nc" id="L524">                maybeAddLatency(expiredCallbackInfo.callback, expiredCallbackInfo.target, pair.right.timeout);</span>
+
+<span class="nc" id="L526">                ConnectionMetrics.totalTimeouts.mark();</span>
+<span class="nc" id="L527">                getConnectionPool(expiredCallbackInfo.target).incrementTimeout();</span>
+
+<span class="nc bnc" id="L529" title="All 2 branches missed.">                if (expiredCallbackInfo.callback.supportsBackPressure())</span>
+                {
+<span class="nc" id="L531">                    updateBackPressureOnReceive(expiredCallbackInfo.target, expiredCallbackInfo.callback, true);</span>
+                }
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if (expiredCallbackInfo.isFailureCallback())</span>
+                {
+<span class="nc" id="L536">                    StageManager.getStage(Stage.INTERNAL_RESPONSE).submit(new Runnable()</span>
+<span class="nc" id="L537">                    {</span>
+                        @Override
+                        public void run()
+                        {
+<span class="nc" id="L541">                            ((IAsyncCallbackWithFailure)expiredCallbackInfo.callback).onFailure(expiredCallbackInfo.target, RequestFailureReason.UNKNOWN);</span>
+<span class="nc" id="L542">                        }</span>
+                    });
+                }
+
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                if (expiredCallbackInfo.shouldHint())</span>
+                {
+<span class="nc" id="L548">                    Mutation mutation = ((WriteCallbackInfo) expiredCallbackInfo).mutation();</span>
+<span class="nc" id="L549">                    return StorageProxy.submitHint(mutation, expiredCallbackInfo.target, null);</span>
+                }
+
+<span class="nc" id="L552">                return null;</span>
+            }
+        };
+
+<span class="fc" id="L556">        callbacks = new ExpiringMap&lt;&gt;(DatabaseDescriptor.getMinRpcTimeout(), timeoutReporter);</span>
+
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">        if (!testOnly)</span>
+        {
+<span class="fc" id="L560">            MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);</span>
+        }
+<span class="fc" id="L562">    }</span>
+
+    public void addMessageSink(IMessageSink sink)
+    {
+<span class="nc" id="L566">        messageSinks.add(sink);</span>
+<span class="nc" id="L567">    }</span>
+
+    public void removeMessageSink(IMessageSink sink)
+    {
+<span class="nc" id="L571">        messageSinks.remove(sink);</span>
+<span class="nc" id="L572">    }</span>
+
+    public void clearMessageSinks()
+    {
+<span class="nc" id="L576">        messageSinks.clear();</span>
+<span class="nc" id="L577">    }</span>
+
+    /**
+     * Updates the back-pressure state on sending to the given host if enabled and the given message callback supports it.
+     *
+     * @param host The replica host the back-pressure state refers to.
+     * @param callback The message callback.
+     * @param message The actual message.
+     */
+    public void updateBackPressureOnSend(InetAddress host, IAsyncCallback callback, MessageOut&lt;?&gt; message)
+    {
+<span class="pc bpc" id="L588" title="3 of 4 branches missed.">        if (DatabaseDescriptor.backPressureEnabled() &amp;&amp; callback.supportsBackPressure())</span>
+        {
+<span class="nc" id="L590">            BackPressureState backPressureState = getConnectionPool(host).getBackPressureState();</span>
+<span class="nc" id="L591">            backPressureState.onMessageSent(message);</span>
+        }
+<span class="fc" id="L593">    }</span>
+
+    /**
+     * Updates the back-pressure state on reception from the given host if enabled and the given message callback supports it.
+     *
+     * @param host The replica host the back-pressure state refers to.
+     * @param callback The message callback.
+     * @param timeout True if updated following a timeout, false otherwise.
+     */
+    public void updateBackPressureOnReceive(InetAddress host, IAsyncCallback callback, boolean timeout)
+    {
+<span class="nc bnc" id="L604" title="All 4 branches missed.">        if (DatabaseDescriptor.backPressureEnabled() &amp;&amp; callback.supportsBackPressure())</span>
+        {
+<span class="nc" id="L606">            BackPressureState backPressureState = getConnectionPool(host).getBackPressureState();</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">            if (!timeout)</span>
+<span class="nc" id="L608">                backPressureState.onResponseReceived();</span>
+            else
+<span class="nc" id="L610">                backPressureState.onResponseTimeout();</span>
+        }
+<span class="nc" id="L612">    }</span>
+
+    /**
+     * Applies back-pressure for the given hosts, according to the configured strategy.
+     *
+     * If the local host is present, it is removed from the pool, as back-pressure is only applied
+     * to remote hosts.
+     *
+     * @param hosts The hosts to apply back-pressure to.
+     * @param timeoutInNanos The max back-pressure timeout.
+     */
+    public void applyBackPressure(Iterable&lt;InetAddress&gt; hosts, long timeoutInNanos)
+    {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if (DatabaseDescriptor.backPressureEnabled())</span>
+        {
+<span class="nc" id="L627">            backPressure.apply(StreamSupport.stream(hosts.spliterator(), false)</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">                    .filter(h -&gt; !h.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc" id="L629">                    .map(h -&gt; getConnectionPool(h).getBackPressureState())</span>
+<span class="nc" id="L630">                    .collect(Collectors.toSet()), timeoutInNanos, TimeUnit.NANOSECONDS);</span>
+        }
+<span class="nc" id="L632">    }</span>
+
+    /**
+     * Track latency information for the dynamic snitch
+     *
+     * @param cb      the callback associated with this message -- this lets us know if it's a message type we're interested in
+     * @param address the host that replied to the message
+     * @param latency
+     */
+    public void maybeAddLatency(IAsyncCallback cb, InetAddress address, long latency)
+    {
+<span class="fc bfc" id="L643" title="All 2 branches covered.">        if (cb.isLatencyForSnitch())</span>
+<span class="fc" id="L644">            addLatency(address, latency);</span>
+<span class="fc" id="L645">    }</span>
+
+    public void addLatency(InetAddress address, long latency)
+    {
+<span class="fc bfc" id="L649" title="All 2 branches covered.">        for (ILatencySubscriber subscriber : subscribers)</span>
+<span class="fc" id="L650">            subscriber.receiveTiming(address, latency);</span>
+<span class="fc" id="L651">    }</span>
+
+    /**
+     * called from gossiper when it notices a node is not responding.
+     */
+    public void convict(InetAddress ep)
+    {
+<span class="fc" id="L658">        logger.trace(&quot;Resetting pool for {}&quot;, ep);</span>
+<span class="fc" id="L659">        getConnectionPool(ep).reset();</span>
+<span class="fc" id="L660">    }</span>
+
+    public void listen()
+    {
+<span class="fc" id="L664">        callbacks.reset(); // hack to allow tests to stop/restart MS</span>
+<span class="fc" id="L665">        listen(FBUtilities.getLocalAddress());</span>
+<span class="pc bpc" id="L666" title="1 of 2 branches missed.">        if (DatabaseDescriptor.shouldListenOnBroadcastAddress()</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">            &amp;&amp; !FBUtilities.getLocalAddress().equals(FBUtilities.getBroadcastAddress()))</span>
+        {
+<span class="nc" id="L669">            listen(FBUtilities.getBroadcastAddress());</span>
+        }
+<span class="fc" id="L671">        listenGate.signalAll();</span>
+<span class="fc" id="L672">    }</span>
+
+    /**
+     * Listen on the specified port.
+     *
+     * @param localEp InetAddress whose port to listen on.
+     */
+    private void listen(InetAddress localEp) throws ConfigurationException
+    {
+<span class="fc bfc" id="L681" title="All 2 branches covered.">        for (ServerSocket ss : getServerSockets(localEp))</span>
+        {
+<span class="fc" id="L683">            SocketThread th = new SocketThread(ss, &quot;ACCEPT-&quot; + localEp);</span>
+<span class="fc" id="L684">            th.start();</span>
+<span class="fc" id="L685">            socketThreads.add(th);</span>
+<span class="fc" id="L686">        }</span>
+<span class="fc" id="L687">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private List&lt;ServerSocket&gt; getServerSockets(InetAddress localEp) throws ConfigurationException
+    {
+<span class="fc" id="L692">        final List&lt;ServerSocket&gt; ss = new ArrayList&lt;ServerSocket&gt;(2);</span>
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">        if (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption != ServerEncryptionOptions.InternodeEncryption.none)</span>
+        {
+            try
+            {
+<span class="nc" id="L697">                ss.add(SSLFactory.getServerSocket(DatabaseDescriptor.getServerEncryptionOptions(), localEp, DatabaseDescriptor.getSSLStoragePort()));</span>
+            }
+<span class="nc" id="L699">            catch (IOException e)</span>
+            {
+<span class="nc" id="L701">                throw new ConfigurationException(&quot;Unable to create ssl socket&quot;, e);</span>
+<span class="nc" id="L702">            }</span>
+            // setReuseAddress happens in the factory.
+<span class="nc" id="L704">            logger.info(&quot;Starting Encrypted Messaging Service on SSL port {}&quot;, DatabaseDescriptor.getSSLStoragePort());</span>
+        }
+
+<span class="pc bpc" id="L707" title="1 of 2 branches missed.">        if (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption != ServerEncryptionOptions.InternodeEncryption.all)</span>
+        {
+<span class="fc" id="L709">            ServerSocketChannel serverChannel = null;</span>
+            try
+            {
+<span class="fc" id="L712">                serverChannel = ServerSocketChannel.open();</span>
+            }
+<span class="nc" id="L714">            catch (IOException e)</span>
+            {
+<span class="nc" id="L716">                throw new RuntimeException(e);</span>
+<span class="fc" id="L717">            }</span>
+<span class="fc" id="L718">            ServerSocket socket = serverChannel.socket();</span>
+            try
+            {
+<span class="fc" id="L721">                socket.setReuseAddress(true);</span>
+            }
+<span class="nc" id="L723">            catch (SocketException e)</span>
+            {
+<span class="nc" id="L725">                FileUtils.closeQuietly(socket);</span>
+<span class="nc" id="L726">                throw new ConfigurationException(&quot;Insufficient permissions to setReuseAddress&quot;, e);</span>
+<span class="fc" id="L727">            }</span>
+<span class="fc" id="L728">            InetSocketAddress address = new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort());</span>
+            try
+            {
+<span class="fc" id="L731">                socket.bind(address,500);</span>
+            }
+<span class="nc" id="L733">            catch (BindException e)</span>
+            {
+<span class="nc" id="L735">                FileUtils.closeQuietly(socket);</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">                if (e.getMessage().contains(&quot;in use&quot;))</span>
+<span class="nc" id="L737">                    throw new ConfigurationException(address + &quot; is in use by another process.  Change listen_address:storage_port in cassandra.yaml to values that do not conflict with other services&quot;);</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">                else if (e.getMessage().contains(&quot;Cannot assign requested address&quot;))</span>
+<span class="nc" id="L739">                    throw new ConfigurationException(&quot;Unable to bind to address &quot; + address</span>
+                                                     + &quot;. Set listen_address in cassandra.yaml to an interface you can bind to, e.g., your private IP address on EC2&quot;);
+                else
+<span class="nc" id="L742">                    throw new RuntimeException(e);</span>
+            }
+<span class="nc" id="L744">            catch (IOException e)</span>
+            {
+<span class="nc" id="L746">                FileUtils.closeQuietly(socket);</span>
+<span class="nc" id="L747">                throw new RuntimeException(e);</span>
+<span class="fc" id="L748">            }</span>
+<span class="fc" id="L749">            String nic = FBUtilities.getNetworkInterface(localEp);</span>
+<span class="fc bfc" id="L750" title="All 2 branches covered.">            logger.info(&quot;Starting Messaging Service on {}:{}{}&quot;, localEp, DatabaseDescriptor.getStoragePort(),</span>
+<span class="fc" id="L751">                        nic == null? &quot;&quot; : String.format(&quot; (%s)&quot;, nic));</span>
+<span class="fc" id="L752">            ss.add(socket);</span>
+        }
+<span class="fc" id="L754">        return ss;</span>
+    }
+
+    public void waitUntilListening()
+    {
+        try
+        {
+<span class="fc" id="L761">            listenGate.await();</span>
+        }
+<span class="nc" id="L763">        catch (InterruptedException ie)</span>
+        {
+<span class="nc" id="L765">            logger.trace(&quot;await interrupted&quot;);</span>
+<span class="fc" id="L766">        }</span>
+<span class="fc" id="L767">    }</span>
+
+    public boolean isListening()
+    {
+<span class="fc" id="L771">        return listenGate.isSignaled();</span>
+    }
+
+    public void destroyConnectionPool(InetAddress to)
+    {
+<span class="nc" id="L776">        OutboundTcpConnectionPool cp = connectionManagers.get(to);</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">        if (cp == null)</span>
+<span class="nc" id="L778">            return;</span>
+<span class="nc" id="L779">        cp.close();</span>
+<span class="nc" id="L780">        connectionManagers.remove(to);</span>
+<span class="nc" id="L781">    }</span>
+
+    public OutboundTcpConnectionPool getConnectionPool(InetAddress to)
+    {
+<span class="fc" id="L785">        OutboundTcpConnectionPool cp = connectionManagers.get(to);</span>
+<span class="fc bfc" id="L786" title="All 2 branches covered.">        if (cp == null)</span>
+        {
+<span class="fc" id="L788">            cp = new OutboundTcpConnectionPool(to, backPressure.newState(to));</span>
+<span class="fc" id="L789">            OutboundTcpConnectionPool existingPool = connectionManagers.putIfAbsent(to, cp);</span>
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">            if (existingPool != null)</span>
+<span class="nc" id="L791">                cp = existingPool;</span>
+            else
+<span class="fc" id="L793">                cp.start();</span>
+        }
+<span class="fc" id="L795">        cp.waitForStarted();</span>
+<span class="fc" id="L796">        return cp;</span>
+    }
+
+
+    public OutboundTcpConnection getConnection(InetAddress to, MessageOut msg)
+    {
+<span class="fc" id="L802">        return getConnectionPool(to).getConnection(msg);</span>
+    }
+
+    /**
+     * Register a verb and the corresponding verb handler with the
+     * Messaging Service.
+     *
+     * @param verb
+     * @param verbHandler handler for the specified verb
+     */
+    public void registerVerbHandlers(Verb verb, IVerbHandler verbHandler)
+    {
+<span class="pc bpc" id="L814" title="2 of 4 branches missed.">        assert !verbHandlers.containsKey(verb);</span>
+<span class="fc" id="L815">        verbHandlers.put(verb, verbHandler);</span>
+<span class="fc" id="L816">    }</span>
+
+    /**
+     * This method returns the verb handler associated with the registered
+     * verb. If no handler has been registered then null is returned.
+     *
+     * @param type for which the verb handler is sought
+     * @return a reference to IVerbHandler which is the handler for the specified verb
+     */
+    public IVerbHandler getVerbHandler(Verb type)
+    {
+<span class="fc" id="L827">        return verbHandlers.get(type);</span>
+    }
+
+    public int addCallback(IAsyncCallback cb, MessageOut message, InetAddress to, long timeout, boolean failureCallback)
+    {
+<span class="pc bpc" id="L832" title="2 of 4 branches missed.">        assert message.verb != Verb.MUTATION; // mutations need to call the overload with a ConsistencyLevel</span>
+<span class="fc" id="L833">        int messageId = nextId();</span>
+<span class="fc" id="L834">        CallbackInfo previous = callbacks.put(messageId, new CallbackInfo(to, cb, callbackDeserializers.get(message.verb), failureCallback), timeout);</span>
+<span class="pc bpc" id="L835" title="2 of 4 branches missed.">        assert previous == null : String.format(&quot;Callback already exists for id %d! (%s)&quot;, messageId, previous);</span>
+<span class="fc" id="L836">        return messageId;</span>
+    }
+
+    public int addCallback(IAsyncCallback cb,
+                           MessageOut&lt;?&gt; message,
+                           InetAddress to,
+                           long timeout,
+                           ConsistencyLevel consistencyLevel,
+                           boolean allowHints)
+    {
+<span class="nc bnc" id="L846" title="All 8 branches missed.">        assert message.verb == Verb.MUTATION</span>
+            || message.verb == Verb.COUNTER_MUTATION
+            || message.verb == Verb.PAXOS_COMMIT;
+<span class="nc" id="L849">        int messageId = nextId();</span>
+
+<span class="nc" id="L851">        CallbackInfo previous = callbacks.put(messageId,</span>
+                                              new WriteCallbackInfo(to,
+                                                                    cb,
+                                                                    message,
+<span class="nc" id="L855">                                                                    callbackDeserializers.get(message.verb),</span>
+                                                                    consistencyLevel,
+                                                                    allowHints),
+                                                                    timeout);
+<span class="nc bnc" id="L859" title="All 4 branches missed.">        assert previous == null : String.format(&quot;Callback already exists for id %d! (%s)&quot;, messageId, previous);</span>
+<span class="nc" id="L860">        return messageId;</span>
+    }
+
+<span class="fc" id="L863">    private static final AtomicInteger idGen = new AtomicInteger(0);</span>
+
+    private static int nextId()
+    {
+<span class="fc" id="L867">        return idGen.incrementAndGet();</span>
+    }
+
+    public int sendRR(MessageOut message, InetAddress to, IAsyncCallback cb)
+    {
+<span class="fc" id="L872">        return sendRR(message, to, cb, message.getTimeout(), false);</span>
+    }
+
+    public int sendRRWithFailure(MessageOut message, InetAddress to, IAsyncCallbackWithFailure cb)
+    {
+<span class="fc" id="L877">        return sendRR(message, to, cb, message.getTimeout(), true);</span>
+    }
+
+    /**
+     * Send a non-mutation message to a given endpoint. This method specifies a callback
+     * which is invoked with the actual response.
+     *
+     * @param message message to be sent.
+     * @param to      endpoint to which the message needs to be sent
+     * @param cb      callback interface which is used to pass the responses or
+     *                suggest that a timeout occurred to the invoker of the send().
+     * @param timeout the timeout used for expiration
+     * @return an reference to message id used to match with the result
+     */
+    public int sendRR(MessageOut message, InetAddress to, IAsyncCallback cb, long timeout, boolean failureCallback)
+    {
+<span class="fc" id="L893">        int id = addCallback(cb, message, to, timeout, failureCallback);</span>
+<span class="fc" id="L894">        updateBackPressureOnSend(to, cb, message);</span>
+<span class="fc bfc" id="L895" title="All 2 branches covered.">        sendOneWay(failureCallback ? message.withParameter(FAILURE_CALLBACK_PARAM, ONE_BYTE) : message, id, to);</span>
+<span class="fc" id="L896">        return id;</span>
+    }
+
+    /**
+     * Send a mutation message or a Paxos Commit to a given endpoint. This method specifies a callback
+     * which is invoked with the actual response.
+     * Also holds the message (only mutation messages) to determine if it
+     * needs to trigger a hint (uses StorageProxy for that).
+     *
+     * @param message message to be sent.
+     * @param to      endpoint to which the message needs to be sent
+     * @param handler callback interface which is used to pass the responses or
+     *                suggest that a timeout occurred to the invoker of the send().
+     * @return an reference to message id used to match with the result
+     */
+    public int sendRR(MessageOut&lt;?&gt; message,
+                      InetAddress to,
+                      AbstractWriteResponseHandler&lt;?&gt; handler,
+                      boolean allowHints)
+    {
+<span class="nc" id="L916">        int id = addCallback(handler, message, to, message.getTimeout(), handler.consistencyLevel, allowHints);</span>
+<span class="nc" id="L917">        updateBackPressureOnSend(to, handler, message);</span>
+<span class="nc" id="L918">        sendOneWay(message.withParameter(FAILURE_CALLBACK_PARAM, ONE_BYTE), id, to);</span>
+<span class="nc" id="L919">        return id;</span>
+    }
+
+    public void sendOneWay(MessageOut message, InetAddress to)
+    {
+<span class="fc" id="L924">        sendOneWay(message, nextId(), to);</span>
+<span class="fc" id="L925">    }</span>
+
+    public void sendReply(MessageOut message, int id, InetAddress to)
+    {
+<span class="fc" id="L929">        sendOneWay(message, id, to);</span>
+<span class="fc" id="L930">    }</span>
+
+    /**
+     * Send a message to a given endpoint. This method adheres to the fire and forget
+     * style messaging.
+     *
+     * @param message messages to be sent.
+     * @param to      endpoint to which the message needs to be sent
+     */
+    public void sendOneWay(MessageOut message, int id, InetAddress to)
+    {
+<span class="pc bpc" id="L941" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L942">            logger.trace(&quot;{} sending {} to {}@{}&quot;, FBUtilities.getBroadcastAddress(), message.verb, id, to);</span>
+
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">        if (to.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc" id="L945">            logger.trace(&quot;Message-to-self {} going over MessagingService&quot;, message);</span>
+
+        // message sinks are a testing hook
+<span class="pc bpc" id="L948" title="1 of 2 branches missed.">        for (IMessageSink ms : messageSinks)</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">            if (!ms.allowOutgoingMessage(message, id, to))</span>
+<span class="nc" id="L950">                return;</span>
+
+        // get pooled connection (really, connection queue)
+<span class="fc" id="L953">        OutboundTcpConnection connection = getConnection(to, message);</span>
+
+        // write it
+<span class="fc" id="L956">        connection.enqueue(message, id);</span>
+<span class="fc" id="L957">    }</span>
+
+    public &lt;T&gt; AsyncOneResponse&lt;T&gt; sendRR(MessageOut message, InetAddress to)
+    {
+<span class="nc" id="L961">        AsyncOneResponse&lt;T&gt; iar = new AsyncOneResponse&lt;T&gt;();</span>
+<span class="nc" id="L962">        sendRR(message, to, iar);</span>
+<span class="nc" id="L963">        return iar;</span>
+    }
+
+    public void register(ILatencySubscriber subcriber)
+    {
+<span class="fc" id="L968">        subscribers.add(subcriber);</span>
+<span class="fc" id="L969">    }</span>
+
+    public void clearCallbacksUnsafe()
+    {
+<span class="nc" id="L973">        callbacks.reset();</span>
+<span class="nc" id="L974">    }</span>
+
+    /**
+     * Wait for callbacks and don't allow any more to be created (since they could require writing hints)
+     */
+    public void shutdown()
+    {
+<span class="nc" id="L981">        shutdown(true);</span>
+<span class="nc" id="L982">    }</span>
+    public void shutdown(boolean gracefully)
+    {
+<span class="nc" id="L985">        logger.info(&quot;Waiting for messaging service to quiesce&quot;);</span>
+        // We may need to schedule hints on the mutation stage, so it's erroneous to shut down the mutation stage first
+<span class="nc bnc" id="L987" title="All 4 branches missed.">        assert !StageManager.getStage(Stage.MUTATION).isShutdown();</span>
+
+        // the important part
+<span class="nc bnc" id="L990" title="All 2 branches missed.">        if (!gracefully)</span>
+<span class="nc" id="L991">            callbacks.reset();</span>
+
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        if (!callbacks.shutdownBlocking())</span>
+<span class="nc" id="L994">            logger.warn(&quot;Failed to wait for messaging service callbacks shutdown&quot;);</span>
+
+        // attempt to humor tests that try to stop and restart MS
+        try
+        {
+<span class="nc" id="L999">            clearMessageSinks();</span>
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">            for (SocketThread th : socketThreads)</span>
+            {
+                try
+                {
+<span class="nc" id="L1004">                    th.close();</span>
+                }
+<span class="nc" id="L1006">                catch (IOException e)</span>
+                {
+                    // see https://issues.apache.org/jira/browse/CASSANDRA-10545
+<span class="nc" id="L1009">                    handleIOExceptionOnClose(e);</span>
+<span class="nc" id="L1010">                }</span>
+<span class="nc" id="L1011">            }</span>
+<span class="nc" id="L1012">            connectionManagers.values().forEach(OutboundTcpConnectionPool::close);</span>
+        }
+<span class="nc" id="L1014">        catch (IOException e)</span>
+        {
+<span class="nc" id="L1016">            throw new IOError(e);</span>
+<span class="nc" id="L1017">        }</span>
+<span class="nc" id="L1018">    }</span>
+
+    public void receive(MessageIn message, int id)
+    {
+<span class="fc" id="L1022">        TraceState state = Tracing.instance.initializeFromMessage(message);</span>
+<span class="pc bpc" id="L1023" title="1 of 2 branches missed.">        if (state != null)</span>
+<span class="nc" id="L1024">            state.trace(&quot;{} message received from {}&quot;, message.verb, message.from);</span>
+
+        // message sinks are a testing hook
+<span class="pc bpc" id="L1027" title="1 of 2 branches missed.">        for (IMessageSink ms : messageSinks)</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">            if (!ms.allowIncomingMessage(message, id))</span>
+<span class="nc" id="L1029">                return;</span>
+
+<span class="fc" id="L1031">        Runnable runnable = new MessageDeliveryTask(message, id);</span>
+<span class="fc" id="L1032">        LocalAwareExecutorService stage = StageManager.getStage(message.getMessageType());</span>
+<span class="pc bpc" id="L1033" title="2 of 4 branches missed.">        assert stage != null : &quot;No stage for message type &quot; + message.verb;</span>
+
+<span class="fc" id="L1035">        stage.execute(runnable, ExecutorLocals.create(state));</span>
+<span class="fc" id="L1036">    }</span>
+
+    public void setCallbackForTests(int messageId, CallbackInfo callback)
+    {
+<span class="nc" id="L1040">        callbacks.put(messageId, callback);</span>
+<span class="nc" id="L1041">    }</span>
+
+    public CallbackInfo getRegisteredCallback(int messageId)
+    {
+<span class="fc" id="L1045">        return callbacks.get(messageId);</span>
+    }
+
+    public CallbackInfo removeRegisteredCallback(int messageId)
+    {
+<span class="fc" id="L1050">        return callbacks.remove(messageId);</span>
+    }
+
+    /**
+     * @return System.nanoTime() when callback was created.
+     */
+    public long getRegisteredCallbackAge(int messageId)
+    {
+<span class="fc" id="L1058">        return callbacks.getAge(messageId);</span>
+    }
+
+    public static void validateMagic(int magic) throws IOException
+    {
+<span class="pc bpc" id="L1063" title="1 of 2 branches missed.">        if (magic != PROTOCOL_MAGIC)</span>
+<span class="nc" id="L1064">            throw new IOException(&quot;invalid protocol header&quot;);</span>
+<span class="fc" id="L1065">    }</span>
+
+    public static int getBits(int packed, int start, int count)
+    {
+<span class="fc" id="L1069">        return packed &gt;&gt;&gt; (start + 1) - count &amp; ~(-1 &lt;&lt; count);</span>
+    }
+
+    public boolean areAllNodesAtLeast22()
+    {
+<span class="fc" id="L1074">        return allNodesAtLeast22;</span>
+    }
+
+    public boolean areAllNodesAtLeast30()
+    {
+<span class="nc" id="L1079">        return allNodesAtLeast30;</span>
+    }
+
+    /**
+     * @return the last version associated with address, or @param version if this is the first such version
+     */
+    public int setVersion(InetAddress endpoint, int version)
+    {
+<span class="fc" id="L1087">        logger.trace(&quot;Setting version {} for {}&quot;, version, endpoint);</span>
+
+<span class="pc bpc" id="L1089" title="1 of 2 branches missed.">        if (version &lt; VERSION_22)</span>
+<span class="nc" id="L1090">            allNodesAtLeast22 = false;</span>
+<span class="pc bpc" id="L1091" title="1 of 2 branches missed.">        if (version &lt; VERSION_30)</span>
+<span class="nc" id="L1092">            allNodesAtLeast30 = false;</span>
+
+<span class="fc" id="L1094">        Integer v = versions.put(endpoint, version);</span>
+
+        // if the version was increased to 2.2 or later see if the min version across the cluster has changed
+<span class="pc bpc" id="L1097" title="3 of 6 branches missed.">        if (v != null &amp;&amp; (v &lt; VERSION_30 &amp;&amp; version &gt;= VERSION_22))</span>
+<span class="nc" id="L1098">            refreshAllNodeMinVersions();</span>
+
+<span class="fc bfc" id="L1100" title="All 2 branches covered.">        return v == null ? version : v;</span>
+    }
+
+    public void resetVersion(InetAddress endpoint)
+    {
+<span class="nc" id="L1105">        logger.trace(&quot;Resetting version for {}&quot;, endpoint);</span>
+<span class="nc" id="L1106">        Integer removed = versions.remove(endpoint);</span>
+<span class="nc bnc" id="L1107" title="All 4 branches missed.">        if (removed != null &amp;&amp; Math.min(removed, current_version) &lt;= VERSION_30)</span>
+<span class="nc" id="L1108">            refreshAllNodeMinVersions();</span>
+<span class="nc" id="L1109">    }</span>
+
+    private void refreshAllNodeMinVersions()
+    {
+<span class="nc" id="L1113">        boolean anyNodeLowerThan30 = false;</span>
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">        for (Integer version : versions.values())</span>
+        {
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_30)</span>
+            {
+<span class="nc" id="L1118">                anyNodeLowerThan30 = true;</span>
+<span class="nc" id="L1119">                allNodesAtLeast30 = false;</span>
+            }
+
+<span class="nc bnc" id="L1122" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_22)</span>
+            {
+<span class="nc" id="L1124">                allNodesAtLeast22 = false;</span>
+<span class="nc" id="L1125">                return;</span>
+            }
+<span class="nc" id="L1127">        }</span>
+<span class="nc" id="L1128">        allNodesAtLeast22 = true;</span>
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">        allNodesAtLeast30 = !anyNodeLowerThan30;</span>
+<span class="nc" id="L1130">    }</span>
+
+    /**
+     * Returns the messaging-version as announced by the given node but capped
+     * to the min of the version as announced by the node and {@link #current_version}.
+     */
+    public int getVersion(InetAddress endpoint)
+    {
+<span class="fc" id="L1138">        Integer v = versions.get(endpoint);</span>
+<span class="fc bfc" id="L1139" title="All 2 branches covered.">        if (v == null)</span>
+        {
+            // we don't know the version. assume current. we'll know soon enough if that was incorrect.
+<span class="fc" id="L1142">            logger.trace(&quot;Assuming current protocol version for {}&quot;, endpoint);</span>
+<span class="fc" id="L1143">            return MessagingService.current_version;</span>
+        }
+        else
+<span class="fc" id="L1146">            return Math.min(v, MessagingService.current_version);</span>
+    }
+
+    public int getVersion(String endpoint) throws UnknownHostException
+    {
+<span class="nc" id="L1151">        return getVersion(InetAddress.getByName(endpoint));</span>
+    }
+
+    /**
+     * Returns the messaging-version exactly as announced by the given endpoint.
+     */
+    public int getRawVersion(InetAddress endpoint)
+    {
+<span class="nc" id="L1159">        Integer v = versions.get(endpoint);</span>
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">        if (v == null)</span>
+<span class="nc" id="L1161">            throw new IllegalStateException(&quot;getRawVersion() was called without checking knowsVersion() result first&quot;);</span>
+<span class="nc" id="L1162">        return v;</span>
+    }
+
+    public boolean knowsVersion(InetAddress endpoint)
+    {
+<span class="nc" id="L1167">        return versions.containsKey(endpoint);</span>
+    }
+
+    public void incrementDroppedMutations(Optional&lt;IMutation&gt; mutationOpt, long timeTaken)
+    {
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">        if (mutationOpt.isPresent())</span>
+        {
+<span class="nc" id="L1174">            updateDroppedMutationCount(mutationOpt.get());</span>
+        }
+<span class="nc" id="L1176">        incrementDroppedMessages(Verb.MUTATION, timeTaken);</span>
+<span class="nc" id="L1177">    }</span>
+
+    public void incrementDroppedMessages(Verb verb)
+    {
+<span class="nc" id="L1181">        incrementDroppedMessages(verb, false);</span>
+<span class="nc" id="L1182">    }</span>
+
+    public void incrementDroppedMessages(Verb verb, long timeTaken)
+    {
+<span class="nc" id="L1186">        incrementDroppedMessages(verb, timeTaken, false);</span>
+<span class="nc" id="L1187">    }</span>
+
+    public void incrementDroppedMessages(MessageIn message, long timeTaken)
+    {
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">        if (message.payload instanceof IMutation)</span>
+        {
+<span class="nc" id="L1193">            updateDroppedMutationCount((IMutation) message.payload);</span>
+        }
+<span class="nc" id="L1195">        incrementDroppedMessages(message.verb, timeTaken, message.isCrossNode());</span>
+<span class="nc" id="L1196">    }</span>
+
+    public void incrementDroppedMessages(Verb verb, long timeTaken, boolean isCrossNode)
+    {
+<span class="nc bnc" id="L1200" title="All 4 branches missed.">        assert DROPPABLE_VERBS.contains(verb) : &quot;Verb &quot; + verb + &quot; should not legally be dropped&quot;;</span>
+<span class="nc" id="L1201">        incrementDroppedMessages(droppedMessagesMap.get(verb), timeTaken, isCrossNode);</span>
+<span class="nc" id="L1202">    }</span>
+
+    public void incrementDroppedMessages(Verb verb, boolean isCrossNode)
+    {
+<span class="nc bnc" id="L1206" title="All 4 branches missed.">        assert DROPPABLE_VERBS.contains(verb) : &quot;Verb &quot; + verb + &quot; should not legally be dropped&quot;;</span>
+<span class="nc" id="L1207">        incrementDroppedMessages(droppedMessagesMap.get(verb), isCrossNode);</span>
+<span class="nc" id="L1208">    }</span>
+
+    private void updateDroppedMutationCount(IMutation mutation)
+    {
+<span class="nc bnc" id="L1212" title="All 4 branches missed.">        assert mutation != null : &quot;Mutation should not be null when updating dropped mutations count&quot;;</span>
+
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">        for (UUID columnFamilyId : mutation.getColumnFamilyIds())</span>
+        {
+<span class="nc" id="L1216">            ColumnFamilyStore cfs = Keyspace.open(mutation.getKeyspaceName()).getColumnFamilyStore(columnFamilyId);</span>
+<span class="nc bnc" id="L1217" title="All 2 branches missed.">            if (cfs != null)</span>
+            {
+<span class="nc" id="L1219">                cfs.metric.droppedMutations.inc();</span>
+            }
+<span class="nc" id="L1221">        }</span>
+<span class="nc" id="L1222">    }</span>
+
+    private void incrementDroppedMessages(DroppedMessages droppedMessages, long timeTaken, boolean isCrossNode)
+    {
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">        if (isCrossNode)</span>
+<span class="nc" id="L1227">            droppedMessages.metrics.crossNodeDroppedLatency.update(timeTaken, TimeUnit.MILLISECONDS);</span>
+        else
+<span class="nc" id="L1229">            droppedMessages.metrics.internalDroppedLatency.update(timeTaken, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1230">        incrementDroppedMessages(droppedMessages, isCrossNode);</span>
+<span class="nc" id="L1231">    }</span>
+
+    private void incrementDroppedMessages(DroppedMessages droppedMessages, boolean isCrossNode)
+    {
+<span class="nc" id="L1235">        droppedMessages.metrics.dropped.mark();</span>
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">        if (isCrossNode)</span>
+<span class="nc" id="L1237">            droppedMessages.droppedCrossNode.incrementAndGet();</span>
+        else
+<span class="nc" id="L1239">            droppedMessages.droppedInternal.incrementAndGet();</span>
+<span class="nc" id="L1240">    }</span>
+
+    private void logDroppedMessages()
+    {
+<span class="fc" id="L1244">        List&lt;String&gt; logs = getDroppedMessagesLogs();</span>
+<span class="pc bpc" id="L1245" title="1 of 2 branches missed.">        for (String log : logs)</span>
+<span class="nc" id="L1246">            logger.info(log);</span>
+
+<span class="pc bpc" id="L1248" title="1 of 2 branches missed.">        if (logs.size() &gt; 0)</span>
+<span class="nc" id="L1249">            StatusLogger.log();</span>
+<span class="fc" id="L1250">    }</span>
+
+    @VisibleForTesting
+    List&lt;String&gt; getDroppedMessagesLogs()
+    {
+<span class="fc" id="L1255">        List&lt;String&gt; ret = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1256" title="All 2 branches covered.">        for (Map.Entry&lt;Verb, DroppedMessages&gt; entry : droppedMessagesMap.entrySet())</span>
+        {
+<span class="fc" id="L1258">            Verb verb = entry.getKey();</span>
+<span class="fc" id="L1259">            DroppedMessages droppedMessages = entry.getValue();</span>
+
+<span class="fc" id="L1261">            int droppedInternal = droppedMessages.droppedInternal.getAndSet(0);</span>
+<span class="fc" id="L1262">            int droppedCrossNode = droppedMessages.droppedCrossNode.getAndSet(0);</span>
+<span class="pc bpc" id="L1263" title="2 of 4 branches missed.">            if (droppedInternal &gt; 0 || droppedCrossNode &gt; 0)</span>
+            {
+<span class="nc" id="L1265">                ret.add(String.format(&quot;%s messages were dropped in last %d ms: %d internal and %d cross node.&quot;</span>
+                                     + &quot; Mean internal dropped latency: %d ms and Mean cross-node dropped latency: %d ms&quot;,
+                                     verb,
+<span class="nc" id="L1268">                                     LOG_DROPPED_INTERVAL_IN_MS,</span>
+<span class="nc" id="L1269">                                     droppedInternal,</span>
+<span class="nc" id="L1270">                                     droppedCrossNode,</span>
+<span class="nc" id="L1271">                                     TimeUnit.NANOSECONDS.toMillis((long)droppedMessages.metrics.internalDroppedLatency.getSnapshot().getMean()),</span>
+<span class="nc" id="L1272">                                     TimeUnit.NANOSECONDS.toMillis((long)droppedMessages.metrics.crossNodeDroppedLatency.getSnapshot().getMean())));</span>
+            }
+<span class="fc" id="L1274">        }</span>
+<span class="fc" id="L1275">        return ret;</span>
+    }
+
+    @VisibleForTesting
+    public static class SocketThread extends Thread
+    {
+        private final ServerSocket server;
+<span class="fc" id="L1282">        @VisibleForTesting</span>
+<span class="fc" id="L1283">        public final Set&lt;Closeable&gt; connections = Sets.newConcurrentHashSet();</span>
+
+        SocketThread(ServerSocket server, String name)
+        {
+<span class="fc" id="L1287">            super(name);</span>
+<span class="fc" id="L1288">            this.server = server;</span>
+<span class="fc" id="L1289">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public void run()
+        {
+<span class="pc bpc" id="L1294" title="1 of 2 branches missed.">            while (!server.isClosed())</span>
+            {
+<span class="fc" id="L1296">                Socket socket = null;</span>
+                try
+                {
+<span class="fc" id="L1299">                    socket = server.accept();</span>
+<span class="pc bpc" id="L1300" title="1 of 2 branches missed.">                    if (!authenticate(socket))</span>
+                    {
+<span class="nc" id="L1302">                        logger.trace(&quot;remote failed to authenticate&quot;);</span>
+<span class="nc" id="L1303">                        socket.close();</span>
+<span class="nc" id="L1304">                        continue;</span>
+                    }
+
+<span class="fc" id="L1307">                    socket.setKeepAlive(true);</span>
+<span class="fc" id="L1308">                    socket.setSoTimeout(2 * OutboundTcpConnection.WAIT_FOR_VERSION_MAX_TIME);</span>
+                    // determine the connection type to decide whether to buffer
+<span class="fc" id="L1310">                    DataInputStream in = new DataInputStream(socket.getInputStream());</span>
+<span class="fc" id="L1311">                    MessagingService.validateMagic(in.readInt());</span>
+<span class="fc" id="L1312">                    int header = in.readInt();</span>
+<span class="pc bpc" id="L1313" title="1 of 2 branches missed.">                    boolean isStream = MessagingService.getBits(header, 3, 1) == 1;</span>
+<span class="fc" id="L1314">                    int version = MessagingService.getBits(header, 15, 8);</span>
+<span class="fc" id="L1315">                    logger.trace(&quot;Connection version {} from {}&quot;, version, socket.getInetAddress());</span>
+<span class="fc" id="L1316">                    socket.setSoTimeout(0);</span>
+
+<span class="pc bpc" id="L1318" title="1 of 2 branches missed.">                    Thread thread = isStream</span>
+                                  ? new IncomingStreamingConnection(version, socket, connections)
+<span class="pc bpc" id="L1320" title="1 of 2 branches missed.">                                  : new IncomingTcpConnection(version, MessagingService.getBits(header, 2, 1) == 1, socket, connections);</span>
+<span class="fc" id="L1321">                    thread.start();</span>
+<span class="fc" id="L1322">                    connections.add((Closeable) thread);</span>
+                }
+<span class="nc" id="L1324">                catch (AsynchronousCloseException e)</span>
+                {
+                    // this happens when another thread calls close().
+<span class="nc" id="L1327">                    logger.trace(&quot;Asynchronous close seen by server thread&quot;);</span>
+<span class="nc" id="L1328">                    break;</span>
+                }
+<span class="nc" id="L1330">                catch (ClosedChannelException e)</span>
+                {
+<span class="nc" id="L1332">                    logger.trace(&quot;MessagingService server thread already closed&quot;);</span>
+<span class="nc" id="L1333">                    break;</span>
+                }
+<span class="nc" id="L1335">                catch (SSLHandshakeException e)</span>
+                {
+<span class="nc" id="L1337">                    logger.error(&quot;SSL handshake error for inbound connection from &quot; + socket, e);</span>
+<span class="nc" id="L1338">                    FileUtils.closeQuietly(socket);</span>
+                }
+<span class="nc" id="L1340">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L1342">                    logger.trace(&quot;Error reading the socket {}&quot;, socket, t);</span>
+<span class="nc" id="L1343">                    FileUtils.closeQuietly(socket);</span>
+<span class="pc" id="L1344">                }</span>
+<span class="fc" id="L1345">            }</span>
+<span class="nc" id="L1346">            logger.info(&quot;MessagingService has terminated the accept() thread&quot;);</span>
+<span class="nc" id="L1347">        }</span>
+
+        void close() throws IOException
+        {
+<span class="nc" id="L1351">            logger.trace(&quot;Closing accept() thread&quot;);</span>
+
+            try
+            {
+<span class="nc" id="L1355">                server.close();</span>
+            }
+<span class="nc" id="L1357">            catch (IOException e)</span>
+            {
+                // see https://issues.apache.org/jira/browse/CASSANDRA-8220
+                // see https://issues.apache.org/jira/browse/CASSANDRA-12513
+<span class="nc" id="L1361">                handleIOExceptionOnClose(e);</span>
+<span class="nc" id="L1362">            }</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">            for (Closeable connection : connections)</span>
+            {
+<span class="nc" id="L1365">                connection.close();</span>
+<span class="nc" id="L1366">            }</span>
+<span class="nc" id="L1367">        }</span>
+
+        private boolean authenticate(Socket socket)
+        {
+<span class="fc" id="L1371">            return DatabaseDescriptor.getInternodeAuthenticator().authenticate(socket.getInetAddress(), socket.getPort());</span>
+        }
+    }
+
+    private static void handleIOExceptionOnClose(IOException e) throws IOException
+    {
+        // dirty hack for clean shutdown on OSX w/ Java &gt;= 1.8.0_20
+        // see https://bugs.openjdk.java.net/browse/JDK-8050499;
+        // also CASSANDRA-12513
+<span class="nc bnc" id="L1380" title="All 2 branches missed.">        if (&quot;Mac OS X&quot;.equals(System.getProperty(&quot;os.name&quot;)))</span>
+        {
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">            switch (e.getMessage())</span>
+            {
+                case &quot;Unknown error: 316&quot;:
+                case &quot;No such file or directory&quot;:
+                case &quot;Bad file descriptor&quot;:
+                case &quot;Thread signal failed&quot;:
+<span class="nc" id="L1388">                    return;</span>
+            }
+        }
+
+<span class="nc" id="L1392">        throw e;</span>
+    }
+
+    public Map&lt;String, Integer&gt; getLargeMessagePendingTasks()
+    {
+<span class="nc" id="L1397">        Map&lt;String, Integer&gt; pendingTasks = new HashMap&lt;String, Integer&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1399">            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().largeMessages.getPendingMessages());</span>
+<span class="nc" id="L1400">        return pendingTasks;</span>
+    }
+
+    public int getLargeMessagePendingTasks(InetAddress address)
+    {
+<span class="nc" id="L1405">        OutboundTcpConnectionPool connection = connectionManagers.get(address);</span>
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">        return connection == null ? 0 : connection.largeMessages.getPendingMessages();</span>
+    }
+
+    public Map&lt;String, Long&gt; getLargeMessageCompletedTasks()
+    {
+<span class="nc" id="L1411">        Map&lt;String, Long&gt; completedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1413">            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().largeMessages.getCompletedMesssages());</span>
+<span class="nc" id="L1414">        return completedTasks;</span>
+    }
+
+    public Map&lt;String, Long&gt; getLargeMessageDroppedTasks()
+    {
+<span class="nc" id="L1419">        Map&lt;String, Long&gt; droppedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1421">            droppedTasks.put(entry.getKey().getHostAddress(), entry.getValue().largeMessages.getDroppedMessages());</span>
+<span class="nc" id="L1422">        return droppedTasks;</span>
+    }
+
+    public Map&lt;String, Integer&gt; getSmallMessagePendingTasks()
+    {
+<span class="nc" id="L1427">        Map&lt;String, Integer&gt; pendingTasks = new HashMap&lt;String, Integer&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1428" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1429">            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().smallMessages.getPendingMessages());</span>
+<span class="nc" id="L1430">        return pendingTasks;</span>
+    }
+
+    public Map&lt;String, Long&gt; getSmallMessageCompletedTasks()
+    {
+<span class="nc" id="L1435">        Map&lt;String, Long&gt; completedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1436" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1437">            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().smallMessages.getCompletedMesssages());</span>
+<span class="nc" id="L1438">        return completedTasks;</span>
+    }
+
+    public Map&lt;String, Long&gt; getSmallMessageDroppedTasks()
+    {
+<span class="nc" id="L1443">        Map&lt;String, Long&gt; droppedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1445">            droppedTasks.put(entry.getKey().getHostAddress(), entry.getValue().smallMessages.getDroppedMessages());</span>
+<span class="nc" id="L1446">        return droppedTasks;</span>
+    }
+
+    public Map&lt;String, Integer&gt; getGossipMessagePendingTasks()
+    {
+<span class="nc" id="L1451">        Map&lt;String, Integer&gt; pendingTasks = new HashMap&lt;String, Integer&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1452" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1453">            pendingTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getPendingMessages());</span>
+<span class="nc" id="L1454">        return pendingTasks;</span>
+    }
+
+    public Map&lt;String, Long&gt; getGossipMessageCompletedTasks()
+    {
+<span class="nc" id="L1459">        Map&lt;String, Long&gt; completedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1461">            completedTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getCompletedMesssages());</span>
+<span class="nc" id="L1462">        return completedTasks;</span>
+    }
+
+    public Map&lt;String, Long&gt; getGossipMessageDroppedTasks()
+    {
+<span class="nc" id="L1467">        Map&lt;String, Long&gt; droppedTasks = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1469">            droppedTasks.put(entry.getKey().getHostAddress(), entry.getValue().gossipMessages.getDroppedMessages());</span>
+<span class="nc" id="L1470">        return droppedTasks;</span>
+    }
+
+    public Map&lt;String, Integer&gt; getDroppedMessages()
+    {
+<span class="nc" id="L1475">        Map&lt;String, Integer&gt; map = new HashMap&lt;&gt;(droppedMessagesMap.size());</span>
+<span class="nc bnc" id="L1476" title="All 2 branches missed.">        for (Map.Entry&lt;Verb, DroppedMessages&gt; entry : droppedMessagesMap.entrySet())</span>
+<span class="nc" id="L1477">            map.put(entry.getKey().toString(), (int) entry.getValue().metrics.dropped.getCount());</span>
+<span class="nc" id="L1478">        return map;</span>
+    }
+
+
+    public long getTotalTimeouts()
+    {
+<span class="nc" id="L1484">        return ConnectionMetrics.totalTimeouts.getCount();</span>
+    }
+
+    public Map&lt;String, Long&gt; getTimeoutsPerHost()
+    {
+<span class="nc" id="L1489">        Map&lt;String, Long&gt; result = new HashMap&lt;String, Long&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1490" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry: connectionManagers.entrySet())</span>
+        {
+<span class="nc" id="L1492">            String ip = entry.getKey().getHostAddress();</span>
+<span class="nc" id="L1493">            long recent = entry.getValue().getTimeouts();</span>
+<span class="nc" id="L1494">            result.put(ip, recent);</span>
+<span class="nc" id="L1495">        }</span>
+<span class="nc" id="L1496">        return result;</span>
+    }
+
+    public Map&lt;String, Double&gt; getBackPressurePerHost()
+    {
+<span class="nc" id="L1501">        Map&lt;String, Double&gt; map = new HashMap&lt;&gt;(connectionManagers.size());</span>
+<span class="nc bnc" id="L1502" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, OutboundTcpConnectionPool&gt; entry : connectionManagers.entrySet())</span>
+<span class="nc" id="L1503">            map.put(entry.getKey().getHostAddress(), entry.getValue().getBackPressureState().getBackPressureRateLimit());</span>
+
+<span class="nc" id="L1505">        return map;</span>
+    }
+
+    @Override
+    public void setBackPressureEnabled(boolean enabled)
+    {
+<span class="nc" id="L1511">        DatabaseDescriptor.setBackPressureEnabled(enabled);</span>
+<span class="nc" id="L1512">    }</span>
+
+    @Override
+    public boolean isBackPressureEnabled()
+    {
+<span class="nc" id="L1517">        return DatabaseDescriptor.backPressureEnabled();</span>
+    }
+
+    public static IPartitioner globalPartitioner()
+    {
+<span class="nc" id="L1522">        return StorageService.instance.getTokenMetadata().partitioner;</span>
+    }
+
+    public static void validatePartitioner(Collection&lt;? extends AbstractBounds&lt;?&gt;&gt; allBounds)
+    {
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">        for (AbstractBounds&lt;?&gt; bounds : allBounds)</span>
+<span class="nc" id="L1528">            validatePartitioner(bounds);</span>
+<span class="nc" id="L1529">    }</span>
+
+    public static void validatePartitioner(AbstractBounds&lt;?&gt; bounds)
+    {
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">        if (globalPartitioner() != bounds.left.getPartitioner())</span>
+<span class="nc" id="L1534">            throw new AssertionError(String.format(&quot;Partitioner in bounds serialization. Expected %s, was %s.&quot;,</span>
+<span class="nc" id="L1535">                                                   globalPartitioner().getClass().getName(),</span>
+<span class="nc" id="L1536">                                                   bounds.left.getPartitioner().getClass().getName()));</span>
+<span class="nc" id="L1537">    }</span>
+
+    @VisibleForTesting
+    public List&lt;SocketThread&gt; getSocketThreads()
+    {
+<span class="nc" id="L1542">        return socketThreads;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

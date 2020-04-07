@@ -1,0 +1,847 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DataResolver.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">DataResolver.java</span></div><h1>DataResolver.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.filter.DataLimits.Counter;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.*;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.ExcludingBounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class DataResolver extends ResponseResolver
+{
+<span class="fc" id="L47">    private static final boolean DROP_OVERSIZED_READ_REPAIR_MUTATIONS =</span>
+<span class="fc" id="L48">        Boolean.getBoolean(&quot;cassandra.drop_oversized_readrepair_mutations&quot;);</span>
+
+<span class="fc" id="L50">    @VisibleForTesting</span>
+<span class="fc" id="L51">    final List&lt;AsyncOneResponse&gt; repairResults = Collections.synchronizedList(new ArrayList&lt;&gt;());</span>
+    private final long queryStartNanoTime;
+    private final boolean enforceStrictLiveness;
+
+    DataResolver(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistency, int maxResponseCount, long queryStartNanoTime)
+    {
+<span class="fc" id="L57">        super(keyspace, command, consistency, maxResponseCount);</span>
+<span class="fc" id="L58">        this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L59">        this.enforceStrictLiveness = command.metadata().enforceStrictLiveness();</span>
+<span class="fc" id="L60">    }</span>
+
+    public PartitionIterator getData()
+    {
+<span class="fc" id="L64">        ReadResponse response = responses.iterator().next().payload;</span>
+<span class="fc" id="L65">        return UnfilteredPartitionIterators.filter(response.makeIterator(command), command.nowInSec());</span>
+    }
+
+    public boolean isDataPresent()
+    {
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">        return !responses.isEmpty();</span>
+    }
+
+    public void compareResponses()
+    {
+        // We need to fully consume the results to trigger read repairs if appropriate
+<span class="nc" id="L76">        try (PartitionIterator iterator = resolve())</span>
+        {
+<span class="nc" id="L78">            PartitionIterators.consume(iterator);</span>
+        }
+<span class="nc" id="L80">    }</span>
+
+    public PartitionIterator resolve()
+    {
+        // We could get more responses while this method runs, which is ok (we're happy to ignore any response not here
+        // at the beginning of this method), so grab the response count once and use that through the method.
+<span class="nc" id="L86">        int count = responses.size();</span>
+<span class="nc" id="L87">        List&lt;UnfilteredPartitionIterator&gt; iters = new ArrayList&lt;&gt;(count);</span>
+<span class="nc" id="L88">        InetAddress[] sources = new InetAddress[count];</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++)</span>
+        {
+<span class="nc" id="L91">            MessageIn&lt;ReadResponse&gt; msg = responses.get(i);</span>
+<span class="nc" id="L92">            iters.add(msg.payload.makeIterator(command));</span>
+<span class="nc" id="L93">            sources[i] = msg.from;</span>
+        }
+
+        /*
+         * Even though every response, individually, will honor the limit, it is possible that we will, after the merge,
+         * have more rows than the client requested. To make sure that we still conform to the original limit,
+         * we apply a top-level post-reconciliation counter to the merged partition iterator.
+         *
+         * Short read protection logic (ShortReadRowsProtection.moreContents()) relies on this counter to be applied
+         * to the current partition to work. For this reason we have to apply the counter transformation before
+         * empty partition discard logic kicks in - for it will eagerly consume the iterator.
+         *
+         * That's why the order here is: 1) merge; 2) filter rows; 3) count; 4) discard empty partitions
+         *
+         * See CASSANDRA-13747 for more details.
+         */
+
+<span class="nc" id="L110">        DataLimits.Counter mergedResultCounter =</span>
+<span class="nc" id="L111">            command.limits().newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);</span>
+
+<span class="nc" id="L113">        UnfilteredPartitionIterator merged = mergeWithShortReadProtection(iters, sources, mergedResultCounter);</span>
+<span class="nc" id="L114">        FilteredPartitions filtered =</span>
+<span class="nc" id="L115">            FilteredPartitions.filter(merged, new Filter(command.nowInSec(), command.metadata().enforceStrictLiveness()));</span>
+<span class="nc" id="L116">        PartitionIterator counted = Transformation.apply(filtered, mergedResultCounter);</span>
+
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        return command.isForThrift()</span>
+             ? counted
+<span class="nc" id="L120">             : Transformation.apply(counted, new EmptyPartitionsDiscarder());</span>
+    }
+
+    private UnfilteredPartitionIterator mergeWithShortReadProtection(List&lt;UnfilteredPartitionIterator&gt; results,
+                                                                     InetAddress[] sources,
+                                                                     DataLimits.Counter mergedResultCounter)
+    {
+        // If we have only one results, there is no read repair to do and we can't get short reads
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (results.size() == 1)</span>
+<span class="nc" id="L129">            return results.get(0);</span>
+
+        /*
+         * So-called short reads stems from nodes returning only a subset of the results they have due to the limit,
+         * but that subset not being enough post-reconciliation. So if we don't have a limit, don't bother.
+         */
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (!command.limits().isUnlimited())</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            for (int i = 0; i &lt; results.size(); i++)</span>
+<span class="nc" id="L137">                results.set(i, extendWithShortReadProtection(results.get(i), sources[i], mergedResultCounter));</span>
+
+<span class="nc" id="L139">        return UnfilteredPartitionIterators.merge(results, command.nowInSec(), new RepairMergeListener(sources));</span>
+    }
+
+<span class="nc bnc" id="L142" title="All 2 branches missed.">    private class RepairMergeListener implements UnfilteredPartitionIterators.MergeListener</span>
+    {
+        private final InetAddress[] sources;
+
+        private RepairMergeListener(InetAddress[] sources)
+<span class="nc" id="L147">        {</span>
+<span class="nc" id="L148">            this.sources = sources;</span>
+<span class="nc" id="L149">        }</span>
+
+        public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List&lt;UnfilteredRowIterator&gt; versions)
+        {
+<span class="nc" id="L153">            return new MergeListener(partitionKey, columns(versions), isReversed(versions));</span>
+        }
+
+        private PartitionColumns columns(List&lt;UnfilteredRowIterator&gt; versions)
+        {
+<span class="nc" id="L158">            Columns statics = Columns.NONE;</span>
+<span class="nc" id="L159">            Columns regulars = Columns.NONE;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            for (UnfilteredRowIterator iter : versions)</span>
+            {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">                if (iter == null)</span>
+<span class="nc" id="L163">                    continue;</span>
+
+<span class="nc" id="L165">                PartitionColumns cols = iter.columns();</span>
+<span class="nc" id="L166">                statics = statics.mergeTo(cols.statics);</span>
+<span class="nc" id="L167">                regulars = regulars.mergeTo(cols.regulars);</span>
+<span class="nc" id="L168">            }</span>
+<span class="nc" id="L169">            return new PartitionColumns(statics, regulars);</span>
+        }
+
+        private boolean isReversed(List&lt;UnfilteredRowIterator&gt; versions)
+        {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            for (UnfilteredRowIterator iter : versions)</span>
+            {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                if (iter == null)</span>
+<span class="nc" id="L177">                    continue;</span>
+
+                // Everything will be in the same order
+<span class="nc" id="L180">                return iter.isReverseOrder();</span>
+            }
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            assert false : &quot;Expected at least one iterator&quot;;</span>
+<span class="nc" id="L184">            return false;</span>
+        }
+
+        public void close()
+        {
+            try
+            {
+<span class="nc" id="L191">                FBUtilities.waitOnFutures(repairResults, DatabaseDescriptor.getWriteRpcTimeout());</span>
+            }
+<span class="nc" id="L193">            catch (TimeoutException ex)</span>
+            {
+                // We got all responses, but timed out while repairing
+<span class="nc" id="L196">                int blockFor = consistency.blockFor(keyspace);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                if (Tracing.isTracing())</span>
+<span class="nc" id="L198">                    Tracing.trace(&quot;Timed out while read-repairing after receiving all {} data and digest responses&quot;, blockFor);</span>
+                else
+<span class="nc" id="L200">                    logger.debug(&quot;Timeout while read-repairing after receiving all {} data and digest responses&quot;, blockFor);</span>
+
+<span class="nc" id="L202">                throw new ReadTimeoutException(consistency, blockFor-1, blockFor, true);</span>
+<span class="nc" id="L203">            }</span>
+<span class="nc" id="L204">        }</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        private class MergeListener implements UnfilteredRowIterators.MergeListener</span>
+        {
+            private final DecoratedKey partitionKey;
+            private final PartitionColumns columns;
+            private final boolean isReversed;
+<span class="nc" id="L211">            private final PartitionUpdate[] repairs = new PartitionUpdate[sources.length];</span>
+
+<span class="nc" id="L213">            private final Row.Builder[] currentRows = new Row.Builder[sources.length];</span>
+            private final RowDiffListener diffListener;
+
+            // The partition level deletion for the merge row.
+            private DeletionTime partitionLevelDeletion;
+            // When merged has a currently open marker, its time. null otherwise.
+            private DeletionTime mergedDeletionTime;
+            // For each source, the time of the current deletion as known by the source.
+<span class="nc" id="L221">            private final DeletionTime[] sourceDeletionTime = new DeletionTime[sources.length];</span>
+            // For each source, record if there is an open range to send as repair, and from where.
+<span class="nc" id="L223">            private final ClusteringBound[] markerToRepair = new ClusteringBound[sources.length];</span>
+
+            private MergeListener(DecoratedKey partitionKey, PartitionColumns columns, boolean isReversed)
+<span class="nc" id="L226">            {</span>
+<span class="nc" id="L227">                this.partitionKey = partitionKey;</span>
+<span class="nc" id="L228">                this.columns = columns;</span>
+<span class="nc" id="L229">                this.isReversed = isReversed;</span>
+
+<span class="nc" id="L231">                this.diffListener = new RowDiffListener()</span>
+<span class="nc" id="L232">                {</span>
+                    public void onPrimaryKeyLivenessInfo(int i, Clustering clustering, LivenessInfo merged, LivenessInfo original)
+                    {
+<span class="nc bnc" id="L235" title="All 4 branches missed.">                        if (merged != null &amp;&amp; !merged.equals(original))</span>
+<span class="nc" id="L236">                            currentRow(i, clustering).addPrimaryKeyLivenessInfo(merged);</span>
+<span class="nc" id="L237">                    }</span>
+
+                    public void onDeletion(int i, Clustering clustering, Row.Deletion merged, Row.Deletion original)
+                    {
+<span class="nc bnc" id="L241" title="All 4 branches missed.">                        if (merged != null &amp;&amp; !merged.equals(original))</span>
+<span class="nc" id="L242">                            currentRow(i, clustering).addRowDeletion(merged);</span>
+<span class="nc" id="L243">                    }</span>
+
+                    public void onComplexDeletion(int i, Clustering clustering, ColumnDefinition column, DeletionTime merged, DeletionTime original)
+                    {
+<span class="nc bnc" id="L247" title="All 4 branches missed.">                        if (merged != null &amp;&amp; !merged.equals(original))</span>
+<span class="nc" id="L248">                            currentRow(i, clustering).addComplexDeletion(column, merged);</span>
+<span class="nc" id="L249">                    }</span>
+
+                    public void onCell(int i, Clustering clustering, Cell merged, Cell original)
+                    {
+<span class="nc bnc" id="L253" title="All 6 branches missed.">                        if (merged != null &amp;&amp; !merged.equals(original) &amp;&amp; isQueried(merged))</span>
+<span class="nc" id="L254">                            currentRow(i, clustering).addCell(merged);</span>
+<span class="nc" id="L255">                    }</span>
+
+                    private boolean isQueried(Cell cell)
+                    {
+                        // When we read, we may have some cell that have been fetched but are not selected by the user. Those cells may
+                        // have empty values as optimization (see CASSANDRA-10655) and hence they should not be included in the read-repair.
+                        // This is fine since those columns are not actually requested by the user and are only present for the sake of CQL
+                        // semantic (making sure we can always distinguish between a row that doesn't exist from one that do exist but has
+                        /// no value for the column requested by the user) and so it won't be unexpected by the user that those columns are
+                        // not repaired.
+<span class="nc" id="L265">                        ColumnDefinition column = cell.column();</span>
+<span class="nc" id="L266">                        ColumnFilter filter = command.columnFilter();</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                        return column.isComplex() ? filter.fetchedCellIsQueried(column, cell.path()) : filter.fetchedColumnIsQueried(column);</span>
+                    }
+                };
+<span class="nc" id="L270">            }</span>
+
+            private PartitionUpdate update(int i)
+            {
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                if (repairs[i] == null)</span>
+<span class="nc" id="L275">                    repairs[i] = new PartitionUpdate(command.metadata(), partitionKey, columns, 1);</span>
+<span class="nc" id="L276">                return repairs[i];</span>
+            }
+
+            /**
+             * The partition level deletion with with which source {@code i} is currently repaired, or
+             * {@code DeletionTime.LIVE} if the source is not repaired on the partition level deletion (meaning it was
+             * up to date on it). The output* of this method is only valid after the call to
+             * {@link #onMergedPartitionLevelDeletion}.
+             */
+            private DeletionTime partitionLevelRepairDeletion(int i)
+            {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">                return repairs[i] == null ? DeletionTime.LIVE : repairs[i].partitionLevelDeletion();</span>
+            }
+
+            private Row.Builder currentRow(int i, Clustering clustering)
+            {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                if (currentRows[i] == null)</span>
+                {
+<span class="nc" id="L294">                    currentRows[i] = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L295">                    currentRows[i].newRow(clustering);</span>
+                }
+<span class="nc" id="L297">                return currentRows[i];</span>
+            }
+
+            public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+            {
+<span class="nc" id="L302">                this.partitionLevelDeletion = mergedDeletion;</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                for (int i = 0; i &lt; versions.length; i++)</span>
+                {
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    if (mergedDeletion.supersedes(versions[i]))</span>
+<span class="nc" id="L306">                        update(i).addPartitionDeletion(mergedDeletion);</span>
+                }
+<span class="nc" id="L308">            }</span>
+
+            public void onMergedRows(Row merged, Row[] versions)
+            {
+                // If a row was shadowed post merged, it must be by a partition level or range tombstone, and we handle
+                // those case directly in their respective methods (in other words, it would be inefficient to send a row
+                // deletion as repair when we know we've already send a partition level or range tombstone that covers it).
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                if (merged.isEmpty())</span>
+<span class="nc" id="L316">                    return;</span>
+
+<span class="nc" id="L318">                Rows.diff(diffListener, merged, versions);</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                for (int i = 0; i &lt; currentRows.length; i++)</span>
+                {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                    if (currentRows[i] != null)</span>
+<span class="nc" id="L322">                        update(i).add(currentRows[i].build());</span>
+                }
+<span class="nc" id="L324">                Arrays.fill(currentRows, null);</span>
+<span class="nc" id="L325">            }</span>
+
+            private DeletionTime currentDeletion()
+            {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                return mergedDeletionTime == null ? partitionLevelDeletion : mergedDeletionTime;</span>
+            }
+
+            public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions)
+            {
+                try
+                {
+                    // The code for merging range tombstones is a tad complex and we had the assertions there triggered
+                    // unexpectedly in a few occasions (CASSANDRA-13237, CASSANDRA-13719). It's hard to get insights
+                    // when that happen without more context that what the assertion errors give us however, hence the
+                    // catch here that basically gather as much as context as reasonable.
+<span class="nc" id="L340">                    internalOnMergedRangeTombstoneMarkers(merged, versions);</span>
+                }
+<span class="nc" id="L342">                catch (AssertionError e)</span>
+                {
+                    // The following can be pretty verbose, but it's really only triggered if a bug happen, so we'd
+                    // rather get more info to debug than not.
+<span class="nc" id="L346">                    CFMetaData table = command.metadata();</span>
+<span class="nc" id="L347">                    String details = String.format(&quot;Error merging RTs on %s.%s: command=%s, reversed=%b, merged=%s, versions=%s, sources={%s}, responses:%n %s&quot;,</span>
+                                                   table.ksName, table.cfName,
+<span class="nc" id="L349">                                                   command.toCQLString(),</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">                                                   isReversed,</span>
+<span class="nc" id="L351">                                                   merged == null ? &quot;null&quot; : merged.toString(table),</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                                                   '[' + Joiner.on(&quot;, &quot;).join(Iterables.transform(Arrays.asList(versions), rt -&gt; rt == null ? &quot;null&quot; : rt.toString(table))) + ']',</span>
+<span class="nc" id="L353">                                                   Arrays.toString(sources),</span>
+<span class="nc" id="L354">                                                   makeResponsesDebugString());</span>
+<span class="nc" id="L355">                    throw new AssertionError(details, e);</span>
+<span class="nc" id="L356">                }</span>
+<span class="nc" id="L357">            }</span>
+
+            private String makeResponsesDebugString()
+            {
+<span class="nc" id="L361">                return Joiner.on(&quot;,\n&quot;)</span>
+<span class="nc" id="L362">                             .join(Iterables.transform(getMessages(), m -&gt; m.from + &quot; =&gt; &quot; + m.payload.toDebugString(command, partitionKey)));</span>
+            }
+
+            private void internalOnMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions)
+            {
+                // The current deletion as of dealing with this marker.
+<span class="nc" id="L368">                DeletionTime currentDeletion = currentDeletion();</span>
+
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                for (int i = 0; i &lt; versions.length; i++)</span>
+                {
+<span class="nc" id="L372">                    RangeTombstoneMarker marker = versions[i];</span>
+
+                    // Update what the source now thinks is the current deletion
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                    if (marker != null)</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                        sourceDeletionTime[i] = marker.isOpen(isReversed) ? marker.openDeletionTime(isReversed) : null;</span>
+
+                    // If merged == null, some of the source is opening or closing a marker
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                    if (merged == null)</span>
+                    {
+                        // but if it's not this source, move to the next one
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                        if (marker == null)</span>
+<span class="nc" id="L383">                            continue;</span>
+
+                        // We have a close and/or open marker for a source, with nothing corresponding in merged.
+                        // Because merged is a superset, this imply that we have a current deletion (being it due to an
+                        // early opening in merged or a partition level deletion) and that this deletion will still be
+                        // active after that point. Further whatever deletion was open or is open by this marker on the
+                        // source, that deletion cannot supersedes the current one.
+                        //
+                        // But while the marker deletion (before and/or after this point) cannot supersede the current
+                        // deletion, we want to know if it's equal to it (both before and after), because in that case
+                        // the source is up to date and we don't want to include repair.
+                        //
+                        // So in practice we have 2 possible case:
+                        //  1) the source was up-to-date on deletion up to that point: then it won't be from that point
+                        //     on unless it's a boundary and the new opened deletion time is also equal to the current
+                        //     deletion (note that this implies the boundary has the same closing and opening deletion
+                        //     time, which should generally not happen, but can due to legacy reading code not avoiding
+                        //     this for a while, see CASSANDRA-13237).
+                        //  2) the source wasn't up-to-date on deletion up to that point and it may now be (if it isn't
+                        //     we just have nothing to do for that marker).
+<span class="nc bnc" id="L403" title="All 4 branches missed.">                        assert !currentDeletion.isLive() : currentDeletion.toString();</span>
+
+                        // Is the source up to date on deletion? It's up to date if it doesn't have an open RT repair
+                        // nor an &quot;active&quot; partition level deletion (where &quot;active&quot; means that it's greater or equal
+                        // to the current deletion: if the source has a repaired partition deletion lower than the
+                        // current deletion, this means the current deletion is due to a previously open range tombstone,
+                        // and if the source isn't currently repaired for that RT, then it means it's up to date on it).
+<span class="nc" id="L410">                        DeletionTime partitionRepairDeletion = partitionLevelRepairDeletion(i);</span>
+<span class="nc bnc" id="L411" title="All 4 branches missed.">                        if (markerToRepair[i] == null &amp;&amp; currentDeletion.supersedes(partitionRepairDeletion))</span>
+                        {
+                            /*
+                             * Since there is an ongoing merged deletion, the only way we don't have an open repair for
+                             * this source is that it had a range open with the same deletion as current marker,
+                             * and the marker is closing it.
+                             */
+<span class="nc bnc" id="L418" title="All 6 branches missed.">                            assert marker.isClose(isReversed) &amp;&amp; currentDeletion.equals(marker.closeDeletionTime(isReversed))</span>
+<span class="nc" id="L419">                                 : String.format(&quot;currentDeletion=%s, marker=%s&quot;, currentDeletion, marker.toString(command.metadata()));</span>
+
+                            // and so unless it's a boundary whose opening deletion time is still equal to the current
+                            // deletion (see comment above for why this can actually happen), we have to repair the source
+                            // from that point on.
+<span class="nc bnc" id="L424" title="All 4 branches missed.">                            if (!(marker.isOpen(isReversed) &amp;&amp; currentDeletion.equals(marker.openDeletionTime(isReversed))))</span>
+<span class="nc" id="L425">                                markerToRepair[i] = marker.closeBound(isReversed).invert();</span>
+                        }
+                        // In case 2) above, we only have something to do if the source is up-to-date after that point
+                        // (which, since the source isn't up-to-date before that point, means we're opening a new deletion
+                        // that is equal to the current one).
+<span class="nc bnc" id="L430" title="All 4 branches missed.">                        else if (marker.isOpen(isReversed) &amp;&amp; currentDeletion.equals(marker.openDeletionTime(isReversed)))</span>
+                        {
+<span class="nc" id="L432">                            closeOpenMarker(i, marker.openBound(isReversed).invert());</span>
+                        }
+<span class="nc" id="L434">                    }</span>
+                    else
+                    {
+                        // We have a change of current deletion in merged (potentially to/from no deletion at all).
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                        if (merged.isClose(isReversed))</span>
+                        {
+                            // We're closing the merged range. If we're recorded that this should be repaird for the
+                            // source, close and add said range to the repair to send.
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                            if (markerToRepair[i] != null)</span>
+<span class="nc" id="L444">                                closeOpenMarker(i, merged.closeBound(isReversed));</span>
+
+                        }
+
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                        if (merged.isOpen(isReversed))</span>
+                        {
+                            // If we're opening a new merged range (or just switching deletion), then unless the source
+                            // is up to date on that deletion (note that we've updated what the source deleteion is
+                            // above), we'll have to sent the range to the source.
+<span class="nc" id="L453">                            DeletionTime newDeletion = merged.openDeletionTime(isReversed);</span>
+<span class="nc" id="L454">                            DeletionTime sourceDeletion = sourceDeletionTime[i];</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                            if (!newDeletion.equals(sourceDeletion))</span>
+<span class="nc" id="L456">                                markerToRepair[i] = merged.openBound(isReversed);</span>
+                        }
+                    }
+                }
+
+<span class="nc bnc" id="L461" title="All 2 branches missed.">                if (merged != null)</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                    mergedDeletionTime = merged.isOpen(isReversed) ? merged.openDeletionTime(isReversed) : null;</span>
+<span class="nc" id="L463">            }</span>
+
+            private void closeOpenMarker(int i, ClusteringBound close)
+            {
+<span class="nc" id="L467">                ClusteringBound open = markerToRepair[i];</span>
+<span class="nc bnc" id="L468" title="All 4 branches missed.">                update(i).add(new RangeTombstone(Slice.make(isReversed ? close : open, isReversed ? open : close), currentDeletion()));</span>
+<span class="nc" id="L469">                markerToRepair[i] = null;</span>
+<span class="nc" id="L470">            }</span>
+
+            public void close()
+            {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                for (int i = 0; i &lt; repairs.length; i++)</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                    if (null != repairs[i])</span>
+<span class="nc" id="L476">                        sendRepairMutation(repairs[i], sources[i]);</span>
+<span class="nc" id="L477">            }</span>
+
+            private void sendRepairMutation(PartitionUpdate partition, InetAddress destination)
+            {
+<span class="nc" id="L481">                Mutation mutation = new Mutation(partition);</span>
+<span class="nc" id="L482">                int messagingVersion = MessagingService.instance().getVersion(destination);</span>
+
+<span class="nc" id="L484">                int    mutationSize = (int) Mutation.serializer.serializedSize(mutation, messagingVersion);</span>
+<span class="nc" id="L485">                int maxMutationSize = DatabaseDescriptor.getMaxMutationSize();</span>
+
+<span class="nc bnc" id="L487" title="All 2 branches missed.">                if (mutationSize &lt;= maxMutationSize)</span>
+                {
+<span class="nc" id="L489">                    Tracing.trace(&quot;Sending read-repair-mutation to {}&quot;, destination);</span>
+                    // use a separate verb here to avoid writing hints on timeouts
+<span class="nc" id="L491">                    MessageOut&lt;Mutation&gt; message = mutation.createMessage(MessagingService.Verb.READ_REPAIR);</span>
+<span class="nc" id="L492">                    repairResults.add(MessagingService.instance().sendRR(message, destination));</span>
+<span class="nc" id="L493">                    ColumnFamilyStore.metricsFor(command.metadata().cfId).readRepairRequests.mark();</span>
+<span class="nc" id="L494">                }</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                else if (DROP_OVERSIZED_READ_REPAIR_MUTATIONS)</span>
+                {
+<span class="nc" id="L497">                    logger.debug(&quot;Encountered an oversized ({}/{}) read repair mutation for table {}.{}, key {}, node {}&quot;,</span>
+<span class="nc" id="L498">                                 mutationSize,</span>
+<span class="nc" id="L499">                                 maxMutationSize,</span>
+<span class="nc" id="L500">                                 command.metadata().ksName,</span>
+<span class="nc" id="L501">                                 command.metadata().cfName,</span>
+<span class="nc" id="L502">                                 command.metadata().getKeyValidator().getString(partitionKey.getKey()),</span>
+                                 destination);
+                }
+                else
+                {
+<span class="nc" id="L507">                    logger.warn(&quot;Encountered an oversized ({}/{}) read repair mutation for table {}.{}, key {}, node {}&quot;,</span>
+<span class="nc" id="L508">                                mutationSize,</span>
+<span class="nc" id="L509">                                maxMutationSize,</span>
+<span class="nc" id="L510">                                command.metadata().ksName,</span>
+<span class="nc" id="L511">                                command.metadata().cfName,</span>
+<span class="nc" id="L512">                                command.metadata().getKeyValidator().getString(partitionKey.getKey()),</span>
+                                destination);
+
+<span class="nc" id="L515">                    int blockFor = consistency.blockFor(keyspace);</span>
+<span class="nc" id="L516">                    Tracing.trace(&quot;Timed out while read-repairing after receiving all {} data and digest responses&quot;, blockFor);</span>
+<span class="nc" id="L517">                    throw new ReadTimeoutException(consistency, blockFor - 1, blockFor, true);</span>
+                }
+<span class="nc" id="L519">            }</span>
+        }
+    }
+
+    private UnfilteredPartitionIterator extendWithShortReadProtection(UnfilteredPartitionIterator partitions,
+                                                                      InetAddress source,
+                                                                      DataLimits.Counter mergedResultCounter)
+    {
+<span class="nc" id="L527">        DataLimits.Counter singleResultCounter =</span>
+<span class="nc" id="L528">            command.limits().newCounter(command.nowInSec(), false, command.selectsFullPartition(), enforceStrictLiveness).onlyCount();</span>
+
+<span class="nc" id="L530">        ShortReadPartitionsProtection protection =</span>
+            new ShortReadPartitionsProtection(source, singleResultCounter, mergedResultCounter, queryStartNanoTime);
+
+        /*
+         * The order of extention and transformations is important here. Extending with more partitions has to happen
+         * first due to the way BaseIterator.hasMoreContents() works: only transformations applied after extension will
+         * be called on the first partition of the extended iterator.
+         *
+         * Additionally, we want singleResultCounter to be applied after SRPP, so that its applyToPartition() method will
+         * be called last, after the extension done by SRRP.applyToPartition() call. That way we preserve the same order
+         * when it comes to calling SRRP.moreContents() and applyToRow() callbacks.
+         *
+         * See ShortReadPartitionsProtection.applyToPartition() for more details.
+         */
+
+        // extend with moreContents() only if it's a range read command with no partition key specified
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        if (!command.isLimitedToOnePartition())</span>
+<span class="nc" id="L547">            partitions = MorePartitions.extend(partitions, protection);     // register SRPP.moreContents()</span>
+
+<span class="nc" id="L549">        partitions = Transformation.apply(partitions, protection);          // register SRPP.applyToPartition()</span>
+<span class="nc" id="L550">        partitions = Transformation.apply(partitions, singleResultCounter); // register the per-source counter</span>
+
+<span class="nc" id="L552">        return partitions;</span>
+    }
+
+    /*
+     * We have a potential short read if the result from a given node contains the requested number of rows
+     * (i.e. it has stopped returning results due to the limit), but some of them haven't
+     * made it into the final post-reconciliation result due to other nodes' row, range, and/or partition tombstones.
+     *
+     * If that is the case, then that node may have more rows that we should fetch, as otherwise we could
+     * ultimately return fewer rows than required. Also, those additional rows may contain tombstones which
+     * which we also need to fetch as they may shadow rows or partitions from other replicas' results, which we would
+     * otherwise return incorrectly.
+     */
+<span class="nc bnc" id="L565" title="All 2 branches missed.">    private class ShortReadPartitionsProtection extends Transformation&lt;UnfilteredRowIterator&gt; implements MorePartitions&lt;UnfilteredPartitionIterator&gt;</span>
+    {
+        private final InetAddress source;
+
+        private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
+        private final DataLimits.Counter mergedResultCounter; // merged end-result counter
+
+        private DecoratedKey lastPartitionKey; // key of the last observed partition
+
+        private boolean partitionsFetched; // whether we've seen any new partitions since iteration start or last moreContents() call
+
+        private final long queryStartNanoTime;
+
+        private ShortReadPartitionsProtection(InetAddress source,
+                                              DataLimits.Counter singleResultCounter,
+                                              DataLimits.Counter mergedResultCounter,
+                                              long queryStartNanoTime)
+<span class="nc" id="L582">        {</span>
+<span class="nc" id="L583">            this.source = source;</span>
+<span class="nc" id="L584">            this.singleResultCounter = singleResultCounter;</span>
+<span class="nc" id="L585">            this.mergedResultCounter = mergedResultCounter;</span>
+<span class="nc" id="L586">            this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="nc" id="L587">        }</span>
+
+        @Override
+        public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+<span class="nc" id="L592">            partitionsFetched = true;</span>
+
+<span class="nc" id="L594">            lastPartitionKey = partition.partitionKey();</span>
+
+            /*
+             * Extend for moreContents() then apply protection to track lastClustering by applyToRow().
+             *
+             * If we don't apply the transformation *after* extending the partition with MoreRows,
+             * applyToRow() method of protection will not be called on the first row of the new extension iterator.
+             */
+<span class="nc" id="L602">            ShortReadRowsProtection protection = new ShortReadRowsProtection(partition.metadata(), partition.partitionKey());</span>
+<span class="nc" id="L603">            return Transformation.apply(MoreRows.extend(partition, protection), protection);</span>
+        }
+
+        /*
+         * We only get here once all the rows and partitions in this iterator have been iterated over, and so
+         * if the node had returned the requested number of rows but we still get here, then some results were
+         * skipped during reconciliation.
+         */
+        public UnfilteredPartitionIterator moreContents()
+        {
+            // never try to request additional partitions from replicas if our reconciled partitions are already filled to the limit
+<span class="nc bnc" id="L614" title="All 4 branches missed.">            assert !mergedResultCounter.isDone();</span>
+
+            // we do not apply short read protection when we have no limits at all
+<span class="nc bnc" id="L617" title="All 4 branches missed.">            assert !command.limits().isUnlimited();</span>
+
+            /*
+             * If this is a single partition read command or an (indexed) partition range read command with
+             * a partition key specified, then we can't and shouldn't try fetch more partitions.
+             */
+<span class="nc bnc" id="L623" title="All 4 branches missed.">            assert !command.isLimitedToOnePartition();</span>
+
+            /*
+             * If the returned result doesn't have enough rows/partitions to satisfy even the original limit, don't ask for more.
+             *
+             * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
+             * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
+             */
+<span class="nc bnc" id="L631" title="All 4 branches missed.">            if (!singleResultCounter.isDone() &amp;&amp; command.limits().perPartitionCount() == DataLimits.NO_LIMIT)</span>
+<span class="nc" id="L632">                return null;</span>
+
+            /*
+             * Either we had an empty iterator as the initial response, or our moreContents() call got us an empty iterator.
+             * There is no point to ask the replica for more rows - it has no more in the requested range.
+             */
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if (!partitionsFetched)</span>
+<span class="nc" id="L639">                return null;</span>
+<span class="nc" id="L640">            partitionsFetched = false;</span>
+
+            /*
+             * We are going to fetch one partition at a time for thrift and potentially more for CQL.
+             * The row limit will either be set to the per partition limit - if the command has no total row limit set, or
+             * the total # of rows remaining - if it has some. If we don't grab enough rows in some of the partitions,
+             * then future ShortReadRowsProtection.moreContents() calls will fetch the missing ones.
+             */
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            int toQuery = command.limits().count() != DataLimits.NO_LIMIT</span>
+<span class="nc" id="L649">                        ? command.limits().count() - counted(mergedResultCounter)</span>
+<span class="nc" id="L650">                        : command.limits().perPartitionCount();</span>
+
+<span class="nc" id="L652">            ColumnFamilyStore.metricsFor(command.metadata().cfId).shortReadProtectionRequests.mark();</span>
+<span class="nc" id="L653">            Tracing.trace(&quot;Requesting {} extra rows from {} for short read protection&quot;, toQuery, source);</span>
+
+<span class="nc" id="L655">            PartitionRangeReadCommand cmd = makeFetchAdditionalPartitionReadCommand(toQuery);</span>
+<span class="nc" id="L656">            return executeReadCommand(cmd);</span>
+        }
+
+        // Counts the number of rows for regular queries and the number of groups for GROUP BY queries
+        private int counted(Counter counter)
+        {
+<span class="nc bnc" id="L662" title="All 2 branches missed.">            return command.limits().isGroupByLimit()</span>
+<span class="nc" id="L663">                 ? counter.rowCounted()</span>
+<span class="nc" id="L664">                 : counter.counted();</span>
+        }
+
+        private PartitionRangeReadCommand makeFetchAdditionalPartitionReadCommand(int toQuery)
+        {
+<span class="nc" id="L669">            PartitionRangeReadCommand cmd = (PartitionRangeReadCommand) command;</span>
+
+<span class="nc" id="L671">            DataLimits newLimits = cmd.limits().forShortReadRetry(toQuery);</span>
+
+<span class="nc" id="L673">            AbstractBounds&lt;PartitionPosition&gt; bounds = cmd.dataRange().keyRange();</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">            AbstractBounds&lt;PartitionPosition&gt; newBounds = bounds.inclusiveRight()</span>
+                                                        ? new Range&lt;&gt;(lastPartitionKey, bounds.right)
+                                                        : new ExcludingBounds&lt;&gt;(lastPartitionKey, bounds.right);
+<span class="nc" id="L677">            DataRange newDataRange = cmd.dataRange().forSubRange(newBounds);</span>
+
+<span class="nc" id="L679">            return cmd.withUpdatedLimitsAndDataRange(newLimits, newDataRange);</span>
+        }
+
+<span class="nc bnc" id="L682" title="All 2 branches missed.">        private class ShortReadRowsProtection extends Transformation implements MoreRows&lt;UnfilteredRowIterator&gt;</span>
+        {
+            private final CFMetaData metadata;
+            private final DecoratedKey partitionKey;
+
+            private Clustering lastClustering; // clustering of the last observed row
+
+<span class="nc" id="L689">            private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows</span>
+<span class="nc" id="L690">            private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)</span>
+<span class="nc" id="L691">            private int lastQueried = 0; // # extra rows requested from the replica last time</span>
+
+            private ShortReadRowsProtection(CFMetaData metadata, DecoratedKey partitionKey)
+<span class="nc" id="L694">            {</span>
+<span class="nc" id="L695">                this.metadata = metadata;</span>
+<span class="nc" id="L696">                this.partitionKey = partitionKey;</span>
+<span class="nc" id="L697">            }</span>
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+<span class="nc" id="L702">                lastClustering = row.clustering();</span>
+<span class="nc" id="L703">                return row;</span>
+            }
+
+            /*
+             * We only get here once all the rows in this iterator have been iterated over, and so if the node
+             * had returned the requested number of rows but we still get here, then some results were skipped
+             * during reconciliation.
+             */
+            public UnfilteredRowIterator moreContents()
+            {
+                // never try to request additional rows from replicas if our reconciled partition is already filled to the limit
+<span class="nc bnc" id="L714" title="All 4 branches missed.">                assert !mergedResultCounter.isDoneForPartition();</span>
+
+                // we do not apply short read protection when we have no limits at all
+<span class="nc bnc" id="L717" title="All 4 branches missed.">                assert !command.limits().isUnlimited();</span>
+
+                /*
+                 * If the returned partition doesn't have enough rows to satisfy even the original limit, don't ask for more.
+                 *
+                 * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
+                 * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
+                 */
+<span class="nc bnc" id="L725" title="All 4 branches missed.">                if (!singleResultCounter.isDoneForPartition() &amp;&amp; command.limits().perPartitionCount() == DataLimits.NO_LIMIT)</span>
+<span class="nc" id="L726">                    return null;</span>
+
+                /*
+                 * If the replica has no live rows in the partition, don't try to fetch more.
+                 *
+                 * Note that the previous branch [if (!singleResultCounter.isDoneForPartition()) return null] doesn't
+                 * always cover this scenario:
+                 * isDoneForPartition() is defined as [isDone() || rowInCurrentPartition &gt;= perPartitionLimit],
+                 * and will return true if isDone() returns true, even if there are 0 rows counted in the current partition.
+                 *
+                 * This can happen with a range read if after 1+ rounds of short read protection requests we managed to fetch
+                 * enough extra rows for other partitions to satisfy the singleResultCounter's total row limit, but only
+                 * have tombstones in the current partition.
+                 *
+                 * One other way we can hit this condition is when the partition only has a live static row and no regular
+                 * rows. In that scenario the counter will remain at 0 until the partition is closed - which happens after
+                 * the moreContents() call.
+                 */
+<span class="nc bnc" id="L744" title="All 2 branches missed.">                if (countedInCurrentPartition(singleResultCounter) == 0)</span>
+<span class="nc" id="L745">                    return null;</span>
+
+                /*
+                 * This is a table with no clustering columns, and has at most one row per partition - with EMPTY clustering.
+                 * We already have the row, so there is no point in asking for more from the partition.
+                 */
+<span class="nc bnc" id="L751" title="All 2 branches missed.">                if (Clustering.EMPTY == lastClustering)</span>
+<span class="nc" id="L752">                    return null;</span>
+
+<span class="nc" id="L754">                lastFetched = countedInCurrentPartition(singleResultCounter) - lastCounted;</span>
+<span class="nc" id="L755">                lastCounted = countedInCurrentPartition(singleResultCounter);</span>
+
+                // getting back fewer rows than we asked for means the partition on the replica has been fully consumed
+<span class="nc bnc" id="L758" title="All 4 branches missed.">                if (lastQueried &gt; 0 &amp;&amp; lastFetched &lt; lastQueried)</span>
+<span class="nc" id="L759">                    return null;</span>
+
+                /*
+                 * At this point we know that:
+                 *     1. the replica returned [repeatedly?] as many rows as we asked for and potentially has more
+                 *        rows in the partition
+                 *     2. at least one of those returned rows was shadowed by a tombstone returned from another
+                 *        replica
+                 *     3. we haven't satisfied the client's limits yet, and should attempt to query for more rows to
+                 *        avoid a short read
+                 *
+                 * In the ideal scenario, we would get exactly min(a, b) or fewer rows from the next request, where a and b
+                 * are defined as follows:
+                 *     [a] limits.count() - mergedResultCounter.counted()
+                 *     [b] limits.perPartitionCount() - mergedResultCounter.countedInCurrentPartition()
+                 *
+                 * It would be naive to query for exactly that many rows, as it's possible and not unlikely
+                 * that some of the returned rows would also be shadowed by tombstones from other hosts.
+                 *
+                 * Note: we don't know, nor do we care, how many rows from the replica made it into the reconciled result;
+                 * we can only tell how many in total we queried for, and that [0, mrc.countedInCurrentPartition()) made it.
+                 *
+                 * In general, our goal should be to minimise the number of extra requests - *not* to minimise the number
+                 * of rows fetched: there is a high transactional cost for every individual request, but a relatively low
+                 * marginal cost for each extra row requested.
+                 *
+                 * As such it's better to overfetch than to underfetch extra rows from a host; but at the same
+                 * time we want to respect paging limits and not blow up spectacularly.
+                 *
+                 * Note: it's ok to retrieve more rows that necessary since singleResultCounter is not stopping and only
+                 * counts.
+                 *
+                 * With that in mind, we'll just request the minimum of (count(), perPartitionCount()) limits.
+                 *
+                 * See CASSANDRA-13794 for more details.
+                 */
+<span class="nc" id="L795">                lastQueried = Math.min(command.limits().count(), command.limits().perPartitionCount());</span>
+
+<span class="nc" id="L797">                ColumnFamilyStore.metricsFor(metadata.cfId).shortReadProtectionRequests.mark();</span>
+<span class="nc" id="L798">                Tracing.trace(&quot;Requesting {} extra rows from {} for short read protection&quot;, lastQueried, source);</span>
+
+<span class="nc" id="L800">                SinglePartitionReadCommand cmd = makeFetchAdditionalRowsReadCommand(lastQueried);</span>
+<span class="nc" id="L801">                return UnfilteredPartitionIterators.getOnlyElement(executeReadCommand(cmd), cmd);</span>
+            }
+
+            // Counts the number of rows for regular queries and the number of groups for GROUP BY queries
+            private int countedInCurrentPartition(Counter counter)
+            {
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                return command.limits().isGroupByLimit()</span>
+<span class="nc" id="L808">                     ? counter.rowCountedInCurrentPartition()</span>
+<span class="nc" id="L809">                     : counter.countedInCurrentPartition();</span>
+            }
+
+            private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)
+            {
+<span class="nc" id="L814">                ClusteringIndexFilter filter = command.clusteringIndexFilter(partitionKey);</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">                if (null != lastClustering)</span>
+<span class="nc" id="L816">                    filter = filter.forPaging(metadata.comparator, lastClustering, false);</span>
+
+<span class="nc" id="L818">                return SinglePartitionReadCommand.create(command.isForThrift(),</span>
+<span class="nc" id="L819">                                                         command.metadata(),</span>
+<span class="nc" id="L820">                                                         command.nowInSec(),</span>
+<span class="nc" id="L821">                                                         command.columnFilter(),</span>
+<span class="nc" id="L822">                                                         command.rowFilter(),</span>
+<span class="nc" id="L823">                                                         command.limits().forShortReadRetry(toQuery),</span>
+                                                         partitionKey,
+                                                         filter,
+<span class="nc" id="L826">                                                         command.indexMetadata());</span>
+            }
+        }
+
+        private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd)
+        {
+<span class="nc" id="L832">            DataResolver resolver = new DataResolver(keyspace, cmd, ConsistencyLevel.ONE, 1, queryStartNanoTime);</span>
+<span class="nc" id="L833">            ReadCallback handler = new ReadCallback(resolver, ConsistencyLevel.ONE, cmd, Collections.singletonList(source), queryStartNanoTime);</span>
+
+<span class="nc bnc" id="L835" title="All 2 branches missed.">            if (StorageProxy.canDoLocalRequest(source))</span>
+<span class="nc" id="L836">                StageManager.getStage(Stage.READ).maybeExecuteImmediately(new StorageProxy.LocalReadRunnable(cmd, handler));</span>
+            else
+<span class="nc" id="L838">                MessagingService.instance().sendRRWithFailure(cmd.createMessage(MessagingService.current_version), source, handler);</span>
+
+            // We don't call handler.get() because we want to preserve tombstones since we're still in the middle of merging node results.
+<span class="nc" id="L841">            handler.awaitResults();</span>
+<span class="nc bnc" id="L842" title="All 4 branches missed.">            assert resolver.responses.size() == 1;</span>
+<span class="nc" id="L843">            return resolver.responses.get(0).payload.makeIterator(command);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

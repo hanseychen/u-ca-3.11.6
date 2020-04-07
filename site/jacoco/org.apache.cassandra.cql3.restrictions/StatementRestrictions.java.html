@@ -1,0 +1,863 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StatementRestrictions.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.restrictions</a> &gt; <span class="el_source">StatementRestrictions.java</span></div><h1>StatementRestrictions.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.restrictions;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.base.Joiner;
+import com.google.common.collect.Iterators;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.ColumnDefinition.Kind;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.statements.Bound;
+import org.apache.cassandra.cql3.statements.StatementType;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+
+/**
+ * The restrictions corresponding to the relations specified on the where-clause of CQL query.
+ */
+<span class="pc bpc" id="L50" title="1 of 2 branches missed.">public final class StatementRestrictions</span>
+{
+    public static final String REQUIRES_ALLOW_FILTERING_MESSAGE =
+            &quot;Cannot execute this query as it might involve data filtering and &quot; +
+            &quot;thus may have unpredictable performance. If you want to execute &quot; +
+            &quot;this query despite the performance unpredictability, use ALLOW FILTERING&quot;;
+
+    /**
+     * The type of statement
+     */
+    private final StatementType type;
+
+    /**
+     * The Column Family meta data
+     */
+    public final CFMetaData cfm;
+
+    /**
+     * Restrictions on partitioning columns
+     */
+    private PartitionKeyRestrictions partitionKeyRestrictions;
+
+    /**
+     * Restrictions on clustering columns
+     */
+    private ClusteringColumnRestrictions clusteringColumnsRestrictions;
+
+    /**
+     * Restriction on non-primary key columns (i.e. secondary index restrictions)
+     */
+    private RestrictionSet nonPrimaryKeyRestrictions;
+
+    private Set&lt;ColumnDefinition&gt; notNullColumns;
+
+    /**
+     * The restrictions used to build the row filter
+     */
+<span class="fc" id="L87">    private final IndexRestrictions filterRestrictions = new IndexRestrictions();</span>
+
+    /**
+     * &lt;code&gt;true&lt;/code&gt; if the secondary index need to be queried, &lt;code&gt;false&lt;/code&gt; otherwise
+     */
+    private boolean usesSecondaryIndexing;
+
+    /**
+     * Specify if the query will return a range of partition keys.
+     */
+    private boolean isKeyRange;
+
+    /**
+     * &lt;code&gt;true&lt;/code&gt; if nonPrimaryKeyRestrictions contains restriction on a regular column,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    private boolean hasRegularColumnsRestrictions;
+
+    /**
+     * Creates a new empty &lt;code&gt;StatementRestrictions&lt;/code&gt;.
+     *
+     * @param type the type of statement
+     * @param cfm the column family meta data
+     * @return a new empty &lt;code&gt;StatementRestrictions&lt;/code&gt;.
+     */
+    public static StatementRestrictions empty(StatementType type, CFMetaData cfm)
+    {
+<span class="nc" id="L114">        return new StatementRestrictions(type, cfm, false);</span>
+    }
+
+    private StatementRestrictions(StatementType type, CFMetaData cfm, boolean allowFiltering)
+<span class="fc" id="L118">    {</span>
+<span class="fc" id="L119">        this.type = type;</span>
+<span class="fc" id="L120">        this.cfm = cfm;</span>
+<span class="fc" id="L121">        this.partitionKeyRestrictions = new PartitionKeySingleRestrictionSet(cfm.getKeyValidatorAsClusteringComparator());</span>
+<span class="fc" id="L122">        this.clusteringColumnsRestrictions = new ClusteringColumnRestrictions(cfm, allowFiltering);</span>
+<span class="fc" id="L123">        this.nonPrimaryKeyRestrictions = new RestrictionSet();</span>
+<span class="fc" id="L124">        this.notNullColumns = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L125">    }</span>
+
+    public StatementRestrictions(StatementType type,
+                                 CFMetaData cfm,
+                                 WhereClause whereClause,
+                                 VariableSpecifications boundNames,
+                                 boolean selectsOnlyStaticColumns,
+                                 boolean selectsComplexColumn,
+                                 boolean allowFiltering,
+                                 boolean forView)
+    {
+<span class="fc" id="L136">        this(type, cfm, allowFiltering);</span>
+
+        ColumnFamilyStore cfs;
+<span class="fc" id="L139">        SecondaryIndexManager secondaryIndexManager = null;</span>
+
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        if (type.allowUseOfSecondaryIndices())</span>
+        {
+<span class="fc" id="L143">            cfs = Keyspace.open(cfm.ksName).getColumnFamilyStore(cfm.cfName);</span>
+<span class="fc" id="L144">            secondaryIndexManager = cfs.indexManager;</span>
+        }
+
+        /*
+         * WHERE clause. For a given entity, rules are:
+         *   - EQ relation conflicts with anything else (including a 2nd EQ)
+         *   - Can't have more than one LT(E) relation (resp. GT(E) relation)
+         *   - IN relation are restricted to row keys (for now) and conflicts with anything else (we could
+         *     allow two IN for the same entity but that doesn't seem very useful)
+         *   - The value_alias cannot be restricted in any way (we don't support wide rows with indexed value
+         *     in CQL so far)
+         */
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        for (Relation relation : whereClause.relations)</span>
+        {
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">            if (relation.operator() == Operator.IS_NOT)</span>
+            {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">                if (!forView)</span>
+<span class="nc" id="L161">                    throw new InvalidRequestException(&quot;Unsupported restriction: &quot; + relation);</span>
+
+<span class="nc bnc" id="L163" title="All 2 branches missed.">                for (ColumnDefinition def : relation.toRestriction(cfm, boundNames).getColumnDefs())</span>
+<span class="nc" id="L164">                    this.notNullColumns.add(def);</span>
+            }
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">            else if (relation.isLIKE())</span>
+            {
+<span class="nc" id="L168">                Restriction restriction = relation.toRestriction(cfm, boundNames);</span>
+
+<span class="nc bnc" id="L170" title="All 4 branches missed.">                if (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(secondaryIndexManager))</span>
+<span class="nc" id="L171">                    throw new InvalidRequestException(String.format(&quot;LIKE restriction is only supported on properly &quot; +</span>
+                                                                    &quot;indexed columns. %s is not valid.&quot;,
+<span class="nc" id="L173">                                                                    relation.toString()));</span>
+
+<span class="nc" id="L175">                addRestriction(restriction);</span>
+<span class="nc" id="L176">            }</span>
+            else
+            {
+<span class="pc bpc" id="L179" title="5 of 6 branches missed.">                if (cfm.isSuper() &amp;&amp; cfm.isDense() &amp;&amp; !relation.onToken())</span>
+<span class="nc" id="L180">                    addRestriction(relation.toSuperColumnAdapter().toRestriction(cfm, boundNames));</span>
+                else
+<span class="fc" id="L182">                    addRestriction(relation.toRestriction(cfm, boundNames));</span>
+            }
+<span class="fc" id="L184">        }</span>
+
+<span class="fc" id="L186">        hasRegularColumnsRestrictions = nonPrimaryKeyRestrictions.hasRestrictionFor(Kind.REGULAR);</span>
+
+<span class="fc" id="L188">        boolean hasQueriableClusteringColumnIndex = false;</span>
+<span class="fc" id="L189">        boolean hasQueriableIndex = false;</span>
+
+<span class="fc bfc" id="L191" title="All 2 branches covered.">        if (type.allowUseOfSecondaryIndices())</span>
+        {
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">            if (whereClause.containsCustomExpressions())</span>
+<span class="nc" id="L194">                processCustomIndexExpressions(whereClause.expressions, boundNames, secondaryIndexManager);</span>
+
+<span class="fc" id="L196">            hasQueriableClusteringColumnIndex = clusteringColumnsRestrictions.hasSupportingIndex(secondaryIndexManager);</span>
+<span class="pc bpc" id="L197" title="2 of 4 branches missed.">            hasQueriableIndex = !filterRestrictions.getCustomIndexExpressions().isEmpty()</span>
+                    || hasQueriableClusteringColumnIndex
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">                    || partitionKeyRestrictions.hasSupportingIndex(secondaryIndexManager)</span>
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">                    || nonPrimaryKeyRestrictions.hasSupportingIndex(secondaryIndexManager);</span>
+        }
+
+        // At this point, the select statement if fully constructed, but we still have a few things to validate
+<span class="fc" id="L204">        processPartitionKeyRestrictions(hasQueriableIndex, allowFiltering, forView);</span>
+
+        // Some but not all of the partition key columns have been specified;
+        // hence we need turn these restrictions into a row filter.
+<span class="pc bpc" id="L208" title="2 of 4 branches missed.">        if (usesSecondaryIndexing || partitionKeyRestrictions.needFiltering(cfm))</span>
+<span class="nc" id="L209">            filterRestrictions.add(partitionKeyRestrictions);</span>
+
+<span class="pc bpc" id="L211" title="3 of 4 branches missed.">        if (selectsOnlyStaticColumns &amp;&amp; hasClusteringColumnsRestrictions())</span>
+        {
+            // If the only updated/deleted columns are static, then we don't need clustering columns.
+            // And in fact, unless it is an INSERT, we reject if clustering colums are provided as that
+            // suggest something unintended. For instance, given:
+            //   CREATE TABLE t (k int, v int, s int static, PRIMARY KEY (k, v))
+            // it can make sense to do:
+            //   INSERT INTO t(k, v, s) VALUES (0, 1, 2)
+            // but both
+            //   UPDATE t SET s = 3 WHERE k = 0 AND v = 1
+            //   DELETE v FROM t WHERE k = 0 AND v = 1
+            // sounds like you don't really understand what your are doing.
+<span class="nc bnc" id="L223" title="All 4 branches missed.">            if (type.isDelete() || type.isUpdate())</span>
+<span class="nc" id="L224">                throw invalidRequest(&quot;Invalid restrictions on clustering columns since the %s statement modifies only static columns&quot;,</span>
+                                     type);
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (type.isSelect())</span>
+<span class="nc" id="L227">                throw invalidRequest(&quot;Cannot restrict clustering columns when selecting only static columns&quot;);</span>
+        }
+
+<span class="fc" id="L230">        processClusteringColumnsRestrictions(hasQueriableIndex,</span>
+                                             selectsOnlyStaticColumns,
+                                             selectsComplexColumn,
+                                             forView,
+                                             allowFiltering);
+
+        // Covers indexes on the first clustering column (among others).
+<span class="pc bpc" id="L237" title="1 of 4 branches missed.">        if (isKeyRange &amp;&amp; hasQueriableClusteringColumnIndex)</span>
+<span class="nc" id="L238">            usesSecondaryIndexing = true;</span>
+
+<span class="pc bpc" id="L240" title="2 of 4 branches missed.">        if (usesSecondaryIndexing || clusteringColumnsRestrictions.needFiltering())</span>
+<span class="nc" id="L241">            filterRestrictions.add(clusteringColumnsRestrictions);</span>
+
+        // Even if usesSecondaryIndexing is false at this point, we'll still have to use one if
+        // there is restrictions not covered by the PK.
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">        if (!nonPrimaryKeyRestrictions.isEmpty())</span>
+        {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (!type.allowNonPrimaryKeyInWhereClause())</span>
+            {
+<span class="nc" id="L249">                Collection&lt;ColumnIdentifier&gt; nonPrimaryKeyColumns =</span>
+<span class="nc" id="L250">                        ColumnDefinition.toIdentifiers(nonPrimaryKeyRestrictions.getColumnDefs());</span>
+
+<span class="nc" id="L252">                throw invalidRequest(&quot;Non PRIMARY KEY columns found in where clause: %s &quot;,</span>
+<span class="nc" id="L253">                                     Joiner.on(&quot;, &quot;).join(nonPrimaryKeyColumns));</span>
+            }
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (hasQueriableIndex)</span>
+            {
+<span class="nc" id="L257">                usesSecondaryIndexing = true;</span>
+            }
+<span class="nc bnc" id="L259" title="All 4 branches missed.">            else if (!allowFiltering &amp;&amp; !cfm.isSuper())</span>
+            {
+<span class="nc" id="L261">                throw invalidRequest(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE);</span>
+            }
+
+<span class="nc bnc" id="L264" title="All 4 branches missed.">            checkFalse(clusteringColumnsRestrictions.isEmpty() &amp;&amp; cfm.isSuper(),</span>
+                       &quot;Filtering is not supported on SuperColumn tables&quot;);
+
+<span class="nc" id="L267">            filterRestrictions.add(nonPrimaryKeyRestrictions);</span>
+        }
+
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">        if (usesSecondaryIndexing)</span>
+<span class="nc" id="L271">            validateSecondaryIndexSelections(selectsOnlyStaticColumns);</span>
+<span class="fc" id="L272">    }</span>
+
+    private void addRestriction(Restriction restriction)
+    {
+<span class="fc" id="L276">        ColumnDefinition def = restriction.getFirstColumn();</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">        if (def.isPartitionKey())</span>
+<span class="fc" id="L278">            partitionKeyRestrictions = partitionKeyRestrictions.mergeWith(restriction);</span>
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">        else if (def.isClusteringColumn())</span>
+<span class="fc" id="L280">            clusteringColumnsRestrictions = clusteringColumnsRestrictions.mergeWith(restriction);</span>
+        else
+<span class="nc" id="L282">            nonPrimaryKeyRestrictions = nonPrimaryKeyRestrictions.addRestriction((SingleRestriction) restriction);</span>
+<span class="fc" id="L283">    }</span>
+
+    public void addFunctionsTo(List&lt;Function&gt; functions)
+    {
+<span class="fc" id="L287">        partitionKeyRestrictions.addFunctionsTo(functions);</span>
+<span class="fc" id="L288">        clusteringColumnsRestrictions.addFunctionsTo(functions);</span>
+<span class="fc" id="L289">        nonPrimaryKeyRestrictions.addFunctionsTo(functions);</span>
+<span class="fc" id="L290">    }</span>
+
+    // may be used by QueryHandler implementations
+    public IndexRestrictions getIndexRestrictions()
+    {
+<span class="nc" id="L295">        return filterRestrictions;</span>
+    }
+
+    /**
+     * Returns the non-PK column that are restricted.  If includeNotNullRestrictions is true, columns that are restricted
+     * by an IS NOT NULL restriction will be included, otherwise they will not be included (unless another restriction
+     * applies to them).
+     */
+    public Set&lt;ColumnDefinition&gt; nonPKRestrictedColumns(boolean includeNotNullRestrictions)
+    {
+<span class="fc" id="L305">        Set&lt;ColumnDefinition&gt; columns = new HashSet&lt;&gt;();</span>
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">        for (Restrictions r : filterRestrictions.getRestrictions())</span>
+        {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            for (ColumnDefinition def : r.getColumnDefs())</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">                if (!def.isPrimaryKeyColumn())</span>
+<span class="nc" id="L310">                    columns.add(def);</span>
+<span class="nc" id="L311">        }</span>
+
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">        if (includeNotNullRestrictions)</span>
+        {
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">            for (ColumnDefinition def : notNullColumns)</span>
+            {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                if (!def.isPrimaryKeyColumn())</span>
+<span class="nc" id="L318">                    columns.add(def);</span>
+<span class="nc" id="L319">            }</span>
+        }
+
+<span class="fc" id="L322">        return columns;</span>
+    }
+
+    /**
+     * @return the set of columns that have an IS NOT NULL restriction on them
+     */
+    public Set&lt;ColumnDefinition&gt; notNullColumns()
+    {
+<span class="nc" id="L330">        return notNullColumns;</span>
+    }
+
+    /**
+     * @return true if column is restricted by some restriction, false otherwise
+     */
+    public boolean isRestricted(ColumnDefinition column)
+    {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (notNullColumns.contains(column))</span>
+<span class="nc" id="L339">            return true;</span>
+
+<span class="nc" id="L341">        return getRestrictions(column.kind).getColumnDefs().contains(column);</span>
+    }
+
+    /**
+     * Checks if the restrictions on the partition key has IN restrictions.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; the restrictions on the partition key has an IN restriction, &lt;code&gt;false&lt;/code&gt;
+     * otherwise.
+     */
+    public boolean keyIsInRelation()
+    {
+<span class="fc" id="L352">        return partitionKeyRestrictions.hasIN();</span>
+    }
+
+    /**
+     * Checks if the query request a range of partition keys.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the query request a range of partition keys, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean isKeyRange()
+    {
+<span class="fc" id="L362">        return this.isKeyRange;</span>
+    }
+
+    /**
+     * Checks if the specified column is restricted by an EQ restriction.
+     *
+     * @param columnDef the column definition
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified column is restricted by an EQ restiction, &lt;code&gt;false&lt;/code&gt;
+     * otherwise.
+     */
+    public boolean isColumnRestrictedByEq(ColumnDefinition columnDef)
+    {
+<span class="nc" id="L374">        Set&lt;Restriction&gt; restrictions = getRestrictions(columnDef.kind).getRestrictions(columnDef);</span>
+<span class="nc" id="L375">        return restrictions.stream()</span>
+<span class="nc" id="L376">                           .filter(SingleRestriction.class::isInstance)</span>
+<span class="nc" id="L377">                           .anyMatch(p -&gt; ((SingleRestriction) p).isEQ());</span>
+    }
+
+    /**
+     * Returns the &lt;code&gt;Restrictions&lt;/code&gt; for the specified type of columns.
+     *
+     * @param kind the column type
+     * @return the &lt;code&gt;Restrictions&lt;/code&gt; for the specified type of columns
+     */
+    private Restrictions getRestrictions(ColumnDefinition.Kind kind)
+    {
+<span class="nc bnc" id="L388" title="All 3 branches missed.">        switch (kind)</span>
+        {
+<span class="nc" id="L390">            case PARTITION_KEY: return partitionKeyRestrictions;</span>
+<span class="nc" id="L391">            case CLUSTERING: return clusteringColumnsRestrictions;</span>
+<span class="nc" id="L392">            default: return nonPrimaryKeyRestrictions;</span>
+        }
+    }
+
+    /**
+     * Checks if the secondary index need to be queried.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the secondary index need to be queried, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean usesSecondaryIndexing()
+    {
+<span class="fc" id="L403">        return this.usesSecondaryIndexing;</span>
+    }
+
+    private void processPartitionKeyRestrictions(boolean hasQueriableIndex, boolean allowFiltering, boolean forView)
+    {
+<span class="fc bfc" id="L408" title="All 2 branches covered.">        if (!type.allowPartitionKeyRanges())</span>
+        {
+<span class="fc" id="L410">            checkFalse(partitionKeyRestrictions.isOnToken(),</span>
+                       &quot;The token function cannot be used in WHERE clauses for %s statements&quot;, type);
+
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">            if (partitionKeyRestrictions.hasUnrestrictedPartitionKeyComponents(cfm))</span>
+<span class="nc" id="L414">                throw invalidRequest(&quot;Some partition key parts are missing: %s&quot;,</span>
+<span class="nc" id="L415">                                     Joiner.on(&quot;, &quot;).join(getPartitionKeyUnrestrictedComponents()));</span>
+
+            // slice query
+<span class="fc" id="L418">            checkFalse(partitionKeyRestrictions.hasSlice(),</span>
+                    &quot;Only EQ and IN relation are supported on the partition key (unless you use the token() function)&quot;
+                            + &quot; for %s statements&quot;, type);
+        }
+        else
+        {
+            // If there are no partition restrictions or there's only token restriction, we have to set a key range
+<span class="fc bfc" id="L425" title="All 2 branches covered.">            if (partitionKeyRestrictions.isOnToken())</span>
+<span class="fc" id="L426">                isKeyRange = true;</span>
+
+<span class="pc bpc" id="L428" title="1 of 4 branches missed.">            if (partitionKeyRestrictions.isEmpty() &amp;&amp; partitionKeyRestrictions.hasUnrestrictedPartitionKeyComponents(cfm))</span>
+            {
+<span class="fc" id="L430">                isKeyRange = true;</span>
+<span class="fc" id="L431">                usesSecondaryIndexing = hasQueriableIndex;</span>
+            }
+
+            // If there is a queriable index, no special condition is required on the other restrictions.
+            // But we still need to know 2 things:
+            // - If we don't have a queriable index, is the query ok
+            // - Is it queriable without 2ndary index, which is always more efficient
+            // If a component of the partition key is restricted by a relation, all preceding
+            // components must have a EQ. Only the last partition key component can be in IN relation.
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">            if (partitionKeyRestrictions.needFiltering(cfm))</span>
+            {
+<span class="nc bnc" id="L442" title="All 6 branches missed.">                if (!allowFiltering &amp;&amp; !forView &amp;&amp; !hasQueriableIndex)</span>
+<span class="nc" id="L443">                    throw new InvalidRequestException(REQUIRES_ALLOW_FILTERING_MESSAGE);</span>
+
+<span class="nc bnc" id="L445" title="All 2 branches missed.">                if (partitionKeyRestrictions.hasIN())</span>
+<span class="nc" id="L446">                    throw new InvalidRequestException(&quot;IN restrictions are not supported when the query involves filtering&quot;);</span>
+
+<span class="nc" id="L448">                isKeyRange = true;</span>
+<span class="nc" id="L449">                usesSecondaryIndexing = hasQueriableIndex;</span>
+            }
+        }
+<span class="fc" id="L452">    }</span>
+
+    public boolean hasPartitionKeyRestrictions()
+    {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        return !partitionKeyRestrictions.isEmpty();</span>
+    }
+
+    /**
+     * Checks if the restrictions contain any non-primary key restrictions
+     * @return &lt;code&gt;true&lt;/code&gt; if the restrictions contain any non-primary key restrictions, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean hasNonPrimaryKeyRestrictions()
+    {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        return !nonPrimaryKeyRestrictions.isEmpty();</span>
+    }
+
+    /**
+     * Returns the partition key components that are not restricted.
+     * @return the partition key components that are not restricted.
+     */
+    private Collection&lt;ColumnIdentifier&gt; getPartitionKeyUnrestrictedComponents()
+    {
+<span class="nc" id="L474">        List&lt;ColumnDefinition&gt; list = new ArrayList&lt;&gt;(cfm.partitionKeyColumns());</span>
+<span class="nc" id="L475">        list.removeAll(partitionKeyRestrictions.getColumnDefs());</span>
+<span class="nc" id="L476">        return ColumnDefinition.toIdentifiers(list);</span>
+    }
+
+    /**
+     * Checks if the restrictions on the partition key are token restrictions.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the restrictions on the partition key are token restrictions,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean isPartitionKeyRestrictionsOnToken()
+    {
+<span class="nc" id="L487">        return partitionKeyRestrictions.isOnToken();</span>
+    }
+
+    /**
+     * Checks if restrictions on the clustering key have IN restrictions.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the restrictions on the clustering key have IN restrictions,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean clusteringKeyRestrictionsHasIN()
+    {
+<span class="nc" id="L498">        return clusteringColumnsRestrictions.hasIN();</span>
+    }
+
+    /**
+     * Processes the clustering column restrictions.
+     *
+     * @param hasQueriableIndex &lt;code&gt;true&lt;/code&gt; if some of the queried data are indexed, &lt;code&gt;false&lt;/code&gt; otherwise
+     * @param selectsOnlyStaticColumns &lt;code&gt;true&lt;/code&gt; if the selected or modified columns are all statics,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     * @param selectsComplexColumn &lt;code&gt;true&lt;/code&gt; if the query should return a collection column
+     */
+    private void processClusteringColumnsRestrictions(boolean hasQueriableIndex,
+                                                      boolean selectsOnlyStaticColumns,
+                                                      boolean selectsComplexColumn,
+                                                      boolean forView,
+                                                      boolean allowFiltering)
+    {
+<span class="pc bpc" id="L515" title="1 of 4 branches missed.">        checkFalse(!type.allowClusteringColumnSlices() &amp;&amp; clusteringColumnsRestrictions.hasSlice(),</span>
+                   &quot;Slice restrictions are not supported on the clustering columns in %s statements&quot;, type);
+
+<span class="fc bfc" id="L518" title="All 2 branches covered.">        if (!type.allowClusteringColumnSlices()</span>
+<span class="pc bpc" id="L519" title="5 of 6 branches missed.">               &amp;&amp; (!cfm.isCompactTable() || (cfm.isCompactTable() &amp;&amp; !hasClusteringColumnsRestrictions())))</span>
+        {
+<span class="pc bpc" id="L521" title="2 of 4 branches missed.">            if (!selectsOnlyStaticColumns &amp;&amp; hasUnrestrictedClusteringColumns())</span>
+<span class="nc" id="L522">                throw invalidRequest(&quot;Some clustering keys are missing: %s&quot;,</span>
+<span class="nc" id="L523">                                     Joiner.on(&quot;, &quot;).join(getUnrestrictedClusteringColumns()));</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L527" title="1 of 4 branches missed.">            checkFalse(clusteringColumnsRestrictions.hasIN() &amp;&amp; selectsComplexColumn,</span>
+                       &quot;Cannot restrict clustering columns by IN relations when a collection is selected by the query&quot;);
+<span class="pc bpc" id="L529" title="5 of 6 branches missed.">            checkFalse(clusteringColumnsRestrictions.hasContains() &amp;&amp; !hasQueriableIndex &amp;&amp; !allowFiltering,</span>
+                       &quot;Clustering columns can only be restricted with CONTAINS with a secondary index or filtering&quot;);
+
+<span class="pc bpc" id="L532" title="1 of 4 branches missed.">            if (hasClusteringColumnsRestrictions() &amp;&amp; clusteringColumnsRestrictions.needFiltering())</span>
+            {
+<span class="nc bnc" id="L534" title="All 4 branches missed.">                if (hasQueriableIndex || forView)</span>
+                {
+<span class="nc" id="L536">                    usesSecondaryIndexing = true;</span>
+                }
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                else if (!allowFiltering)</span>
+                {
+<span class="nc" id="L540">                    List&lt;ColumnDefinition&gt; clusteringColumns = cfm.clusteringColumns();</span>
+<span class="nc" id="L541">                    List&lt;ColumnDefinition&gt; restrictedColumns = new LinkedList&lt;&gt;(clusteringColumnsRestrictions.getColumnDefs());</span>
+
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                    for (int i = 0, m = restrictedColumns.size(); i &lt; m; i++)</span>
+                    {
+<span class="nc" id="L545">                        ColumnDefinition clusteringColumn = clusteringColumns.get(i);</span>
+<span class="nc" id="L546">                        ColumnDefinition restrictedColumn = restrictedColumns.get(i);</span>
+
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                        if (!clusteringColumn.equals(restrictedColumn))</span>
+                        {
+<span class="nc" id="L550">                            throw invalidRequest(&quot;PRIMARY KEY column \&quot;%s\&quot; cannot be restricted as preceding column \&quot;%s\&quot; is not restricted&quot;,</span>
+                                                 restrictedColumn.name,
+                                                 clusteringColumn.name);
+                        }
+                    }
+                }
+            }
+
+        }
+
+<span class="fc" id="L560">    }</span>
+
+    /**
+     * Returns the clustering columns that are not restricted.
+     * @return the clustering columns that are not restricted.
+     */
+    private Collection&lt;ColumnIdentifier&gt; getUnrestrictedClusteringColumns()
+    {
+<span class="nc" id="L568">        List&lt;ColumnDefinition&gt; missingClusteringColumns = new ArrayList&lt;&gt;(cfm.clusteringColumns());</span>
+<span class="nc" id="L569">        missingClusteringColumns.removeAll(new LinkedList&lt;&gt;(clusteringColumnsRestrictions.getColumnDefs()));</span>
+<span class="nc" id="L570">        return ColumnDefinition.toIdentifiers(missingClusteringColumns);</span>
+    }
+
+    /**
+     * Checks if some clustering columns are not restricted.
+     * @return &lt;code&gt;true&lt;/code&gt; if some clustering columns are not restricted, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    private boolean hasUnrestrictedClusteringColumns()
+    {
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">        return cfm.clusteringColumns().size() != clusteringColumnsRestrictions.size();</span>
+    }
+
+    private void processCustomIndexExpressions(List&lt;CustomIndexExpression&gt; expressions,
+                                               VariableSpecifications boundNames,
+                                               SecondaryIndexManager indexManager)
+    {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (!MessagingService.instance().areAllNodesAtLeast30())</span>
+<span class="nc" id="L587">            throw new InvalidRequestException(&quot;Please upgrade all nodes to at least 3.0 before using custom index expressions&quot;);</span>
+
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        if (expressions.size() &gt; 1)</span>
+<span class="nc" id="L590">            throw new InvalidRequestException(IndexRestrictions.MULTIPLE_EXPRESSIONS);</span>
+
+<span class="nc" id="L592">        CustomIndexExpression expression = expressions.get(0);</span>
+
+<span class="nc" id="L594">        CFName cfName = expression.targetIndex.getCfName();</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        if (cfName.hasKeyspace()</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">            &amp;&amp; !expression.targetIndex.getKeyspace().equals(cfm.ksName))</span>
+<span class="nc" id="L597">            throw IndexRestrictions.invalidIndex(expression.targetIndex, cfm);</span>
+
+<span class="nc bnc" id="L599" title="All 4 branches missed.">        if (cfName.getColumnFamily() != null &amp;&amp; !cfName.getColumnFamily().equals(cfm.cfName))</span>
+<span class="nc" id="L600">            throw IndexRestrictions.invalidIndex(expression.targetIndex, cfm);</span>
+
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (!cfm.getIndexes().has(expression.targetIndex.getIdx()))</span>
+<span class="nc" id="L603">            throw IndexRestrictions.indexNotFound(expression.targetIndex, cfm);</span>
+
+<span class="nc" id="L605">        Index index = indexManager.getIndex(cfm.getIndexes().get(expression.targetIndex.getIdx()).get());</span>
+
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        if (!index.getIndexMetadata().isCustom())</span>
+<span class="nc" id="L608">            throw IndexRestrictions.nonCustomIndexInExpression(expression.targetIndex);</span>
+
+<span class="nc" id="L610">        AbstractType&lt;?&gt; expressionType = index.customExpressionValueType();</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        if (expressionType == null)</span>
+<span class="nc" id="L612">            throw IndexRestrictions.customExpressionNotSupported(expression.targetIndex);</span>
+
+<span class="nc" id="L614">        expression.prepareValue(cfm, expressionType, boundNames);</span>
+
+<span class="nc" id="L616">        filterRestrictions.add(expression);</span>
+<span class="nc" id="L617">    }</span>
+
+    public RowFilter getRowFilter(SecondaryIndexManager indexManager, QueryOptions options)
+    {
+<span class="pc bpc" id="L621" title="1 of 2 branches missed.">        if (filterRestrictions.isEmpty())</span>
+<span class="fc" id="L622">            return RowFilter.NONE;</span>
+
+<span class="nc" id="L624">        RowFilter filter = RowFilter.create();</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        for (Restrictions restrictions : filterRestrictions.getRestrictions())</span>
+<span class="nc" id="L626">            restrictions.addRowFilterTo(filter, indexManager, options);</span>
+
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        for (CustomIndexExpression expression : filterRestrictions.getCustomIndexExpressions())</span>
+<span class="nc" id="L629">            expression.addToRowFilter(filter, cfm, options);</span>
+
+<span class="nc" id="L631">        return filter;</span>
+    }
+
+    /**
+     * Returns the partition keys for which the data is requested.
+     *
+     * @param options the query options
+     * @return the partition keys for which the data is requested.
+     */
+    public List&lt;ByteBuffer&gt; getPartitionKeys(final QueryOptions options)
+    {
+<span class="fc" id="L642">        return partitionKeyRestrictions.values(options);</span>
+    }
+
+    /**
+     * Returns the specified bound of the partition key.
+     *
+     * @param b the boundary type
+     * @param options the query options
+     * @return the specified bound of the partition key
+     */
+    private ByteBuffer getPartitionKeyBound(Bound b, QueryOptions options)
+    {
+        // We deal with IN queries for keys in other places, so we know buildBound will return only one result
+<span class="fc" id="L655">        return partitionKeyRestrictions.bounds(b, options).get(0);</span>
+    }
+
+    /**
+     * Returns the partition key bounds.
+     *
+     * @param options the query options
+     * @return the partition key bounds
+     */
+    public AbstractBounds&lt;PartitionPosition&gt; getPartitionKeyBounds(QueryOptions options)
+    {
+<span class="fc" id="L666">        IPartitioner p = cfm.partitioner;</span>
+
+<span class="fc bfc" id="L668" title="All 2 branches covered.">        if (partitionKeyRestrictions.isOnToken())</span>
+        {
+<span class="fc" id="L670">            return getPartitionKeyBoundsForTokenRestrictions(p, options);</span>
+        }
+
+<span class="fc" id="L673">        return getPartitionKeyBounds(p, options);</span>
+    }
+
+    private AbstractBounds&lt;PartitionPosition&gt; getPartitionKeyBounds(IPartitioner p,
+                                                                    QueryOptions options)
+    {
+        // Deal with unrestricted partition key components (special-casing is required to deal with 2i queries on the
+        // first component of a composite partition key) queries that filter on the partition key.
+<span class="pc bpc" id="L681" title="1 of 2 branches missed.">        if (partitionKeyRestrictions.needFiltering(cfm))</span>
+<span class="nc" id="L682">            return new Range&lt;&gt;(p.getMinimumToken().minKeyBound(), p.getMinimumToken().maxKeyBound());</span>
+
+<span class="fc" id="L684">        ByteBuffer startKeyBytes = getPartitionKeyBound(Bound.START, options);</span>
+<span class="fc" id="L685">        ByteBuffer finishKeyBytes = getPartitionKeyBound(Bound.END, options);</span>
+
+<span class="fc" id="L687">        PartitionPosition startKey = PartitionPosition.ForKey.get(startKeyBytes, p);</span>
+<span class="fc" id="L688">        PartitionPosition finishKey = PartitionPosition.ForKey.get(finishKeyBytes, p);</span>
+
+<span class="pc bpc" id="L690" title="3 of 4 branches missed.">        if (startKey.compareTo(finishKey) &gt; 0 &amp;&amp; !finishKey.isMinimum())</span>
+<span class="nc" id="L691">            return null;</span>
+
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">        if (partitionKeyRestrictions.isInclusive(Bound.START))</span>
+        {
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            return partitionKeyRestrictions.isInclusive(Bound.END)</span>
+                    ? new Bounds&lt;&gt;(startKey, finishKey)
+                    : new IncludingExcludingBounds&lt;&gt;(startKey, finishKey);
+        }
+
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">        return partitionKeyRestrictions.isInclusive(Bound.END)</span>
+                ? new Range&lt;&gt;(startKey, finishKey)
+                : new ExcludingBounds&lt;&gt;(startKey, finishKey);
+    }
+
+    private AbstractBounds&lt;PartitionPosition&gt; getPartitionKeyBoundsForTokenRestrictions(IPartitioner p,
+                                                                                        QueryOptions options)
+    {
+<span class="fc" id="L708">        Token startToken = getTokenBound(Bound.START, options, p);</span>
+<span class="fc" id="L709">        Token endToken = getTokenBound(Bound.END, options, p);</span>
+
+<span class="fc" id="L711">        boolean includeStart = partitionKeyRestrictions.isInclusive(Bound.START);</span>
+<span class="fc" id="L712">        boolean includeEnd = partitionKeyRestrictions.isInclusive(Bound.END);</span>
+
+        /*
+         * If we ask SP.getRangeSlice() for (token(200), token(200)], it will happily return the whole ring.
+         * However, wrapping range doesn't really make sense for CQL, and we want to return an empty result in that
+         * case (CASSANDRA-5573). So special case to create a range that is guaranteed to be empty.
+         *
+         * In practice, we want to return an empty result set if either startToken &gt; endToken, or both are equal but
+         * one of the bound is excluded (since [a, a] can contains something, but not (a, a], [a, a) or (a, a)).
+         * Note though that in the case where startToken or endToken is the minimum token, then this special case
+         * rule should not apply.
+         */
+<span class="fc" id="L724">        int cmp = startToken.compareTo(endToken);</span>
+<span class="pc bpc" id="L725" title="8 of 12 branches missed.">        if (!startToken.isMinimum() &amp;&amp; !endToken.isMinimum()</span>
+                &amp;&amp; (cmp &gt; 0 || (cmp == 0 &amp;&amp; (!includeStart || !includeEnd))))
+<span class="nc" id="L727">            return null;</span>
+
+<span class="pc bpc" id="L729" title="1 of 2 branches missed.">        PartitionPosition start = includeStart ? startToken.minKeyBound() : startToken.maxKeyBound();</span>
+<span class="pc bpc" id="L730" title="1 of 2 branches missed.">        PartitionPosition end = includeEnd ? endToken.maxKeyBound() : endToken.minKeyBound();</span>
+
+<span class="fc" id="L732">        return new Range&lt;&gt;(start, end);</span>
+    }
+
+    private Token getTokenBound(Bound b, QueryOptions options, IPartitioner p)
+    {
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">        if (!partitionKeyRestrictions.hasBound(b))</span>
+<span class="nc" id="L738">            return p.getMinimumToken();</span>
+
+<span class="fc" id="L740">        ByteBuffer value = partitionKeyRestrictions.bounds(b, options).get(0);</span>
+<span class="fc" id="L741">        checkNotNull(value, &quot;Invalid null token value&quot;);</span>
+<span class="fc" id="L742">        return p.getTokenFactory().fromByteArray(value);</span>
+    }
+
+    /**
+     * Checks if the query has some restrictions on the clustering columns.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the query has some restrictions on the clustering columns,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean hasClusteringColumnsRestrictions()
+    {
+<span class="fc bfc" id="L753" title="All 2 branches covered.">        return !clusteringColumnsRestrictions.isEmpty();</span>
+    }
+
+    /**
+     * Returns the requested clustering columns.
+     *
+     * @param options the query options
+     * @return the requested clustering columns
+     */
+    public NavigableSet&lt;Clustering&gt; getClusteringColumns(QueryOptions options)
+    {
+        // If this is a names command and the table is a static compact one, then as far as CQL is concerned we have
+        // only a single row which internally correspond to the static parts. In which case we want to return an empty
+        // set (since that's what ClusteringIndexNamesFilter expects).
+<span class="fc bfc" id="L767" title="All 2 branches covered.">        if (cfm.isStaticCompactTable())</span>
+<span class="fc" id="L768">            return BTreeSet.empty(cfm.comparator);</span>
+
+<span class="fc" id="L770">        return clusteringColumnsRestrictions.valuesAsClustering(options);</span>
+    }
+
+    /**
+     * Returns the bounds (start or end) of the clustering columns.
+     *
+     * @param b the bound type
+     * @param options the query options
+     * @return the bounds (start or end) of the clustering columns
+     */
+    public NavigableSet&lt;ClusteringBound&gt; getClusteringColumnsBounds(Bound b, QueryOptions options)
+    {
+<span class="fc" id="L782">        return clusteringColumnsRestrictions.boundsAsClustering(b, options);</span>
+    }
+
+    /**
+     * Checks if the query returns a range of columns.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the query returns a range of columns, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean isColumnRange()
+    {
+        // For static compact tables we want to ignore the fake clustering column (note that if we weren't special casing,
+        // this would mean a 'SELECT *' on a static compact table would query whole partitions, even though we'll only return
+        // the static part as far as CQL is concerned. This is thus mostly an optimization to use the query-by-name path).
+<span class="fc bfc" id="L795" title="All 2 branches covered.">        int numberOfClusteringColumns = cfm.isStaticCompactTable() ? 0 : cfm.clusteringColumns().size();</span>
+        // it is a range query if it has at least one the column alias for which no relation is defined or is not EQ or IN.
+<span class="fc bfc" id="L797" title="All 2 branches covered.">        return clusteringColumnsRestrictions.size() &lt; numberOfClusteringColumns</span>
+<span class="pc bpc" id="L798" title="1 of 2 branches missed.">            || !clusteringColumnsRestrictions.hasOnlyEqualityRestrictions();</span>
+    }
+
+    /**
+     * Checks if the query need to use filtering.
+     * @return &lt;code&gt;true&lt;/code&gt; if the query need to use filtering, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean needFiltering()
+    {
+<span class="fc" id="L807">        int numberOfRestrictions = filterRestrictions.getCustomIndexExpressions().size();</span>
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">        for (Restrictions restrictions : filterRestrictions.getRestrictions())</span>
+<span class="nc" id="L809">            numberOfRestrictions += restrictions.size();</span>
+
+<span class="pc bpc" id="L811" title="2 of 4 branches missed.">        return numberOfRestrictions &gt; 1</span>
+<span class="pc bpc" id="L812" title="2 of 4 branches missed.">                || (numberOfRestrictions == 0 &amp;&amp; !clusteringColumnsRestrictions.isEmpty())</span>
+                || (numberOfRestrictions != 0
+<span class="pc bnc" id="L814" title="All 2 branches missed.">                        &amp;&amp; nonPrimaryKeyRestrictions.hasMultipleContains());</span>
+    }
+
+    private void validateSecondaryIndexSelections(boolean selectsOnlyStaticColumns)
+    {
+<span class="nc" id="L819">        checkFalse(keyIsInRelation(),</span>
+                   &quot;Select on indexed columns and with IN clause for the PRIMARY KEY are not supported&quot;);
+        // When the user only select static columns, the intent is that we don't query the whole partition but just
+        // the static parts. But 1) we don't have an easy way to do that with 2i and 2) since we don't support index on
+        // static columns
+        // so far, 2i means that you've restricted a non static column, so the query is somewhat non-sensical.
+<span class="nc" id="L825">        checkFalse(selectsOnlyStaticColumns, &quot;Queries using 2ndary indexes don't support selecting only static columns&quot;);</span>
+<span class="nc" id="L826">    }</span>
+
+    /**
+     * Checks that all the primary key columns (partition key and clustering columns) are restricted by an equality
+     * relation ('=' or 'IN').
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if all the primary key columns are restricted by an equality relation.
+     */
+    public boolean hasAllPKColumnsRestrictedByEqualities()
+    {
+<span class="nc bnc" id="L836" title="All 2 branches missed.">        return !isPartitionKeyRestrictionsOnToken()</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">                &amp;&amp; !partitionKeyRestrictions.hasUnrestrictedPartitionKeyComponents(cfm)</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">                &amp;&amp; (partitionKeyRestrictions.hasOnlyEqualityRestrictions())</span>
+<span class="nc bnc" id="L839" title="All 2 branches missed.">                &amp;&amp; !hasUnrestrictedClusteringColumns()</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                &amp;&amp; (clusteringColumnsRestrictions.hasOnlyEqualityRestrictions());</span>
+    }
+
+    /**
+     * Checks if one of the restrictions applies to a regular column.
+     * @return {@code true} if one of the restrictions applies to a regular column, {@code false} otherwise.
+     */
+    public boolean hasRegularColumnsRestrictions()
+    {
+<span class="nc" id="L849">        return hasRegularColumnsRestrictions;</span>
+    }
+
+    private SuperColumnCompatibility.SuperColumnRestrictions cached;
+    public SuperColumnCompatibility.SuperColumnRestrictions getSuperColumnRestrictions()
+    {
+<span class="nc bnc" id="L855" title="All 6 branches missed.">        assert cfm.isSuper() &amp;&amp; cfm.isDense();</span>
+
+<span class="nc bnc" id="L857" title="All 2 branches missed.">        if (cached == null)</span>
+<span class="nc" id="L858">            cached = new SuperColumnCompatibility.SuperColumnRestrictions(Iterators.concat(clusteringColumnsRestrictions.iterator(),</span>
+<span class="nc" id="L859">                                                                                           nonPrimaryKeyRestrictions.iterator()));</span>
+<span class="nc" id="L860">        return cached;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,1479 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TokenMetadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.locator</a> &gt; <span class="el_source">TokenMetadata.java</span></div><h1>TokenMetadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.locator;
+
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.BiMultiValMap;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.SortedBiMultiValMap;
+
+<span class="pc bpc" id="L46" title="1 of 2 branches missed.">public class TokenMetadata</span>
+{
+<span class="fc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(TokenMetadata.class);</span>
+
+    /**
+     * Maintains token to endpoint map of every node in the cluster.
+     * Each Token is associated with exactly one Address, but each Address may have
+     * multiple tokens.  Hence, the BiMultiValMap collection.
+     */
+    private final BiMultiValMap&lt;Token, InetAddress&gt; tokenToEndpointMap;
+
+    /** Maintains endpoint to host ID map of every node in the cluster */
+    private final BiMap&lt;InetAddress, UUID&gt; endpointToHostIdMap;
+
+    // Prior to CASSANDRA-603, we just had &lt;tt&gt;Map&lt;Range, InetAddress&gt; pendingRanges&lt;tt&gt;,
+    // which was added to when a node began bootstrap and removed from when it finished.
+    //
+    // This is inadequate when multiple changes are allowed simultaneously.  For example,
+    // suppose that there is a ring of nodes A, C and E, with replication factor 3.
+    // Node D bootstraps between C and E, so its pending ranges will be E-A, A-C and C-D.
+    // Now suppose node B bootstraps between A and C at the same time. Its pending ranges
+    // would be C-E, E-A and A-B. Now both nodes need to be assigned pending range E-A,
+    // which we would be unable to represent with the old Map.  The same thing happens
+    // even more obviously for any nodes that boot simultaneously between same two nodes.
+    //
+    // So, we made two changes:
+    //
+    // First, we changed pendingRanges to a &lt;tt&gt;Multimap&lt;Range, InetAddress&gt;&lt;/tt&gt; (now
+    // &lt;tt&gt;Map&lt;String, Multimap&lt;Range, InetAddress&gt;&gt;&lt;/tt&gt;, because replication strategy
+    // and options are per-KeySpace).
+    //
+    // Second, we added the bootstrapTokens and leavingEndpoints collections, so we can
+    // rebuild pendingRanges from the complete information of what is going on, when
+    // additional changes are made mid-operation.
+    //
+    // Finally, note that recording the tokens of joining nodes in bootstrapTokens also
+    // means we can detect and reject the addition of multiple nodes at the same token
+    // before one becomes part of the ring.
+<span class="fc" id="L84">    private final BiMultiValMap&lt;Token, InetAddress&gt; bootstrapTokens = new BiMultiValMap&lt;&gt;();</span>
+
+<span class="fc" id="L86">    private final BiMap&lt;InetAddress, InetAddress&gt; replacementToOriginal = HashBiMap.create();</span>
+
+    // (don't need to record Token here since it's still part of tokenToEndpointMap until it's done leaving)
+<span class="fc" id="L89">    private final Set&lt;InetAddress&gt; leavingEndpoints = new HashSet&lt;&gt;();</span>
+    // this is a cache of the calculation from {tokenToEndpointMap, bootstrapTokens, leavingEndpoints}
+<span class="fc" id="L91">    private final ConcurrentMap&lt;String, PendingRangeMaps&gt; pendingRanges = new ConcurrentHashMap&lt;String, PendingRangeMaps&gt;();</span>
+
+    // nodes which are migrating to the new tokens in the ring
+<span class="fc" id="L94">    private final Set&lt;Pair&lt;Token, InetAddress&gt;&gt; movingEndpoints = new HashSet&lt;&gt;();</span>
+
+    /* Use this lock for manipulating the token map */
+<span class="fc" id="L97">    private final ReadWriteLock lock = new ReentrantReadWriteLock(true);</span>
+    private volatile ArrayList&lt;Token&gt; sortedTokens; // safe to be read without a lock, as it's never mutated
+
+    private volatile Topology topology;
+
+    public final IPartitioner partitioner;
+
+<span class="fc" id="L104">    private static final Comparator&lt;InetAddress&gt; inetaddressCmp = new Comparator&lt;InetAddress&gt;()</span>
+<span class="fc" id="L105">    {</span>
+        public int compare(InetAddress o1, InetAddress o2)
+        {
+<span class="fc" id="L108">            return ByteBuffer.wrap(o1.getAddress()).compareTo(ByteBuffer.wrap(o2.getAddress()));</span>
+        }
+    };
+
+    // signals replication strategies that nodes have joined or left the ring and they need to recompute ownership
+<span class="fc" id="L113">    private volatile long ringVersion = 0;</span>
+
+    public TokenMetadata()
+    {
+<span class="fc" id="L117">        this(SortedBiMultiValMap.&lt;Token, InetAddress&gt;create(null, inetaddressCmp),</span>
+<span class="fc" id="L118">             HashBiMap.&lt;InetAddress, UUID&gt;create(),</span>
+<span class="fc" id="L119">             Topology.empty(),</span>
+<span class="fc" id="L120">             DatabaseDescriptor.getPartitioner());</span>
+<span class="fc" id="L121">    }</span>
+
+    private TokenMetadata(BiMultiValMap&lt;Token, InetAddress&gt; tokenToEndpointMap, BiMap&lt;InetAddress, UUID&gt; endpointsMap, Topology topology, IPartitioner partitioner)
+<span class="fc" id="L124">    {</span>
+<span class="fc" id="L125">        this.tokenToEndpointMap = tokenToEndpointMap;</span>
+<span class="fc" id="L126">        this.topology = topology;</span>
+<span class="fc" id="L127">        this.partitioner = partitioner;</span>
+<span class="fc" id="L128">        endpointToHostIdMap = endpointsMap;</span>
+<span class="fc" id="L129">        sortedTokens = sortTokens();</span>
+<span class="fc" id="L130">    }</span>
+
+    /**
+     * To be used by tests only (via {@link org.apache.cassandra.service.StorageService#setPartitionerUnsafe}).
+     */
+    @VisibleForTesting
+    public TokenMetadata cloneWithNewPartitioner(IPartitioner newPartitioner)
+    {
+<span class="nc" id="L138">        return new TokenMetadata(tokenToEndpointMap, endpointToHostIdMap, topology, newPartitioner);</span>
+    }
+
+    private ArrayList&lt;Token&gt; sortTokens()
+    {
+<span class="fc" id="L143">        return new ArrayList&lt;&gt;(tokenToEndpointMap.keySet());</span>
+    }
+
+    /** @return the number of nodes bootstrapping into source's primary range */
+    public int pendingRangeChanges(InetAddress source)
+    {
+<span class="nc" id="L149">        int n = 0;</span>
+<span class="nc" id="L150">        Collection&lt;Range&lt;Token&gt;&gt; sourceRanges = getPrimaryRangesFor(getTokens(source));</span>
+<span class="nc" id="L151">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            for (Token token : bootstrapTokens.keySet())</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                for (Range&lt;Token&gt; range : sourceRanges)</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                    if (range.contains(token))</span>
+<span class="nc" id="L157">                        n++;</span>
+        }
+        finally
+        {
+<span class="nc" id="L161">            lock.readLock().unlock();</span>
+        }
+<span class="nc" id="L163">        return n;</span>
+    }
+
+    /**
+     * Update token map with a single token/endpoint pair in normal state.
+     */
+    public void updateNormalToken(Token token, InetAddress endpoint)
+    {
+<span class="nc" id="L171">        updateNormalTokens(Collections.singleton(token), endpoint);</span>
+<span class="nc" id="L172">    }</span>
+
+    public void updateNormalTokens(Collection&lt;Token&gt; tokens, InetAddress endpoint)
+    {
+<span class="fc" id="L176">        Multimap&lt;InetAddress, Token&gt; endpointTokens = HashMultimap.create();</span>
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        for (Token token : tokens)</span>
+<span class="fc" id="L178">            endpointTokens.put(endpoint, token);</span>
+<span class="fc" id="L179">        updateNormalTokens(endpointTokens);</span>
+<span class="fc" id="L180">    }</span>
+
+    /**
+     * Update token map with a set of token/endpoint pairs in normal state.
+     *
+     * Prefer this whenever there are multiple pairs to update, as each update (whether a single or multiple)
+     * is expensive (CASSANDRA-3831).
+     */
+    public void updateNormalTokens(Multimap&lt;InetAddress, Token&gt; endpointTokens)
+    {
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">        if (endpointTokens.isEmpty())</span>
+<span class="nc" id="L191">            return;</span>
+
+<span class="fc" id="L193">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="fc" id="L196">            boolean shouldSortTokens = false;</span>
+<span class="fc" id="L197">            Topology.Builder topologyBuilder = topology.unbuild();</span>
+<span class="fc bfc" id="L198" title="All 2 branches covered.">            for (InetAddress endpoint : endpointTokens.keySet())</span>
+            {
+<span class="fc" id="L200">                Collection&lt;Token&gt; tokens = endpointTokens.get(endpoint);</span>
+
+<span class="pc bpc" id="L202" title="3 of 6 branches missed.">                assert tokens != null &amp;&amp; !tokens.isEmpty();</span>
+
+<span class="fc" id="L204">                bootstrapTokens.removeValue(endpoint);</span>
+<span class="fc" id="L205">                tokenToEndpointMap.removeValue(endpoint);</span>
+<span class="fc" id="L206">                topologyBuilder.addEndpoint(endpoint);</span>
+<span class="fc" id="L207">                leavingEndpoints.remove(endpoint);</span>
+<span class="fc" id="L208">                replacementToOriginal.remove(endpoint);</span>
+<span class="fc" id="L209">                removeFromMoving(endpoint); // also removing this endpoint from moving</span>
+
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                for (Token token : tokens)</span>
+                {
+<span class="fc" id="L213">                    InetAddress prev = tokenToEndpointMap.put(token, endpoint);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                    if (!endpoint.equals(prev))</span>
+                    {
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">                        if (prev != null)</span>
+<span class="nc" id="L217">                            logger.warn(&quot;Token {} changing ownership from {} to {}&quot;, token, prev, endpoint);</span>
+<span class="fc" id="L218">                        shouldSortTokens = true;</span>
+                    }
+<span class="fc" id="L220">                }</span>
+<span class="fc" id="L221">            }</span>
+<span class="fc" id="L222">            topology = topologyBuilder.build();</span>
+
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">            if (shouldSortTokens)</span>
+<span class="fc" id="L225">                sortedTokens = sortTokens();</span>
+        }
+        finally
+        {
+<span class="fc" id="L229">            lock.writeLock().unlock();</span>
+        }
+<span class="fc" id="L231">    }</span>
+
+    /**
+     * Store an end-point to host ID mapping.  Each ID must be unique, and
+     * cannot be changed after the fact.
+     */
+    public void updateHostId(UUID hostId, InetAddress endpoint)
+    {
+<span class="pc bpc" id="L239" title="2 of 4 branches missed.">        assert hostId != null;</span>
+<span class="pc bpc" id="L240" title="2 of 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="fc" id="L242">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="fc" id="L245">            InetAddress storedEp = endpointToHostIdMap.inverse().get(hostId);</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">            if (storedEp != null)</span>
+            {
+<span class="pc bpc" id="L248" title="3 of 4 branches missed.">                if (!storedEp.equals(endpoint) &amp;&amp; (FailureDetector.instance.isAlive(storedEp)))</span>
+                {
+<span class="nc" id="L250">                    throw new RuntimeException(String.format(&quot;Host ID collision between active endpoint %s and %s (id=%s)&quot;,</span>
+                                                             storedEp,
+                                                             endpoint,
+                                                             hostId));
+                }
+            }
+
+<span class="fc" id="L257">            UUID storedId = endpointToHostIdMap.get(endpoint);</span>
+<span class="pc bpc" id="L258" title="1 of 4 branches missed.">            if ((storedId != null) &amp;&amp; (!storedId.equals(hostId)))</span>
+<span class="nc" id="L259">                logger.warn(&quot;Changing {}'s host ID from {} to {}&quot;, endpoint, storedId, hostId);</span>
+    
+<span class="fc" id="L261">            endpointToHostIdMap.forcePut(endpoint, hostId);</span>
+        }
+        finally
+        {
+<span class="fc" id="L265">            lock.writeLock().unlock();</span>
+        }
+
+<span class="fc" id="L268">    }</span>
+
+    /** Return the unique host ID for an end-point. */
+    public UUID getHostId(InetAddress endpoint)
+    {
+<span class="nc" id="L273">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L276">            return endpointToHostIdMap.get(endpoint);</span>
+        }
+        finally
+        {
+<span class="nc" id="L280">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /** Return the end-point for a unique host ID */
+    public InetAddress getEndpointForHostId(UUID hostId)
+    {
+<span class="fc" id="L287">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L290">            return endpointToHostIdMap.inverse().get(hostId);</span>
+        }
+        finally
+        {
+<span class="fc" id="L294">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /** @return a copy of the endpoint-to-id map for read-only operations */
+    public Map&lt;InetAddress, UUID&gt; getEndpointToHostIdMapForReading()
+    {
+<span class="nc" id="L301">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L304">            Map&lt;InetAddress, UUID&gt; readMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L305">            readMap.putAll(endpointToHostIdMap);</span>
+<span class="nc" id="L306">            return readMap;</span>
+        }
+        finally
+        {
+<span class="nc" id="L310">            lock.readLock().unlock();</span>
+        }
+    }
+
+    @Deprecated
+    public void addBootstrapToken(Token token, InetAddress endpoint)
+    {
+<span class="nc" id="L317">        addBootstrapTokens(Collections.singleton(token), endpoint);</span>
+<span class="nc" id="L318">    }</span>
+
+    public void addBootstrapTokens(Collection&lt;Token&gt; tokens, InetAddress endpoint)
+    {
+<span class="nc" id="L322">        addBootstrapTokens(tokens, endpoint, null);</span>
+<span class="nc" id="L323">    }</span>
+
+    private void addBootstrapTokens(Collection&lt;Token&gt; tokens, InetAddress endpoint, InetAddress original)
+    {
+<span class="nc bnc" id="L327" title="All 6 branches missed.">        assert tokens != null &amp;&amp; !tokens.isEmpty();</span>
+<span class="nc bnc" id="L328" title="All 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="nc" id="L330">        lock.writeLock().lock();</span>
+        try
+        {
+
+            InetAddress oldEndpoint;
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            for (Token token : tokens)</span>
+            {
+<span class="nc" id="L338">                oldEndpoint = bootstrapTokens.get(token);</span>
+<span class="nc bnc" id="L339" title="All 4 branches missed.">                if (oldEndpoint != null &amp;&amp; !oldEndpoint.equals(endpoint))</span>
+<span class="nc" id="L340">                    throw new RuntimeException(&quot;Bootstrap Token collision between &quot; + oldEndpoint + &quot; and &quot; + endpoint + &quot; (token &quot; + token);</span>
+
+<span class="nc" id="L342">                oldEndpoint = tokenToEndpointMap.get(token);</span>
+<span class="nc bnc" id="L343" title="All 6 branches missed.">                if (oldEndpoint != null &amp;&amp; !oldEndpoint.equals(endpoint) &amp;&amp; !oldEndpoint.equals(original))</span>
+<span class="nc" id="L344">                    throw new RuntimeException(&quot;Bootstrap Token collision between &quot; + oldEndpoint + &quot; and &quot; + endpoint + &quot; (token &quot; + token);</span>
+<span class="nc" id="L345">            }</span>
+
+<span class="nc" id="L347">            bootstrapTokens.removeValue(endpoint);</span>
+
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            for (Token token : tokens)</span>
+<span class="nc" id="L350">                bootstrapTokens.put(token, endpoint);</span>
+        }
+        finally
+        {
+<span class="nc" id="L354">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L356">    }</span>
+
+    public void addReplaceTokens(Collection&lt;Token&gt; replacingTokens, InetAddress newNode, InetAddress oldNode)
+    {
+<span class="nc bnc" id="L360" title="All 6 branches missed.">        assert replacingTokens != null &amp;&amp; !replacingTokens.isEmpty();</span>
+<span class="nc bnc" id="L361" title="All 6 branches missed.">        assert newNode != null &amp;&amp; oldNode != null;</span>
+
+<span class="nc" id="L363">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L366">            Collection&lt;Token&gt; oldNodeTokens = tokenToEndpointMap.inverse().get(oldNode);</span>
+<span class="nc bnc" id="L367" title="All 4 branches missed.">            if (!replacingTokens.containsAll(oldNodeTokens) || !oldNodeTokens.containsAll(replacingTokens))</span>
+            {
+<span class="nc" id="L369">                throw new RuntimeException(String.format(&quot;Node %s is trying to replace node %s with tokens %s with a &quot; +</span>
+                                                         &quot;different set of tokens %s.&quot;, newNode, oldNode, oldNodeTokens,
+                                                         replacingTokens));
+            }
+
+<span class="nc" id="L374">            logger.debug(&quot;Replacing {} with {}&quot;, newNode, oldNode);</span>
+<span class="nc" id="L375">            replacementToOriginal.put(newNode, oldNode);</span>
+
+<span class="nc" id="L377">            addBootstrapTokens(replacingTokens, newNode, oldNode);</span>
+        }
+        finally
+        {
+<span class="nc" id="L381">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L383">    }</span>
+
+    public Optional&lt;InetAddress&gt; getReplacementNode(InetAddress endpoint)
+    {
+<span class="fc" id="L387">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L390">            return Optional.ofNullable(replacementToOriginal.inverse().get(endpoint));</span>
+        }
+        finally
+        {
+<span class="fc" id="L394">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public Optional&lt;InetAddress&gt; getReplacingNode(InetAddress endpoint)
+    {
+<span class="fc" id="L400">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L403">            return Optional.ofNullable((replacementToOriginal.get(endpoint)));</span>
+        }
+        finally
+        {
+<span class="fc" id="L407">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public void removeBootstrapTokens(Collection&lt;Token&gt; tokens)
+    {
+<span class="nc bnc" id="L413" title="All 6 branches missed.">        assert tokens != null &amp;&amp; !tokens.isEmpty();</span>
+
+<span class="nc" id="L415">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            for (Token token : tokens)</span>
+<span class="nc" id="L419">                bootstrapTokens.remove(token);</span>
+        }
+        finally
+        {
+<span class="nc" id="L423">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L425">    }</span>
+
+    public void addLeavingEndpoint(InetAddress endpoint)
+    {
+<span class="nc bnc" id="L429" title="All 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="nc" id="L431">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L434">            leavingEndpoints.add(endpoint);</span>
+        }
+        finally
+        {
+<span class="nc" id="L438">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L440">    }</span>
+
+    /**
+     * Add a new moving endpoint
+     * @param token token which is node moving to
+     * @param endpoint address of the moving node
+     */
+    public void addMovingEndpoint(Token token, InetAddress endpoint)
+    {
+<span class="nc bnc" id="L449" title="All 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="nc" id="L451">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L454">            movingEndpoints.add(Pair.create(token, endpoint));</span>
+        }
+        finally
+        {
+<span class="nc" id="L458">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L460">    }</span>
+
+    public void removeEndpoint(InetAddress endpoint)
+    {
+<span class="nc bnc" id="L464" title="All 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="nc" id="L466">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L469">            bootstrapTokens.removeValue(endpoint);</span>
+<span class="nc" id="L470">            tokenToEndpointMap.removeValue(endpoint);</span>
+<span class="nc" id="L471">            topology = topology.unbuild().removeEndpoint(endpoint).build();</span>
+<span class="nc" id="L472">            leavingEndpoints.remove(endpoint);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (replacementToOriginal.remove(endpoint) != null)</span>
+            {
+<span class="nc" id="L475">                logger.debug(&quot;Node {} failed during replace.&quot;, endpoint);</span>
+            }
+<span class="nc" id="L477">            endpointToHostIdMap.remove(endpoint);</span>
+<span class="nc" id="L478">            sortedTokens = sortTokens();</span>
+<span class="nc" id="L479">            invalidateCachedRings();</span>
+        }
+        finally
+        {
+<span class="nc" id="L483">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L485">    }</span>
+
+    /**
+     * This is called when the snitch properties for this endpoint are updated, see CASSANDRA-10238.
+     */
+    public Topology updateTopology(InetAddress endpoint)
+    {
+<span class="pc bpc" id="L492" title="2 of 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="fc" id="L494">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="fc" id="L497">            logger.info(&quot;Updating topology for {}&quot;, endpoint);</span>
+<span class="fc" id="L498">            topology = topology.unbuild().updateEndpoint(endpoint).build();</span>
+<span class="fc" id="L499">            invalidateCachedRings();</span>
+<span class="fc" id="L500">            return topology;</span>
+        }
+        finally
+        {
+<span class="fc" id="L504">            lock.writeLock().unlock();</span>
+        }
+    }
+
+    /**
+     * This is called when the snitch properties for many endpoints are updated, it will update
+     * the topology mappings of any endpoints whose snitch has changed, see CASSANDRA-10238.
+     */
+    public Topology updateTopology()
+    {
+<span class="nc" id="L514">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L517">            logger.info(&quot;Updating topology for all endpoints that have changed&quot;);</span>
+<span class="nc" id="L518">            topology = topology.unbuild().updateEndpoints().build();</span>
+<span class="nc" id="L519">            invalidateCachedRings();</span>
+<span class="nc" id="L520">            return topology;</span>
+        }
+        finally
+        {
+<span class="nc" id="L524">            lock.writeLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Remove pair of token/address from moving endpoints
+     * @param endpoint address of the moving node
+     */
+    public void removeFromMoving(InetAddress endpoint)
+    {
+<span class="pc bpc" id="L534" title="2 of 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="fc" id="L536">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">            for (Pair&lt;Token, InetAddress&gt; pair : movingEndpoints)</span>
+            {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (pair.right.equals(endpoint))</span>
+                {
+<span class="nc" id="L543">                    movingEndpoints.remove(pair);</span>
+<span class="nc" id="L544">                    break;</span>
+                }
+<span class="nc" id="L546">            }</span>
+
+<span class="fc" id="L548">            invalidateCachedRings();</span>
+        }
+        finally
+        {
+<span class="fc" id="L552">            lock.writeLock().unlock();</span>
+        }
+<span class="fc" id="L554">    }</span>
+
+    public Collection&lt;Token&gt; getTokens(InetAddress endpoint)
+    {
+<span class="nc bnc" id="L558" title="All 4 branches missed.">        assert endpoint != null;</span>
+<span class="nc bnc" id="L559" title="All 4 branches missed.">        assert isMember(endpoint); // don't want to return nulls</span>
+
+<span class="nc" id="L561">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L564">            return new ArrayList&lt;&gt;(tokenToEndpointMap.inverse().get(endpoint));</span>
+        }
+        finally
+        {
+<span class="nc" id="L568">            lock.readLock().unlock();</span>
+        }
+    }
+
+    @Deprecated
+    public Token getToken(InetAddress endpoint)
+    {
+<span class="nc" id="L575">        return getTokens(endpoint).iterator().next();</span>
+    }
+
+    public boolean isMember(InetAddress endpoint)
+    {
+<span class="pc bpc" id="L580" title="2 of 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="fc" id="L582">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L585">            return tokenToEndpointMap.inverse().containsKey(endpoint);</span>
+        }
+        finally
+        {
+<span class="fc" id="L589">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public boolean isLeaving(InetAddress endpoint)
+    {
+<span class="nc bnc" id="L595" title="All 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="nc" id="L597">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L600">            return leavingEndpoints.contains(endpoint);</span>
+        }
+        finally
+        {
+<span class="nc" id="L604">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public boolean isMoving(InetAddress endpoint)
+    {
+<span class="pc bpc" id="L610" title="2 of 4 branches missed.">        assert endpoint != null;</span>
+
+<span class="fc" id="L612">        lock.readLock().lock();</span>
+        try
+        {
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">            for (Pair&lt;Token, InetAddress&gt; pair : movingEndpoints)</span>
+            {
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                if (pair.right.equals(endpoint))</span>
+<span class="nc" id="L618">                    return true;</span>
+<span class="nc" id="L619">            }</span>
+
+<span class="fc" id="L621">            return false;</span>
+        }
+        finally
+        {
+<span class="fc" id="L625">            lock.readLock().unlock();</span>
+        }
+    }
+
+<span class="fc" id="L629">    private final AtomicReference&lt;TokenMetadata&gt; cachedTokenMap = new AtomicReference&lt;&gt;();</span>
+
+    /**
+     * Create a copy of TokenMetadata with only tokenToEndpointMap. That is, pending ranges,
+     * bootstrap tokens and leaving endpoints are not included in the copy.
+     */
+    public TokenMetadata cloneOnlyTokenMap()
+    {
+<span class="fc" id="L637">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L640">            return new TokenMetadata(SortedBiMultiValMap.create(tokenToEndpointMap, null, inetaddressCmp),</span>
+<span class="fc" id="L641">                                     HashBiMap.create(endpointToHostIdMap),</span>
+                                     topology,
+                                     partitioner);
+        }
+        finally
+        {
+<span class="fc" id="L647">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Return a cached TokenMetadata with only tokenToEndpointMap, i.e., the same as cloneOnlyTokenMap but
+     * uses a cached copy that is invalided when the ring changes, so in the common case
+     * no extra locking is required.
+     *
+     * Callers must *NOT* mutate the returned metadata object.
+     */
+    public TokenMetadata cachedOnlyTokenMap()
+    {
+<span class="fc" id="L660">        TokenMetadata tm = cachedTokenMap.get();</span>
+<span class="fc bfc" id="L661" title="All 2 branches covered.">        if (tm != null)</span>
+<span class="fc" id="L662">            return tm;</span>
+
+        // synchronize to prevent thundering herd (CASSANDRA-6345)
+<span class="fc" id="L665">        synchronized (this)</span>
+        {
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">            if ((tm = cachedTokenMap.get()) != null)</span>
+<span class="nc" id="L668">                return tm;</span>
+
+<span class="fc" id="L670">            tm = cloneOnlyTokenMap();</span>
+<span class="fc" id="L671">            cachedTokenMap.set(tm);</span>
+<span class="fc" id="L672">            return tm;</span>
+        }
+    }
+
+    /**
+     * Create a copy of TokenMetadata with tokenToEndpointMap reflecting situation after all
+     * current leave operations have finished.
+     *
+     * @return new token metadata
+     */
+    public TokenMetadata cloneAfterAllLeft()
+    {
+<span class="nc" id="L684">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L687">            return removeEndpoints(cloneOnlyTokenMap(), leavingEndpoints);</span>
+        }
+        finally
+        {
+<span class="nc" id="L691">            lock.readLock().unlock();</span>
+        }
+    }
+
+    private static TokenMetadata removeEndpoints(TokenMetadata allLeftMetadata, Set&lt;InetAddress&gt; leavingEndpoints)
+    {
+<span class="nc bnc" id="L697" title="All 2 branches missed.">        for (InetAddress endpoint : leavingEndpoints)</span>
+<span class="nc" id="L698">            allLeftMetadata.removeEndpoint(endpoint);</span>
+
+<span class="nc" id="L700">        return allLeftMetadata;</span>
+    }
+
+    /**
+     * Create a copy of TokenMetadata with tokenToEndpointMap reflecting situation after all
+     * current leave, and move operations have finished.
+     *
+     * @return new token metadata
+     */
+    public TokenMetadata cloneAfterAllSettled()
+    {
+<span class="fc" id="L711">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L714">            TokenMetadata metadata = cloneOnlyTokenMap();</span>
+
+<span class="pc bpc" id="L716" title="1 of 2 branches missed.">            for (InetAddress endpoint : leavingEndpoints)</span>
+<span class="nc" id="L717">                metadata.removeEndpoint(endpoint);</span>
+
+
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">            for (Pair&lt;Token, InetAddress&gt; pair : movingEndpoints)</span>
+<span class="nc" id="L721">                metadata.updateNormalToken(pair.left, pair.right);</span>
+
+<span class="fc" id="L723">            return metadata;</span>
+        }
+        finally
+        {
+<span class="fc" id="L727">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public InetAddress getEndpoint(Token token)
+    {
+<span class="fc" id="L733">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L736">            return tokenToEndpointMap.get(token);</span>
+        }
+        finally
+        {
+<span class="fc" id="L740">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public Collection&lt;Range&lt;Token&gt;&gt; getPrimaryRangesFor(Collection&lt;Token&gt; tokens)
+    {
+<span class="fc" id="L746">        Collection&lt;Range&lt;Token&gt;&gt; ranges = new ArrayList&lt;&gt;(tokens.size());</span>
+<span class="fc bfc" id="L747" title="All 2 branches covered.">        for (Token right : tokens)</span>
+<span class="fc" id="L748">            ranges.add(new Range&lt;&gt;(getPredecessor(right), right));</span>
+<span class="fc" id="L749">        return ranges;</span>
+    }
+
+    @Deprecated
+    public Range&lt;Token&gt; getPrimaryRangeFor(Token right)
+    {
+<span class="fc" id="L755">        return getPrimaryRangesFor(Arrays.asList(right)).iterator().next();</span>
+    }
+
+    public ArrayList&lt;Token&gt; sortedTokens()
+    {
+<span class="fc" id="L760">        return sortedTokens;</span>
+    }
+
+    public Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; getPendingRangesMM(String keyspaceName)
+    {
+<span class="nc" id="L765">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; map = HashMultimap.create();</span>
+<span class="nc" id="L766">        PendingRangeMaps pendingRangeMaps = this.pendingRanges.get(keyspaceName);</span>
+
+<span class="nc bnc" id="L768" title="All 2 branches missed.">        if (pendingRangeMaps != null)</span>
+        {
+<span class="nc bnc" id="L770" title="All 2 branches missed.">            for (Map.Entry&lt;Range&lt;Token&gt;, List&lt;InetAddress&gt;&gt; entry : pendingRangeMaps)</span>
+            {
+<span class="nc" id="L772">                Range&lt;Token&gt; range = entry.getKey();</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                for (InetAddress address : entry.getValue())</span>
+                {
+<span class="nc" id="L775">                    map.put(range, address);</span>
+<span class="nc" id="L776">                }</span>
+<span class="nc" id="L777">            }</span>
+        }
+
+<span class="nc" id="L780">        return map;</span>
+    }
+
+    /** a mutable map may be returned but caller should not modify it */
+    public PendingRangeMaps getPendingRanges(String keyspaceName)
+    {
+<span class="nc" id="L786">        return this.pendingRanges.get(keyspaceName);</span>
+    }
+
+    public List&lt;Range&lt;Token&gt;&gt; getPendingRanges(String keyspaceName, InetAddress endpoint)
+    {
+<span class="nc" id="L791">        List&lt;Range&lt;Token&gt;&gt; ranges = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">        for (Map.Entry&lt;Range&lt;Token&gt;, InetAddress&gt; entry : getPendingRangesMM(keyspaceName).entries())</span>
+        {
+<span class="nc bnc" id="L794" title="All 2 branches missed.">            if (entry.getValue().equals(endpoint))</span>
+            {
+<span class="nc" id="L796">                ranges.add(entry.getKey());</span>
+            }
+<span class="nc" id="L798">        }</span>
+<span class="nc" id="L799">        return ranges;</span>
+    }
+
+     /**
+     * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
+     *
+     * (1) When in doubt, it is better to write too much to a node than too little. That is, if
+     * there are multiple nodes moving, calculate the biggest ranges a node could have. Cleaning
+     * up unneeded data afterwards is better than missing writes during movement.
+     * (2) When a node leaves, ranges for other nodes can only grow (a node might get additional
+     * ranges, but it will not lose any of its current ranges as a result of a leave). Therefore
+     * we will first remove _all_ leaving tokens for the sake of calculation and then check what
+     * ranges would go where if all nodes are to leave. This way we get the biggest possible
+     * ranges with regard current leave operations, covering all subsets of possible final range
+     * values.
+     * (3) When a node bootstraps, ranges of other nodes can only get smaller. Without doing
+     * complex calculations to see if multiple bootstraps overlap, we simply base calculations
+     * on the same token ring used before (reflecting situation after all leave operations have
+     * completed). Bootstrapping nodes will be added and removed one by one to that metadata and
+     * checked what their ranges would be. This will give us the biggest possible ranges the
+     * node could have. It might be that other bootstraps make our actual final ranges smaller,
+     * but it does not matter as we can clean up the data afterwards.
+     *
+     * NOTE: This is heavy and ineffective operation. This will be done only once when a node
+     * changes state in the cluster, so it should be manageable.
+     */
+    public void calculatePendingRanges(AbstractReplicationStrategy strategy, String keyspaceName)
+    {
+        // avoid race between both branches - do not use a lock here as this will block any other unrelated operations!
+<span class="fc" id="L828">        long startedAt = System.currentTimeMillis();</span>
+<span class="fc" id="L829">        synchronized (pendingRanges)</span>
+        {
+            // create clone of current state
+            BiMultiValMap&lt;Token, InetAddress&gt; bootstrapTokensClone;
+            Set&lt;InetAddress&gt; leavingEndpointsClone;
+            Set&lt;Pair&lt;Token, InetAddress&gt;&gt; movingEndpointsClone;
+            TokenMetadata metadata;
+
+<span class="fc" id="L837">            lock.readLock().lock();</span>
+            try
+            {
+<span class="pc bpc" id="L840" title="3 of 6 branches missed.">                if (bootstrapTokens.isEmpty() &amp;&amp; leavingEndpoints.isEmpty() &amp;&amp; movingEndpoints.isEmpty())</span>
+                {
+<span class="pc bpc" id="L842" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L843">                        logger.trace(&quot;No bootstrapping, leaving or moving nodes -&gt; empty pending ranges for {}&quot;, keyspaceName);</span>
+
+<span class="fc" id="L845">                    pendingRanges.put(keyspaceName, new PendingRangeMaps());</span>
+
+<span class="fc" id="L847">                    return;</span>
+                }
+
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                if (logger.isDebugEnabled())</span>
+<span class="nc" id="L851">                    logger.debug(&quot;Starting pending range calculation for {}&quot;, keyspaceName);</span>
+
+<span class="nc" id="L853">                bootstrapTokensClone  = new BiMultiValMap&lt;&gt;(this.bootstrapTokens);</span>
+<span class="nc" id="L854">                leavingEndpointsClone = new HashSet&lt;&gt;(this.leavingEndpoints);</span>
+<span class="nc" id="L855">                movingEndpointsClone = new HashSet&lt;&gt;(this.movingEndpoints);</span>
+<span class="nc" id="L856">                metadata = this.cloneOnlyTokenMap();</span>
+            }
+            finally
+            {
+<span class="fc" id="L860">                lock.readLock().unlock();</span>
+            }
+
+<span class="nc" id="L863">            pendingRanges.put(keyspaceName, calculatePendingRanges(strategy, metadata, bootstrapTokensClone,</span>
+                                                                   leavingEndpointsClone, movingEndpointsClone));
+<span class="nc" id="L865">            long took = System.currentTimeMillis() - startedAt;</span>
+
+<span class="nc bnc" id="L867" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="nc" id="L868">                logger.debug(&quot;Pending range calculation for {} completed (took: {}ms)&quot;, keyspaceName, took);</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                logger.trace(&quot;Calculated pending ranges for {}:\n{}&quot;, keyspaceName, (pendingRanges.isEmpty() ? &quot;&lt;empty&gt;&quot; : printPendingRanges()));</span>
+<span class="nc" id="L871">        }</span>
+<span class="nc" id="L872">    }</span>
+
+    /**
+     * @see TokenMetadata#calculatePendingRanges(AbstractReplicationStrategy, String)
+     */
+    private static PendingRangeMaps calculatePendingRanges(AbstractReplicationStrategy strategy,
+                                                           TokenMetadata metadata,
+                                                           BiMultiValMap&lt;Token, InetAddress&gt; bootstrapTokens,
+                                                           Set&lt;InetAddress&gt; leavingEndpoints,
+                                                           Set&lt;Pair&lt;Token, InetAddress&gt;&gt; movingEndpoints)
+    {
+<span class="nc" id="L883">        PendingRangeMaps newPendingRanges = new PendingRangeMaps();</span>
+
+<span class="nc" id="L885">        Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; addressRanges = strategy.getAddressRanges(metadata);</span>
+
+        // Copy of metadata reflecting the situation after all leave operations are finished.
+<span class="nc" id="L888">        TokenMetadata allLeftMetadata = removeEndpoints(metadata.cloneOnlyTokenMap(), leavingEndpoints);</span>
+
+        // get all ranges that will be affected by leaving nodes
+<span class="nc" id="L891">        Set&lt;Range&lt;Token&gt;&gt; affectedRanges = new HashSet&lt;Range&lt;Token&gt;&gt;();</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">        for (InetAddress endpoint : leavingEndpoints)</span>
+<span class="nc" id="L893">            affectedRanges.addAll(addressRanges.get(endpoint));</span>
+
+        // for each of those ranges, find what new nodes will be responsible for the range when
+        // all leaving nodes are gone.
+<span class="nc bnc" id="L897" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : affectedRanges)</span>
+        {
+<span class="nc" id="L899">            Set&lt;InetAddress&gt; currentEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, metadata));</span>
+<span class="nc" id="L900">            Set&lt;InetAddress&gt; newEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, allLeftMetadata));</span>
+<span class="nc bnc" id="L901" title="All 2 branches missed.">            for (InetAddress address : Sets.difference(newEndpoints, currentEndpoints))</span>
+            {
+<span class="nc" id="L903">                newPendingRanges.addPendingRange(range, address);</span>
+<span class="nc" id="L904">            }</span>
+<span class="nc" id="L905">        }</span>
+
+        // At this stage newPendingRanges has been updated according to leave operations. We can
+        // now continue the calculation by checking bootstrapping nodes.
+
+        // For each of the bootstrapping nodes, simply add and remove them one by one to
+        // allLeftMetadata and check in between what their ranges would be.
+<span class="nc" id="L912">        Multimap&lt;InetAddress, Token&gt; bootstrapAddresses = bootstrapTokens.inverse();</span>
+<span class="nc bnc" id="L913" title="All 2 branches missed.">        for (InetAddress endpoint : bootstrapAddresses.keySet())</span>
+        {
+<span class="nc" id="L915">            Collection&lt;Token&gt; tokens = bootstrapAddresses.get(endpoint);</span>
+
+<span class="nc" id="L917">            allLeftMetadata.updateNormalTokens(tokens, endpoint);</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))</span>
+            {
+<span class="nc" id="L920">                newPendingRanges.addPendingRange(range, endpoint);</span>
+<span class="nc" id="L921">            }</span>
+<span class="nc" id="L922">            allLeftMetadata.removeEndpoint(endpoint);</span>
+<span class="nc" id="L923">        }</span>
+
+        // At this stage newPendingRanges has been updated according to leaving and bootstrapping nodes.
+        // We can now finish the calculation by checking moving nodes.
+
+        // For each of the moving nodes, we do the same thing we did for bootstrapping:
+        // simply add and remove them one by one to allLeftMetadata and check in between what their ranges would be.
+<span class="nc bnc" id="L930" title="All 2 branches missed.">        for (Pair&lt;Token, InetAddress&gt; moving : movingEndpoints)</span>
+        {
+            //Calculate all the ranges which will could be affected. This will include the ranges before and after the move.
+<span class="nc" id="L933">            Set&lt;Range&lt;Token&gt;&gt; moveAffectedRanges = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L934">            InetAddress endpoint = moving.right; // address of the moving node</span>
+            //Add ranges before the move
+<span class="nc bnc" id="L936" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))</span>
+            {
+<span class="nc" id="L938">                moveAffectedRanges.add(range);</span>
+<span class="nc" id="L939">            }</span>
+
+<span class="nc" id="L941">            allLeftMetadata.updateNormalToken(moving.left, endpoint);</span>
+            //Add ranges after the move
+<span class="nc bnc" id="L943" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : strategy.getAddressRanges(allLeftMetadata).get(endpoint))</span>
+            {
+<span class="nc" id="L945">                moveAffectedRanges.add(range);</span>
+<span class="nc" id="L946">            }</span>
+
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            for(Range&lt;Token&gt; range : moveAffectedRanges)</span>
+            {
+<span class="nc" id="L950">                Set&lt;InetAddress&gt; currentEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, metadata));</span>
+<span class="nc" id="L951">                Set&lt;InetAddress&gt; newEndpoints = ImmutableSet.copyOf(strategy.calculateNaturalEndpoints(range.right, allLeftMetadata));</span>
+<span class="nc" id="L952">                Set&lt;InetAddress&gt; difference = Sets.difference(newEndpoints, currentEndpoints);</span>
+<span class="nc bnc" id="L953" title="All 2 branches missed.">                for(final InetAddress address : difference)</span>
+                {
+<span class="nc" id="L955">                    Collection&lt;Range&lt;Token&gt;&gt; newRanges = strategy.getAddressRanges(allLeftMetadata).get(address);</span>
+<span class="nc" id="L956">                    Collection&lt;Range&lt;Token&gt;&gt; oldRanges = strategy.getAddressRanges(metadata).get(address);</span>
+                    //We want to get rid of any ranges which the node is currently getting.
+<span class="nc" id="L958">                    newRanges.removeAll(oldRanges);</span>
+
+<span class="nc bnc" id="L960" title="All 2 branches missed.">                    for(Range&lt;Token&gt; newRange : newRanges)</span>
+                    {
+<span class="nc bnc" id="L962" title="All 2 branches missed.">                        for(Range&lt;Token&gt; pendingRange : newRange.subtractAll(oldRanges))</span>
+                        {
+<span class="nc" id="L964">                            newPendingRanges.addPendingRange(pendingRange, address);</span>
+<span class="nc" id="L965">                        }</span>
+<span class="nc" id="L966">                    }</span>
+<span class="nc" id="L967">                }</span>
+<span class="nc" id="L968">            }</span>
+
+<span class="nc" id="L970">            allLeftMetadata.removeEndpoint(endpoint);</span>
+<span class="nc" id="L971">        }</span>
+
+<span class="nc" id="L973">        return newPendingRanges;</span>
+    }
+
+    public Token getPredecessor(Token token)
+    {
+<span class="fc" id="L978">        List&lt;Token&gt; tokens = sortedTokens();</span>
+<span class="fc" id="L979">        int index = Collections.binarySearch(tokens, token);</span>
+<span class="pc bpc" id="L980" title="2 of 4 branches missed.">        assert index &gt;= 0 : token + &quot; not found in &quot; + tokenToEndpointMapKeysAsStrings();</span>
+<span class="fc bfc" id="L981" title="All 2 branches covered.">        return index == 0 ? tokens.get(tokens.size() - 1) : tokens.get(index - 1);</span>
+    }
+
+    public Token getSuccessor(Token token)
+    {
+<span class="nc" id="L986">        List&lt;Token&gt; tokens = sortedTokens();</span>
+<span class="nc" id="L987">        int index = Collections.binarySearch(tokens, token);</span>
+<span class="nc bnc" id="L988" title="All 4 branches missed.">        assert index &gt;= 0 : token + &quot; not found in &quot; + tokenToEndpointMapKeysAsStrings();</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">        return (index == (tokens.size() - 1)) ? tokens.get(0) : tokens.get(index + 1);</span>
+    }
+
+    private String tokenToEndpointMapKeysAsStrings()
+    {
+<span class="nc" id="L994">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L997">            return StringUtils.join(tokenToEndpointMap.keySet(), &quot;, &quot;);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1001">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /** @return a copy of the bootstrapping tokens map */
+    public BiMultiValMap&lt;Token, InetAddress&gt; getBootstrapTokens()
+    {
+<span class="nc" id="L1008">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1011">            return new BiMultiValMap&lt;&gt;(bootstrapTokens);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1015">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public Set&lt;InetAddress&gt; getAllEndpoints()
+    {
+<span class="fc" id="L1021">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L1024">            return ImmutableSet.copyOf(endpointToHostIdMap.keySet());</span>
+        }
+        finally
+        {
+<span class="fc" id="L1028">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /** caller should not modify leavingEndpoints */
+    public Set&lt;InetAddress&gt; getLeavingEndpoints()
+    {
+<span class="nc" id="L1035">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1038">            return ImmutableSet.copyOf(leavingEndpoints);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1042">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Endpoints which are migrating to the new tokens
+     * @return set of addresses of moving endpoints
+     */
+    public Set&lt;Pair&lt;Token, InetAddress&gt;&gt; getMovingEndpoints()
+    {
+<span class="nc" id="L1052">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1055">            return ImmutableSet.copyOf(movingEndpoints);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1059">            lock.readLock().unlock();</span>
+        }
+    }
+
+    public static int firstTokenIndex(final ArrayList&lt;Token&gt; ring, Token start, boolean insertMin)
+    {
+<span class="pc bpc" id="L1065" title="2 of 4 branches missed.">        assert ring.size() &gt; 0;</span>
+        // insert the minimum token (at index == -1) if we were asked to include it and it isn't a member of the ring
+<span class="fc" id="L1067">        int i = Collections.binarySearch(ring, start);</span>
+<span class="fc bfc" id="L1068" title="All 2 branches covered.">        if (i &lt; 0)</span>
+        {
+<span class="fc" id="L1070">            i = (i + 1) * (-1);</span>
+<span class="pc bpc" id="L1071" title="1 of 2 branches missed.">            if (i &gt;= ring.size())</span>
+<span class="pc bpc" id="L1072" title="1 of 2 branches missed.">                i = insertMin ? -1 : 0;</span>
+        }
+<span class="fc" id="L1074">        return i;</span>
+    }
+
+    public static Token firstToken(final ArrayList&lt;Token&gt; ring, Token start)
+    {
+<span class="fc" id="L1079">        return ring.get(firstTokenIndex(ring, start, false));</span>
+    }
+
+    /**
+     * iterator over the Tokens in the given ring, starting with the token for the node owning start
+     * (which does not have to be a Token in the ring)
+     * @param includeMin True if the minimum token should be returned in the ring even if it has no owner.
+     */
+    public static Iterator&lt;Token&gt; ringIterator(final ArrayList&lt;Token&gt; ring, Token start, boolean includeMin)
+    {
+<span class="pc bpc" id="L1089" title="1 of 2 branches missed.">        if (ring.isEmpty())</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">            return includeMin ? Iterators.singletonIterator(start.getPartitioner().getMinimumToken())</span>
+<span class="nc" id="L1091">                              : Collections.emptyIterator();</span>
+
+<span class="pc bpc" id="L1093" title="1 of 4 branches missed.">        final boolean insertMin = includeMin &amp;&amp; !ring.get(0).isMinimum();</span>
+<span class="fc" id="L1094">        final int startIndex = firstTokenIndex(ring, start, insertMin);</span>
+<span class="fc" id="L1095">        return new AbstractIterator&lt;Token&gt;()</span>
+<span class="fc" id="L1096">        {</span>
+<span class="fc" id="L1097">            int j = startIndex;</span>
+            protected Token computeNext()
+            {
+<span class="fc bfc" id="L1100" title="All 2 branches covered.">                if (j &lt; -1)</span>
+<span class="fc" id="L1101">                    return endOfData();</span>
+                try
+                {
+                    // return minimum for index == -1
+<span class="pc bpc" id="L1105" title="1 of 2 branches missed.">                    if (j == -1)</span>
+<span class="nc" id="L1106">                        return start.getPartitioner().getMinimumToken();</span>
+                    // return ring token for other indexes
+<span class="fc" id="L1108">                    return ring.get(j);</span>
+                }
+                finally
+                {
+<span class="fc" id="L1112">                    j++;</span>
+<span class="fc bfc" id="L1113" title="All 2 branches covered.">                    if (j == ring.size())</span>
+<span class="pc bpc" id="L1114" title="1 of 2 branches missed.">                        j = insertMin ? -1 : 0;</span>
+<span class="fc bfc" id="L1115" title="All 2 branches covered.">                    if (j == startIndex)</span>
+                        // end iteration
+<span class="fc" id="L1117">                        j = -2;</span>
+                }
+            }
+        };
+    }
+
+    /** used by tests */
+    public void clearUnsafe()
+    {
+<span class="nc" id="L1126">        lock.writeLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1129">            tokenToEndpointMap.clear();</span>
+<span class="nc" id="L1130">            endpointToHostIdMap.clear();</span>
+<span class="nc" id="L1131">            bootstrapTokens.clear();</span>
+<span class="nc" id="L1132">            leavingEndpoints.clear();</span>
+<span class="nc" id="L1133">            pendingRanges.clear();</span>
+<span class="nc" id="L1134">            movingEndpoints.clear();</span>
+<span class="nc" id="L1135">            sortedTokens.clear();</span>
+<span class="nc" id="L1136">            topology = Topology.empty();</span>
+<span class="nc" id="L1137">            invalidateCachedRings();</span>
+        }
+        finally
+        {
+<span class="nc" id="L1141">            lock.writeLock().unlock();</span>
+        }
+<span class="nc" id="L1143">    }</span>
+
+    public String toString()
+    {
+<span class="fc" id="L1147">        StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L1148">        lock.readLock().lock();</span>
+        try
+        {
+<span class="fc" id="L1151">            Multimap&lt;InetAddress, Token&gt; endpointToTokenMap = tokenToEndpointMap.inverse();</span>
+<span class="fc" id="L1152">            Set&lt;InetAddress&gt; eps = endpointToTokenMap.keySet();</span>
+
+<span class="pc bpc" id="L1154" title="1 of 2 branches missed.">            if (!eps.isEmpty())</span>
+            {
+<span class="nc" id="L1156">                sb.append(&quot;Normal Tokens:&quot;);</span>
+<span class="nc" id="L1157">                sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">                for (InetAddress ep : eps)</span>
+                {
+<span class="nc" id="L1160">                    sb.append(ep);</span>
+<span class="nc" id="L1161">                    sb.append(':');</span>
+<span class="nc" id="L1162">                    sb.append(endpointToTokenMap.get(ep));</span>
+<span class="nc" id="L1163">                    sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc" id="L1164">                }</span>
+            }
+
+<span class="pc bpc" id="L1167" title="1 of 2 branches missed.">            if (!bootstrapTokens.isEmpty())</span>
+            {
+<span class="nc" id="L1169">                sb.append(&quot;Bootstrapping Tokens:&quot; );</span>
+<span class="nc" id="L1170">                sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc bnc" id="L1171" title="All 2 branches missed.">                for (Map.Entry&lt;Token, InetAddress&gt; entry : bootstrapTokens.entrySet())</span>
+                {
+<span class="nc" id="L1173">                    sb.append(entry.getValue()).append(':').append(entry.getKey());</span>
+<span class="nc" id="L1174">                    sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc" id="L1175">                }</span>
+            }
+
+<span class="pc bpc" id="L1178" title="1 of 2 branches missed.">            if (!leavingEndpoints.isEmpty())</span>
+            {
+<span class="nc" id="L1180">                sb.append(&quot;Leaving Endpoints:&quot;);</span>
+<span class="nc" id="L1181">                sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">                for (InetAddress ep : leavingEndpoints)</span>
+                {
+<span class="nc" id="L1184">                    sb.append(ep);</span>
+<span class="nc" id="L1185">                    sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc" id="L1186">                }</span>
+            }
+
+<span class="pc bpc" id="L1189" title="1 of 2 branches missed.">            if (!pendingRanges.isEmpty())</span>
+            {
+<span class="nc" id="L1191">                sb.append(&quot;Pending Ranges:&quot;);</span>
+<span class="nc" id="L1192">                sb.append(System.getProperty(&quot;line.separator&quot;));</span>
+<span class="nc" id="L1193">                sb.append(printPendingRanges());</span>
+            }
+        }
+        finally
+        {
+<span class="fc" id="L1198">            lock.readLock().unlock();</span>
+        }
+
+<span class="fc" id="L1201">        return sb.toString();</span>
+    }
+
+    private String printPendingRanges()
+    {
+<span class="nc" id="L1206">        StringBuilder sb = new StringBuilder();</span>
+
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">        for (PendingRangeMaps pendingRangeMaps : pendingRanges.values())</span>
+        {
+<span class="nc" id="L1210">            sb.append(pendingRangeMaps.printPendingRanges());</span>
+<span class="nc" id="L1211">        }</span>
+
+<span class="nc" id="L1213">        return sb.toString();</span>
+    }
+
+    public Collection&lt;InetAddress&gt; pendingEndpointsFor(Token token, String keyspaceName)
+    {
+<span class="fc" id="L1218">        PendingRangeMaps pendingRangeMaps = this.pendingRanges.get(keyspaceName);</span>
+<span class="pc bpc" id="L1219" title="1 of 2 branches missed.">        if (pendingRangeMaps == null)</span>
+<span class="nc" id="L1220">            return Collections.emptyList();</span>
+
+<span class="fc" id="L1222">        return pendingRangeMaps.pendingEndpointsFor(token);</span>
+    }
+
+    /**
+     * @deprecated retained for benefit of old tests
+     */
+    public Collection&lt;InetAddress&gt; getWriteEndpoints(Token token, String keyspaceName, Collection&lt;InetAddress&gt; naturalEndpoints)
+    {
+<span class="nc" id="L1230">        return ImmutableList.copyOf(Iterables.concat(naturalEndpoints, pendingEndpointsFor(token, keyspaceName)));</span>
+    }
+
+    /** @return an endpoint to token multimap representation of tokenToEndpointMap (a copy) */
+    public Multimap&lt;InetAddress, Token&gt; getEndpointToTokenMapForReading()
+    {
+<span class="nc" id="L1236">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1239">            Multimap&lt;InetAddress, Token&gt; cloned = HashMultimap.create();</span>
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">            for (Map.Entry&lt;Token, InetAddress&gt; entry : tokenToEndpointMap.entrySet())</span>
+<span class="nc" id="L1241">                cloned.put(entry.getValue(), entry.getKey());</span>
+<span class="nc" id="L1242">            return cloned;</span>
+        }
+        finally
+        {
+<span class="nc" id="L1246">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * @return a (stable copy, won't be modified) Token to Endpoint map for all the normal and bootstrapping nodes
+     *         in the cluster.
+     */
+    public Map&lt;Token, InetAddress&gt; getNormalAndBootstrappingTokenToEndpointMap()
+    {
+<span class="nc" id="L1256">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L1259">            Map&lt;Token, InetAddress&gt; map = new HashMap&lt;&gt;(tokenToEndpointMap.size() + bootstrapTokens.size());</span>
+<span class="nc" id="L1260">            map.putAll(tokenToEndpointMap);</span>
+<span class="nc" id="L1261">            map.putAll(bootstrapTokens);</span>
+<span class="nc" id="L1262">            return map;</span>
+        }
+        finally
+        {
+<span class="nc" id="L1266">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * @return the Topology map of nodes to DCs + Racks
+     *
+     * This is only allowed when a copy has been made of TokenMetadata, to avoid concurrent modifications
+     * when Topology methods are subsequently used by the caller.
+     */
+    public Topology getTopology()
+    {
+<span class="nc bnc" id="L1278" title="All 4 branches missed.">        assert this != StorageService.instance.getTokenMetadata();</span>
+<span class="nc" id="L1279">        return topology;</span>
+    }
+
+    public long getRingVersion()
+    {
+<span class="fc" id="L1284">        return ringVersion;</span>
+    }
+
+    public void invalidateCachedRings()
+    {
+<span class="fc" id="L1289">        ringVersion++;</span>
+<span class="fc" id="L1290">        cachedTokenMap.set(null);</span>
+<span class="fc" id="L1291">    }</span>
+
+    public DecoratedKey decorateKey(ByteBuffer key)
+    {
+<span class="nc" id="L1295">        return partitioner.decorateKey(key);</span>
+    }
+
+    /**
+     * Tracks the assignment of racks and endpoints in each datacenter for all the &quot;normal&quot; endpoints
+     * in this TokenMetadata. This allows faster calculation of endpoints in NetworkTopologyStrategy.
+     */
+    public static class Topology
+    {
+        /** multi-map of DC to endpoints in that DC */
+        private final ImmutableMultimap&lt;String, InetAddress&gt; dcEndpoints;
+        /** map of DC to multi-map of rack to endpoints in that rack */
+        private final ImmutableMap&lt;String, ImmutableMultimap&lt;String, InetAddress&gt;&gt; dcRacks;
+        /** reverse-lookup map for endpoint to current known dc/rack assignment */
+        private final ImmutableMap&lt;InetAddress, Pair&lt;String, String&gt;&gt; currentLocations;
+
+        private Topology(Builder builder)
+<span class="fc" id="L1312">        {</span>
+<span class="fc" id="L1313">            this.dcEndpoints = ImmutableMultimap.copyOf(builder.dcEndpoints);</span>
+
+<span class="fc" id="L1315">            ImmutableMap.Builder&lt;String, ImmutableMultimap&lt;String, InetAddress&gt;&gt; dcRackBuilder = ImmutableMap.builder();</span>
+<span class="fc bfc" id="L1316" title="All 2 branches covered.">            for (Map.Entry&lt;String, Multimap&lt;String, InetAddress&gt;&gt; entry : builder.dcRacks.entrySet())</span>
+<span class="fc" id="L1317">                dcRackBuilder.put(entry.getKey(), ImmutableMultimap.copyOf(entry.getValue()));</span>
+<span class="fc" id="L1318">            this.dcRacks = dcRackBuilder.build();</span>
+
+<span class="fc" id="L1320">            this.currentLocations = ImmutableMap.copyOf(builder.currentLocations);</span>
+<span class="fc" id="L1321">        }</span>
+
+        /**
+         * @return multi-map of DC to endpoints in that DC
+         */
+        public Multimap&lt;String, InetAddress&gt; getDatacenterEndpoints()
+        {
+<span class="nc" id="L1328">            return dcEndpoints;</span>
+        }
+
+        /**
+         * @return map of DC to multi-map of rack to endpoints in that rack
+         */
+        public ImmutableMap&lt;String, ImmutableMultimap&lt;String, InetAddress&gt;&gt; getDatacenterRacks()
+        {
+<span class="nc" id="L1336">            return dcRacks;</span>
+        }
+
+        /**
+         * @return The DC and rack of the given endpoint.
+         */
+        public Pair&lt;String, String&gt; getLocation(InetAddress addr)
+        {
+<span class="nc" id="L1344">            return currentLocations.get(addr);</span>
+        }
+
+        Builder unbuild()
+        {
+<span class="fc" id="L1349">            return new Builder(this);</span>
+        }
+
+        static Builder builder()
+        {
+<span class="fc" id="L1354">            return new Builder();</span>
+        }
+
+        static Topology empty()
+        {
+<span class="fc" id="L1359">            return builder().build();</span>
+        }
+
+        private static class Builder
+        {
+            /** multi-map of DC to endpoints in that DC */
+            private final Multimap&lt;String, InetAddress&gt; dcEndpoints;
+            /** map of DC to multi-map of rack to endpoints in that rack */
+            private final Map&lt;String, Multimap&lt;String, InetAddress&gt;&gt; dcRacks;
+            /** reverse-lookup map for endpoint to current known dc/rack assignment */
+            private final Map&lt;InetAddress, Pair&lt;String, String&gt;&gt; currentLocations;
+
+            Builder()
+<span class="fc" id="L1372">            {</span>
+<span class="fc" id="L1373">                this.dcEndpoints = HashMultimap.create();</span>
+<span class="fc" id="L1374">                this.dcRacks = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1375">                this.currentLocations = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1376">            }</span>
+
+            Builder(Topology from)
+<span class="fc" id="L1379">            {</span>
+<span class="fc" id="L1380">                this.dcEndpoints = HashMultimap.create(from.dcEndpoints);</span>
+
+<span class="fc" id="L1382">                this.dcRacks = Maps.newHashMapWithExpectedSize(from.dcRacks.size());</span>
+<span class="fc bfc" id="L1383" title="All 2 branches covered.">                for (Map.Entry&lt;String, ImmutableMultimap&lt;String, InetAddress&gt;&gt; entry : from.dcRacks.entrySet())</span>
+<span class="fc" id="L1384">                    dcRacks.put(entry.getKey(), HashMultimap.create(entry.getValue()));</span>
+
+<span class="fc" id="L1386">                this.currentLocations = new HashMap&lt;&gt;(from.currentLocations);</span>
+<span class="fc" id="L1387">            }</span>
+
+            /**
+             * Stores current DC/rack assignment for ep
+             */
+            Builder addEndpoint(InetAddress ep)
+            {
+<span class="fc" id="L1394">                IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="fc" id="L1395">                String dc = snitch.getDatacenter(ep);</span>
+<span class="fc" id="L1396">                String rack = snitch.getRack(ep);</span>
+<span class="fc" id="L1397">                Pair&lt;String, String&gt; current = currentLocations.get(ep);</span>
+<span class="fc bfc" id="L1398" title="All 2 branches covered.">                if (current != null)</span>
+                {
+<span class="pc bpc" id="L1400" title="2 of 4 branches missed.">                    if (current.left.equals(dc) &amp;&amp; current.right.equals(rack))</span>
+<span class="fc" id="L1401">                        return this;</span>
+<span class="nc" id="L1402">                    doRemoveEndpoint(ep, current);</span>
+                }
+
+<span class="fc" id="L1405">                doAddEndpoint(ep, dc, rack);</span>
+<span class="fc" id="L1406">                return this;</span>
+            }
+
+            private void doAddEndpoint(InetAddress ep, String dc, String rack)
+            {
+<span class="fc" id="L1411">                dcEndpoints.put(dc, ep);</span>
+
+<span class="fc bfc" id="L1413" title="All 2 branches covered.">                if (!dcRacks.containsKey(dc))</span>
+<span class="fc" id="L1414">                    dcRacks.put(dc, HashMultimap.&lt;String, InetAddress&gt;create());</span>
+<span class="fc" id="L1415">                dcRacks.get(dc).put(rack, ep);</span>
+
+<span class="fc" id="L1417">                currentLocations.put(ep, Pair.create(dc, rack));</span>
+<span class="fc" id="L1418">            }</span>
+
+            /**
+             * Removes current DC/rack assignment for ep
+             */
+            Builder removeEndpoint(InetAddress ep)
+            {
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">                if (!currentLocations.containsKey(ep))</span>
+<span class="nc" id="L1426">                    return this;</span>
+
+<span class="nc" id="L1428">                doRemoveEndpoint(ep, currentLocations.remove(ep));</span>
+<span class="nc" id="L1429">                return this;</span>
+            }
+
+            private void doRemoveEndpoint(InetAddress ep, Pair&lt;String, String&gt; current)
+            {
+<span class="nc" id="L1434">                dcRacks.get(current.left).remove(current.right, ep);</span>
+<span class="nc" id="L1435">                dcEndpoints.remove(current.left, ep);</span>
+<span class="nc" id="L1436">            }</span>
+
+            Builder updateEndpoint(InetAddress ep)
+            {
+<span class="fc" id="L1440">                IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="pc bpc" id="L1441" title="2 of 4 branches missed.">                if (snitch == null || !currentLocations.containsKey(ep))</span>
+<span class="nc" id="L1442">                    return this;</span>
+
+<span class="fc" id="L1444">                updateEndpoint(ep, snitch);</span>
+<span class="fc" id="L1445">                return this;</span>
+            }
+
+            Builder updateEndpoints()
+            {
+<span class="nc" id="L1450">                IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="nc bnc" id="L1451" title="All 2 branches missed.">                if (snitch == null)</span>
+<span class="nc" id="L1452">                    return this;</span>
+
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">                for (InetAddress ep : currentLocations.keySet())</span>
+<span class="nc" id="L1455">                    updateEndpoint(ep, snitch);</span>
+
+<span class="nc" id="L1457">                return this;</span>
+            }
+
+            private void updateEndpoint(InetAddress ep, IEndpointSnitch snitch)
+            {
+<span class="fc" id="L1462">                Pair&lt;String, String&gt; current = currentLocations.get(ep);</span>
+<span class="fc" id="L1463">                String dc = snitch.getDatacenter(ep);</span>
+<span class="fc" id="L1464">                String rack = snitch.getRack(ep);</span>
+<span class="pc bpc" id="L1465" title="2 of 4 branches missed.">                if (dc.equals(current.left) &amp;&amp; rack.equals(current.right))</span>
+<span class="fc" id="L1466">                    return;</span>
+
+<span class="nc" id="L1468">                doRemoveEndpoint(ep, current);</span>
+<span class="nc" id="L1469">                doAddEndpoint(ep, dc, rack);</span>
+<span class="nc" id="L1470">            }</span>
+
+            Topology build()
+            {
+<span class="fc" id="L1474">                return new Topology(this);</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

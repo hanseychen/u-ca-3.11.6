@@ -1,0 +1,869 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BufferPool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.memory</a> &gt; <span class="el_source">BufferPool.java</span></div><h1>BufferPool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils.memory;
+
+import java.lang.ref.PhantomReference;
+import java.lang.ref.ReferenceQueue;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Queue;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.cassandra.concurrent.InfiniteLoopExecutor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.metrics.BufferPoolMetrics;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.Ref;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdownNow;
+
+/**
+ * A pool of ByteBuffers that can be recycled.
+ */
+<span class="nc" id="L50">public class BufferPool</span>
+{
+    /** The size of a page aligned buffer, 64KiB */
+    public static final int CHUNK_SIZE = 64 &lt;&lt; 10;
+
+    @VisibleForTesting
+<span class="fc" id="L56">    public static long MEMORY_USAGE_THRESHOLD = DatabaseDescriptor.getFileCacheSizeInMB() * 1024L * 1024L;</span>
+
+    @VisibleForTesting
+<span class="fc" id="L59">    public static boolean ALLOCATE_ON_HEAP_WHEN_EXAHUSTED = DatabaseDescriptor.getBufferPoolUseHeapIfExhausted();</span>
+
+    @VisibleForTesting
+<span class="fc" id="L62">    public static boolean DISABLED = Boolean.parseBoolean(System.getProperty(&quot;cassandra.test.disable_buffer_pool&quot;, &quot;false&quot;));</span>
+
+    @VisibleForTesting
+<span class="fc" id="L65">    public static boolean DEBUG = false;</span>
+
+<span class="fc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(BufferPool.class);</span>
+<span class="fc" id="L68">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 15L, TimeUnit.MINUTES);</span>
+<span class="fc" id="L69">    private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);</span>
+
+    /** A global pool of chunks (page aligned buffers) */
+<span class="fc" id="L72">    private static final GlobalPool globalPool = new GlobalPool();</span>
+
+    /** A thread local pool of chunks, where chunks come from the global pool */
+<span class="fc" id="L75">    private static final FastThreadLocal&lt;LocalPool&gt; localPool = new FastThreadLocal&lt;LocalPool&gt;()</span>
+<span class="fc" id="L76">    {</span>
+        @Override
+        protected LocalPool initialValue()
+        {
+<span class="fc" id="L80">            return new LocalPool();</span>
+        }
+    };
+
+    public static ByteBuffer get(int size)
+    {
+<span class="nc bnc" id="L86" title="All 2 branches missed.">        if (DISABLED)</span>
+<span class="nc" id="L87">            return allocate(size, ALLOCATE_ON_HEAP_WHEN_EXAHUSTED);</span>
+        else
+<span class="nc" id="L89">            return takeFromPool(size, ALLOCATE_ON_HEAP_WHEN_EXAHUSTED);</span>
+    }
+
+    public static ByteBuffer get(int size, BufferType bufferType)
+    {
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">        boolean direct = bufferType == BufferType.OFF_HEAP;</span>
+<span class="pc bpc" id="L95" title="2 of 4 branches missed.">        if (DISABLED || !direct)</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">            return allocate(size, !direct);</span>
+        else
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">            return takeFromPool(size, !direct);</span>
+    }
+
+    /** Unlike the get methods, this will return null if the pool is exhausted */
+    public static ByteBuffer tryGet(int size)
+    {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (DISABLED)</span>
+<span class="nc" id="L105">            return allocate(size, ALLOCATE_ON_HEAP_WHEN_EXAHUSTED);</span>
+        else
+<span class="nc" id="L107">            return maybeTakeFromPool(size, ALLOCATE_ON_HEAP_WHEN_EXAHUSTED);</span>
+    }
+
+    private static ByteBuffer allocate(int size, boolean onHeap)
+    {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        return onHeap</span>
+<span class="nc" id="L113">               ? ByteBuffer.allocate(size)</span>
+<span class="nc" id="L114">               : ByteBuffer.allocateDirect(size);</span>
+    }
+
+    private static ByteBuffer takeFromPool(int size, boolean allocateOnHeapWhenExhausted)
+    {
+<span class="fc" id="L119">        ByteBuffer ret = maybeTakeFromPool(size, allocateOnHeapWhenExhausted);</span>
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">        if (ret != null)</span>
+<span class="fc" id="L121">            return ret;</span>
+
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L124">            logger.trace(&quot;Requested buffer size {} has been allocated directly due to lack of capacity&quot;, FBUtilities.prettyPrintMemory(size));</span>
+
+<span class="nc" id="L126">        return localPool.get().allocate(size, allocateOnHeapWhenExhausted);</span>
+    }
+
+    private static ByteBuffer maybeTakeFromPool(int size, boolean allocateOnHeapWhenExhausted)
+    {
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (size &lt; 0)</span>
+<span class="nc" id="L132">            throw new IllegalArgumentException(&quot;Size must be positive (&quot; + size + &quot;)&quot;);</span>
+
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">        if (size == 0)</span>
+<span class="nc" id="L135">            return EMPTY_BUFFER;</span>
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        if (size &gt; CHUNK_SIZE)</span>
+        {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L140">                logger.trace(&quot;Requested buffer size {} is bigger than {}, allocating directly&quot;,</span>
+<span class="nc" id="L141">                             FBUtilities.prettyPrintMemory(size),</span>
+<span class="nc" id="L142">                             FBUtilities.prettyPrintMemory(CHUNK_SIZE));</span>
+
+<span class="nc" id="L144">            return localPool.get().allocate(size, allocateOnHeapWhenExhausted);</span>
+        }
+
+<span class="fc" id="L147">        return localPool.get().get(size);</span>
+    }
+
+    public static void put(ByteBuffer buffer)
+    {
+<span class="pc bpc" id="L152" title="2 of 4 branches missed.">        if (!(DISABLED || buffer.hasArray()))</span>
+<span class="fc" id="L153">            localPool.get().put(buffer);</span>
+<span class="fc" id="L154">    }</span>
+
+    /** This is not thread safe and should only be used for unit testing. */
+    @VisibleForTesting
+    static void reset()
+    {
+<span class="nc" id="L160">        localPool.get().reset();</span>
+<span class="nc" id="L161">        globalPool.reset();</span>
+<span class="nc" id="L162">    }</span>
+
+    @VisibleForTesting
+    static Chunk currentChunk()
+    {
+<span class="nc" id="L167">        return localPool.get().chunks[0];</span>
+    }
+
+    @VisibleForTesting
+    static int numChunks()
+    {
+<span class="nc" id="L173">        int ret = 0;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        for (Chunk chunk : localPool.get().chunks)</span>
+        {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (chunk != null)</span>
+<span class="nc" id="L177">                ret++;</span>
+        }
+<span class="nc" id="L179">        return ret;</span>
+    }
+
+    @VisibleForTesting
+    static void assertAllRecycled()
+    {
+<span class="nc" id="L185">        globalPool.debug.check();</span>
+<span class="nc" id="L186">    }</span>
+
+    public static long sizeInBytes()
+    {
+<span class="nc" id="L190">        return globalPool.sizeInBytes();</span>
+    }
+
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">    static final class Debug</span>
+    {
+<span class="fc" id="L195">        long recycleRound = 1;</span>
+<span class="fc" id="L196">        final Queue&lt;Chunk&gt; allChunks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        void register(Chunk chunk)
+        {
+<span class="nc" id="L199">            allChunks.add(chunk);</span>
+<span class="nc" id="L200">        }</span>
+        void recycle(Chunk chunk)
+        {
+<span class="nc" id="L203">            chunk.lastRecycled = recycleRound;</span>
+<span class="nc" id="L204">        }</span>
+        void check()
+        {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            for (Chunk chunk : allChunks)</span>
+<span class="nc bnc" id="L208" title="All 4 branches missed.">                assert chunk.lastRecycled == recycleRound;</span>
+<span class="nc" id="L209">            recycleRound++;</span>
+<span class="nc" id="L210">        }</span>
+    }
+
+    /**
+     * A queue of page aligned buffers, the chunks, which have been sliced from bigger chunks,
+     * the macro-chunks, also page aligned. Macro-chunks are allocated as long as we have not exceeded the
+     * memory maximum threshold, MEMORY_USAGE_THRESHOLD and are never released.
+     *
+     * This class is shared by multiple thread local pools and must be thread-safe.
+     */
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">    static final class GlobalPool</span>
+    {
+        /** The size of a bigger chunk, 1-mbit, must be a multiple of CHUNK_SIZE */
+        static final int MACRO_CHUNK_SIZE = 1 &lt;&lt; 20;
+
+        static
+        {
+<span class="pc bpc" id="L227" title="2 of 4 branches missed.">            assert Integer.bitCount(CHUNK_SIZE) == 1; // must be a power of 2</span>
+<span class="pc bpc" id="L228" title="2 of 4 branches missed.">            assert Integer.bitCount(MACRO_CHUNK_SIZE) == 1; // must be a power of 2</span>
+            assert MACRO_CHUNK_SIZE % CHUNK_SIZE == 0; // must be a multiple
+
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">            if (DISABLED)</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                logger.info(&quot;Global buffer pool is disabled, allocating {}&quot;, ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? &quot;on heap&quot; : &quot;off heap&quot;);</span>
+            else
+<span class="fc" id="L234">                logger.info(&quot;Global buffer pool is enabled, when pool is exhausted (max is {}) it will allocate {}&quot;,</span>
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">                            FBUtilities.prettyPrintMemory(MEMORY_USAGE_THRESHOLD),</span>
+                            ALLOCATE_ON_HEAP_WHEN_EXAHUSTED ? &quot;on heap&quot; : &quot;off heap&quot;);
+<span class="fc" id="L237">        }</span>
+
+<span class="fc" id="L239">        private final Debug debug = new Debug();</span>
+<span class="fc" id="L240">        private final Queue&lt;Chunk&gt; macroChunks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        // TODO (future): it would be preferable to use a CLStack to improve cache occupancy; it would also be preferable to use &quot;CoreLocal&quot; storage
+<span class="fc" id="L242">        private final Queue&lt;Chunk&gt; chunks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L243">        private final AtomicLong memoryUsage = new AtomicLong();</span>
+
+        /** Return a chunk, the caller will take owership of the parent chunk. */
+        public Chunk get()
+        {
+            while (true)
+            {
+<span class="fc" id="L250">                Chunk chunk = chunks.poll();</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                if (chunk != null)</span>
+<span class="fc" id="L252">                    return chunk;</span>
+
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">                if (!allocateMoreChunks())</span>
+                    // give it one last attempt, in case someone else allocated before us
+<span class="nc" id="L256">                    return chunks.poll();</span>
+<span class="fc" id="L257">            }</span>
+        }
+
+        /**
+         * This method might be called by multiple threads and that's fine if we add more
+         * than one chunk at the same time as long as we don't exceed the MEMORY_USAGE_THRESHOLD.
+         */
+        private boolean allocateMoreChunks()
+        {
+            while (true)
+            {
+<span class="fc" id="L268">                long cur = memoryUsage.get();</span>
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">                if (cur + MACRO_CHUNK_SIZE &gt; MEMORY_USAGE_THRESHOLD)</span>
+                {
+<span class="nc" id="L271">                    noSpamLogger.info(&quot;Maximum memory usage reached ({}), cannot allocate chunk of {}&quot;,</span>
+<span class="nc" id="L272">                                      MEMORY_USAGE_THRESHOLD, MACRO_CHUNK_SIZE);</span>
+<span class="nc" id="L273">                    return false;</span>
+                }
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">                if (memoryUsage.compareAndSet(cur, cur + MACRO_CHUNK_SIZE))</span>
+<span class="fc" id="L276">                    break;</span>
+<span class="nc" id="L277">            }</span>
+
+            // allocate a large chunk
+            Chunk chunk;
+            try
+            {
+<span class="fc" id="L283">                chunk = new Chunk(allocateDirectAligned(MACRO_CHUNK_SIZE));</span>
+            }
+<span class="nc" id="L285">            catch (OutOfMemoryError oom)</span>
+            {
+<span class="nc" id="L287">                noSpamLogger.error(&quot;Buffer pool failed to allocate chunk of {}, current size {} ({}). &quot; +</span>
+                                   &quot;Attempting to continue; buffers will be allocated in on-heap memory which can degrade performance. &quot; +
+                                   &quot;Make sure direct memory size (-XX:MaxDirectMemorySize) is large enough to accommodate off-heap memtables and caches.&quot;,
+<span class="nc" id="L290">                                   MACRO_CHUNK_SIZE, sizeInBytes(), oom.toString());</span>
+<span class="nc" id="L291">                return false;</span>
+<span class="fc" id="L292">            }</span>
+
+<span class="fc" id="L294">            chunk.acquire(null);</span>
+<span class="fc" id="L295">            macroChunks.add(chunk);</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            for (int i = 0 ; i &lt; MACRO_CHUNK_SIZE ; i += CHUNK_SIZE)</span>
+            {
+<span class="fc" id="L298">                Chunk add = new Chunk(chunk.get(CHUNK_SIZE));</span>
+<span class="fc" id="L299">                chunks.add(add);</span>
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">                if (DEBUG)</span>
+<span class="nc" id="L301">                    debug.register(add);</span>
+            }
+
+<span class="fc" id="L304">            return true;</span>
+        }
+
+        public void recycle(Chunk chunk)
+        {
+<span class="fc" id="L309">            chunks.add(chunk);</span>
+<span class="fc" id="L310">        }</span>
+
+        public long sizeInBytes()
+        {
+<span class="nc" id="L314">            return memoryUsage.get();</span>
+        }
+
+        /** This is not thread safe and should only be used for unit testing. */
+        @VisibleForTesting
+        void reset()
+        {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            while (!chunks.isEmpty())</span>
+<span class="nc" id="L322">                chunks.poll().reset();</span>
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            while (!macroChunks.isEmpty())</span>
+<span class="nc" id="L325">                macroChunks.poll().reset();</span>
+
+<span class="nc" id="L327">            memoryUsage.set(0);</span>
+<span class="nc" id="L328">        }</span>
+    }
+
+    /**
+     * A thread local class that grabs chunks from the global pool for this thread allocations.
+     * Only one thread can do the allocations but multiple threads can release the allocations.
+     */
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">    static final class LocalPool</span>
+    {
+<span class="fc" id="L337">        private final static BufferPoolMetrics metrics = new BufferPoolMetrics();</span>
+        // a microqueue of Chunks:
+        //  * if any are null, they are at the end;
+        //  * new Chunks are added to the last null index
+        //  * if no null indexes available, the smallest is swapped with the last index, and this replaced
+        //  * this results in a queue that will typically be visited in ascending order of available space, so that
+        //    small allocations preferentially slice from the Chunks with the smallest space available to furnish them
+        // WARNING: if we ever change the size of this, we must update removeFromLocalQueue, and addChunk
+<span class="fc" id="L345">        private final Chunk[] chunks = new Chunk[3];</span>
+<span class="fc" id="L346">        private byte chunkCount = 0;</span>
+
+        public LocalPool()
+<span class="fc" id="L349">        {</span>
+<span class="fc" id="L350">            localPoolReferences.add(new LocalPoolRef(this, localPoolRefQueue));</span>
+<span class="fc" id="L351">        }</span>
+
+        private Chunk addChunkFromGlobalPool()
+        {
+<span class="fc" id="L355">            Chunk chunk = globalPool.get();</span>
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">            if (chunk == null)</span>
+<span class="nc" id="L357">                return null;</span>
+
+<span class="fc" id="L359">            addChunk(chunk);</span>
+<span class="fc" id="L360">            return chunk;</span>
+        }
+
+        private void addChunk(Chunk chunk)
+        {
+<span class="fc" id="L365">            chunk.acquire(this);</span>
+
+<span class="fc bfc" id="L367" title="All 2 branches covered.">            if (chunkCount &lt; 3)</span>
+            {
+<span class="fc" id="L369">                chunks[chunkCount++] = chunk;</span>
+<span class="fc" id="L370">                return;</span>
+            }
+
+<span class="fc" id="L373">            int smallestChunkIdx = 0;</span>
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">            if (chunks[1].free() &lt; chunks[0].free())</span>
+<span class="nc" id="L375">                smallestChunkIdx = 1;</span>
+<span class="pc bpc" id="L376" title="1 of 2 branches missed.">            if (chunks[2].free() &lt; chunks[smallestChunkIdx].free())</span>
+<span class="nc" id="L377">                smallestChunkIdx = 2;</span>
+
+<span class="fc" id="L379">            chunks[smallestChunkIdx].release();</span>
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">            if (smallestChunkIdx != 2)</span>
+<span class="fc" id="L381">                chunks[smallestChunkIdx] = chunks[2];</span>
+<span class="fc" id="L382">            chunks[2] = chunk;</span>
+<span class="fc" id="L383">        }</span>
+
+        public ByteBuffer get(int size)
+        {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">            for (Chunk chunk : chunks)</span>
+            { // first see if our own chunks can serve this buffer
+<span class="fc bfc" id="L389" title="All 2 branches covered.">                if (chunk == null)</span>
+<span class="fc" id="L390">                    break;</span>
+
+<span class="fc" id="L392">                ByteBuffer buffer = chunk.get(size);</span>
+<span class="fc bfc" id="L393" title="All 2 branches covered.">                if (buffer != null)</span>
+<span class="fc" id="L394">                    return buffer;</span>
+            }
+
+            // else ask the global pool
+<span class="fc" id="L398">            Chunk chunk = addChunkFromGlobalPool();</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">            if (chunk != null)</span>
+<span class="fc" id="L400">                return chunk.get(size);</span>
+
+<span class="nc" id="L402">           return null;</span>
+        }
+
+        private ByteBuffer allocate(int size, boolean onHeap)
+        {
+<span class="nc" id="L407">            metrics.misses.mark();</span>
+<span class="nc" id="L408">            return BufferPool.allocate(size, onHeap);</span>
+        }
+
+        public void put(ByteBuffer buffer)
+        {
+<span class="fc" id="L413">            Chunk chunk = Chunk.getParentChunk(buffer);</span>
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">            if (chunk == null)</span>
+            {
+<span class="nc" id="L416">                FileUtils.clean(buffer);</span>
+<span class="nc" id="L417">                return;</span>
+            }
+
+<span class="fc" id="L420">            LocalPool owner = chunk.owner;</span>
+            // ask the free method to take exclusive ownership of the act of recycling
+            // if we are either: already not owned by anyone, or owned by ourselves
+<span class="fc bfc" id="L423" title="All 4 branches covered.">            long free = chunk.free(buffer, owner == null | owner == this);</span>
+<span class="fc bfc" id="L424" title="All 2 branches covered.">            if (free == 0L)</span>
+            {
+                // 0L =&gt; we own recycling responsibility, so must recycle;
+<span class="fc" id="L427">                chunk.recycle();</span>
+                // if we are also the owner, we must remove the Chunk from our local queue
+<span class="fc bfc" id="L429" title="All 2 branches covered.">                if (owner == this)</span>
+<span class="fc" id="L430">                    removeFromLocalQueue(chunk);</span>
+            }
+<span class="pc bpc" id="L432" title="3 of 6 branches missed.">            else if (((free == -1L) &amp;&amp; owner != this) &amp;&amp; chunk.owner == null)</span>
+            {
+                // although we try to take recycle ownership cheaply, it is not always possible to do so if the owner is racing to unset.
+                // we must also check after completely freeing if the owner has since been unset, and try to recycle
+<span class="nc" id="L436">                chunk.tryRecycle();</span>
+            }
+<span class="fc" id="L438">        }</span>
+
+        private void removeFromLocalQueue(Chunk chunk)
+        {
+            // since we only have three elements in the queue, it is clearer, easier and faster to just hard code the options
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">            if (chunks[0] == chunk)</span>
+            {   // remove first by shifting back second two
+<span class="fc" id="L445">                chunks[0] = chunks[1];</span>
+<span class="fc" id="L446">                chunks[1] = chunks[2];</span>
+            }
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            else if (chunks[1] == chunk)</span>
+            {   // remove second by shifting back last
+<span class="nc" id="L450">                chunks[1] = chunks[2];</span>
+            }
+<span class="nc bnc" id="L452" title="All 4 branches missed.">            else assert chunks[2] == chunk;</span>
+            // whatever we do, the last element myst be null
+<span class="fc" id="L454">            chunks[2] = null;</span>
+<span class="fc" id="L455">            chunkCount--;</span>
+<span class="fc" id="L456">        }</span>
+
+        @VisibleForTesting
+        void reset()
+        {
+<span class="nc" id="L461">            chunkCount = 0;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            for (int i = 0; i &lt; chunks.length; i++)</span>
+            {
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                if (chunks[i] != null)</span>
+                {
+<span class="nc" id="L466">                    chunks[i].owner = null;</span>
+<span class="nc" id="L467">                    chunks[i].freeSlots = 0L;</span>
+<span class="nc" id="L468">                    chunks[i].recycle();</span>
+<span class="nc" id="L469">                    chunks[i] = null;</span>
+                }
+            }
+<span class="nc" id="L472">        }</span>
+    }
+
+    private static final class LocalPoolRef extends  PhantomReference&lt;LocalPool&gt;
+    {
+        private final Chunk[] chunks;
+        public LocalPoolRef(LocalPool localPool, ReferenceQueue&lt;? super LocalPool&gt; q)
+        {
+<span class="fc" id="L480">            super(localPool, q);</span>
+<span class="fc" id="L481">            chunks = localPool.chunks;</span>
+<span class="fc" id="L482">        }</span>
+
+        public void release()
+        {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            for (int i = 0 ; i &lt; chunks.length ; i++)</span>
+            {
+<span class="nc bnc" id="L488" title="All 2 branches missed.">                if (chunks[i] != null)</span>
+                {
+<span class="nc" id="L490">                    chunks[i].release();</span>
+<span class="nc" id="L491">                    chunks[i] = null;</span>
+                }
+            }
+<span class="nc" id="L494">        }</span>
+    }
+
+<span class="fc" id="L497">    private static final ConcurrentLinkedQueue&lt;LocalPoolRef&gt; localPoolReferences = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+<span class="fc" id="L499">    private static final ReferenceQueue&lt;Object&gt; localPoolRefQueue = new ReferenceQueue&lt;&gt;();</span>
+<span class="fc" id="L500">    private static final InfiniteLoopExecutor EXEC = new InfiniteLoopExecutor(&quot;LocalPool-Cleaner&quot;, BufferPool::cleanupOneReference).start();</span>
+
+    private static void cleanupOneReference() throws InterruptedException
+    {
+<span class="fc" id="L504">        Object obj = localPoolRefQueue.remove(100);</span>
+<span class="pc bpc" id="L505" title="1 of 2 branches missed.">        if (obj instanceof LocalPoolRef)</span>
+        {
+<span class="nc" id="L507">            ((LocalPoolRef) obj).release();</span>
+<span class="nc" id="L508">            localPoolReferences.remove(obj);</span>
+        }
+<span class="fc" id="L510">    }</span>
+
+    private static ByteBuffer allocateDirectAligned(int capacity)
+    {
+<span class="fc" id="L514">        int align = MemoryUtil.pageSize();</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">        if (Integer.bitCount(align) != 1)</span>
+<span class="nc" id="L516">            throw new IllegalArgumentException(&quot;Alignment must be a power of 2&quot;);</span>
+
+<span class="fc" id="L518">        ByteBuffer buffer = ByteBuffer.allocateDirect(capacity + align);</span>
+<span class="fc" id="L519">        long address = MemoryUtil.getAddress(buffer);</span>
+<span class="fc" id="L520">        long offset = address &amp; (align -1); // (address % align)</span>
+
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">        if (offset == 0)</span>
+        { // already aligned
+<span class="nc" id="L524">            buffer.limit(capacity);</span>
+        }
+        else
+        { // shift by offset
+<span class="fc" id="L528">            int pos = (int)(align - offset);</span>
+<span class="fc" id="L529">            buffer.position(pos);</span>
+<span class="fc" id="L530">            buffer.limit(pos + capacity);</span>
+        }
+
+<span class="fc" id="L533">        return buffer.slice();</span>
+    }
+
+    /**
+     * A memory chunk: it takes a buffer (the slab) and slices it
+     * into smaller buffers when requested.
+     *
+     * It divides the slab into 64 units and keeps a long mask, freeSlots,
+     * indicating if a unit is in use or not. Each bit in freeSlots corresponds
+     * to a unit, if the bit is set then the unit is free (available for allocation)
+     * whilst if it is not set then the unit is in use.
+     *
+     * When we receive a request of a given size we round up the size to the nearest
+     * multiple of allocation units required. Then we search for n consecutive free units,
+     * where n is the number of units required. We also align to page boundaries.
+     *
+     * When we reiceve a release request we work out the position by comparing the buffer
+     * address to our base address and we simply release the units.
+     */
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">    final static class Chunk</span>
+    {
+        private final ByteBuffer slab;
+        private final long baseAddress;
+        private final int shift;
+
+        private volatile long freeSlots;
+<span class="fc" id="L559">        private static final AtomicLongFieldUpdater&lt;Chunk&gt; freeSlotsUpdater = AtomicLongFieldUpdater.newUpdater(Chunk.class, &quot;freeSlots&quot;);</span>
+
+        // the pool that is _currently allocating_ from this Chunk
+        // if this is set, it means the chunk may not be recycled because we may still allocate from it;
+        // if it has been unset the local pool has finished with it, and it may be recycled
+        private volatile LocalPool owner;
+        private long lastRecycled;
+        private final Chunk original;
+
+        Chunk(Chunk recycle)
+<span class="fc" id="L569">        {</span>
+<span class="pc bpc" id="L570" title="2 of 4 branches missed.">            assert recycle.freeSlots == 0L;</span>
+<span class="fc" id="L571">            this.slab = recycle.slab;</span>
+<span class="fc" id="L572">            this.baseAddress = recycle.baseAddress;</span>
+<span class="fc" id="L573">            this.shift = recycle.shift;</span>
+<span class="fc" id="L574">            this.freeSlots = -1L;</span>
+<span class="fc" id="L575">            this.original = recycle.original;</span>
+<span class="pc bpc" id="L576" title="1 of 2 branches missed.">            if (DEBUG)</span>
+<span class="nc" id="L577">                globalPool.debug.recycle(original);</span>
+<span class="fc" id="L578">        }</span>
+
+        Chunk(ByteBuffer slab)
+<span class="fc" id="L581">        {</span>
+<span class="pc bpc" id="L582" title="2 of 4 branches missed.">            assert !slab.hasArray();</span>
+<span class="fc" id="L583">            this.slab = slab;</span>
+<span class="fc" id="L584">            this.baseAddress = MemoryUtil.getAddress(slab);</span>
+
+            // The number of bits by which we need to shift to obtain a unit
+            // &quot;31 &amp;&quot; is because numberOfTrailingZeros returns 32 when the capacity is zero
+<span class="fc" id="L588">            this.shift = 31 &amp; (Integer.numberOfTrailingZeros(slab.capacity() / 64));</span>
+            // -1 means all free whilst 0 means all in use
+<span class="pc bpc" id="L590" title="1 of 2 branches missed.">            this.freeSlots = slab.capacity() == 0 ? 0L : -1L;</span>
+<span class="pc bpc" id="L591" title="1 of 2 branches missed.">            this.original = DEBUG ? this : null;</span>
+<span class="fc" id="L592">        }</span>
+
+        /**
+         * Acquire the chunk for future allocations: set the owner and prep
+         * the free slots mask.
+         */
+        void acquire(LocalPool owner)
+        {
+<span class="pc bpc" id="L600" title="2 of 4 branches missed.">            assert this.owner == null;</span>
+<span class="fc" id="L601">            this.owner = owner;</span>
+<span class="fc" id="L602">        }</span>
+
+        /**
+         * Set the owner to null and return the chunk to the global pool if the chunk is fully free.
+         * This method must be called by the LocalPool when it is certain that
+         * the local pool shall never try to allocate any more buffers from this chunk.
+         */
+        void release()
+        {
+<span class="fc" id="L611">            this.owner = null;</span>
+<span class="fc" id="L612">            tryRecycle();</span>
+<span class="fc" id="L613">        }</span>
+
+        void tryRecycle()
+        {
+<span class="pc bpc" id="L617" title="2 of 4 branches missed.">            assert owner == null;</span>
+<span class="pc bpc" id="L618" title="3 of 4 branches missed.">            if (isFree() &amp;&amp; freeSlotsUpdater.compareAndSet(this, -1L, 0L))</span>
+<span class="nc" id="L619">                recycle();</span>
+<span class="fc" id="L620">        }</span>
+
+        void recycle()
+        {
+<span class="pc bpc" id="L624" title="2 of 4 branches missed.">            assert freeSlots == 0L;</span>
+<span class="fc" id="L625">            globalPool.recycle(new Chunk(this));</span>
+<span class="fc" id="L626">        }</span>
+
+        /**
+         * We stash the chunk in the attachment of a buffer
+         * that was returned by get(), this method simply
+         * retrives the chunk that sliced a buffer, if any.
+         */
+        static Chunk getParentChunk(ByteBuffer buffer)
+        {
+<span class="fc" id="L635">            Object attachment = MemoryUtil.getAttachment(buffer);</span>
+
+<span class="pc bpc" id="L637" title="1 of 2 branches missed.">            if (attachment instanceof Chunk)</span>
+<span class="fc" id="L638">                return (Chunk) attachment;</span>
+
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            if (attachment instanceof Ref)</span>
+<span class="nc" id="L641">                return ((Ref&lt;Chunk&gt;) attachment).get();</span>
+
+<span class="nc" id="L643">            return null;</span>
+        }
+
+        ByteBuffer setAttachment(ByteBuffer buffer)
+        {
+<span class="pc bpc" id="L648" title="1 of 2 branches missed.">            if (Ref.DEBUG_ENABLED)</span>
+<span class="nc" id="L649">                MemoryUtil.setAttachment(buffer, new Ref&lt;&gt;(this, null));</span>
+            else
+<span class="fc" id="L651">                MemoryUtil.setAttachment(buffer, this);</span>
+
+<span class="fc" id="L653">            return buffer;</span>
+        }
+
+        boolean releaseAttachment(ByteBuffer buffer)
+        {
+<span class="fc" id="L658">            Object attachment = MemoryUtil.getAttachment(buffer);</span>
+<span class="pc bpc" id="L659" title="1 of 2 branches missed.">            if (attachment == null)</span>
+<span class="nc" id="L660">                return false;</span>
+
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">            if (attachment instanceof Ref)</span>
+<span class="nc" id="L663">                ((Ref&lt;Chunk&gt;) attachment).release();</span>
+
+<span class="fc" id="L665">            return true;</span>
+        }
+
+        @VisibleForTesting
+        void reset()
+        {
+<span class="nc" id="L671">            Chunk parent = getParentChunk(slab);</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            if (parent != null)</span>
+<span class="nc" id="L673">                parent.free(slab, false);</span>
+            else
+<span class="nc" id="L675">                FileUtils.clean(slab);</span>
+<span class="nc" id="L676">        }</span>
+
+        @VisibleForTesting
+        long setFreeSlots(long val)
+        {
+<span class="nc" id="L681">            long ret = freeSlots;</span>
+<span class="nc" id="L682">            freeSlots = val;</span>
+<span class="nc" id="L683">            return ret;</span>
+        }
+
+        int capacity()
+        {
+<span class="fc" id="L688">            return 64 &lt;&lt; shift;</span>
+        }
+
+        final int unit()
+        {
+<span class="fc" id="L693">            return 1 &lt;&lt; shift;</span>
+        }
+
+        final boolean isFree()
+        {
+<span class="pc bpc" id="L698" title="1 of 2 branches missed.">            return freeSlots == -1L;</span>
+        }
+
+        /** The total free size */
+        int free()
+        {
+<span class="fc" id="L704">            return Long.bitCount(freeSlots) * unit();</span>
+        }
+
+        /**
+         * Return the next available slice of this size. If
+         * we have exceeded the capacity we return null.
+         */
+        ByteBuffer get(int size)
+        {
+            // how many multiples of our units is the size?
+            // we add (unit - 1), so that when we divide by unit (&gt;&gt;&gt; shift), we effectively round up
+<span class="fc" id="L715">            int slotCount = (size - 1 + unit()) &gt;&gt;&gt; shift;</span>
+
+            // if we require more than 64 slots, we cannot possibly accommodate the allocation
+<span class="pc bpc" id="L718" title="1 of 2 branches missed.">            if (slotCount &gt; 64)</span>
+<span class="nc" id="L719">                return null;</span>
+
+            // convert the slotCount into the bits needed in the bitmap, but at the bottom of the register
+<span class="fc" id="L722">            long slotBits = -1L &gt;&gt;&gt; (64 - slotCount);</span>
+
+            // in order that we always allocate page aligned results, we require that any allocation is &quot;somewhat&quot; aligned
+            // i.e. any single unit allocation can go anywhere; any 2 unit allocation must begin in one of the first 3 slots
+            // of a page; a 3 unit must go in the first two slots; and any four unit allocation must be fully page-aligned
+
+            // to achieve this, we construct a searchMask that constrains the bits we find to those we permit starting
+            // a match from. as we find bits, we remove them from the mask to continue our search.
+            // this has an odd property when it comes to concurrent alloc/free, as we can safely skip backwards if
+            // a new slot is freed up, but we always make forward progress (i.e. never check the same bits twice),
+            // so running time is bounded
+<span class="fc" id="L733">            long searchMask = 0x1111111111111111L;</span>
+<span class="fc" id="L734">            searchMask *= 15L &gt;&gt;&gt; ((slotCount - 1) &amp; 3);</span>
+            // i.e. switch (slotCount &amp; 3)
+            // case 1: searchMask = 0xFFFFFFFFFFFFFFFFL
+            // case 2: searchMask = 0x7777777777777777L
+            // case 3: searchMask = 0x3333333333333333L
+            // case 0: searchMask = 0x1111111111111111L
+
+            // truncate the mask, removing bits that have too few slots proceeding them
+<span class="fc" id="L742">            searchMask &amp;= -1L &gt;&gt;&gt; (slotCount - 1);</span>
+
+            // this loop is very unroll friendly, and would achieve high ILP, but not clear if the compiler will exploit this.
+            // right now, not worth manually exploiting, but worth noting for future
+            while (true)
+            {
+<span class="fc" id="L748">                long cur = freeSlots;</span>
+                // find the index of the lowest set bit that also occurs in our mask (i.e. is permitted alignment, and not yet searched)
+                // we take the index, rather than finding the lowest bit, since we must obtain it anyway, and shifting is more efficient
+                // than multiplication
+<span class="fc" id="L752">                int index = Long.numberOfTrailingZeros(cur &amp; searchMask);</span>
+
+                // if no bit was actually found, we cannot serve this request, so return null.
+                // due to truncating the searchMask this immediately terminates any search when we run out of indexes
+                // that could accommodate the allocation, i.e. is equivalent to checking (64 - index) &lt; slotCount
+<span class="fc bfc" id="L757" title="All 2 branches covered.">                if (index == 64)</span>
+<span class="fc" id="L758">                    return null;</span>
+
+                // remove this bit from our searchMask, so we don't return here next round
+<span class="fc" id="L761">                searchMask ^= 1L &lt;&lt; index;</span>
+                // if our bits occur starting at the index, remove ourselves from the bitmask and return
+<span class="fc" id="L763">                long candidate = slotBits &lt;&lt; index;</span>
+<span class="pc bpc" id="L764" title="1 of 2 branches missed.">                if ((candidate &amp; cur) == candidate)</span>
+                {
+                    // here we are sure we will manage to CAS successfully without changing candidate because
+                    // there is only one thread allocating at the moment, the concurrency is with the release
+                    // operations only
+                    while (true)
+                    {
+                        // clear the candidate bits (freeSlots &amp;= ~candidate)
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">                        if (freeSlotsUpdater.compareAndSet(this, cur, cur &amp; ~candidate))</span>
+<span class="fc" id="L773">                            break;</span>
+
+<span class="nc" id="L775">                        cur = freeSlots;</span>
+                        // make sure no other thread has cleared the candidate bits
+<span class="nc bnc" id="L777" title="All 4 branches missed.">                        assert ((candidate &amp; cur) == candidate);</span>
+                    }
+<span class="fc" id="L779">                    return get(index &lt;&lt; shift, size);</span>
+                }
+<span class="nc" id="L781">            }</span>
+        }
+
+        private ByteBuffer get(int offset, int size)
+        {
+<span class="fc" id="L786">            slab.limit(offset + size);</span>
+<span class="fc" id="L787">            slab.position(offset);</span>
+
+<span class="fc" id="L789">            return setAttachment(slab.slice());</span>
+        }
+
+        /**
+         * Round the size to the next unit multiple.
+         */
+        int roundUp(int v)
+        {
+<span class="fc" id="L797">            return BufferPool.roundUp(v, unit());</span>
+        }
+
+        /**
+         * Release a buffer. Return:
+         *    0L if the buffer must be recycled after the call;
+         *   -1L if it is free (and so we should tryRecycle if owner is now null)
+         *    some other value otherwise
+         **/
+        long free(ByteBuffer buffer, boolean tryRelease)
+        {
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">            if (!releaseAttachment(buffer))</span>
+<span class="nc" id="L809">                return 1L;</span>
+
+<span class="fc" id="L811">            long address = MemoryUtil.getAddress(buffer);</span>
+<span class="pc bpc" id="L812" title="4 of 8 branches missed.">            assert (address &gt;= baseAddress) &amp; (address &lt;= baseAddress + capacity());</span>
+
+<span class="fc" id="L814">            int position = (int)(address - baseAddress);</span>
+<span class="fc" id="L815">            int size = roundUp(buffer.capacity());</span>
+
+<span class="fc" id="L817">            position &gt;&gt;= shift;</span>
+<span class="fc" id="L818">            int slotCount = size &gt;&gt; shift;</span>
+
+<span class="fc" id="L820">            long slotBits = (1L &lt;&lt; slotCount) - 1;</span>
+<span class="fc" id="L821">            long shiftedSlotBits = (slotBits &lt;&lt; position);</span>
+
+<span class="fc bfc" id="L823" title="All 2 branches covered.">            if (slotCount == 64)</span>
+            {
+<span class="pc bpc" id="L825" title="2 of 4 branches missed.">                assert size == capacity();</span>
+<span class="pc bpc" id="L826" title="2 of 4 branches missed.">                assert position == 0;</span>
+<span class="fc" id="L827">                shiftedSlotBits = -1L;</span>
+            }
+
+            long next;
+            while (true)
+            {
+<span class="fc" id="L833">                long cur = freeSlots;</span>
+<span class="fc" id="L834">                next = cur | shiftedSlotBits;</span>
+<span class="pc bpc" id="L835" title="2 of 4 branches missed.">                assert next == (cur ^ shiftedSlotBits); // ensure no double free</span>
+<span class="pc bpc" id="L836" title="1 of 4 branches missed.">                if (tryRelease &amp;&amp; (next == -1L))</span>
+<span class="fc" id="L837">                    next = 0L;</span>
+<span class="pc bpc" id="L838" title="1 of 2 branches missed.">                if (freeSlotsUpdater.compareAndSet(this, cur, next))</span>
+<span class="fc" id="L839">                    return next;</span>
+<span class="nc" id="L840">            }</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L846">            return String.format(&quot;[slab %s, slots bitmap %s, capacity %d, free %d]&quot;, slab, Long.toBinaryString(freeSlots), capacity(), free());</span>
+        }
+    }
+
+    @VisibleForTesting
+    public static int roundUpNormal(int size)
+    {
+<span class="nc" id="L853">        return roundUp(size, CHUNK_SIZE / 64);</span>
+    }
+
+    private static int roundUp(int size, int unit)
+    {
+<span class="fc" id="L858">        int mask = unit - 1;</span>
+<span class="fc" id="L859">        return (size + mask) &amp; ~mask;</span>
+    }
+
+    @VisibleForTesting
+    public static void shutdownLocalCleaner(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L865">        shutdownNow(Arrays.asList(EXEC));</span>
+<span class="nc" id="L866">        awaitTermination(timeout, unit, Arrays.asList(EXEC));</span>
+<span class="nc" id="L867">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

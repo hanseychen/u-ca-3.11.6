@@ -1,0 +1,812 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Scrubber.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">Scrubber.java</span></div><h1>Scrubber.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.nio.ByteBuffer;
+import java.io.*;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.Refs;
+import org.apache.cassandra.utils.memory.HeapAllocator;
+
+<span class="nc bnc" id="L42" title="All 2 branches missed.">public class Scrubber implements Closeable</span>
+{
+    private final ColumnFamilyStore cfs;
+    private final SSTableReader sstable;
+    private final LifecycleTransaction transaction;
+    private final File destination;
+    private final boolean skipCorrupted;
+    private final boolean reinsertOverflowedTTLRows;
+
+    private final boolean isCommutative;
+    private final boolean isIndex;
+    private final boolean checkData;
+    private final long expectedBloomFilterSize;
+
+    private final RandomAccessReader dataFile;
+    private final RandomAccessReader indexFile;
+    private final ScrubInfo scrubInfo;
+    private final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+
+    private int goodRows;
+    private int badRows;
+    private int emptyRows;
+
+    private ByteBuffer currentIndexKey;
+    private ByteBuffer nextIndexKey;
+    long currentRowPositionFromIndex;
+    long nextRowPositionFromIndex;
+
+<span class="nc" id="L70">    private NegativeLocalDeletionInfoMetrics negativeLocalDeletionInfoMetrics = new NegativeLocalDeletionInfoMetrics();</span>
+
+    private final OutputHandler outputHandler;
+
+<span class="nc" id="L74">    private static final Comparator&lt;Partition&gt; partitionComparator = new Comparator&lt;Partition&gt;()</span>
+<span class="nc" id="L75">    {</span>
+        public int compare(Partition r1, Partition r2)
+        {
+<span class="nc" id="L78">            return r1.partitionKey().compareTo(r2.partitionKey());</span>
+        }
+    };
+<span class="nc" id="L81">    private final SortedSet&lt;Partition&gt; outOfOrder = new TreeSet&lt;&gt;(partitionComparator);</span>
+
+    public Scrubber(ColumnFamilyStore cfs, LifecycleTransaction transaction, boolean skipCorrupted, boolean checkData) throws IOException
+    {
+<span class="nc" id="L85">        this(cfs, transaction, skipCorrupted, checkData, false);</span>
+<span class="nc" id="L86">    }</span>
+
+    public Scrubber(ColumnFamilyStore cfs, LifecycleTransaction transaction, boolean skipCorrupted, boolean checkData,
+                    boolean reinsertOverflowedTTLRows) throws IOException
+    {
+<span class="nc" id="L91">        this(cfs, transaction, skipCorrupted, new OutputHandler.LogOutput(), checkData, reinsertOverflowedTTLRows);</span>
+<span class="nc" id="L92">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public Scrubber(ColumnFamilyStore cfs,
+                    LifecycleTransaction transaction,
+                    boolean skipCorrupted,
+                    OutputHandler outputHandler,
+                    boolean checkData,
+                    boolean reinsertOverflowedTTLRows) throws IOException
+<span class="nc" id="L101">    {</span>
+<span class="nc" id="L102">        this.cfs = cfs;</span>
+<span class="nc" id="L103">        this.transaction = transaction;</span>
+<span class="nc" id="L104">        this.sstable = transaction.onlyOne();</span>
+<span class="nc" id="L105">        this.outputHandler = outputHandler;</span>
+<span class="nc" id="L106">        this.skipCorrupted = skipCorrupted;</span>
+<span class="nc" id="L107">        this.reinsertOverflowedTTLRows = reinsertOverflowedTTLRows;</span>
+<span class="nc" id="L108">        this.rowIndexEntrySerializer = sstable.descriptor.version.getSSTableFormat().getIndexSerializer(sstable.metadata,</span>
+                                                                                                        sstable.descriptor.version,
+                                                                                                        sstable.header);
+
+<span class="nc" id="L112">        List&lt;SSTableReader&gt; toScrub = Collections.singletonList(sstable);</span>
+
+
+<span class="nc" id="L115">        this.destination = cfs.getDirectories().getLocationForDisk(cfs.getDiskBoundaries().getCorrectDiskForSSTable(sstable));</span>
+<span class="nc" id="L116">        this.isCommutative = cfs.metadata.isCounter();</span>
+
+<span class="nc" id="L118">        boolean hasIndexFile = (new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX))).exists();</span>
+<span class="nc" id="L119">        this.isIndex = cfs.isIndex();</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (!hasIndexFile)</span>
+        {
+            // if there's any corruption in the -Data.db then rows can't be skipped over. but it's worth a shot.
+<span class="nc" id="L123">            outputHandler.warn(&quot;Missing component: &quot; + sstable.descriptor.filenameFor(Component.PRIMARY_INDEX));</span>
+        }
+<span class="nc bnc" id="L125" title="All 4 branches missed.">        this.checkData = checkData &amp;&amp; !this.isIndex; //LocalByPartitionerType does not support validation</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        this.expectedBloomFilterSize = Math.max(</span>
+        cfs.metadata.params.minIndexInterval,
+<span class="nc" id="L128">        hasIndexFile ? SSTableReader.getApproximateKeyCount(toScrub) : 0);</span>
+
+        // loop through each row, deserializing to check for damage.
+        // we'll also loop through the index at the same time, using the position from the index to recover if the
+        // row header (key or data size) is corrupt. (This means our position in the index file will be one row
+        // &quot;ahead&quot; of the data file.)
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        this.dataFile = transaction.isOffline()</span>
+<span class="nc" id="L135">                        ? sstable.openDataReader()</span>
+<span class="nc" id="L136">                        : sstable.openDataReader(CompactionManager.instance.getRateLimiter());</span>
+
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        this.indexFile = hasIndexFile</span>
+<span class="nc" id="L139">                         ? RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)))</span>
+                         : null;
+
+<span class="nc" id="L142">        this.scrubInfo = new ScrubInfo(dataFile, sstable);</span>
+
+<span class="nc" id="L144">        this.currentRowPositionFromIndex = 0;</span>
+<span class="nc" id="L145">        this.nextRowPositionFromIndex = 0;</span>
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (reinsertOverflowedTTLRows)</span>
+<span class="nc" id="L148">            outputHandler.output(&quot;Starting scrub with reinsert overflowed TTL option&quot;);</span>
+<span class="nc" id="L149">    }</span>
+
+    private UnfilteredRowIterator withValidation(UnfilteredRowIterator iter, String filename)
+    {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        return checkData ? UnfilteredRowIterators.withValidation(iter, filename) : iter;</span>
+    }
+
+    public void scrub()
+    {
+<span class="nc" id="L158">        List&lt;SSTableReader&gt; finished = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L159">        boolean completed = false;</span>
+<span class="nc" id="L160">        outputHandler.output(String.format(&quot;Scrubbing %s (%s)&quot;, sstable, FBUtilities.prettyPrintMemory(dataFile.length())));</span>
+<span class="nc" id="L161">        try (SSTableRewriter writer = SSTableRewriter.construct(cfs, transaction, false, sstable.maxDataAge);</span>
+<span class="nc" id="L162">             Refs&lt;SSTableReader&gt; refs = Refs.ref(Collections.singleton(sstable)))</span>
+        {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            nextIndexKey = indexAvailable() ? ByteBufferUtil.readWithShortLength(indexFile) : null;</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            if (indexAvailable())</span>
+            {
+                // throw away variable so we don't have a side effect in the assert
+<span class="nc" id="L168">                long firstRowPositionFromIndex = rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">                assert firstRowPositionFromIndex == 0 : firstRowPositionFromIndex;</span>
+            }
+
+<span class="nc" id="L172">            writer.switchWriter(CompactionManager.createWriter(cfs, destination, expectedBloomFilterSize, sstable.getSSTableMetadata().repairedAt, sstable, transaction));</span>
+
+<span class="nc" id="L174">            DecoratedKey prevKey = null;</span>
+
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            while (!dataFile.isEOF())</span>
+            {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                if (scrubInfo.isStopRequested())</span>
+<span class="nc" id="L179">                    throw new CompactionInterruptedException(scrubInfo.getCompactionInfo());</span>
+
+<span class="nc" id="L181">                long rowStart = dataFile.getFilePointer();</span>
+<span class="nc" id="L182">                outputHandler.debug(&quot;Reading row at &quot; + rowStart);</span>
+
+<span class="nc" id="L184">                DecoratedKey key = null;</span>
+                try
+                {
+<span class="nc" id="L187">                    key = sstable.decorateKey(ByteBufferUtil.readWithShortLength(dataFile));</span>
+                }
+<span class="nc" id="L189">                catch (Throwable th)</span>
+                {
+<span class="nc" id="L191">                    throwIfFatal(th);</span>
+                    // check for null key below
+<span class="nc" id="L193">                }</span>
+
+<span class="nc" id="L195">                updateIndexKey();</span>
+
+<span class="nc" id="L197">                long dataStart = dataFile.getFilePointer();</span>
+
+<span class="nc" id="L199">                long dataStartFromIndex = -1;</span>
+<span class="nc" id="L200">                long dataSizeFromIndex = -1;</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                if (currentIndexKey != null)</span>
+                {
+<span class="nc" id="L203">                    dataStartFromIndex = currentRowPositionFromIndex + 2 + currentIndexKey.remaining();</span>
+<span class="nc" id="L204">                    dataSizeFromIndex = nextRowPositionFromIndex - dataStartFromIndex;</span>
+                }
+
+                // avoid an NPE if key is null
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                String keyName = key == null ? &quot;(unreadable key)&quot; : ByteBufferUtil.bytesToHex(key.getKey());</span>
+<span class="nc" id="L209">                outputHandler.debug(String.format(&quot;row %s is %s&quot;, keyName, FBUtilities.prettyPrintMemory(dataSizeFromIndex)));</span>
+
+<span class="nc bnc" id="L211" title="All 6 branches missed.">                assert currentIndexKey != null || !indexAvailable();</span>
+
+                try
+                {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    if (key == null)</span>
+<span class="nc" id="L216">                        throw new IOError(new IOException(&quot;Unable to read row key from data file&quot;));</span>
+
+<span class="nc bnc" id="L218" title="All 4 branches missed.">                    if (currentIndexKey != null &amp;&amp; !key.getKey().equals(currentIndexKey))</span>
+                    {
+<span class="nc" id="L220">                        throw new IOError(new IOException(String.format(&quot;Key from data file (%s) does not match key from index file (%s)&quot;,</span>
+                                                                        //ByteBufferUtil.bytesToHex(key.getKey()), ByteBufferUtil.bytesToHex(currentIndexKey))));
+<span class="nc" id="L222">                                                                        &quot;_too big_&quot;, ByteBufferUtil.bytesToHex(currentIndexKey))));</span>
+                    }
+
+<span class="nc bnc" id="L225" title="All 4 branches missed.">                    if (indexFile != null &amp;&amp; dataSizeFromIndex &gt; dataFile.length())</span>
+<span class="nc" id="L226">                        throw new IOError(new IOException(&quot;Impossible row size (greater than file length): &quot; + dataSizeFromIndex));</span>
+
+<span class="nc bnc" id="L228" title="All 4 branches missed.">                    if (indexFile != null &amp;&amp; dataStart != dataStartFromIndex)</span>
+<span class="nc" id="L229">                        outputHandler.warn(String.format(&quot;Data file row position %d differs from index file row position %d&quot;, dataStart, dataStartFromIndex));</span>
+
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                    if (tryAppend(prevKey, key, writer))</span>
+<span class="nc" id="L232">                        prevKey = key;</span>
+                }
+<span class="nc" id="L234">                catch (Throwable th)</span>
+                {
+<span class="nc" id="L236">                    throwIfFatal(th);</span>
+<span class="nc" id="L237">                    outputHandler.warn(&quot;Error reading row (stacktrace follows):&quot;, th);</span>
+
+<span class="nc bnc" id="L239" title="All 4 branches missed.">                    if (currentIndexKey != null</span>
+<span class="nc bnc" id="L240" title="All 4 branches missed.">                        &amp;&amp; (key == null || !key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex))</span>
+                    {
+<span class="nc" id="L242">                        outputHandler.output(String.format(&quot;Retrying from row index; data is %s bytes starting at %s&quot;,</span>
+<span class="nc" id="L243">                                                           dataSizeFromIndex, dataStartFromIndex));</span>
+<span class="nc" id="L244">                        key = sstable.decorateKey(currentIndexKey);</span>
+                        try
+                        {
+<span class="nc" id="L247">                            dataFile.seek(dataStartFromIndex);</span>
+
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                            if (tryAppend(prevKey, key, writer))</span>
+<span class="nc" id="L250">                                prevKey = key;</span>
+                        }
+<span class="nc" id="L252">                        catch (Throwable th2)</span>
+                        {
+<span class="nc" id="L254">                            throwIfFatal(th2);</span>
+<span class="nc" id="L255">                            throwIfCannotContinue(key, th2);</span>
+
+<span class="nc" id="L257">                            outputHandler.warn(&quot;Retry failed too. Skipping to next row (retry's stacktrace follows)&quot;, th2);</span>
+<span class="nc" id="L258">                            badRows++;</span>
+<span class="nc" id="L259">                            seekToNextRow();</span>
+<span class="nc" id="L260">                        }</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L264">                        throwIfCannotContinue(key, th);</span>
+
+<span class="nc" id="L266">                        outputHandler.warn(&quot;Row starting at position &quot; + dataStart + &quot; is unreadable; skipping to next&quot;);</span>
+<span class="nc" id="L267">                        badRows++;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                        if (currentIndexKey != null)</span>
+<span class="nc" id="L269">                            seekToNextRow();</span>
+                    }
+<span class="nc" id="L271">                }</span>
+<span class="nc" id="L272">            }</span>
+
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            if (!outOfOrder.isEmpty())</span>
+            {
+                // out of order rows, but no bad rows found - we can keep our repairedAt time
+<span class="nc bnc" id="L277" title="All 2 branches missed.">                long repairedAt = badRows &gt; 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt;</span>
+                SSTableReader newInOrderSstable;
+<span class="nc" id="L279">                try (SSTableWriter inOrderWriter = CompactionManager.createWriter(cfs, destination, expectedBloomFilterSize, repairedAt, sstable, transaction))</span>
+                {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                    for (Partition partition : outOfOrder)</span>
+<span class="nc" id="L282">                        inOrderWriter.append(partition.unfilteredIterator());</span>
+<span class="nc" id="L283">                    newInOrderSstable = inOrderWriter.finish(-1, sstable.maxDataAge, true);</span>
+                }
+<span class="nc" id="L285">                transaction.update(newInOrderSstable, false);</span>
+<span class="nc" id="L286">                finished.add(newInOrderSstable);</span>
+<span class="nc" id="L287">                outputHandler.warn(String.format(&quot;%d out of order rows found while scrubbing %s; Those have been written (in order) to a new sstable (%s)&quot;, outOfOrder.size(), sstable, newInOrderSstable));</span>
+            }
+
+            // finish obsoletes the old sstable
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            finished.addAll(writer.setRepairedAt(badRows &gt; 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt).finish());</span>
+<span class="nc" id="L292">            completed = true;</span>
+        }
+<span class="nc" id="L294">        catch (IOException e)</span>
+        {
+<span class="nc" id="L296">            throw Throwables.propagate(e);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (transaction.isOffline())</span>
+<span class="nc" id="L301">                finished.forEach(sstable -&gt; sstable.selfRef().release());</span>
+        }
+
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (completed)</span>
+        {
+<span class="nc" id="L306">            outputHandler.output(&quot;Scrub of &quot; + sstable + &quot; complete: &quot; + goodRows + &quot; rows in new sstable and &quot; + emptyRows + &quot; empty (tombstoned) rows dropped&quot;);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (negativeLocalDeletionInfoMetrics.fixedRows &gt; 0)</span>
+<span class="nc" id="L308">                outputHandler.output(&quot;Fixed &quot; + negativeLocalDeletionInfoMetrics.fixedRows + &quot; rows with overflowed local deletion time.&quot;);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (badRows &gt; 0)</span>
+<span class="nc" id="L310">                outputHandler.warn(&quot;Unable to recover &quot; + badRows + &quot; rows that were skipped.  You can attempt manual recovery from the pre-scrub snapshot.  You can also run nodetool repair to transfer the data from a healthy replica, if any&quot;);</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">            if (badRows &gt; 0)</span>
+<span class="nc" id="L315">                outputHandler.warn(&quot;No valid rows found while scrubbing &quot; + sstable + &quot;; it is marked for deletion now. If you want to attempt manual recovery, you can find a copy in the pre-scrub snapshot&quot;);</span>
+            else
+<span class="nc" id="L317">                outputHandler.output(&quot;Scrub of &quot; + sstable + &quot; complete; looks like all &quot; + emptyRows + &quot; rows were tombstoned&quot;);</span>
+        }
+<span class="nc" id="L319">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private boolean tryAppend(DecoratedKey prevKey, DecoratedKey key, SSTableRewriter writer)
+    {
+        // OrderCheckerIterator will check, at iteration time, that the rows are in the proper order. If it detects
+        // that one row is out of order, it will stop returning them. The remaining rows will be sorted and added
+        // to the outOfOrder set that will be later written to a new SSTable.
+<span class="nc" id="L327">        OrderCheckerIterator sstableIterator = new OrderCheckerIterator(getIterator(key),</span>
+                                                                        cfs.metadata.comparator);
+
+<span class="nc" id="L330">        try (UnfilteredRowIterator iterator = withValidation(sstableIterator, dataFile.getPath()))</span>
+        {
+<span class="nc bnc" id="L332" title="All 4 branches missed.">            if (prevKey != null &amp;&amp; prevKey.compareTo(key) &gt; 0)</span>
+            {
+<span class="nc" id="L334">                saveOutOfOrderRow(prevKey, key, iterator);</span>
+<span class="nc" id="L335">                return false;</span>
+            }
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            if (writer.tryAppend(iterator) == null)</span>
+<span class="nc" id="L339">                emptyRows++;</span>
+            else
+<span class="nc" id="L341">                goodRows++;</span>
+        }
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (sstableIterator.hasRowsOutOfOrder())</span>
+        {
+<span class="nc" id="L346">            outputHandler.warn(String.format(&quot;Out of order rows found in partition: %s&quot;, key));</span>
+<span class="nc" id="L347">            outOfOrder.add(sstableIterator.getRowsOutOfOrder());</span>
+        }
+
+<span class="nc" id="L350">        return true;</span>
+    }
+
+    /**
+     * Only wrap with {@link FixNegativeLocalDeletionTimeIterator} if {@link #reinsertOverflowedTTLRows} option
+     * is specified
+     */
+    private UnfilteredRowIterator getIterator(DecoratedKey key)
+    {
+<span class="nc" id="L359">        RowMergingSSTableIterator rowMergingIterator = new RowMergingSSTableIterator(SSTableIdentityIterator.create(sstable, dataFile, key));</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        return reinsertOverflowedTTLRows ? new FixNegativeLocalDeletionTimeIterator(rowMergingIterator,</span>
+                                                                                    outputHandler,
+                                                                                    negativeLocalDeletionInfoMetrics) : rowMergingIterator;
+    }
+
+    private void updateIndexKey()
+    {
+<span class="nc" id="L367">        currentIndexKey = nextIndexKey;</span>
+<span class="nc" id="L368">        currentRowPositionFromIndex = nextRowPositionFromIndex;</span>
+        try
+        {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            nextIndexKey = !indexAvailable() ? null : ByteBufferUtil.readWithShortLength(indexFile);</span>
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            nextRowPositionFromIndex = !indexAvailable()</span>
+<span class="nc" id="L374">                                       ? dataFile.length()</span>
+<span class="nc" id="L375">                                       : rowIndexEntrySerializer.deserializePositionAndSkip(indexFile);</span>
+        }
+<span class="nc" id="L377">        catch (Throwable th)</span>
+        {
+<span class="nc" id="L379">            JVMStabilityInspector.inspectThrowable(th);</span>
+<span class="nc" id="L380">            outputHandler.warn(&quot;Error reading index file&quot;, th);</span>
+<span class="nc" id="L381">            nextIndexKey = null;</span>
+<span class="nc" id="L382">            nextRowPositionFromIndex = dataFile.length();</span>
+<span class="nc" id="L383">        }</span>
+<span class="nc" id="L384">    }</span>
+
+    private boolean indexAvailable()
+    {
+<span class="nc bnc" id="L388" title="All 4 branches missed.">        return indexFile != null &amp;&amp; !indexFile.isEOF();</span>
+    }
+
+    private void seekToNextRow()
+    {
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        while(nextRowPositionFromIndex &lt; dataFile.length())</span>
+        {
+            try
+            {
+<span class="nc" id="L397">                dataFile.seek(nextRowPositionFromIndex);</span>
+<span class="nc" id="L398">                return;</span>
+            }
+<span class="nc" id="L400">            catch (Throwable th)</span>
+            {
+<span class="nc" id="L402">                throwIfFatal(th);</span>
+<span class="nc" id="L403">                outputHandler.warn(String.format(&quot;Failed to seek to next row position %d&quot;, nextRowPositionFromIndex), th);</span>
+<span class="nc" id="L404">                badRows++;</span>
+            }
+
+<span class="nc" id="L407">            updateIndexKey();</span>
+        }
+<span class="nc" id="L409">    }</span>
+
+    private void saveOutOfOrderRow(DecoratedKey prevKey, DecoratedKey key, UnfilteredRowIterator iterator)
+    {
+        // TODO bitch if the row is too large?  if it is there's not much we can do ...
+<span class="nc" id="L414">        outputHandler.warn(String.format(&quot;Out of order row detected (%s found after %s)&quot;, key, prevKey));</span>
+<span class="nc" id="L415">        outOfOrder.add(ImmutableBTreePartition.create(iterator));</span>
+<span class="nc" id="L416">    }</span>
+
+    private void throwIfFatal(Throwable th)
+    {
+<span class="nc bnc" id="L420" title="All 6 branches missed.">        if (th instanceof Error &amp;&amp; !(th instanceof AssertionError || th instanceof IOError))</span>
+<span class="nc" id="L421">            throw (Error) th;</span>
+<span class="nc" id="L422">    }</span>
+
+    private void throwIfCannotContinue(DecoratedKey key, Throwable th)
+    {
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (isIndex)</span>
+        {
+<span class="nc" id="L428">            outputHandler.warn(String.format(&quot;An error occurred while scrubbing the row with key '%s' for an index table. &quot; +</span>
+                                             &quot;Scrubbing will abort for this table and the index will be rebuilt.&quot;, key));
+<span class="nc" id="L430">            throw new IOError(th);</span>
+        }
+
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        if (isCommutative &amp;&amp; !skipCorrupted)</span>
+        {
+<span class="nc" id="L435">            outputHandler.warn(String.format(&quot;An error occurred while scrubbing the row with key '%s'.  Skipping corrupt &quot; +</span>
+                                             &quot;rows in counter tables will result in undercounts for the affected &quot; +
+                                             &quot;counters (see CASSANDRA-2759 for more details), so by default the scrub will &quot; +
+                                             &quot;stop at this point.  If you would like to skip the row anyway and continue &quot; +
+                                             &quot;scrubbing, re-run the scrub with the --skip-corrupted option.&quot;, key));
+<span class="nc" id="L440">            throw new IOError(th);</span>
+        }
+<span class="nc" id="L442">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L446">        FileUtils.closeQuietly(dataFile);</span>
+<span class="nc" id="L447">        FileUtils.closeQuietly(indexFile);</span>
+<span class="nc" id="L448">    }</span>
+
+    public CompactionInfo.Holder getScrubInfo()
+    {
+<span class="nc" id="L452">        return scrubInfo;</span>
+    }
+
+    private static class ScrubInfo extends CompactionInfo.Holder
+    {
+        private final RandomAccessReader dataFile;
+        private final SSTableReader sstable;
+        private final UUID scrubCompactionId;
+
+        public ScrubInfo(RandomAccessReader dataFile, SSTableReader sstable)
+<span class="nc" id="L462">        {</span>
+<span class="nc" id="L463">            this.dataFile = dataFile;</span>
+<span class="nc" id="L464">            this.sstable = sstable;</span>
+<span class="nc" id="L465">            scrubCompactionId = UUIDGen.getTimeUUID();</span>
+<span class="nc" id="L466">        }</span>
+
+        public CompactionInfo getCompactionInfo()
+        {
+            try
+            {
+<span class="nc" id="L472">                return new CompactionInfo(sstable.metadata,</span>
+                                          OperationType.SCRUB,
+<span class="nc" id="L474">                                          dataFile.getFilePointer(),</span>
+<span class="nc" id="L475">                                          dataFile.length(),</span>
+                                          scrubCompactionId);
+            }
+<span class="nc" id="L478">            catch (Exception e)</span>
+            {
+<span class="nc" id="L480">                throw new RuntimeException(e);</span>
+            }
+        }
+
+        public boolean isGlobal()
+        {
+<span class="nc" id="L486">            return false;</span>
+        }
+    }
+
+    @VisibleForTesting
+    public ScrubResult scrubWithResult()
+    {
+<span class="nc" id="L493">        scrub();</span>
+<span class="nc" id="L494">        return new ScrubResult(this);</span>
+    }
+
+    public static final class ScrubResult
+    {
+        public final int goodRows;
+        public final int badRows;
+        public final int emptyRows;
+
+        public ScrubResult(Scrubber scrubber)
+<span class="nc" id="L504">        {</span>
+<span class="nc" id="L505">            this.goodRows = scrubber.goodRows;</span>
+<span class="nc" id="L506">            this.badRows = scrubber.badRows;</span>
+<span class="nc" id="L507">            this.emptyRows = scrubber.emptyRows;</span>
+<span class="nc" id="L508">        }</span>
+    }
+
+<span class="nc" id="L511">    public class NegativeLocalDeletionInfoMetrics</span>
+    {
+<span class="nc" id="L513">        public volatile int fixedRows = 0;</span>
+    }
+
+    /**
+     * During 2.x migration, under some circumstances rows might have gotten duplicated.
+     * Merging iterator merges rows with same clustering.
+     *
+     * For more details, refer to CASSANDRA-12144.
+     */
+    private static class RowMergingSSTableIterator extends WrappingUnfilteredRowIterator
+    {
+<span class="nc" id="L524">        Unfiltered nextToOffer = null;</span>
+
+        RowMergingSSTableIterator(UnfilteredRowIterator source)
+        {
+<span class="nc" id="L528">            super(source);</span>
+<span class="nc" id="L529">        }</span>
+
+        @Override
+        public boolean hasNext()
+        {
+<span class="nc bnc" id="L534" title="All 4 branches missed.">            return nextToOffer != null || wrapped.hasNext();</span>
+        }
+
+        @Override
+        public Unfiltered next()
+        {
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            Unfiltered next = nextToOffer != null ? nextToOffer : wrapped.next();</span>
+
+<span class="nc bnc" id="L542" title="All 2 branches missed.">            if (next.isRow())</span>
+            {
+<span class="nc bnc" id="L544" title="All 2 branches missed.">                while (wrapped.hasNext())</span>
+                {
+<span class="nc" id="L546">                    Unfiltered peek = wrapped.next();</span>
+<span class="nc bnc" id="L547" title="All 4 branches missed.">                    if (!peek.isRow() || !next.clustering().equals(peek.clustering()))</span>
+                    {
+<span class="nc" id="L549">                        nextToOffer = peek; // Offer peek in next call</span>
+<span class="nc" id="L550">                        return next;</span>
+                    }
+
+                    // Duplicate row, merge it.
+<span class="nc" id="L554">                    next = Rows.merge((Row) next, (Row) peek, FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L555">                }</span>
+            }
+
+<span class="nc" id="L558">            nextToOffer = null;</span>
+<span class="nc" id="L559">            return next;</span>
+        }
+    }
+
+    /**
+     * In some case like CASSANDRA-12127 the cells might have been stored in the wrong order. This decorator check the
+     * cells order and collect the out of order cells to correct the problem.
+     */
+    private static final class OrderCheckerIterator extends AbstractIterator&lt;Unfiltered&gt; implements UnfilteredRowIterator
+    {
+        /**
+         * The decorated iterator.
+         */
+        private final UnfilteredRowIterator iterator;
+
+        private final ClusteringComparator comparator;
+
+        private Unfiltered previous;
+
+        /**
+         * The partition containing the rows which are out of order.
+         */
+        private Partition rowsOutOfOrder;
+
+        public OrderCheckerIterator(UnfilteredRowIterator iterator, ClusteringComparator comparator)
+<span class="nc" id="L584">        {</span>
+<span class="nc" id="L585">            this.iterator = iterator;</span>
+<span class="nc" id="L586">            this.comparator = comparator;</span>
+<span class="nc" id="L587">        }</span>
+
+        public CFMetaData metadata()
+        {
+<span class="nc" id="L591">            return iterator.metadata();</span>
+        }
+
+        public boolean isReverseOrder()
+        {
+<span class="nc" id="L596">            return iterator.isReverseOrder();</span>
+        }
+
+        public PartitionColumns columns()
+        {
+<span class="nc" id="L601">            return iterator.columns();</span>
+        }
+
+        public DecoratedKey partitionKey()
+        {
+<span class="nc" id="L606">            return iterator.partitionKey();</span>
+        }
+
+        public Row staticRow()
+        {
+<span class="nc" id="L611">            return iterator.staticRow();</span>
+        }
+
+        @Override
+        public boolean isEmpty()
+        {
+<span class="nc" id="L617">            return iterator.isEmpty();</span>
+        }
+
+        public void close()
+        {
+<span class="nc" id="L622">            iterator.close();</span>
+<span class="nc" id="L623">        }</span>
+
+        public DeletionTime partitionLevelDeletion()
+        {
+<span class="nc" id="L627">            return iterator.partitionLevelDeletion();</span>
+        }
+
+        public EncodingStats stats()
+        {
+<span class="nc" id="L632">            return iterator.stats();</span>
+        }
+
+        public boolean hasRowsOutOfOrder()
+        {
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            return rowsOutOfOrder != null;</span>
+        }
+
+        public Partition getRowsOutOfOrder()
+        {
+<span class="nc" id="L642">            return rowsOutOfOrder;</span>
+        }
+
+        protected Unfiltered computeNext()
+        {
+<span class="nc bnc" id="L647" title="All 2 branches missed.">            if (!iterator.hasNext())</span>
+<span class="nc" id="L648">                return endOfData();</span>
+
+<span class="nc" id="L650">            Unfiltered next = iterator.next();</span>
+
+            // If we detect that some rows are out of order we will store and sort the remaining ones to insert them
+            // in a separate SSTable.
+<span class="nc bnc" id="L654" title="All 4 branches missed.">            if (previous != null &amp;&amp; comparator.compare(next, previous) &lt; 0)</span>
+            {
+<span class="nc" id="L656">                rowsOutOfOrder = ImmutableBTreePartition.create(UnfilteredRowIterators.concat(next, iterator), false);</span>
+<span class="nc" id="L657">                return endOfData();</span>
+            }
+<span class="nc" id="L659">            previous = next;</span>
+<span class="nc" id="L660">            return next;</span>
+        }
+    }
+
+    /**
+     * This iterator converts negative {@link AbstractCell#localDeletionTime()} into {@link AbstractCell#MAX_DELETION_TIME}
+     *
+     * This is to recover entries with overflowed localExpirationTime due to CASSANDRA-14092
+     */
+    private static final class FixNegativeLocalDeletionTimeIterator extends AbstractIterator&lt;Unfiltered&gt; implements UnfilteredRowIterator
+    {
+        /**
+         * The decorated iterator.
+         */
+        private final UnfilteredRowIterator iterator;
+
+        private final OutputHandler outputHandler;
+        private final NegativeLocalDeletionInfoMetrics negativeLocalExpirationTimeMetrics;
+
+        public FixNegativeLocalDeletionTimeIterator(UnfilteredRowIterator iterator, OutputHandler outputHandler,
+                                                    NegativeLocalDeletionInfoMetrics negativeLocalDeletionInfoMetrics)
+<span class="nc" id="L681">        {</span>
+<span class="nc" id="L682">            this.iterator = iterator;</span>
+<span class="nc" id="L683">            this.outputHandler = outputHandler;</span>
+<span class="nc" id="L684">            this.negativeLocalExpirationTimeMetrics = negativeLocalDeletionInfoMetrics;</span>
+<span class="nc" id="L685">        }</span>
+
+        public CFMetaData metadata()
+        {
+<span class="nc" id="L689">            return iterator.metadata();</span>
+        }
+
+        public boolean isReverseOrder()
+        {
+<span class="nc" id="L694">            return iterator.isReverseOrder();</span>
+        }
+
+        public PartitionColumns columns()
+        {
+<span class="nc" id="L699">            return iterator.columns();</span>
+        }
+
+        public DecoratedKey partitionKey()
+        {
+<span class="nc" id="L704">            return iterator.partitionKey();</span>
+        }
+
+        public Row staticRow()
+        {
+<span class="nc" id="L709">            return iterator.staticRow();</span>
+        }
+
+        @Override
+        public boolean isEmpty()
+        {
+<span class="nc" id="L715">            return iterator.isEmpty();</span>
+        }
+
+        public void close()
+        {
+<span class="nc" id="L720">            iterator.close();</span>
+<span class="nc" id="L721">        }</span>
+
+        public DeletionTime partitionLevelDeletion()
+        {
+<span class="nc" id="L725">            return iterator.partitionLevelDeletion();</span>
+        }
+
+        public EncodingStats stats()
+        {
+<span class="nc" id="L730">            return iterator.stats();</span>
+        }
+
+        protected Unfiltered computeNext()
+        {
+<span class="nc bnc" id="L735" title="All 2 branches missed.">            if (!iterator.hasNext())</span>
+<span class="nc" id="L736">                return endOfData();</span>
+
+<span class="nc" id="L738">            Unfiltered next = iterator.next();</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">            if (!next.isRow())</span>
+<span class="nc" id="L740">                return next;</span>
+
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            if (hasNegativeLocalExpirationTime((Row) next))</span>
+            {
+<span class="nc" id="L744">                outputHandler.debug(String.format(&quot;Found row with negative local expiration time: %s&quot;, next.toString(metadata(), false)));</span>
+<span class="nc" id="L745">                negativeLocalExpirationTimeMetrics.fixedRows++;</span>
+<span class="nc" id="L746">                return fixNegativeLocalExpirationTime((Row) next);</span>
+            }
+
+<span class="nc" id="L749">            return next;</span>
+        }
+
+        private boolean hasNegativeLocalExpirationTime(Row next)
+        {
+<span class="nc" id="L754">            Row row = next;</span>
+<span class="nc bnc" id="L755" title="All 4 branches missed.">            if (row.primaryKeyLivenessInfo().isExpiring() &amp;&amp; row.primaryKeyLivenessInfo().localExpirationTime() &lt; 0)</span>
+            {
+<span class="nc" id="L757">                return true;</span>
+            }
+
+<span class="nc bnc" id="L760" title="All 2 branches missed.">            for (ColumnData cd : row)</span>
+            {
+<span class="nc bnc" id="L762" title="All 2 branches missed.">                if (cd.column().isSimple())</span>
+                {
+<span class="nc" id="L764">                    Cell cell = (Cell)cd;</span>
+<span class="nc bnc" id="L765" title="All 4 branches missed.">                    if (cell.isExpiring() &amp;&amp; cell.localDeletionTime() &lt; 0)</span>
+<span class="nc" id="L766">                        return true;</span>
+<span class="nc" id="L767">                }</span>
+                else
+                {
+<span class="nc" id="L770">                    ComplexColumnData complexData = (ComplexColumnData)cd;</span>
+<span class="nc bnc" id="L771" title="All 2 branches missed.">                    for (Cell cell : complexData)</span>
+                    {
+<span class="nc bnc" id="L773" title="All 4 branches missed.">                        if (cell.isExpiring() &amp;&amp; cell.localDeletionTime() &lt; 0)</span>
+<span class="nc" id="L774">                            return true;</span>
+<span class="nc" id="L775">                    }</span>
+                }
+<span class="nc" id="L777">            }</span>
+
+<span class="nc" id="L779">            return false;</span>
+        }
+
+        private Unfiltered fixNegativeLocalExpirationTime(Row row)
+        {
+<span class="nc" id="L784">            Row.Builder builder = HeapAllocator.instance.cloningBTreeRowBuilder();</span>
+<span class="nc" id="L785">            builder.newRow(row.clustering());</span>
+<span class="nc bnc" id="L786" title="All 4 branches missed.">            builder.addPrimaryKeyLivenessInfo(row.primaryKeyLivenessInfo().isExpiring() &amp;&amp; row.primaryKeyLivenessInfo().localExpirationTime() &lt; 0 ?</span>
+<span class="nc" id="L787">                                              row.primaryKeyLivenessInfo().withUpdatedTimestampAndLocalDeletionTime(row.primaryKeyLivenessInfo().timestamp() + 1, AbstractCell.MAX_DELETION_TIME)</span>
+<span class="nc" id="L788">                                              :row.primaryKeyLivenessInfo());</span>
+<span class="nc" id="L789">            builder.addRowDeletion(row.deletion());</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">            for (ColumnData cd : row)</span>
+            {
+<span class="nc bnc" id="L792" title="All 2 branches missed.">                if (cd.column().isSimple())</span>
+                {
+<span class="nc" id="L794">                    Cell cell = (Cell)cd;</span>
+<span class="nc bnc" id="L795" title="All 4 branches missed.">                    builder.addCell(cell.isExpiring() &amp;&amp; cell.localDeletionTime() &lt; 0 ? cell.withUpdatedTimestampAndLocalDeletionTime(cell.timestamp() + 1, AbstractCell.MAX_DELETION_TIME) : cell);</span>
+<span class="nc" id="L796">                }</span>
+                else
+                {
+<span class="nc" id="L799">                    ComplexColumnData complexData = (ComplexColumnData)cd;</span>
+<span class="nc" id="L800">                    builder.addComplexDeletion(complexData.column(), complexData.complexDeletion());</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                    for (Cell cell : complexData)</span>
+                    {
+<span class="nc bnc" id="L803" title="All 4 branches missed.">                        builder.addCell(cell.isExpiring() &amp;&amp; cell.localDeletionTime() &lt; 0 ? cell.withUpdatedTimestampAndLocalDeletionTime(cell.timestamp() + 1, AbstractCell.MAX_DELETION_TIME) : cell);</span>
+<span class="nc" id="L804">                    }</span>
+                }
+<span class="nc" id="L806">            }</span>
+<span class="nc" id="L807">            return builder.build();</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

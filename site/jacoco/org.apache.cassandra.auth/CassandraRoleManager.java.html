@@ -1,0 +1,680 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraRoleManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth</a> &gt; <span class="el_source">CassandraRoleManager.java</span></div><h1>CassandraRoleManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.auth;
+
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.*;
+import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.mindrot.jbcrypt.BCrypt;
+
+/**
+ * Responsible for the creation, maintenance and deletion of roles
+ * for the purposes of authentication and authorization.
+ * Role data is stored internally, using the roles and role_members tables
+ * in the system_auth keyspace.
+ *
+ * Additionally, if org.apache.cassandra.auth.PasswordAuthenticator is used,
+ * encrypted passwords are also stored in the system_auth.roles table. This
+ * coupling between the IAuthenticator and IRoleManager implementations exists
+ * because setting a role's password via CQL is done with a CREATE ROLE or
+ * ALTER ROLE statement, the processing of which is handled by IRoleManager.
+ * As IAuthenticator is concerned only with credentials checking and has no
+ * means to modify passwords, PasswordAuthenticator depends on
+ * CassandraRoleManager for those functions.
+ *
+ * Alternative IAuthenticator implementations may be used in conjunction with
+ * CassandraRoleManager, but WITH PASSWORD = 'password' will not be supported
+ * in CREATE/ALTER ROLE statements.
+ *
+ * Such a configuration could be implemented using a custom IRoleManager that
+ * extends CassandraRoleManager and which includes Option.PASSWORD in the {@code Set&lt;Option&gt;}
+ * returned from supportedOptions/alterableOptions. Any additional processing
+ * of the password itself (such as storing it in an alternative location) would
+ * be added in overridden createRole and alterRole implementations.
+ */
+public class CassandraRoleManager implements IRoleManager
+{
+<span class="fc" id="L77">    private static final Logger logger = LoggerFactory.getLogger(CassandraRoleManager.class);</span>
+
+    static final String DEFAULT_SUPERUSER_NAME = &quot;cassandra&quot;;
+    static final String DEFAULT_SUPERUSER_PASSWORD = &quot;cassandra&quot;;
+
+    // Transform a row in the AuthKeyspace.ROLES to a Role instance
+<span class="fc" id="L83">    private static final Function&lt;UntypedResultSet.Row, Role&gt; ROW_TO_ROLE = new Function&lt;UntypedResultSet.Row, Role&gt;()</span>
+<span class="fc" id="L84">    {</span>
+        public Role apply(UntypedResultSet.Row row)
+        {
+            try
+            {
+<span class="nc" id="L89">                return new Role(row.getString(&quot;role&quot;),</span>
+<span class="nc" id="L90">                         row.getBoolean(&quot;is_superuser&quot;),</span>
+<span class="nc" id="L91">                         row.getBoolean(&quot;can_login&quot;),</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">                         row.has(&quot;member_of&quot;) ? row.getSet(&quot;member_of&quot;, UTF8Type.instance)</span>
+<span class="nc" id="L93">                                              : Collections.&lt;String&gt;emptySet());</span>
+            }
+            // Failing to deserialize a boolean in is_superuser or can_login will throw an NPE
+<span class="nc" id="L96">            catch (NullPointerException e)</span>
+            {
+<span class="nc" id="L98">                logger.warn(&quot;An invalid value has been detected in the {} table for role {}. If you are &quot; +</span>
+                            &quot;unable to login, you may need to disable authentication and confirm &quot; +
+<span class="nc" id="L100">                            &quot;that values in that table are accurate&quot;, AuthKeyspace.ROLES, row.getString(&quot;role&quot;));</span>
+<span class="nc" id="L101">                throw new RuntimeException(String.format(&quot;Invalid metadata has been detected for role %s&quot;, row.getString(&quot;role&quot;)), e);</span>
+            }
+
+        }
+    };
+
+    public static final String LEGACY_USERS_TABLE = &quot;users&quot;;
+    // Transform a row in the legacy system_auth.users table to a Role instance,
+    // used to fallback to previous schema on a mixed cluster during an upgrade
+<span class="fc" id="L110">    private static final Function&lt;UntypedResultSet.Row, Role&gt; LEGACY_ROW_TO_ROLE = new Function&lt;UntypedResultSet.Row, Role&gt;()</span>
+<span class="fc" id="L111">    {</span>
+        public Role apply(UntypedResultSet.Row row)
+        {
+<span class="nc" id="L114">            return new Role(row.getString(&quot;name&quot;),</span>
+<span class="nc" id="L115">                            row.getBoolean(&quot;super&quot;),</span>
+                            true,
+<span class="nc" id="L117">                            Collections.&lt;String&gt;emptySet());</span>
+        }
+    };
+
+    // 2 ** GENSALT_LOG2_ROUNDS rounds of hashing will be performed.
+    private static final String GENSALT_LOG2_ROUNDS_PROPERTY = Config.PROPERTY_PREFIX + &quot;auth_bcrypt_gensalt_log2_rounds&quot;;
+<span class="fc" id="L123">    private static final int GENSALT_LOG2_ROUNDS = getGensaltLogRounds();</span>
+
+    static int getGensaltLogRounds()
+    {
+<span class="fc" id="L127">         int rounds = Integer.getInteger(GENSALT_LOG2_ROUNDS_PROPERTY, 10);</span>
+<span class="pc bpc" id="L128" title="2 of 4 branches missed.">         if (rounds &lt; 4 || rounds &gt; 31)</span>
+<span class="nc" id="L129">         throw new ConfigurationException(String.format(&quot;Bad value for system property -D%s.&quot; +</span>
+                                                        &quot;Please use a value between 4 and 31 inclusively&quot;,
+                                                        GENSALT_LOG2_ROUNDS_PROPERTY));
+<span class="fc" id="L132">         return rounds;</span>
+    }
+
+    // NullObject returned when a supplied role name not found in AuthKeyspace.ROLES
+<span class="fc" id="L136">    private static final Role NULL_ROLE = new Role(null, false, false, Collections.&lt;String&gt;emptySet());</span>
+
+    private SelectStatement loadRoleStatement;
+    private SelectStatement legacySelectUserStatement;
+
+    private final Set&lt;Option&gt; supportedOptions;
+    private final Set&lt;Option&gt; alterableOptions;
+
+    // Will be set to true when all nodes in the cluster are on a version which supports roles (i.e. 2.2+)
+<span class="fc" id="L145">    private volatile boolean isClusterReady = false;</span>
+
+    public CassandraRoleManager()
+<span class="fc" id="L148">    {</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">        supportedOptions = DatabaseDescriptor.getAuthenticator().getClass() == PasswordAuthenticator.class</span>
+<span class="pc" id="L150">                         ? ImmutableSet.of(Option.LOGIN, Option.SUPERUSER, Option.PASSWORD)</span>
+<span class="fc" id="L151">                         : ImmutableSet.of(Option.LOGIN, Option.SUPERUSER);</span>
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">        alterableOptions = DatabaseDescriptor.getAuthenticator().getClass().equals(PasswordAuthenticator.class)</span>
+<span class="nc" id="L153">                         ? ImmutableSet.of(Option.PASSWORD)</span>
+<span class="fc" id="L154">                         : ImmutableSet.&lt;Option&gt;of();</span>
+<span class="fc" id="L155">    }</span>
+
+    public void setup()
+    {
+<span class="fc" id="L159">        loadRoleStatement = (SelectStatement) prepare(&quot;SELECT * from %s.%s WHERE role = ?&quot;,</span>
+                                                      SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                      AuthKeyspace.ROLES);
+        // If the old users table exists, we may need to migrate the legacy authn
+        // data to the new table. We also need to prepare a statement to read from
+        // it, so we can continue to use the old tables while the cluster is upgraded.
+        // Otherwise, we may need to create a default superuser role to enable others
+        // to be added.
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (Schema.instance.getCFMetaData(SchemaConstants.AUTH_KEYSPACE_NAME, &quot;users&quot;) != null)</span>
+        {
+<span class="nc" id="L169">            legacySelectUserStatement = prepareLegacySelectUserStatement();</span>
+
+<span class="nc" id="L171">            scheduleSetupTask(() -&gt; {</span>
+<span class="nc" id="L172">                convertLegacyData();</span>
+<span class="nc" id="L173">                return null;</span>
+            });
+        }
+        else
+        {
+<span class="fc" id="L178">            scheduleSetupTask(() -&gt; {</span>
+<span class="fc" id="L179">                setupDefaultRole();</span>
+<span class="fc" id="L180">                return null;</span>
+            });
+        }
+<span class="fc" id="L183">    }</span>
+
+    public Set&lt;Option&gt; supportedOptions()
+    {
+<span class="nc" id="L187">        return supportedOptions;</span>
+    }
+
+    public Set&lt;Option&gt; alterableOptions()
+    {
+<span class="nc" id="L192">        return alterableOptions;</span>
+    }
+
+    public void createRole(AuthenticatedUser performer, RoleResource role, RoleOptions options)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        String insertCql = options.getPassword().isPresent()</span>
+<span class="nc" id="L199">                         ? String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login, salted_hash) VALUES ('%s', %s, %s, '%s')&quot;,</span>
+                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                         AuthKeyspace.ROLES,
+<span class="nc" id="L202">                                         escape(role.getRoleName()),</span>
+<span class="nc" id="L203">                                         options.getSuperuser().or(false),</span>
+<span class="nc" id="L204">                                         options.getLogin().or(false),</span>
+<span class="nc" id="L205">                                         escape(hashpw(options.getPassword().get())))</span>
+<span class="nc" id="L206">                         : String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login) VALUES ('%s', %s, %s)&quot;,</span>
+                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                         AuthKeyspace.ROLES,
+<span class="nc" id="L209">                                         escape(role.getRoleName()),</span>
+<span class="nc" id="L210">                                         options.getSuperuser().or(false),</span>
+<span class="nc" id="L211">                                         options.getLogin().or(false));</span>
+<span class="nc" id="L212">        process(insertCql, consistencyForRole(role.getRoleName()));</span>
+<span class="nc" id="L213">    }</span>
+
+    public void dropRole(AuthenticatedUser performer, RoleResource role) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L217">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLES,
+<span class="nc" id="L220">                              escape(role.getRoleName())),</span>
+<span class="nc" id="L221">                consistencyForRole(role.getRoleName()));</span>
+<span class="nc" id="L222">        removeAllMembers(role.getRoleName());</span>
+<span class="nc" id="L223">    }</span>
+
+    public void alterRole(AuthenticatedUser performer, RoleResource role, RoleOptions options)
+    {
+        // Unlike most of the other data access methods here, this does not use a
+        // prepared statement in order to allow the set of assignments to be variable.
+<span class="nc" id="L229">        String assignments = Joiner.on(',').join(Iterables.filter(optionsToAssignments(options.getOptions()),</span>
+<span class="nc" id="L230">                                                                  Predicates.notNull()));</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (!Strings.isNullOrEmpty(assignments))</span>
+        {
+<span class="nc" id="L233">            process(String.format(&quot;UPDATE %s.%s SET %s WHERE role = '%s'&quot;,</span>
+                                  SchemaConstants.AUTH_KEYSPACE_NAME,
+                                  AuthKeyspace.ROLES,
+                                  assignments,
+<span class="nc" id="L237">                                  escape(role.getRoleName())),</span>
+<span class="nc" id="L238">                    consistencyForRole(role.getRoleName()));</span>
+        }
+<span class="nc" id="L240">    }</span>
+
+    public void grantRole(AuthenticatedUser performer, RoleResource role, RoleResource grantee)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (getRoles(grantee, true).contains(role))</span>
+<span class="nc" id="L246">            throw new InvalidRequestException(String.format(&quot;%s is a member of %s&quot;,</span>
+<span class="nc" id="L247">                                                            grantee.getRoleName(),</span>
+<span class="nc" id="L248">                                                            role.getRoleName()));</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (getRoles(role, true).contains(grantee))</span>
+<span class="nc" id="L250">            throw new InvalidRequestException(String.format(&quot;%s is a member of %s&quot;,</span>
+<span class="nc" id="L251">                                                            role.getRoleName(),</span>
+<span class="nc" id="L252">                                                            grantee.getRoleName()));</span>
+
+<span class="nc" id="L254">        modifyRoleMembership(grantee.getRoleName(), role.getRoleName(), &quot;+&quot;);</span>
+<span class="nc" id="L255">        process(String.format(&quot;INSERT INTO %s.%s (role, member) values ('%s', '%s')&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="nc" id="L258">                              escape(role.getRoleName()),</span>
+<span class="nc" id="L259">                              escape(grantee.getRoleName())),</span>
+<span class="nc" id="L260">                consistencyForRole(role.getRoleName()));</span>
+<span class="nc" id="L261">    }</span>
+
+    public void revokeRole(AuthenticatedUser performer, RoleResource role, RoleResource revokee)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (!getRoles(revokee, false).contains(role))</span>
+<span class="nc" id="L267">            throw new InvalidRequestException(String.format(&quot;%s is not a member of %s&quot;,</span>
+<span class="nc" id="L268">                                                            revokee.getRoleName(),</span>
+<span class="nc" id="L269">                                                            role.getRoleName()));</span>
+
+<span class="nc" id="L271">        modifyRoleMembership(revokee.getRoleName(), role.getRoleName(), &quot;-&quot;);</span>
+<span class="nc" id="L272">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s' and member = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="nc" id="L275">                              escape(role.getRoleName()),</span>
+<span class="nc" id="L276">                              escape(revokee.getRoleName())),</span>
+<span class="nc" id="L277">                consistencyForRole(role.getRoleName()));</span>
+<span class="nc" id="L278">    }</span>
+
+    public Set&lt;RoleResource&gt; getRoles(RoleResource grantee, boolean includeInherited) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L282">        Set&lt;RoleResource&gt; roles = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L283">        Role role = getRole(grantee.getRoleName());</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">        if (!role.equals(NULL_ROLE))</span>
+        {
+<span class="nc" id="L286">            roles.add(RoleResource.role(role.name));</span>
+<span class="nc" id="L287">            collectRoles(role, roles, includeInherited);</span>
+        }
+<span class="nc" id="L289">        return roles;</span>
+    }
+
+    public Set&lt;RoleResource&gt; getAllRoles() throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc" id="L294">        UntypedResultSet rows = process(String.format(&quot;SELECT role from %s.%s&quot;, SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES), ConsistencyLevel.QUORUM);</span>
+<span class="nc" id="L295">        Iterable&lt;RoleResource&gt; roles = Iterables.transform(rows, new Function&lt;UntypedResultSet.Row, RoleResource&gt;()</span>
+<span class="nc" id="L296">        {</span>
+            public RoleResource apply(UntypedResultSet.Row row)
+            {
+<span class="nc" id="L299">                return RoleResource.role(row.getString(&quot;role&quot;));</span>
+            }
+        });
+<span class="nc" id="L302">        return ImmutableSet.&lt;RoleResource&gt;builder().addAll(roles).build();</span>
+    }
+
+    public boolean isSuper(RoleResource role)
+    {
+        try
+        {
+<span class="nc" id="L309">            return getRole(role.getRoleName()).isSuper;</span>
+        }
+<span class="nc" id="L311">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L313">            logger.debug(&quot;Failed to authorize {} for super-user permission&quot;, role.getRoleName());</span>
+<span class="nc" id="L314">            throw new UnauthorizedException(&quot;Unable to perform authorization of super-user permission: &quot; + e.getMessage(), e);</span>
+        }
+    }
+
+    public boolean canLogin(RoleResource role)
+    {
+        try
+        {
+<span class="nc" id="L322">            return getRole(role.getRoleName()).canLogin;</span>
+        }
+<span class="nc" id="L324">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L326">            logger.debug(&quot;Failed to authorize {} for login permission&quot;, role.getRoleName());</span>
+<span class="nc" id="L327">            throw new UnauthorizedException(&quot;Unable to perform authorization of login permission: &quot; + e.getMessage(), e);</span>
+        }
+    }
+
+    public Map&lt;String, String&gt; getCustomOptions(RoleResource role)
+    {
+<span class="nc" id="L333">        return Collections.emptyMap();</span>
+    }
+
+    public boolean isExistingRole(RoleResource role)
+    {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        return getRole(role.getRoleName()) != NULL_ROLE;</span>
+    }
+
+    public Set&lt;? extends IResource&gt; protectedResources()
+    {
+<span class="fc" id="L343">        return ImmutableSet.of(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES),</span>
+<span class="fc" id="L344">                               DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLE_MEMBERS));</span>
+    }
+
+    public void validateConfiguration() throws ConfigurationException
+    {
+<span class="fc" id="L349">    }</span>
+
+    /*
+     * Create the default superuser role to bootstrap role creation on a clean system. Preemptively
+     * gives the role the default password so PasswordAuthenticator can be used to log in (if
+     * configured)
+     */
+    private static void setupDefaultRole()
+    {
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        if (StorageService.instance.getTokenMetadata().sortedTokens().isEmpty())</span>
+<span class="nc" id="L359">            throw new IllegalStateException(&quot;CassandraRoleManager skipped default role setup: no known tokens in ring&quot;);</span>
+
+        try
+        {
+<span class="fc bfc" id="L363" title="All 2 branches covered.">            if (!hasExistingRoles())</span>
+            {
+<span class="fc" id="L365">                QueryProcessor.process(String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login, salted_hash) &quot; +</span>
+                                                     &quot;VALUES ('%s', true, true, '%s')&quot;,
+                                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                     AuthKeyspace.ROLES,
+                                                     DEFAULT_SUPERUSER_NAME,
+<span class="fc" id="L370">                                                     escape(hashpw(DEFAULT_SUPERUSER_PASSWORD))),</span>
+<span class="fc" id="L371">                                       consistencyForRole(DEFAULT_SUPERUSER_NAME));</span>
+<span class="fc" id="L372">                logger.info(&quot;Created default superuser role '{}'&quot;, DEFAULT_SUPERUSER_NAME);</span>
+            }
+        }
+<span class="nc" id="L375">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L377">            logger.warn(&quot;CassandraRoleManager skipped default role setup: some nodes were not ready&quot;);</span>
+<span class="nc" id="L378">            throw e;</span>
+<span class="fc" id="L379">        }</span>
+<span class="fc" id="L380">    }</span>
+
+    private static boolean hasExistingRoles() throws RequestExecutionException
+    {
+        // Try looking up the 'cassandra' default role first, to avoid the range query if possible.
+<span class="fc" id="L385">        String defaultSUQuery = String.format(&quot;SELECT * FROM %s.%s WHERE role = '%s'&quot;, SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES, DEFAULT_SUPERUSER_NAME);</span>
+<span class="fc" id="L386">        String allUsersQuery = String.format(&quot;SELECT * FROM %s.%s LIMIT 1&quot;, SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES);</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">        return !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.ONE).isEmpty()</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">               || !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.QUORUM).isEmpty()</span>
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">               || !QueryProcessor.process(allUsersQuery, ConsistencyLevel.QUORUM).isEmpty();</span>
+    }
+
+    private void scheduleSetupTask(final Callable&lt;Void&gt; setupTask)
+    {
+        // The delay is to give the node a chance to see its peers before attempting the operation
+<span class="fc" id="L395">        ScheduledExecutors.optionalTasks.schedule(new Runnable()</span>
+<span class="fc" id="L396">        {</span>
+            public void run()
+            {
+                // If not all nodes are on 2.2, we don't want to initialize the role manager as this will confuse 2.1
+                // nodes (see CASSANDRA-9761 for details). So we re-schedule the setup for later, hoping that the upgrade
+                // will be finished by then.
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">                if (!MessagingService.instance().areAllNodesAtLeast22())</span>
+                {
+<span class="nc" id="L404">                    logger.trace(&quot;Not all nodes are upgraded to a version that supports Roles yet, rescheduling setup task&quot;);</span>
+<span class="nc" id="L405">                    scheduleSetupTask(setupTask);</span>
+<span class="nc" id="L406">                    return;</span>
+                }
+
+<span class="fc" id="L409">                isClusterReady = true;</span>
+                try
+                {
+<span class="fc" id="L412">                    setupTask.call();</span>
+                }
+<span class="nc" id="L414">                catch (Exception e)</span>
+                {
+<span class="nc" id="L416">                    logger.info(&quot;Setup task failed with error, rescheduling&quot;);</span>
+<span class="nc" id="L417">                    scheduleSetupTask(setupTask);</span>
+<span class="fc" id="L418">                }</span>
+<span class="fc" id="L419">            }</span>
+        }, AuthKeyspace.SUPERUSER_SETUP_DELAY, TimeUnit.MILLISECONDS);
+<span class="fc" id="L421">    }</span>
+
+    /*
+     * Copy legacy auth data from the system_auth.users &amp; system_auth.credentials tables to
+     * the new system_auth.roles table. This setup is not performed if AllowAllAuthenticator
+     * is configured (see Auth#setup).
+     */
+    private void convertLegacyData() throws Exception
+    {
+        try
+        {
+            // read old data at QUORUM as it may contain the data for the default superuser
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            if (Schema.instance.getCFMetaData(&quot;system_auth&quot;, &quot;users&quot;) != null)</span>
+            {
+<span class="nc" id="L435">                logger.info(&quot;Converting legacy users&quot;);</span>
+<span class="nc" id="L436">                UntypedResultSet users = QueryProcessor.process(&quot;SELECT * FROM system_auth.users&quot;,</span>
+                                                                ConsistencyLevel.QUORUM);
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                for (UntypedResultSet.Row row : users)</span>
+                {
+<span class="nc" id="L440">                    RoleOptions options = new RoleOptions();</span>
+<span class="nc" id="L441">                    options.setOption(Option.SUPERUSER, row.getBoolean(&quot;super&quot;));</span>
+<span class="nc" id="L442">                    options.setOption(Option.LOGIN, true);</span>
+<span class="nc" id="L443">                    createRole(null, RoleResource.role(row.getString(&quot;name&quot;)), options);</span>
+<span class="nc" id="L444">                }</span>
+<span class="nc" id="L445">                logger.info(&quot;Completed conversion of legacy users&quot;);</span>
+            }
+
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (Schema.instance.getCFMetaData(&quot;system_auth&quot;, &quot;credentials&quot;) != null)</span>
+            {
+<span class="nc" id="L450">                logger.info(&quot;Migrating legacy credentials data to new system table&quot;);</span>
+<span class="nc" id="L451">                UntypedResultSet credentials = QueryProcessor.process(&quot;SELECT * FROM system_auth.credentials&quot;,</span>
+                                                                      ConsistencyLevel.QUORUM);
+<span class="nc bnc" id="L453" title="All 2 branches missed.">                for (UntypedResultSet.Row row : credentials)</span>
+                {
+                    // Write the password directly into the table to avoid doubly encrypting it
+<span class="nc" id="L456">                    QueryProcessor.process(String.format(&quot;UPDATE %s.%s SET salted_hash = '%s' WHERE role = '%s'&quot;,</span>
+                                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                         AuthKeyspace.ROLES,
+<span class="nc" id="L459">                                                         row.getString(&quot;salted_hash&quot;),</span>
+<span class="nc" id="L460">                                                         row.getString(&quot;username&quot;)),</span>
+<span class="nc" id="L461">                                           consistencyForRole(row.getString(&quot;username&quot;)));</span>
+<span class="nc" id="L462">                }</span>
+<span class="nc" id="L463">                logger.info(&quot;Completed conversion of legacy credentials&quot;);</span>
+            }
+        }
+<span class="nc" id="L466">        catch (Exception e)</span>
+        {
+<span class="nc" id="L468">            logger.info(&quot;Unable to complete conversion of legacy auth data (perhaps not enough nodes are upgraded yet). &quot; +</span>
+                        &quot;Conversion should not be considered complete&quot;);
+<span class="nc" id="L470">            logger.trace(&quot;Conversion error&quot;, e);</span>
+<span class="nc" id="L471">            throw e;</span>
+<span class="nc" id="L472">        }</span>
+<span class="nc" id="L473">    }</span>
+
+    private SelectStatement prepareLegacySelectUserStatement()
+    {
+<span class="nc" id="L477">        return (SelectStatement) prepare(&quot;SELECT * FROM %s.%s WHERE name = ?&quot;,</span>
+                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                         LEGACY_USERS_TABLE);
+    }
+
+    private CQLStatement prepare(String template, String keyspace, String table)
+    {
+        try
+        {
+<span class="fc" id="L486">            return QueryProcessor.parseStatement(String.format(template, keyspace, table)).prepare(ClientState.forInternalCalls()).statement;</span>
+        }
+<span class="nc" id="L488">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L490">            throw new AssertionError(e); // not supposed to happen</span>
+        }
+    }
+
+    /*
+     * Retrieve all roles granted to the given role. includeInherited specifies
+     * whether to include only those roles granted directly or all inherited roles.
+     */
+    private void collectRoles(Role role, Set&lt;RoleResource&gt; collected, boolean includeInherited) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        for (String memberOf : role.memberOf)</span>
+        {
+<span class="nc" id="L502">            Role granted = getRole(memberOf);</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            if (granted.equals(NULL_ROLE))</span>
+<span class="nc" id="L504">                continue;</span>
+<span class="nc" id="L505">            collected.add(RoleResource.role(granted.name));</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">            if (includeInherited)</span>
+<span class="nc" id="L507">                collectRoles(granted, collected, true);</span>
+<span class="nc" id="L508">        }</span>
+<span class="nc" id="L509">    }</span>
+
+    /*
+     * Get a single Role instance given the role name. This never returns null, instead it
+     * uses the null object NULL_ROLE when a role with the given name cannot be found. So
+     * it's always safe to call methods on the returned object without risk of NPE.
+     */
+    private Role getRole(String name)
+    {
+        // If it exists, try the legacy users table in case the cluster
+        // is in the process of being upgraded and so is running with mixed
+        // versions of the authn schema.
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (Schema.instance.getCFMetaData(SchemaConstants.AUTH_KEYSPACE_NAME, &quot;users&quot;) == null)</span>
+<span class="nc" id="L522">            return getRoleFromTable(name, loadRoleStatement, ROW_TO_ROLE);</span>
+        else
+        {
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (legacySelectUserStatement == null)</span>
+<span class="nc" id="L526">                legacySelectUserStatement = prepareLegacySelectUserStatement();</span>
+<span class="nc" id="L527">            return getRoleFromTable(name, legacySelectUserStatement, LEGACY_ROW_TO_ROLE);</span>
+        }
+    }
+
+    private Role getRoleFromTable(String name, SelectStatement statement, Function&lt;UntypedResultSet.Row, Role&gt; function)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L534">        ResultMessage.Rows rows =</span>
+<span class="nc" id="L535">            statement.execute(QueryState.forInternalCalls(),</span>
+<span class="nc" id="L536">                              QueryOptions.forInternalCalls(consistencyForRole(name),</span>
+<span class="nc" id="L537">                                                            Collections.singletonList(ByteBufferUtil.bytes(name))),</span>
+<span class="nc" id="L538">                              System.nanoTime());</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if (rows.result.isEmpty())</span>
+<span class="nc" id="L540">            return NULL_ROLE;</span>
+
+<span class="nc" id="L542">        return function.apply(UntypedResultSet.create(rows.result).one());</span>
+    }
+
+    /*
+     * Adds or removes a role name from the membership list of an entry in the roles table table
+     * (adds if op is &quot;+&quot;, removes if op is &quot;-&quot;)
+     */
+    private void modifyRoleMembership(String grantee, String role, String op)
+    throws RequestExecutionException
+    {
+<span class="nc" id="L552">        process(String.format(&quot;UPDATE %s.%s SET member_of = member_of %s {'%s'} WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLES,
+                              op,
+<span class="nc" id="L556">                              escape(role),</span>
+<span class="nc" id="L557">                              escape(grantee)),</span>
+<span class="nc" id="L558">                consistencyForRole(grantee));</span>
+<span class="nc" id="L559">    }</span>
+
+    /*
+     * Clear the membership list of the given role
+     */
+    private void removeAllMembers(String role) throws RequestValidationException, RequestExecutionException
+    {
+        // Get the membership list of the the given role
+<span class="nc" id="L567">        UntypedResultSet rows = process(String.format(&quot;SELECT member FROM %s.%s WHERE role = '%s'&quot;,</span>
+                                                      SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                      AuthKeyspace.ROLE_MEMBERS,
+<span class="nc" id="L570">                                                      escape(role)),</span>
+<span class="nc" id="L571">                                        consistencyForRole(role));</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">        if (rows.isEmpty())</span>
+<span class="nc" id="L573">            return;</span>
+
+        // Update each member in the list, removing this role from its own list of granted roles
+<span class="nc bnc" id="L576" title="All 2 branches missed.">        for (UntypedResultSet.Row row : rows)</span>
+<span class="nc" id="L577">            modifyRoleMembership(row.getString(&quot;member&quot;), role, &quot;-&quot;);</span>
+
+        // Finally, remove the membership list for the dropped role
+<span class="nc" id="L580">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="nc" id="L583">                              escape(role)),</span>
+<span class="nc" id="L584">                consistencyForRole(role));</span>
+<span class="nc" id="L585">    }</span>
+
+    /*
+     * Convert a map of Options from a CREATE/ALTER statement into
+     * assignment clauses used to construct a CQL UPDATE statement
+     */
+    private Iterable&lt;String&gt; optionsToAssignments(Map&lt;Option, Object&gt; options)
+    {
+<span class="nc" id="L593">        return Iterables.transform(</span>
+<span class="nc" id="L594">                                  options.entrySet(),</span>
+                                  new Function&lt;Map.Entry&lt;Option, Object&gt;, String&gt;()
+<span class="nc" id="L596">                                  {</span>
+                                      public String apply(Map.Entry&lt;Option, Object&gt; entry)
+                                      {
+<span class="nc bnc" id="L599" title="All 4 branches missed.">                                          switch (entry.getKey())</span>
+                                          {
+                                              case LOGIN:
+<span class="nc" id="L602">                                                  return String.format(&quot;can_login = %s&quot;, entry.getValue());</span>
+                                              case SUPERUSER:
+<span class="nc" id="L604">                                                  return String.format(&quot;is_superuser = %s&quot;, entry.getValue());</span>
+                                              case PASSWORD:
+<span class="nc" id="L606">                                                  return String.format(&quot;salted_hash = '%s'&quot;, escape(hashpw((String) entry.getValue())));</span>
+                                              default:
+<span class="nc" id="L608">                                                  return null;</span>
+                                          }
+                                      }
+                                  });
+    }
+
+    protected static ConsistencyLevel consistencyForRole(String role)
+    {
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        if (role.equals(DEFAULT_SUPERUSER_NAME))</span>
+<span class="fc" id="L617">            return ConsistencyLevel.QUORUM;</span>
+        else
+<span class="nc" id="L619">            return ConsistencyLevel.LOCAL_ONE;</span>
+    }
+
+    private static String hashpw(String password)
+    {
+<span class="fc" id="L624">        return BCrypt.hashpw(password, BCrypt.gensalt(GENSALT_LOG2_ROUNDS));</span>
+    }
+
+    private static String escape(String name)
+    {
+<span class="fc" id="L629">        return StringUtils.replace(name, &quot;'&quot;, &quot;''&quot;);</span>
+    }
+
+    /**
+     * Executes the provided query.
+     * This shouldn't be used during setup as this will directly return an error if the manager is not setup yet. Setup tasks
+     * should use QueryProcessor.process directly.
+     */
+    private UntypedResultSet process(String query, ConsistencyLevel consistencyLevel) throws RequestValidationException, RequestExecutionException
+    {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (!isClusterReady)</span>
+<span class="nc" id="L640">            throw new InvalidRequestException(&quot;Cannot process role related query as the role manager isn't yet setup. &quot;</span>
+                                            + &quot;This is likely because some of nodes in the cluster are on version 2.1 or earlier. &quot;
+                                            + &quot;You need to upgrade all nodes to Cassandra 2.2 or more to use roles.&quot;);
+
+<span class="nc" id="L644">        return QueryProcessor.process(query, consistencyLevel);</span>
+    }
+
+    private static final class Role
+    {
+        private String name;
+        private final boolean isSuper;
+        private final boolean canLogin;
+        private Set&lt;String&gt; memberOf;
+
+        private Role(String name, boolean isSuper, boolean canLogin, Set&lt;String&gt; memberOf)
+<span class="fc" id="L655">        {</span>
+<span class="fc" id="L656">            this.name = name;</span>
+<span class="fc" id="L657">            this.isSuper = isSuper;</span>
+<span class="fc" id="L658">            this.canLogin = canLogin;</span>
+<span class="fc" id="L659">            this.memberOf = memberOf;</span>
+<span class="fc" id="L660">        }</span>
+
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            if (this == o)</span>
+<span class="nc" id="L665">                return true;</span>
+
+<span class="nc bnc" id="L667" title="All 2 branches missed.">            if (!(o instanceof Role))</span>
+<span class="nc" id="L668">                return false;</span>
+
+<span class="nc" id="L670">            Role r = (Role) o;</span>
+<span class="nc" id="L671">            return Objects.equal(name, r.name);</span>
+        }
+
+        public int hashCode()
+        {
+<span class="nc" id="L676">            return Objects.hashCode(name);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

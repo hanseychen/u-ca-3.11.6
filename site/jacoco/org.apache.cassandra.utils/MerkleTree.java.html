@@ -1,0 +1,1194 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MerkleTree.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">MerkleTree.java</span></div><h1>MerkleTree.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import java.io.DataInput;
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.PeekingIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.IPartitionerDependentSerializer;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+
+/**
+ * A MerkleTree implemented as a binary tree.
+ *
+ * A MerkleTree is a full binary tree that represents a perfect binary tree of
+ * depth 'hashdepth'. In a perfect binary tree, each leaf contains a
+ * sequentially hashed range, and each inner node contains the binary hash of
+ * its two children. In the MerkleTree, many ranges will not be split to the
+ * full depth of the perfect binary tree: the leaves of this tree are Leaf objects,
+ * which contain the computed values of the nodes that would be below them if
+ * the tree were perfect.
+ *
+ * The hash values of the inner nodes of the MerkleTree are calculated lazily based
+ * on their children when the hash of a range is requested with hash(range).
+ *
+ * Inputs passed to TreeRange.validate should be calculated using a very secure hash,
+ * because all hashing internal to the tree is accomplished using XOR.
+ *
+ * If two MerkleTrees have the same hashdepth, they represent a perfect tree
+ * of the same depth, and can always be compared, regardless of size or splits.
+ */
+<span class="nc bnc" id="L63" title="All 2 branches missed.">public class MerkleTree implements Serializable</span>
+{
+<span class="nc" id="L65">    private static Logger logger = LoggerFactory.getLogger(MerkleTree.class);</span>
+
+<span class="nc" id="L67">    public static final MerkleTreeSerializer serializer = new MerkleTreeSerializer();</span>
+    private static final long serialVersionUID = 2L;
+
+    public static final byte RECOMMENDED_DEPTH = Byte.MAX_VALUE - 1;
+
+    public static final int CONSISTENT = 0;
+    public static final int FULLY_INCONSISTENT = 1;
+    public static final int PARTIALLY_INCONSISTENT = 2;
+<span class="nc" id="L75">    private static final byte[] EMPTY_HASH = new byte[0];</span>
+
+    public final byte hashdepth;
+
+    /** The top level range that this MerkleTree covers. */
+    public final Range&lt;Token&gt; fullRange;
+    private final IPartitioner partitioner;
+
+    private long maxsize;
+    private long size;
+    private Hashable root;
+
+<span class="nc" id="L87">    public static class MerkleTreeSerializer implements IVersionedSerializer&lt;MerkleTree&gt;</span>
+    {
+        public void serialize(MerkleTree mt, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L91">            out.writeByte(mt.hashdepth);</span>
+<span class="nc" id="L92">            out.writeLong(mt.maxsize);</span>
+<span class="nc" id="L93">            out.writeLong(mt.size);</span>
+<span class="nc" id="L94">            out.writeUTF(mt.partitioner.getClass().getCanonicalName());</span>
+            // full range
+<span class="nc" id="L96">            Token.serializer.serialize(mt.fullRange.left, out, version);</span>
+<span class="nc" id="L97">            Token.serializer.serialize(mt.fullRange.right, out, version);</span>
+<span class="nc" id="L98">            Hashable.serializer.serialize(mt.root, out, version);</span>
+<span class="nc" id="L99">        }</span>
+
+        public MerkleTree deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L103">            byte hashdepth = in.readByte();</span>
+<span class="nc" id="L104">            long maxsize = in.readLong();</span>
+<span class="nc" id="L105">            long size = in.readLong();</span>
+            IPartitioner partitioner;
+            try
+            {
+<span class="nc" id="L109">                partitioner = FBUtilities.newPartitioner(in.readUTF());</span>
+            }
+<span class="nc" id="L111">            catch (ConfigurationException e)</span>
+            {
+<span class="nc" id="L113">                throw new IOException(e);</span>
+<span class="nc" id="L114">            }</span>
+
+            // full range
+<span class="nc" id="L117">            Token left = Token.serializer.deserialize(in, partitioner, version);</span>
+<span class="nc" id="L118">            Token right = Token.serializer.deserialize(in, partitioner, version);</span>
+<span class="nc" id="L119">            Range&lt;Token&gt; fullRange = new Range&lt;&gt;(left, right);</span>
+
+<span class="nc" id="L121">            MerkleTree mt = new MerkleTree(partitioner, fullRange, hashdepth, maxsize);</span>
+<span class="nc" id="L122">            mt.size = size;</span>
+<span class="nc" id="L123">            mt.root = Hashable.serializer.deserialize(in, partitioner, version);</span>
+<span class="nc" id="L124">            return mt;</span>
+        }
+
+        public long serializedSize(MerkleTree mt, int version)
+        {
+<span class="nc" id="L129">            long size = 1 // mt.hashdepth</span>
+<span class="nc" id="L130">                 + TypeSizes.sizeof(mt.maxsize)</span>
+<span class="nc" id="L131">                 + TypeSizes.sizeof(mt.size)</span>
+<span class="nc" id="L132">                 + TypeSizes.sizeof(mt.partitioner.getClass().getCanonicalName());</span>
+
+            // full range
+<span class="nc" id="L135">            size += Token.serializer.serializedSize(mt.fullRange.left, version);</span>
+<span class="nc" id="L136">            size += Token.serializer.serializedSize(mt.fullRange.right, version);</span>
+
+<span class="nc" id="L138">            size += Hashable.serializer.serializedSize(mt.root, version);</span>
+<span class="nc" id="L139">            return size;</span>
+        }
+    }
+
+    /**
+     * @param partitioner The partitioner in use.
+     * @param range the range this tree covers
+     * @param hashdepth The maximum depth of the tree. 100/(2^depth) is the %
+     *        of the key space covered by each subrange of a fully populated tree.
+     * @param maxsize The maximum number of subranges in the tree.
+     */
+    public MerkleTree(IPartitioner partitioner, Range&lt;Token&gt; range, byte hashdepth, long maxsize)
+<span class="nc" id="L151">    {</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">        assert hashdepth &lt; Byte.MAX_VALUE;</span>
+<span class="nc" id="L153">        this.fullRange = Preconditions.checkNotNull(range);</span>
+<span class="nc" id="L154">        this.partitioner = Preconditions.checkNotNull(partitioner);</span>
+<span class="nc" id="L155">        this.hashdepth = hashdepth;</span>
+<span class="nc" id="L156">        this.maxsize = maxsize;</span>
+
+<span class="nc" id="L158">        size = 1;</span>
+<span class="nc" id="L159">        root = new Leaf(null);</span>
+<span class="nc" id="L160">    }</span>
+
+
+    static byte inc(byte in)
+    {
+<span class="nc bnc" id="L165" title="All 4 branches missed.">        assert in &lt; Byte.MAX_VALUE;</span>
+<span class="nc" id="L166">        return (byte)(in + 1);</span>
+    }
+
+    /**
+     * Initializes this tree by splitting it until hashdepth is reached,
+     * or until an additional level of splits would violate maxsize.
+     *
+     * NB: Replaces all nodes in the tree.
+     */
+    public void init()
+    {
+        // determine the depth to which we can safely split the tree
+<span class="nc" id="L178">        byte sizedepth = (byte)(Math.log10(maxsize) / Math.log10(2));</span>
+<span class="nc" id="L179">        byte depth = (byte)Math.min(sizedepth, hashdepth);</span>
+
+<span class="nc" id="L181">        root = initHelper(fullRange.left, fullRange.right, (byte)0, depth);</span>
+<span class="nc" id="L182">        size = (long)Math.pow(2, depth);</span>
+<span class="nc" id="L183">    }</span>
+
+    private Hashable initHelper(Token left, Token right, byte depth, byte max)
+    {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (depth == max)</span>
+            // we've reached the leaves
+<span class="nc" id="L189">            return new Leaf();</span>
+<span class="nc" id="L190">        Token midpoint = partitioner.midpoint(left, right);</span>
+
+<span class="nc bnc" id="L192" title="All 4 branches missed.">        if (midpoint.equals(left) || midpoint.equals(right))</span>
+<span class="nc" id="L193">            return new Leaf();</span>
+
+<span class="nc" id="L195">        Hashable lchild =  initHelper(left, midpoint, inc(depth), max);</span>
+<span class="nc" id="L196">        Hashable rchild =  initHelper(midpoint, right, inc(depth), max);</span>
+<span class="nc" id="L197">        return new Inner(midpoint, lchild, rchild);</span>
+    }
+
+    Hashable root()
+    {
+<span class="nc" id="L202">        return root;</span>
+    }
+
+    public IPartitioner partitioner()
+    {
+<span class="nc" id="L207">        return partitioner;</span>
+    }
+
+    /**
+     * The number of distinct ranges contained in this tree. This is a reasonable
+     * measure of the memory usage of the tree (assuming 'this.order' is significant).
+     */
+    public long size()
+    {
+<span class="nc" id="L216">        return size;</span>
+    }
+
+    public long maxsize()
+    {
+<span class="nc" id="L221">        return maxsize;</span>
+    }
+
+    public void maxsize(long maxsize)
+    {
+<span class="nc" id="L226">        this.maxsize = maxsize;</span>
+<span class="nc" id="L227">    }</span>
+
+    /**
+     * @param ltree First tree.
+     * @param rtree Second tree.
+     * @return A list of the largest contiguous ranges where the given trees disagree.
+     */
+    public static List&lt;TreeRange&gt; difference(MerkleTree ltree, MerkleTree rtree)
+    {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if (!ltree.fullRange.equals(rtree.fullRange))</span>
+<span class="nc" id="L237">            throw new IllegalArgumentException(&quot;Difference only make sense on tree covering the same range (but &quot; + ltree.fullRange + &quot; != &quot; + rtree.fullRange + &quot;)&quot;);</span>
+
+<span class="nc" id="L239">        List&lt;TreeRange&gt; diff = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L240">        TreeDifference active = new TreeDifference(ltree.fullRange.left, ltree.fullRange.right, (byte)0);</span>
+
+<span class="nc" id="L242">        Hashable lnode = ltree.find(active);</span>
+<span class="nc" id="L243">        Hashable rnode = rtree.find(active);</span>
+<span class="nc" id="L244">        byte[] lhash = lnode.hash();</span>
+<span class="nc" id="L245">        byte[] rhash = rnode.hash();</span>
+<span class="nc" id="L246">        active.setSize(lnode.sizeOfRange(), rnode.sizeOfRange());</span>
+
+<span class="nc bnc" id="L248" title="All 6 branches missed.">        if (lhash != null &amp;&amp; rhash != null &amp;&amp; !Arrays.equals(lhash, rhash))</span>
+        {
+<span class="nc bnc" id="L250" title="All 4 branches missed.">            if(lnode instanceof  Leaf || rnode instanceof Leaf)</span>
+            {
+<span class="nc" id="L252">                logger.debug(&quot;Digest mismatch detected among leaf nodes {}, {}&quot;, lnode, rnode);</span>
+<span class="nc" id="L253">                diff.add(active);</span>
+            }
+            else
+            {
+<span class="nc" id="L257">                logger.debug(&quot;Digest mismatch detected, traversing trees [{}, {}]&quot;, ltree, rtree);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                if (FULLY_INCONSISTENT == differenceHelper(ltree, rtree, diff, active))</span>
+                {
+<span class="nc" id="L260">                    logger.debug(&quot;Range {} fully inconsistent&quot;, active);</span>
+<span class="nc" id="L261">                    diff.add(active);</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L265" title="All 4 branches missed.">        else if (lhash == null || rhash == null)</span>
+<span class="nc" id="L266">            diff.add(active);</span>
+<span class="nc" id="L267">        return diff;</span>
+    }
+
+    /**
+     * TODO: This function could be optimized into a depth first traversal of
+     * the two trees in parallel.
+     *
+     * Takes two trees and a range for which they have hashes, but are inconsistent.
+     * @return FULLY_INCONSISTENT if active is inconsistent, PARTIALLY_INCONSISTENT if only a subrange is inconsistent.
+     */
+    @VisibleForTesting
+    static int differenceHelper(MerkleTree ltree, MerkleTree rtree, List&lt;TreeRange&gt; diff, TreeRange active)
+    {
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (active.depth == Byte.MAX_VALUE)</span>
+<span class="nc" id="L281">            return CONSISTENT;</span>
+
+<span class="nc" id="L283">        Token midpoint = ltree.partitioner().midpoint(active.left, active.right);</span>
+        // sanity check for midpoint calculation, see CASSANDRA-13052
+<span class="nc bnc" id="L285" title="All 4 branches missed.">        if (midpoint.equals(active.left) || midpoint.equals(active.right))</span>
+        {
+            // If the midpoint equals either the left or the right, we have a range that's too small to split - we'll simply report the
+            // whole range as inconsistent
+<span class="nc" id="L289">            logger.debug(&quot;({}) No sane midpoint ({}) for range {} , marking whole range as inconsistent&quot;, active.depth, midpoint, active);</span>
+<span class="nc" id="L290">            return FULLY_INCONSISTENT;</span>
+        }
+
+<span class="nc" id="L293">        TreeDifference left = new TreeDifference(active.left, midpoint, inc(active.depth));</span>
+<span class="nc" id="L294">        TreeDifference right = new TreeDifference(midpoint, active.right, inc(active.depth));</span>
+<span class="nc" id="L295">        logger.debug(&quot;({}) Hashing sub-ranges [{}, {}] for {} divided by midpoint {}&quot;, active.depth, left, right, active, midpoint);</span>
+        byte[] lhash, rhash;
+        Hashable lnode, rnode;
+
+        // see if we should recurse left
+<span class="nc" id="L300">        lnode = ltree.find(left);</span>
+<span class="nc" id="L301">        rnode = rtree.find(left);</span>
+<span class="nc" id="L302">        lhash = lnode.hash();</span>
+<span class="nc" id="L303">        rhash = rnode.hash();</span>
+<span class="nc" id="L304">        left.setSize(lnode.sizeOfRange(), rnode.sizeOfRange());</span>
+<span class="nc" id="L305">        left.setRows(lnode.rowsInRange(), rnode.rowsInRange());</span>
+
+<span class="nc" id="L307">        int ldiff = CONSISTENT;</span>
+<span class="nc bnc" id="L308" title="All 4 branches missed.">        boolean lreso = lhash != null &amp;&amp; rhash != null;</span>
+<span class="nc bnc" id="L309" title="All 4 branches missed.">        if (lreso &amp;&amp; !Arrays.equals(lhash, rhash))</span>
+        {
+<span class="nc" id="L311">            logger.debug(&quot;({}) Inconsistent digest on left sub-range {}: [{}, {}]&quot;, active.depth, left, lnode, rnode);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (lnode instanceof Leaf) ldiff = FULLY_INCONSISTENT;</span>
+<span class="nc" id="L313">            else ldiff = differenceHelper(ltree, rtree, diff, left);</span>
+        }
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        else if (!lreso)</span>
+        {
+<span class="nc" id="L317">            logger.debug(&quot;({}) Left sub-range fully inconsistent {}&quot;, active.depth, right);</span>
+<span class="nc" id="L318">            ldiff = FULLY_INCONSISTENT;</span>
+        }
+
+        // see if we should recurse right
+<span class="nc" id="L322">        lnode = ltree.find(right);</span>
+<span class="nc" id="L323">        rnode = rtree.find(right);</span>
+<span class="nc" id="L324">        lhash = lnode.hash();</span>
+<span class="nc" id="L325">        rhash = rnode.hash();</span>
+<span class="nc" id="L326">        right.setSize(lnode.sizeOfRange(), rnode.sizeOfRange());</span>
+<span class="nc" id="L327">        right.setRows(lnode.rowsInRange(), rnode.rowsInRange());</span>
+
+<span class="nc" id="L329">        int rdiff = CONSISTENT;</span>
+<span class="nc bnc" id="L330" title="All 4 branches missed.">        boolean rreso = lhash != null &amp;&amp; rhash != null;</span>
+<span class="nc bnc" id="L331" title="All 4 branches missed.">        if (rreso &amp;&amp; !Arrays.equals(lhash, rhash))</span>
+        {
+<span class="nc" id="L333">            logger.debug(&quot;({}) Inconsistent digest on right sub-range {}: [{}, {}]&quot;, active.depth, right, lnode, rnode);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (rnode instanceof Leaf) rdiff = FULLY_INCONSISTENT;</span>
+<span class="nc" id="L335">            else rdiff = differenceHelper(ltree, rtree, diff, right);</span>
+        }
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        else if (!rreso)</span>
+        {
+<span class="nc" id="L339">            logger.debug(&quot;({}) Right sub-range fully inconsistent {}&quot;, active.depth, right);</span>
+<span class="nc" id="L340">            rdiff = FULLY_INCONSISTENT;</span>
+        }
+
+<span class="nc bnc" id="L343" title="All 4 branches missed.">        if (ldiff == FULLY_INCONSISTENT &amp;&amp; rdiff == FULLY_INCONSISTENT)</span>
+        {
+            // both children are fully inconsistent
+<span class="nc" id="L346">            logger.debug(&quot;({}) Fully inconsistent range [{}, {}]&quot;, active.depth, left, right);</span>
+<span class="nc" id="L347">            return FULLY_INCONSISTENT;</span>
+        }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        else if (ldiff == FULLY_INCONSISTENT)</span>
+        {
+<span class="nc" id="L351">            logger.debug(&quot;({}) Adding left sub-range to diff as fully inconsistent {}&quot;, active.depth, left);</span>
+<span class="nc" id="L352">            diff.add(left);</span>
+<span class="nc" id="L353">            return PARTIALLY_INCONSISTENT;</span>
+        }
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        else if (rdiff == FULLY_INCONSISTENT)</span>
+        {
+<span class="nc" id="L357">            logger.debug(&quot;({}) Adding right sub-range to diff as fully inconsistent {}&quot;, active.depth, right);</span>
+<span class="nc" id="L358">            diff.add(right);</span>
+<span class="nc" id="L359">            return PARTIALLY_INCONSISTENT;</span>
+        }
+<span class="nc" id="L361">        logger.debug(&quot;({}) Range {} partially inconstent&quot;, active.depth, active);</span>
+<span class="nc" id="L362">        return PARTIALLY_INCONSISTENT;</span>
+    }
+
+    /**
+     * For testing purposes.
+     * Gets the smallest range containing the token.
+     */
+    public TreeRange get(Token t)
+    {
+<span class="nc" id="L371">        return getHelper(root, fullRange.left, fullRange.right, (byte)0, t);</span>
+    }
+
+    TreeRange getHelper(Hashable hashable, Token pleft, Token pright, byte depth, Token t)
+    {
+        while (true)
+        {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            if (hashable instanceof Leaf)</span>
+            {
+                // we've reached a hash: wrap it up and deliver it
+<span class="nc" id="L381">                return new TreeRange(this, pleft, pright, depth, hashable);</span>
+            }
+            // else: node.
+
+<span class="nc" id="L385">            Inner node = (Inner) hashable;</span>
+<span class="nc" id="L386">            depth = inc(depth);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (Range.contains(pleft, node.token, t))</span>
+            { // left child contains token
+<span class="nc" id="L389">                hashable = node.lchild;</span>
+<span class="nc" id="L390">                pright = node.token;</span>
+            }
+            else
+            { // else: right child contains token
+<span class="nc" id="L394">                hashable = node.rchild;</span>
+<span class="nc" id="L395">                pleft = node.token;</span>
+            }
+<span class="nc" id="L397">        }</span>
+    }
+
+    /**
+     * Invalidates the ranges containing the given token.
+     * Useful for testing.
+     */
+    public void invalidate(Token t)
+    {
+<span class="nc" id="L406">        invalidateHelper(root, fullRange.left, t);</span>
+<span class="nc" id="L407">    }</span>
+
+    private void invalidateHelper(Hashable hashable, Token pleft, Token t)
+    {
+<span class="nc" id="L411">        hashable.hash(null);</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (hashable instanceof Leaf)</span>
+<span class="nc" id="L413">            return;</span>
+        // else: node.
+
+<span class="nc" id="L416">        Inner node = (Inner)hashable;</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        if (Range.contains(pleft, node.token, t))</span>
+            // left child contains token
+<span class="nc" id="L419">            invalidateHelper(node.lchild, pleft, t);</span>
+        else
+            // right child contains token
+<span class="nc" id="L422">            invalidateHelper(node.rchild, node.token, t);</span>
+<span class="nc" id="L423">    }</span>
+
+    /**
+     * Hash the given range in the tree. The range must have been generated
+     * with recursive applications of partitioner.midpoint().
+     *
+     * NB: Currently does not support wrapping ranges that do not end with
+     * partitioner.getMinimumToken().
+     *
+     * @return Null if any subrange of the range is invalid, or if the exact
+     *         range cannot be calculated using this tree.
+     */
+    public byte[] hash(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L437">        return find(range).hash();</span>
+    }
+
+    /**
+     * Find the {@link Hashable} node that matches the given {@code range}.
+     *
+     * @param range Range to find
+     * @return {@link Hashable} found. If nothing found, return {@link Leaf} with null hash.
+     */
+    private Hashable find(Range&lt;Token&gt; range)
+    {
+        try
+        {
+<span class="nc" id="L450">            return findHelper(root, new Range&lt;Token&gt;(fullRange.left, fullRange.right), range);</span>
+        }
+<span class="nc" id="L452">        catch (StopRecursion e)</span>
+        {
+<span class="nc" id="L454">            return new Leaf();</span>
+        }
+    }
+
+    /**
+     * @throws StopRecursion If no match could be found for the range.
+     */
+    private Hashable findHelper(Hashable current, Range&lt;Token&gt; activeRange, Range&lt;Token&gt; find) throws StopRecursion
+    {
+        while (true)
+        {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (current instanceof Leaf)</span>
+            {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                if (!find.contains(activeRange))</span>
+                    // we are not fully contained in this range!
+<span class="nc" id="L469">                    throw new StopRecursion.BadRange();</span>
+<span class="nc" id="L470">                return current;</span>
+            }
+            // else: node.
+
+<span class="nc" id="L474">            Inner node = (Inner) current;</span>
+<span class="nc" id="L475">            Range&lt;Token&gt; leftRange = new Range&lt;&gt;(activeRange.left, node.token);</span>
+<span class="nc" id="L476">            Range&lt;Token&gt; rightRange = new Range&lt;&gt;(node.token, activeRange.right);</span>
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if (find.contains(activeRange))</span>
+                // this node is fully contained in the range
+<span class="nc" id="L480">                return node.calc();</span>
+
+            // else: one of our children contains the range
+
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (leftRange.contains(find))</span>
+            { // left child contains/matches the range
+<span class="nc" id="L486">                current = node.lchild;</span>
+<span class="nc" id="L487">                activeRange = leftRange;</span>
+            }
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            else if (rightRange.contains(find))</span>
+            { // right child contains/matches the range
+<span class="nc" id="L491">                current = node.rchild;</span>
+<span class="nc" id="L492">                activeRange = rightRange;</span>
+            }
+            else
+            {
+<span class="nc" id="L496">                throw new StopRecursion.BadRange();</span>
+            }
+<span class="nc" id="L498">        }</span>
+    }
+
+    /**
+     * Splits the range containing the given token, if no tree limits would be
+     * violated. If the range would be split to a depth below hashdepth, or if
+     * the tree already contains maxsize subranges, this operation will fail.
+     *
+     * @return True if the range was successfully split.
+     */
+    public boolean split(Token t)
+    {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (!(size &lt; maxsize))</span>
+<span class="nc" id="L511">            return false;</span>
+
+        try
+        {
+<span class="nc" id="L515">            root = splitHelper(root, fullRange.left, fullRange.right, (byte)0, t);</span>
+        }
+<span class="nc" id="L517">        catch (StopRecursion.TooDeep e)</span>
+        {
+<span class="nc" id="L519">            return false;</span>
+<span class="nc" id="L520">        }</span>
+<span class="nc" id="L521">        return true;</span>
+    }
+
+    private Hashable splitHelper(Hashable hashable, Token pleft, Token pright, byte depth, Token t) throws StopRecursion.TooDeep
+    {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">        if (depth &gt;= hashdepth)</span>
+<span class="nc" id="L527">            throw new StopRecursion.TooDeep();</span>
+
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (hashable instanceof Leaf)</span>
+        {
+<span class="nc" id="L531">            Token midpoint = partitioner.midpoint(pleft, pright);</span>
+
+            // We should not create a non-sensical range where start and end are the same token (this is non-sensical because range are
+            // start exclusive). Note that we shouldn't hit that unless the full range is very small or we are fairly deep
+<span class="nc bnc" id="L535" title="All 4 branches missed.">            if (midpoint.equals(pleft) || midpoint.equals(pright))</span>
+<span class="nc" id="L536">                throw new StopRecursion.TooDeep();</span>
+
+            // split
+<span class="nc" id="L539">            size++;</span>
+<span class="nc" id="L540">            return new Inner(midpoint, new Leaf(), new Leaf());</span>
+        }
+        // else: node.
+
+        // recurse on the matching child
+<span class="nc" id="L545">        Inner node = (Inner)hashable;</span>
+
+<span class="nc bnc" id="L547" title="All 2 branches missed.">        if (Range.contains(pleft, node.token, t))</span>
+            // left child contains token
+<span class="nc" id="L549">            node.lchild(splitHelper(node.lchild, pleft, node.token, inc(depth), t));</span>
+        else
+            // else: right child contains token
+<span class="nc" id="L552">            node.rchild(splitHelper(node.rchild, node.token, pright, inc(depth), t));</span>
+<span class="nc" id="L553">        return node;</span>
+    }
+
+    /**
+     * Returns a lazy iterator of invalid TreeRanges that need to be filled
+     * in order to make the given Range valid.
+     */
+    public TreeRangeIterator invalids()
+    {
+<span class="nc" id="L562">        return new TreeRangeIterator(this);</span>
+    }
+
+    public EstimatedHistogram histogramOfRowSizePerLeaf()
+    {
+<span class="nc" id="L567">        HistogramBuilder histbuild = new HistogramBuilder();</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="nc" id="L570">            histbuild.add(range.hashable.sizeOfRange);</span>
+<span class="nc" id="L571">        }</span>
+<span class="nc" id="L572">        return histbuild.buildWithStdevRangesAroundMean();</span>
+    }
+
+    public EstimatedHistogram histogramOfRowCountPerLeaf()
+    {
+<span class="nc" id="L577">        HistogramBuilder histbuild = new HistogramBuilder();</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="nc" id="L580">            histbuild.add(range.hashable.rowsInRange);</span>
+<span class="nc" id="L581">        }</span>
+<span class="nc" id="L582">        return histbuild.buildWithStdevRangesAroundMean();</span>
+    }
+
+    public long rowCount()
+    {
+<span class="nc" id="L587">        long count = 0;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="nc" id="L590">            count += range.hashable.rowsInRange;</span>
+<span class="nc" id="L591">        }</span>
+<span class="nc" id="L592">        return count;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L598">        StringBuilder buff = new StringBuilder();</span>
+<span class="nc" id="L599">        buff.append(&quot;#&lt;MerkleTree root=&quot;);</span>
+<span class="nc" id="L600">        root.toString(buff, 8);</span>
+<span class="nc" id="L601">        buff.append(&quot;&gt;&quot;);</span>
+<span class="nc" id="L602">        return buff.toString();</span>
+    }
+
+    public static class TreeDifference extends TreeRange
+    {
+        private static final long serialVersionUID = 6363654174549968183L;
+
+        private long sizeOnLeft;
+        private long sizeOnRight;
+        private long rowsOnLeft;
+        private long rowsOnRight;
+
+        void setSize(long sizeOnLeft, long sizeOnRight)
+        {
+<span class="nc" id="L616">            this.sizeOnLeft = sizeOnLeft;</span>
+<span class="nc" id="L617">            this.sizeOnRight = sizeOnRight;</span>
+<span class="nc" id="L618">        }</span>
+
+        void setRows(long rowsOnLeft, long rowsOnRight)
+        {
+<span class="nc" id="L622">            this.rowsOnLeft = rowsOnLeft;</span>
+<span class="nc" id="L623">            this.rowsOnRight = rowsOnRight;</span>
+<span class="nc" id="L624">        }</span>
+
+        public long sizeOnLeft()
+        {
+<span class="nc" id="L628">            return sizeOnLeft;</span>
+        }
+
+        public long sizeOnRight()
+        {
+<span class="nc" id="L633">            return sizeOnRight;</span>
+        }
+
+        public long rowsOnLeft()
+        {
+<span class="nc" id="L638">            return rowsOnLeft;</span>
+        }
+
+        public long rowsOnRight()
+        {
+<span class="nc" id="L643">            return rowsOnRight;</span>
+        }
+
+        public TreeDifference(Token left, Token right, byte depth)
+        {
+<span class="nc" id="L648">            super(null, left, right, depth, null);</span>
+<span class="nc" id="L649">        }</span>
+
+        public long totalRows()
+        {
+<span class="nc" id="L653">            return rowsOnLeft + rowsOnRight;</span>
+        }
+
+    }
+
+    /**
+     * The public interface to a range in the tree.
+     *
+     * NB: A TreeRange should not be returned by a public method unless the
+     * parents of the range it represents are already invalidated, since it
+     * will allow someone to modify the hash. Alternatively, a TreeRange
+     * may be created with a null tree, indicating that it is read only.
+     */
+<span class="nc bnc" id="L666" title="All 2 branches missed.">    public static class TreeRange extends Range&lt;Token&gt;</span>
+    {
+        public static final long serialVersionUID = 1L;
+        private final MerkleTree tree;
+        public final byte depth;
+        private final Hashable hashable;
+
+        TreeRange(MerkleTree tree, Token left, Token right, byte depth, Hashable hashable)
+        {
+<span class="nc" id="L675">            super(left, right);</span>
+<span class="nc" id="L676">            this.tree = tree;</span>
+<span class="nc" id="L677">            this.depth = depth;</span>
+<span class="nc" id="L678">            this.hashable = hashable;</span>
+<span class="nc" id="L679">        }</span>
+
+        public void hash(byte[] hash)
+        {
+<span class="nc bnc" id="L683" title="All 4 branches missed.">            assert tree != null : &quot;Not intended for modification!&quot;;</span>
+<span class="nc" id="L684">            hashable.hash(hash);</span>
+<span class="nc" id="L685">        }</span>
+
+        public byte[] hash()
+        {
+<span class="nc" id="L689">            return hashable.hash();</span>
+        }
+
+        /**
+         * @param entry Row to mix into the hash for this range.
+         */
+        public void addHash(RowHash entry)
+        {
+<span class="nc bnc" id="L697" title="All 4 branches missed.">            assert tree != null : &quot;Not intended for modification!&quot;;</span>
+<span class="nc bnc" id="L698" title="All 4 branches missed.">            assert hashable instanceof Leaf;</span>
+
+<span class="nc" id="L700">            hashable.addHash(entry.hash, entry.size);</span>
+<span class="nc" id="L701">        }</span>
+
+        public void ensureHashInitialised()
+        {
+<span class="nc bnc" id="L705" title="All 4 branches missed.">            assert tree != null : &quot;Not intended for modification!&quot;;</span>
+<span class="nc bnc" id="L706" title="All 4 branches missed.">            assert hashable instanceof Leaf;</span>
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            if (hashable.hash == null)</span>
+<span class="nc" id="L709">                hashable.hash = EMPTY_HASH;</span>
+<span class="nc" id="L710">        }</span>
+
+        public void addAll(Iterator&lt;RowHash&gt; entries)
+        {
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            while (entries.hasNext())</span>
+<span class="nc" id="L715">                addHash(entries.next());</span>
+<span class="nc" id="L716">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L721">            StringBuilder buff = new StringBuilder(&quot;#&lt;TreeRange &quot;);</span>
+<span class="nc" id="L722">            buff.append(super.toString()).append(&quot; depth=&quot;).append(depth);</span>
+<span class="nc" id="L723">            return buff.append(&quot;&gt;&quot;).toString();</span>
+        }
+    }
+
+    /**
+     * Returns the leaf (range) of a given tree in increasing order.
+     * If the full range covered by the tree don't wrap, then it will return the
+     * ranges in increasing order.
+     * If the full range wrap, the first *and* last range returned by the
+     * iterator will be the wrapping range. It is the only case where the same
+     * leaf will be returned twice.
+     */
+    public static class TreeRangeIterator extends AbstractIterator&lt;TreeRange&gt; implements Iterable&lt;TreeRange&gt;, PeekingIterator&lt;TreeRange&gt;
+    {
+        // stack of ranges to visit
+        private final ArrayDeque&lt;TreeRange&gt; tovisit;
+        // interesting range
+        private final MerkleTree tree;
+
+        TreeRangeIterator(MerkleTree tree)
+<span class="nc" id="L743">        {</span>
+<span class="nc" id="L744">            tovisit = new ArrayDeque&lt;TreeRange&gt;();</span>
+<span class="nc" id="L745">            tovisit.add(new TreeRange(tree, tree.fullRange.left, tree.fullRange.right, (byte)0, tree.root));</span>
+<span class="nc" id="L746">            this.tree = tree;</span>
+<span class="nc" id="L747">        }</span>
+
+        /**
+         * Find the next TreeRange.
+         *
+         * @return The next TreeRange.
+         */
+        public TreeRange computeNext()
+        {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            while (!tovisit.isEmpty())</span>
+            {
+<span class="nc" id="L758">                TreeRange active = tovisit.pop();</span>
+
+<span class="nc bnc" id="L760" title="All 2 branches missed.">                if (active.hashable instanceof Leaf)</span>
+                {
+                    // found a leaf invalid range
+<span class="nc bnc" id="L763" title="All 4 branches missed.">                    if (active.isWrapAround() &amp;&amp; !tovisit.isEmpty())</span>
+                        // put to be taken again last
+<span class="nc" id="L765">                        tovisit.addLast(active);</span>
+<span class="nc" id="L766">                    return active;</span>
+                }
+
+<span class="nc" id="L769">                Inner node = (Inner)active.hashable;</span>
+<span class="nc" id="L770">                TreeRange left = new TreeRange(tree, active.left, node.token, inc(active.depth), node.lchild);</span>
+<span class="nc" id="L771">                TreeRange right = new TreeRange(tree, node.token, active.right, inc(active.depth), node.rchild);</span>
+
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                if (right.isWrapAround())</span>
+                {
+                    // whatever is on the left is 'after' everything we have seen so far (it has greater tokens)
+<span class="nc" id="L776">                    tovisit.addLast(left);</span>
+<span class="nc" id="L777">                    tovisit.addFirst(right);</span>
+                }
+                else
+                {
+                    // do left first then right
+<span class="nc" id="L782">                    tovisit.addFirst(right);</span>
+<span class="nc" id="L783">                    tovisit.addFirst(left);</span>
+                }
+<span class="nc" id="L785">            }</span>
+<span class="nc" id="L786">            return endOfData();</span>
+        }
+
+        public Iterator&lt;TreeRange&gt; iterator()
+        {
+<span class="nc" id="L791">            return this;</span>
+        }
+    }
+
+    /**
+     * An inner node in the MerkleTree. Inners can contain cached hash values, which
+     * are the binary hash of their two children.
+     */
+    static class Inner extends Hashable
+    {
+        public static final long serialVersionUID = 1L;
+        static final byte IDENT = 2;
+        public final Token token;
+        private Hashable lchild;
+        private Hashable rchild;
+
+<span class="nc" id="L807">        private static final InnerSerializer serializer = new InnerSerializer();</span>
+
+        /**
+         * Constructs an Inner with the given token and children, and a null hash.
+         */
+        public Inner(Token token, Hashable lchild, Hashable rchild)
+        {
+<span class="nc" id="L814">            super(null);</span>
+<span class="nc" id="L815">            this.token = token;</span>
+<span class="nc" id="L816">            this.lchild = lchild;</span>
+<span class="nc" id="L817">            this.rchild = rchild;</span>
+<span class="nc" id="L818">        }</span>
+
+        public Hashable lchild()
+        {
+<span class="nc" id="L822">            return lchild;</span>
+        }
+
+        public Hashable rchild()
+        {
+<span class="nc" id="L827">            return rchild;</span>
+        }
+
+        public void lchild(Hashable child)
+        {
+<span class="nc" id="L832">            lchild = child;</span>
+<span class="nc" id="L833">        }</span>
+
+        public void rchild(Hashable child)
+        {
+<span class="nc" id="L837">            rchild = child;</span>
+<span class="nc" id="L838">        }</span>
+
+        Hashable calc()
+        {
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            if (hash == null)</span>
+            {
+                // hash and size haven't been calculated; calc children then compute
+<span class="nc" id="L845">                Hashable lnode = lchild.calc();</span>
+<span class="nc" id="L846">                Hashable rnode = rchild.calc();</span>
+                // cache the computed value
+<span class="nc" id="L848">                hash(lnode.hash, rnode.hash);</span>
+<span class="nc" id="L849">                sizeOfRange = lnode.sizeOfRange + rnode.sizeOfRange;</span>
+<span class="nc" id="L850">                rowsInRange = lnode.rowsInRange + rnode.rowsInRange;</span>
+            }
+<span class="nc" id="L852">            return this;</span>
+        }
+
+        /**
+         * Recursive toString.
+         */
+        public void toString(StringBuilder buff, int maxdepth)
+        {
+<span class="nc" id="L860">            buff.append(&quot;#&lt;&quot;).append(getClass().getSimpleName());</span>
+<span class="nc" id="L861">            buff.append(&quot; &quot;).append(token);</span>
+<span class="nc" id="L862">            buff.append(&quot; hash=&quot;).append(Hashable.toString(hash()));</span>
+<span class="nc" id="L863">            buff.append(&quot; children=[&quot;);</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">            if (maxdepth &lt; 1)</span>
+            {
+<span class="nc" id="L866">                buff.append(&quot;#&quot;);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                if (lchild == null)</span>
+<span class="nc" id="L871">                    buff.append(&quot;null&quot;);</span>
+                else
+<span class="nc" id="L873">                    lchild.toString(buff, maxdepth-1);</span>
+<span class="nc" id="L874">                buff.append(&quot; &quot;);</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">                if (rchild == null)</span>
+<span class="nc" id="L876">                    buff.append(&quot;null&quot;);</span>
+                else
+<span class="nc" id="L878">                    rchild.toString(buff, maxdepth-1);</span>
+            }
+<span class="nc" id="L880">            buff.append(&quot;]&gt;&quot;);</span>
+<span class="nc" id="L881">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L886">            StringBuilder buff = new StringBuilder();</span>
+<span class="nc" id="L887">            toString(buff, 1);</span>
+<span class="nc" id="L888">            return buff.toString();</span>
+        }
+
+        private static class InnerSerializer implements IPartitionerDependentSerializer&lt;Inner&gt;
+        {
+            public void serialize(Inner inner, DataOutputPlus out, int version) throws IOException
+            {
+<span class="nc bnc" id="L895" title="All 2 branches missed.">                if (version &lt; MessagingService.VERSION_30)</span>
+                {
+<span class="nc bnc" id="L897" title="All 2 branches missed.">                    if (inner.hash == null)</span>
+<span class="nc" id="L898">                        out.writeInt(-1);</span>
+                    else
+                    {
+<span class="nc" id="L901">                        out.writeInt(inner.hash.length);</span>
+<span class="nc" id="L902">                        out.write(inner.hash);</span>
+                    }
+                }
+<span class="nc" id="L905">                Token.serializer.serialize(inner.token, out, version);</span>
+<span class="nc" id="L906">                Hashable.serializer.serialize(inner.lchild, out, version);</span>
+<span class="nc" id="L907">                Hashable.serializer.serialize(inner.rchild, out, version);</span>
+<span class="nc" id="L908">            }</span>
+
+            public Inner deserialize(DataInput in, IPartitioner p, int version) throws IOException
+            {
+<span class="nc bnc" id="L912" title="All 2 branches missed.">                if (version &lt; MessagingService.VERSION_30)</span>
+                {
+<span class="nc" id="L914">                    int hashLen = in.readInt();</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">                    byte[] hash = hashLen &gt;= 0 ? new byte[hashLen] : null;</span>
+<span class="nc bnc" id="L916" title="All 2 branches missed.">                    if (hash != null)</span>
+<span class="nc" id="L917">                        in.readFully(hash);</span>
+                }
+<span class="nc" id="L919">                Token token = Token.serializer.deserialize(in, p, version);</span>
+<span class="nc" id="L920">                Hashable lchild = Hashable.serializer.deserialize(in, p, version);</span>
+<span class="nc" id="L921">                Hashable rchild = Hashable.serializer.deserialize(in, p, version);</span>
+<span class="nc" id="L922">                return new Inner(token, lchild, rchild);</span>
+            }
+
+            public long serializedSize(Inner inner, int version)
+            {
+<span class="nc" id="L927">                long size = 0;</span>
+<span class="nc bnc" id="L928" title="All 2 branches missed.">                if (version &lt; MessagingService.VERSION_30)</span>
+                {
+<span class="nc bnc" id="L930" title="All 2 branches missed.">                    size += inner.hash == null</span>
+<span class="nc" id="L931">                                       ? TypeSizes.sizeof(-1)</span>
+<span class="nc" id="L932">                                       : TypeSizes.sizeof(inner.hash().length) + inner.hash().length;</span>
+                }
+
+<span class="nc" id="L935">                size += Token.serializer.serializedSize(inner.token, version)</span>
+<span class="nc" id="L936">                + Hashable.serializer.serializedSize(inner.lchild, version)</span>
+<span class="nc" id="L937">                + Hashable.serializer.serializedSize(inner.rchild, version);</span>
+<span class="nc" id="L938">                return size;</span>
+            }
+        }
+    }
+
+    /**
+     * A leaf node in the MerkleTree. Because the MerkleTree represents a much
+     * larger perfect binary tree of depth hashdepth, a Leaf object contains
+     * the value that would be contained in the perfect tree at its position.
+     *
+     * When rows are added to the MerkleTree using TreeRange.validate(), the
+     * tree extending below the Leaf is generated in memory, but only the root
+     * is stored in the Leaf.
+     */
+    static class Leaf extends Hashable
+    {
+        public static final long serialVersionUID = 1L;
+        static final byte IDENT = 1;
+<span class="nc" id="L956">        private static final LeafSerializer serializer = new LeafSerializer();</span>
+
+        /**
+         * Constructs a null hash.
+         */
+        public Leaf()
+        {
+<span class="nc" id="L963">            super(null);</span>
+<span class="nc" id="L964">        }</span>
+
+        public Leaf(byte[] hash)
+        {
+<span class="nc" id="L968">            super(hash);</span>
+<span class="nc" id="L969">        }</span>
+
+        public void toString(StringBuilder buff, int maxdepth)
+        {
+<span class="nc" id="L973">            buff.append(toString());</span>
+<span class="nc" id="L974">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L979">            return &quot;#&lt;Leaf &quot; + Hashable.toString(hash()) + &quot;&gt;&quot;;</span>
+        }
+
+        private static class LeafSerializer implements IPartitionerDependentSerializer&lt;Leaf&gt;
+        {
+            public void serialize(Leaf leaf, DataOutputPlus out, int version) throws IOException
+            {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">                if (leaf.hash == null)</span>
+                {
+<span class="nc bnc" id="L988" title="All 2 branches missed.">                    if (version &lt; MessagingService.VERSION_30)</span>
+<span class="nc" id="L989">                        out.writeInt(-1);</span>
+                    else
+<span class="nc" id="L991">                        out.writeByte(-1);</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                    if (version &lt; MessagingService.VERSION_30)</span>
+<span class="nc" id="L996">                        out.writeInt(leaf.hash.length);</span>
+                    else
+<span class="nc" id="L998">                        out.writeByte(leaf.hash.length);</span>
+<span class="nc" id="L999">                    out.write(leaf.hash);</span>
+                }
+<span class="nc" id="L1001">            }</span>
+
+            public Leaf deserialize(DataInput in, IPartitioner p, int version) throws IOException
+            {
+<span class="nc bnc" id="L1005" title="All 2 branches missed.">                int hashLen = version &lt; MessagingService.VERSION_30 ? in.readInt() : in.readByte();</span>
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">                byte[] hash = hashLen &lt; 0 ? null : new byte[hashLen];</span>
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">                if (hash != null)</span>
+<span class="nc" id="L1008">                    in.readFully(hash);</span>
+<span class="nc" id="L1009">                return new Leaf(hash);</span>
+            }
+
+            public long serializedSize(Leaf leaf, int version)
+            {
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">                long size = version &lt; MessagingService.VERSION_30 ? TypeSizes.sizeof(1) : 1;</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">                if (leaf.hash != null)</span>
+                {
+<span class="nc" id="L1017">                    size += leaf.hash().length;</span>
+                }
+<span class="nc" id="L1019">                return size;</span>
+            }
+        }
+    }
+
+    /**
+     * Hash value representing a row, to be used to pass hashes to the MerkleTree.
+     * The byte[] hash value should contain a digest of the key and value of the row
+     * created using a very strong hash function.
+     */
+    public static class RowHash
+    {
+        public final Token token;
+        public final byte[] hash;
+        public final long size;
+        public RowHash(Token token, byte[] hash, long size)
+<span class="nc" id="L1035">        {</span>
+<span class="nc" id="L1036">            this.token = token;</span>
+<span class="nc" id="L1037">            this.hash  = hash;</span>
+<span class="nc" id="L1038">            this.size = size;</span>
+<span class="nc" id="L1039">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1044">            return &quot;#&lt;RowHash &quot; + token + &quot; &quot; + Hashable.toString(hash) + &quot; @ &quot; + size + &quot; bytes&gt;&quot;;</span>
+        }
+    }
+
+    /**
+     * Abstract class containing hashing logic, and containing a single hash field.
+     */
+    static abstract class Hashable implements Serializable
+    {
+        private static final long serialVersionUID = 1L;
+<span class="nc" id="L1054">        private static final IPartitionerDependentSerializer&lt;Hashable&gt; serializer = new HashableSerializer();</span>
+
+        protected byte[] hash;
+        protected long sizeOfRange;
+        protected long rowsInRange;
+
+        protected Hashable(byte[] hash)
+<span class="nc" id="L1061">        {</span>
+<span class="nc" id="L1062">            this.hash = hash;</span>
+<span class="nc" id="L1063">        }</span>
+
+        public byte[] hash()
+        {
+<span class="nc" id="L1067">            return hash;</span>
+        }
+
+        public long sizeOfRange()
+        {
+<span class="nc" id="L1072">            return sizeOfRange;</span>
+        }
+
+        public long rowsInRange()
+        {
+<span class="nc" id="L1077">            return rowsInRange;</span>
+        }
+
+        void hash(byte[] hash)
+        {
+<span class="nc" id="L1082">            this.hash = hash;</span>
+<span class="nc" id="L1083">        }</span>
+
+        Hashable calc()
+        {
+<span class="nc" id="L1087">            return this;</span>
+        }
+
+        /**
+         * Sets the value of this hash to binaryHash of its children.
+         * @param lefthash Hash of left child.
+         * @param righthash Hash of right child.
+         */
+        void hash(byte[] lefthash, byte[] righthash)
+        {
+<span class="nc" id="L1097">            hash = binaryHash(lefthash, righthash);</span>
+<span class="nc" id="L1098">        }</span>
+
+        /**
+         * Mixes the given value into our hash. If our hash is null,
+         * our hash will become the given value.
+         */
+        void addHash(byte[] righthash, long sizeOfRow)
+        {
+<span class="nc bnc" id="L1106" title="All 2 branches missed.">            if (hash == null)</span>
+<span class="nc" id="L1107">                hash = righthash;</span>
+            else
+<span class="nc" id="L1109">                hash = binaryHash(hash, righthash);</span>
+<span class="nc" id="L1110">            this.sizeOfRange += sizeOfRow;</span>
+<span class="nc" id="L1111">            this.rowsInRange += 1;</span>
+<span class="nc" id="L1112">        }</span>
+
+        /**
+         * The primitive with which all hashing should be accomplished: hashes
+         * a left and right value together.
+         */
+        static byte[] binaryHash(final byte[] left, final byte[] right)
+        {
+<span class="nc" id="L1120">            return FBUtilities.xor(left, right);</span>
+        }
+
+        public abstract void toString(StringBuilder buff, int maxdepth);
+
+        public static String toString(byte[] hash)
+        {
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">            if (hash == null)</span>
+<span class="nc" id="L1128">                return &quot;null&quot;;</span>
+<span class="nc" id="L1129">            return &quot;[&quot; + Hex.bytesToHex(hash) + &quot;]&quot;;</span>
+        }
+
+        private static class HashableSerializer implements IPartitionerDependentSerializer&lt;Hashable&gt;
+        {
+            public void serialize(Hashable h, DataOutputPlus out, int version) throws IOException
+            {
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">                if (h instanceof Inner)</span>
+                {
+<span class="nc" id="L1138">                    out.writeByte(Inner.IDENT);</span>
+<span class="nc" id="L1139">                    Inner.serializer.serialize((Inner)h, out, version);</span>
+                }
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">                else if (h instanceof Leaf)</span>
+                {
+<span class="nc" id="L1143">                    out.writeByte(Leaf.IDENT);</span>
+<span class="nc" id="L1144">                    Leaf.serializer.serialize((Leaf) h, out, version);</span>
+                }
+                else
+<span class="nc" id="L1147">                    throw new IOException(&quot;Unexpected Hashable: &quot; + h.getClass().getCanonicalName());</span>
+<span class="nc" id="L1148">            }</span>
+
+            public Hashable deserialize(DataInput in, IPartitioner p, int version) throws IOException
+            {
+<span class="nc" id="L1152">                byte ident = in.readByte();</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">                if (Inner.IDENT == ident)</span>
+<span class="nc" id="L1154">                    return Inner.serializer.deserialize(in, p, version);</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">                else if (Leaf.IDENT == ident)</span>
+<span class="nc" id="L1156">                    return Leaf.serializer.deserialize(in, p, version);</span>
+                else
+<span class="nc" id="L1158">                    throw new IOException(&quot;Unexpected Hashable: &quot; + ident);</span>
+            }
+
+            public long serializedSize(Hashable h, int version)
+            {
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">                if (h instanceof Inner)</span>
+<span class="nc" id="L1164">                    return 1 + Inner.serializer.serializedSize((Inner) h, version);</span>
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">                else if (h instanceof Leaf)</span>
+<span class="nc" id="L1166">                    return 1 + Leaf.serializer.serializedSize((Leaf) h, version);</span>
+<span class="nc" id="L1167">                throw new AssertionError(h.getClass());</span>
+            }
+        }
+    }
+
+    /**
+     * Exceptions that stop recursion early when we are sure that no answer
+     * can be found.
+     */
+<span class="nc" id="L1176">    static abstract class StopRecursion extends Exception</span>
+    {
+        static class BadRange extends StopRecursion
+        {
+<span class="nc" id="L1180">            public BadRange(){ super(); }</span>
+        }
+
+        static class InvalidHash extends StopRecursion
+        {
+<span class="nc" id="L1185">            public InvalidHash(){ super(); }</span>
+        }
+
+        static class TooDeep extends StopRecursion
+        {
+<span class="nc" id="L1190">            public TooDeep(){ super(); }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

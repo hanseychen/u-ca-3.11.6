@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ThriftResultsMerger.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.thrift</a> &gt; <span class="el_source">ThriftResultsMerger.java</span></div><h1>ThriftResultsMerger.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.thrift;
+
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.partitions.*;
+
+/**
+ * Given an iterator on a partition of a compact table, this return an iterator that merges the
+ * static row columns with the other results.
+ *
+ * Compact tables stores thrift column_metadata as static columns (see CompactTables for
+ * details). When reading for thrift however, we want to merge those static values with other
+ * results because:
+ *   1) on thrift, all &quot;columns&quot; are sorted together, whether or not they are declared
+ *      column_metadata.
+ *   2) it's possible that a table add a value for a &quot;dynamic&quot; column, and later that column
+ *      is statically defined. Merging &quot;static&quot; and &quot;dynamic&quot; columns make sure we don't miss
+ *      a value prior to the column declaration.
+ *
+ * For example, if a thrift table declare 2 columns &quot;c1&quot; and &quot;c5&quot; and the results from a query
+ * is:
+ *    Partition: static: { c1: 3, c5: 4 }
+ *                 &quot;a&quot; : { value : 2 }
+ *                 &quot;c3&quot;: { value : 8 }
+ *                 &quot;c7&quot;: { value : 1 }
+ * then this class transform it into:
+ *    Partition:   &quot;a&quot; : { value : 2 }
+ *                 &quot;c1&quot;: { value : 3 }
+ *                 &quot;c3&quot;: { value : 8 }
+ *                 &quot;c5&quot;: { value : 4 }
+ *                 &quot;c7&quot;: { value : 1 }
+ */
+public class ThriftResultsMerger extends Transformation&lt;UnfilteredRowIterator&gt;
+{
+    private final int nowInSec;
+
+    private ThriftResultsMerger(int nowInSec)
+<span class="nc" id="L68">    {</span>
+<span class="nc" id="L69">        this.nowInSec = nowInSec;</span>
+<span class="nc" id="L70">    }</span>
+
+    public static UnfilteredPartitionIterator maybeWrap(UnfilteredPartitionIterator iterator, CFMetaData metadata, int nowInSec)
+    {
+<span class="nc bnc" id="L74" title="All 4 branches missed.">        if (!metadata.isStaticCompactTable() &amp;&amp; !metadata.isSuper())</span>
+<span class="nc" id="L75">            return iterator;</span>
+
+<span class="nc" id="L77">        return Transformation.apply(iterator, new ThriftResultsMerger(nowInSec));</span>
+    }
+
+    public static UnfilteredRowIterator maybeWrap(UnfilteredRowIterator iterator, int nowInSec)
+    {
+<span class="nc bnc" id="L82" title="All 4 branches missed.">        if (!iterator.metadata().isStaticCompactTable() &amp;&amp; !iterator.metadata().isSuper())</span>
+<span class="nc" id="L83">            return iterator;</span>
+
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        return iterator.metadata().isSuper()</span>
+<span class="nc" id="L86">             ? Transformation.apply(iterator, new SuperColumnsPartitionMerger(iterator, nowInSec))</span>
+             : new PartitionMerger(iterator, nowInSec);
+    }
+
+    @Override
+    public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
+    {
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        return iter.metadata().isSuper()</span>
+<span class="nc" id="L94">             ? Transformation.apply(iter, new SuperColumnsPartitionMerger(iter, nowInSec))</span>
+             : new PartitionMerger(iter, nowInSec);
+    }
+
+<span class="nc bnc" id="L98" title="All 2 branches missed.">    private static class PartitionMerger extends WrappingUnfilteredRowIterator</span>
+    {
+        private final int nowInSec;
+
+        // We initialize lazily to avoid having this iterator fetch the wrapped iterator before it's actually asked for it.
+        private boolean isInit;
+
+        private Iterator&lt;Cell&gt; staticCells;
+
+        private final Row.Builder builder;
+        private Row nextToMerge;
+        private Unfiltered nextFromWrapped;
+
+        private PartitionMerger(UnfilteredRowIterator results, int nowInSec)
+        {
+<span class="nc" id="L113">            super(results);</span>
+<span class="nc bnc" id="L114" title="All 4 branches missed.">            assert results.metadata().isStaticCompactTable();</span>
+<span class="nc" id="L115">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L116">            this.builder = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L117">        }</span>
+
+        private void init()
+        {
+<span class="nc bnc" id="L121" title="All 4 branches missed.">            assert !isInit;</span>
+<span class="nc" id="L122">            Row staticRow = super.staticRow();</span>
+<span class="nc bnc" id="L123" title="All 4 branches missed.">            assert !staticRow.hasComplex();</span>
+
+<span class="nc" id="L125">            staticCells = staticRow.cells().iterator();</span>
+<span class="nc" id="L126">            updateNextToMerge();</span>
+<span class="nc" id="L127">            isInit = true;</span>
+<span class="nc" id="L128">        }</span>
+
+        @Override
+        public Row staticRow()
+        {
+<span class="nc" id="L133">            return Rows.EMPTY_STATIC_ROW;</span>
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">            if (!isInit)</span>
+<span class="nc" id="L140">                init();</span>
+
+<span class="nc bnc" id="L142" title="All 6 branches missed.">            return nextFromWrapped != null || nextToMerge != null || super.hasNext();</span>
+        }
+
+        @Override
+        public Unfiltered next()
+        {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (!isInit)</span>
+<span class="nc" id="L149">                init();</span>
+
+<span class="nc bnc" id="L151" title="All 4 branches missed.">            if (nextFromWrapped == null &amp;&amp; super.hasNext())</span>
+<span class="nc" id="L152">                nextFromWrapped = super.next();</span>
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            if (nextFromWrapped == null)</span>
+            {
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                if (nextToMerge == null)</span>
+<span class="nc" id="L157">                    throw new NoSuchElementException();</span>
+
+<span class="nc" id="L159">                return consumeNextToMerge();</span>
+            }
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (nextToMerge == null)</span>
+<span class="nc" id="L163">                return consumeNextWrapped();</span>
+
+<span class="nc" id="L165">            int cmp = metadata().comparator.compare(nextToMerge, nextFromWrapped);</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">            if (cmp &lt; 0)</span>
+<span class="nc" id="L167">                return consumeNextToMerge();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            if (cmp &gt; 0)</span>
+<span class="nc" id="L169">                return consumeNextWrapped();</span>
+
+            // Same row, so merge them
+<span class="nc bnc" id="L172" title="All 4 branches missed.">            assert nextFromWrapped instanceof Row;</span>
+<span class="nc" id="L173">            return Rows.merge((Row)consumeNextWrapped(), consumeNextToMerge(), nowInSec);</span>
+        }
+
+        private Unfiltered consumeNextWrapped()
+        {
+<span class="nc" id="L178">            Unfiltered toReturn = nextFromWrapped;</span>
+<span class="nc" id="L179">            nextFromWrapped = null;</span>
+<span class="nc" id="L180">            return toReturn;</span>
+        }
+
+        private Row consumeNextToMerge()
+        {
+<span class="nc" id="L185">            Row toReturn = nextToMerge;</span>
+<span class="nc" id="L186">            updateNextToMerge();</span>
+<span class="nc" id="L187">            return toReturn;</span>
+        }
+
+        private void updateNextToMerge()
+        {
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            if (!staticCells.hasNext())</span>
+            {
+                // Nothing more to merge.
+<span class="nc" id="L195">                nextToMerge = null;</span>
+<span class="nc" id="L196">                return;</span>
+            }
+
+<span class="nc" id="L199">            Cell cell = staticCells.next();</span>
+
+            // Given a static cell, the equivalent row uses the column name as clustering and the value as unique cell value.
+<span class="nc" id="L202">            builder.newRow(Clustering.make(cell.column().name.bytes));</span>
+<span class="nc" id="L203">            builder.addCell(new BufferCell(metadata().compactValueColumn(), cell.timestamp(), cell.ttl(), cell.localDeletionTime(), cell.value(), cell.path()));</span>
+<span class="nc" id="L204">            nextToMerge = builder.build();</span>
+<span class="nc" id="L205">        }</span>
+    }
+
+<span class="nc bnc" id="L208" title="All 2 branches missed.">    private static class SuperColumnsPartitionMerger extends Transformation</span>
+    {
+        private final int nowInSec;
+        private final Row.Builder builder;
+        private final ColumnDefinition superColumnMapColumn;
+        private final AbstractType&lt;?&gt; columnComparator;
+
+        private SuperColumnsPartitionMerger(UnfilteredRowIterator applyTo, int nowInSec)
+<span class="nc" id="L216">        {</span>
+<span class="nc bnc" id="L217" title="All 4 branches missed.">            assert applyTo.metadata().isSuper();</span>
+<span class="nc" id="L218">            this.nowInSec = nowInSec;</span>
+
+<span class="nc" id="L220">            this.superColumnMapColumn = applyTo.metadata().compactValueColumn();</span>
+<span class="nc bnc" id="L221" title="All 6 branches missed.">            assert superColumnMapColumn != null &amp;&amp; superColumnMapColumn.type instanceof MapType;</span>
+
+<span class="nc" id="L223">            this.builder = BTreeRow.sortedBuilder();</span>
+<span class="nc" id="L224">            this.columnComparator = ((MapType)superColumnMapColumn.type).nameComparator();</span>
+<span class="nc" id="L225">        }</span>
+
+        @Override
+        public Row applyToRow(Row row)
+        {
+<span class="nc" id="L230">            PeekingIterator&lt;Cell&gt; staticCells = Iterators.peekingIterator(simpleCellsIterator(row));</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (!staticCells.hasNext())</span>
+<span class="nc" id="L232">                return row;</span>
+
+<span class="nc" id="L234">            builder.newRow(row.clustering());</span>
+
+<span class="nc" id="L236">            ComplexColumnData complexData = row.getComplexColumnData(superColumnMapColumn);</span>
+            
+            PeekingIterator&lt;Cell&gt; dynamicCells;
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (complexData == null)</span>
+            {
+<span class="nc" id="L241">                dynamicCells = Iterators.peekingIterator(Collections.&lt;Cell&gt;emptyIterator());</span>
+            }
+            else
+            {
+<span class="nc" id="L245">                dynamicCells = Iterators.peekingIterator(complexData.iterator());</span>
+<span class="nc" id="L246">                builder.addComplexDeletion(superColumnMapColumn, complexData.complexDeletion());</span>
+            }
+
+<span class="nc bnc" id="L249" title="All 4 branches missed.">            while (staticCells.hasNext() &amp;&amp; dynamicCells.hasNext())</span>
+            {
+<span class="nc" id="L251">                Cell staticCell = staticCells.peek();</span>
+<span class="nc" id="L252">                Cell dynamicCell = dynamicCells.peek();</span>
+<span class="nc" id="L253">                int cmp = columnComparator.compare(staticCell.column().name.bytes, dynamicCell.path().get(0));</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                if (cmp &lt; 0)</span>
+<span class="nc" id="L255">                    builder.addCell(makeDynamicCell(staticCells.next()));</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">                else if (cmp &gt; 0)</span>
+<span class="nc" id="L257">                    builder.addCell(dynamicCells.next());</span>
+                else
+<span class="nc" id="L259">                    builder.addCell(Cells.reconcile(makeDynamicCell(staticCells.next()), dynamicCells.next(), nowInSec));</span>
+<span class="nc" id="L260">            }</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            while (staticCells.hasNext())</span>
+<span class="nc" id="L263">                builder.addCell(makeDynamicCell(staticCells.next()));</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            while (dynamicCells.hasNext())</span>
+<span class="nc" id="L265">                builder.addCell(dynamicCells.next());</span>
+
+<span class="nc" id="L267">            return builder.build();</span>
+        }
+
+        private Cell makeDynamicCell(Cell staticCell)
+        {
+<span class="nc" id="L272">            return new BufferCell(superColumnMapColumn, staticCell.timestamp(), staticCell.ttl(), staticCell.localDeletionTime(), staticCell.value(), CellPath.create(staticCell.column().name.bytes));</span>
+        }
+
+        private Iterator&lt;Cell&gt; simpleCellsIterator(Row row)
+        {
+<span class="nc" id="L277">            final Iterator&lt;Cell&gt; cells = row.cells().iterator();</span>
+<span class="nc" id="L278">            return new AbstractIterator&lt;Cell&gt;()</span>
+<span class="nc" id="L279">            {</span>
+                protected Cell computeNext()
+                {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">                    if (cells.hasNext())</span>
+                    {
+<span class="nc" id="L284">                        Cell cell = cells.next();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                        if (cell.column().isSimple())</span>
+<span class="nc" id="L286">                            return cell;</span>
+                    }
+<span class="nc" id="L288">                    return endOfData();</span>
+                }
+            };
+        }
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractCommitLogService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">AbstractCommitLogService.java</span></div><h1>AbstractCommitLogService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.commitlog;
+
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.codahale.metrics.Timer.Context;
+
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.WaitQueue;
+
+<span class="pc bpc" id="L37" title="1 of 2 branches missed.">public abstract class AbstractCommitLogService</span>
+{
+    /**
+     * When in {@link Config.CommitLogSync#periodic} mode, the default number of milliseconds to wait between updating
+     * the commit log chained markers.
+     */
+    static final long DEFAULT_MARKER_INTERVAL_MILLIS = 100;
+
+    private volatile Thread thread;
+<span class="fc" id="L46">    private volatile boolean shutdown = false;</span>
+
+    // all Allocations written before this time will be synced
+<span class="fc" id="L49">    protected volatile long lastSyncedAt = System.currentTimeMillis();</span>
+
+    // counts of total written, and pending, log messages
+<span class="fc" id="L52">    private final AtomicLong written = new AtomicLong(0);</span>
+<span class="fc" id="L53">    protected final AtomicLong pending = new AtomicLong(0);</span>
+
+    // signal that writers can wait on to be notified of a completed sync
+<span class="fc" id="L56">    protected final WaitQueue syncComplete = new WaitQueue();</span>
+
+    final CommitLog commitLog;
+    private final String name;
+
+    /**
+     * The duration between syncs to disk.
+     */
+    final long syncIntervalNanos;
+
+    /**
+     * The duration between updating the chained markers in the the commit log file. This value should be
+     * 0 &lt; {@link #markerIntervalNanos} &lt;= {@link #syncIntervalNanos}.
+     */
+    final long markerIntervalNanos;
+
+    /**
+     * A flag that callers outside of the sync thread can use to signal they want the commitlog segments
+     * to be flushed to disk. Note: this flag is primarily to support commit log's batch mode, which requires
+     * an immediate flush to disk on every mutation; see {@link BatchCommitLogService#maybeWaitForSync(Allocation)}.
+     */
+    private volatile boolean syncRequested;
+
+<span class="fc" id="L79">    private static final Logger logger = LoggerFactory.getLogger(AbstractCommitLogService.class);</span>
+
+    /**
+     * CommitLogService provides a fsync service for Allocations, fulfilling either the
+     * Batch or Periodic contract.
+     *
+     * Subclasses may be notified when a sync finishes by using the syncComplete WaitQueue.
+     */
+    AbstractCommitLogService(final CommitLog commitLog, final String name, long syncIntervalMillis)
+    {
+<span class="nc" id="L89">        this (commitLog, name, syncIntervalMillis, false);</span>
+<span class="nc" id="L90">    }</span>
+
+    /**
+     * CommitLogService provides a fsync service for Allocations, fulfilling either the
+     * Batch or Periodic contract.
+     *
+     * Subclasses may be notified when a sync finishes by using the syncComplete WaitQueue.
+     *
+     * @param markHeadersFaster true if the chained markers should be updated more frequently than on the disk sync bounds.
+     */
+    AbstractCommitLogService(final CommitLog commitLog, final String name, long syncIntervalMillis, boolean markHeadersFaster)
+<span class="fc" id="L101">    {</span>
+<span class="fc" id="L102">        this.commitLog = commitLog;</span>
+<span class="fc" id="L103">        this.name = name;</span>
+
+        final long markerIntervalMillis;
+<span class="pc bpc" id="L106" title="2 of 4 branches missed.">        if (markHeadersFaster &amp;&amp; syncIntervalMillis &gt; DEFAULT_MARKER_INTERVAL_MILLIS)</span>
+        {
+<span class="fc" id="L108">            markerIntervalMillis = DEFAULT_MARKER_INTERVAL_MILLIS;</span>
+<span class="fc" id="L109">            long modulo = syncIntervalMillis % markerIntervalMillis;</span>
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">            if (modulo != 0)</span>
+            {
+                // quantize syncIntervalMillis to a multiple of markerIntervalMillis
+<span class="nc" id="L113">                syncIntervalMillis -= modulo;</span>
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">                if (modulo &gt;= markerIntervalMillis / 2)</span>
+<span class="nc" id="L116">                    syncIntervalMillis += markerIntervalMillis;</span>
+            }
+<span class="fc" id="L118">            logger.debug(&quot;Will update the commitlog markers every {}ms and flush every {}ms&quot;, markerIntervalMillis, syncIntervalMillis);</span>
+<span class="fc" id="L119">        }</span>
+        else
+        {
+<span class="nc" id="L122">            markerIntervalMillis = syncIntervalMillis;</span>
+        }
+<span class="pc bpc" id="L124" title="2 of 4 branches missed.">        assert syncIntervalMillis % markerIntervalMillis == 0;</span>
+<span class="fc" id="L125">        this.markerIntervalNanos = TimeUnit.NANOSECONDS.convert(markerIntervalMillis, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L126">        this.syncIntervalNanos = TimeUnit.NANOSECONDS.convert(syncIntervalMillis, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L127">    }</span>
+
+    // Separated into individual method to ensure relevant objects are constructed before this is started.
+    void start()
+    {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (syncIntervalNanos &lt; 1)</span>
+<span class="nc" id="L133">            throw new IllegalArgumentException(String.format(&quot;Commit log flush interval must be positive: %fms&quot;,</span>
+<span class="nc" id="L134">                                                             syncIntervalNanos * 1e-6));</span>
+<span class="fc" id="L135">        shutdown = false;</span>
+<span class="fc" id="L136">        Runnable runnable = new SyncRunnable(new Clock());</span>
+<span class="fc" id="L137">        thread = NamedThreadFactory.createThread(runnable, name);</span>
+<span class="fc" id="L138">        thread.start();</span>
+<span class="fc" id="L139">    }</span>
+
+    class SyncRunnable implements Runnable
+    {
+        private final Clock clock;
+<span class="fc" id="L144">        private long firstLagAt = 0;</span>
+<span class="fc" id="L145">        private long totalSyncDuration = 0; // total time spent syncing since firstLagAt</span>
+<span class="fc" id="L146">        private long syncExceededIntervalBy = 0; // time that syncs exceeded pollInterval since firstLagAt</span>
+<span class="fc" id="L147">        private int lagCount = 0;</span>
+<span class="fc" id="L148">        private int syncCount = 0;</span>
+
+        SyncRunnable(Clock clock)
+<span class="fc" id="L151">        {</span>
+<span class="fc" id="L152">            this.clock = clock;</span>
+<span class="fc" id="L153">        }</span>
+
+        public void run()
+        {
+            while (true)
+            {
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">                if (!sync())</span>
+<span class="nc" id="L160">                    break;</span>
+            }
+<span class="nc" id="L162">        }</span>
+
+        boolean sync()
+        {
+            // always run once after shutdown signalled
+<span class="fc" id="L167">            boolean shutdownRequested = shutdown;</span>
+
+            try
+            {
+                // sync and signal
+<span class="fc" id="L172">                long pollStarted = clock.nanoTime();</span>
+<span class="pc bpc" id="L173" title="2 of 6 branches missed.">                boolean flushToDisk = lastSyncedAt + syncIntervalNanos &lt;= pollStarted || shutdownRequested || syncRequested;</span>
+<span class="fc bfc" id="L174" title="All 2 branches covered.">                if (flushToDisk)</span>
+                {
+                    // in this branch, we want to flush the commit log to disk
+<span class="fc" id="L177">                    syncRequested = false;</span>
+<span class="fc" id="L178">                    commitLog.sync(true);</span>
+<span class="fc" id="L179">                    lastSyncedAt = pollStarted;</span>
+<span class="fc" id="L180">                    syncComplete.signalAll();</span>
+<span class="fc" id="L181">                    syncCount++;</span>
+                }
+                else
+                {
+                    // in this branch, just update the commit log sync headers
+<span class="fc" id="L186">                    commitLog.sync(false);</span>
+                }
+
+<span class="fc" id="L189">                long now = clock.nanoTime();</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">                if (flushToDisk)</span>
+<span class="fc" id="L191">                    maybeLogFlushLag(pollStarted, now);</span>
+
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">                if (shutdownRequested)</span>
+<span class="nc" id="L194">                    return false;</span>
+
+<span class="fc" id="L196">                long wakeUpAt = pollStarted + markerIntervalNanos;</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">                if (wakeUpAt &gt; now)</span>
+<span class="fc" id="L198">                    LockSupport.parkNanos(wakeUpAt - now);</span>
+            }
+<span class="nc" id="L200">            catch (Throwable t)</span>
+            {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                if (!CommitLog.handleCommitError(&quot;Failed to persist commits to disk&quot;, t))</span>
+<span class="nc" id="L203">                    return false;</span>
+
+                // sleep for full poll-interval after an error, so we don't spam the log file
+<span class="nc" id="L206">                LockSupport.parkNanos(markerIntervalNanos);</span>
+<span class="fc" id="L207">            }</span>
+
+<span class="fc" id="L209">            return true;</span>
+        }
+
+        /**
+         * Add a log entry whenever the time to flush the commit log to disk exceeds {@link #syncIntervalNanos}.
+         */
+        @VisibleForTesting
+        boolean maybeLogFlushLag(long pollStarted, long now)
+        {
+<span class="fc" id="L218">            long flushDuration = now - pollStarted;</span>
+<span class="fc" id="L219">            totalSyncDuration += flushDuration;</span>
+
+            // this is the timestamp by which we should have completed the flush
+<span class="fc" id="L222">            long maxFlushTimestamp = pollStarted + syncIntervalNanos;</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">            if (maxFlushTimestamp &gt; now)</span>
+<span class="fc" id="L224">                return false;</span>
+
+            // if we have lagged noticeably, update our lag counter
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            if (firstLagAt == 0)</span>
+            {
+<span class="nc" id="L229">                firstLagAt = now;</span>
+<span class="nc" id="L230">                syncExceededIntervalBy = lagCount = 0;</span>
+<span class="nc" id="L231">                syncCount = 1;</span>
+<span class="nc" id="L232">                totalSyncDuration = flushDuration;</span>
+            }
+<span class="nc" id="L234">            syncExceededIntervalBy += now - maxFlushTimestamp;</span>
+<span class="nc" id="L235">            lagCount++;</span>
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (firstLagAt &gt; 0)</span>
+            {
+                //Only reset the lag tracking if it actually logged this time
+<span class="nc" id="L240">                boolean logged = NoSpamLogger.log(logger,</span>
+                                                  NoSpamLogger.Level.WARN,
+                                                  5,
+                                                  TimeUnit.MINUTES,
+                                                  &quot;Out of {} commit log syncs over the past {}s with average duration of {}ms, {} have exceeded the configured commit interval by an average of {}ms&quot;,
+<span class="nc" id="L245">                                                  syncCount,</span>
+<span class="nc" id="L246">                                                  String.format(&quot;%.2f&quot;, (now - firstLagAt) * 1e-9d),</span>
+<span class="nc" id="L247">                                                  String.format(&quot;%.2f&quot;, totalSyncDuration * 1e-6d / syncCount),</span>
+<span class="nc" id="L248">                                                  lagCount,</span>
+<span class="nc" id="L249">                                                  String.format(&quot;%.2f&quot;, syncExceededIntervalBy * 1e-6d / lagCount));</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                if (logged)</span>
+<span class="nc" id="L251">                    firstLagAt = 0;</span>
+            }
+<span class="nc" id="L253">            return true;</span>
+        }
+
+        @VisibleForTesting
+        long getTotalSyncDuration()
+        {
+<span class="nc" id="L259">            return totalSyncDuration;</span>
+        }
+    }
+
+    /**
+     * Block for @param alloc to be sync'd as necessary, and handle bookkeeping
+     */
+    public void finishWriteFor(Allocation alloc)
+    {
+<span class="fc" id="L268">        maybeWaitForSync(alloc);</span>
+<span class="fc" id="L269">        written.incrementAndGet();</span>
+<span class="fc" id="L270">    }</span>
+
+    protected abstract void maybeWaitForSync(Allocation alloc);
+
+    /**
+     * Request an additional sync cycle without blocking.
+     */
+    void requestExtraSync()
+    {
+<span class="fc" id="L279">        syncRequested = true;</span>
+<span class="fc" id="L280">        LockSupport.unpark(thread);</span>
+<span class="fc" id="L281">    }</span>
+
+    public void shutdown()
+    {
+<span class="nc" id="L285">        shutdown = true;</span>
+<span class="nc" id="L286">        requestExtraSync();</span>
+<span class="nc" id="L287">    }</span>
+
+    /**
+     * Request sync and wait until the current state is synced.
+     *
+     * Note: If a sync is in progress at the time of this request, the call will return after both it and a cycle
+     * initiated immediately afterwards complete.
+     */
+    public void syncBlocking()
+    {
+<span class="nc" id="L297">        long requestTime = System.nanoTime();</span>
+<span class="nc" id="L298">        requestExtraSync();</span>
+<span class="nc" id="L299">        awaitSyncAt(requestTime, null);</span>
+<span class="nc" id="L300">    }</span>
+
+    void awaitSyncAt(long syncTime, Context context)
+    {
+        do
+        {
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            WaitQueue.Signal signal = context != null ? syncComplete.register(context) : syncComplete.register();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (lastSyncedAt &lt; syncTime)</span>
+<span class="nc" id="L308">                signal.awaitUninterruptibly();</span>
+            else
+<span class="nc" id="L310">                signal.cancel();</span>
+        }
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        while (lastSyncedAt &lt; syncTime);</span>
+<span class="nc" id="L313">    }</span>
+
+    public void awaitTermination() throws InterruptedException
+    {
+<span class="nc" id="L317">        thread.join();</span>
+<span class="nc" id="L318">    }</span>
+
+    public long getCompletedTasks()
+    {
+<span class="nc" id="L322">        return written.get();</span>
+    }
+
+    public long getPendingTasks()
+    {
+<span class="nc" id="L327">        return pending.get();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

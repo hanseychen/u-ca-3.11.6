@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompressedInputStream.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming.compress</a> &gt; <span class="el_source">CompressedInputStream.java</span></div><h1>CompressedInputStream.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming.compress;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Iterator;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
+
+import com.google.common.collect.Iterators;
+import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocalThread;
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+/**
+ * InputStream which reads data from underlining source with given {@link CompressionInfo}.
+ */
+<span class="nc bnc" id="L42" title="All 2 branches missed.">public class CompressedInputStream extends InputStream</span>
+{
+
+<span class="nc" id="L45">    private static final Logger logger = LoggerFactory.getLogger(CompressedInputStream.class);</span>
+
+    private final CompressionInfo info;
+    // chunk buffer
+    private final BlockingQueue&lt;byte[]&gt; dataBuffer;
+    private final Supplier&lt;Double&gt; crcCheckChanceSupplier;
+
+    // uncompressed bytes
+    private final byte[] buffer;
+
+    // offset from the beginning of the buffer
+<span class="nc" id="L56">    protected long bufferOffset = 0;</span>
+    // current position in stream
+<span class="nc" id="L58">    private long current = 0;</span>
+    // number of bytes in the buffer that are actually valid
+<span class="nc" id="L60">    protected int validBufferBytes = -1;</span>
+
+    private final ChecksumType checksumType;
+
+    // raw checksum bytes
+<span class="nc" id="L65">    private final byte[] checksumBytes = new byte[4];</span>
+
+    /**
+     * Indicates there was a problem when reading from source stream.
+     * When this is added to the &lt;code&gt;dataBuffer&lt;/code&gt; by the stream Reader,
+     * it is expected that the &lt;code&gt;readException&lt;/code&gt; variable is populated
+     * with the cause of the error when reading from source stream, so it is
+     * thrown to the consumer on subsequent read operation.
+     */
+<span class="nc" id="L74">    private static final byte[] POISON_PILL = new byte[0];</span>
+
+<span class="nc" id="L76">    protected volatile IOException readException = null;</span>
+
+    private long totalCompressedBytesRead;
+
+    /**
+     * @param source Input source to read compressed data from
+     * @param info Compression info
+     */
+    public CompressedInputStream(InputStream source, CompressionInfo info, ChecksumType checksumType, Supplier&lt;Double&gt; crcCheckChanceSupplier)
+<span class="nc" id="L85">    {</span>
+<span class="nc" id="L86">        this.info = info;</span>
+<span class="nc" id="L87">        this.buffer = new byte[info.parameters.chunkLength()];</span>
+        // buffer is limited to store up to 1024 chunks
+<span class="nc" id="L89">        this.dataBuffer = new ArrayBlockingQueue&lt;&gt;(Math.min(info.chunks.length, 1024));</span>
+<span class="nc" id="L90">        this.crcCheckChanceSupplier = crcCheckChanceSupplier;</span>
+<span class="nc" id="L91">        this.checksumType = checksumType;</span>
+
+<span class="nc" id="L93">        new FastThreadLocalThread(new Reader(source, info, dataBuffer)).start();</span>
+<span class="nc" id="L94">    }</span>
+
+    private void decompressNextChunk() throws IOException
+    {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        if (readException != null)</span>
+<span class="nc" id="L99">            throw readException;</span>
+
+        try
+        {
+<span class="nc" id="L103">            byte[] compressedWithCRC = dataBuffer.take();</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            if (compressedWithCRC == POISON_PILL)</span>
+            {
+<span class="nc bnc" id="L106" title="All 4 branches missed.">                assert readException != null;</span>
+<span class="nc" id="L107">                throw readException;</span>
+            }
+<span class="nc" id="L109">            decompress(compressedWithCRC);</span>
+        }
+<span class="nc" id="L111">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L113">            throw new EOFException(&quot;No chunk available&quot;);</span>
+<span class="nc" id="L114">        }</span>
+<span class="nc" id="L115">    }</span>
+
+    @Override
+    public int read() throws IOException
+    {
+<span class="nc bnc" id="L120" title="All 4 branches missed.">        if (current &gt;= bufferOffset + buffer.length || validBufferBytes == -1)</span>
+<span class="nc" id="L121">            decompressNextChunk();</span>
+
+<span class="nc bnc" id="L123" title="All 6 branches missed.">        assert current &gt;= bufferOffset &amp;&amp; current &lt; bufferOffset + validBufferBytes;</span>
+
+<span class="nc" id="L125">        return ((int) buffer[(int) (current++ - bufferOffset)]) &amp; 0xff;</span>
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException
+    {
+<span class="nc" id="L131">        long nextCurrent = current + len;</span>
+
+<span class="nc bnc" id="L133" title="All 4 branches missed.">        if (current &gt;= bufferOffset + buffer.length || validBufferBytes == -1)</span>
+<span class="nc" id="L134">            decompressNextChunk();</span>
+
+<span class="nc bnc" id="L136" title="All 4 branches missed.">        assert nextCurrent &gt;= bufferOffset;</span>
+
+<span class="nc" id="L138">        int read = 0;</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        while (read &lt; len)</span>
+        {
+<span class="nc" id="L141">            int nextLen = Math.min((len - read), (int)((bufferOffset + validBufferBytes) - current));</span>
+
+<span class="nc" id="L143">            System.arraycopy(buffer, (int)(current - bufferOffset), b, off + read, nextLen);</span>
+<span class="nc" id="L144">            read += nextLen;</span>
+
+<span class="nc" id="L146">            current += nextLen;</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if (read != len)</span>
+<span class="nc" id="L148">                decompressNextChunk();</span>
+<span class="nc" id="L149">        }</span>
+
+<span class="nc" id="L151">        return len;</span>
+    }
+
+    public void position(long position)
+    {
+<span class="nc bnc" id="L156" title="All 4 branches missed.">        assert position &gt;= current : &quot;stream can only read forward.&quot;;</span>
+<span class="nc" id="L157">        current = position;</span>
+<span class="nc" id="L158">    }</span>
+
+    private void decompress(byte[] compressed) throws IOException
+    {
+        // uncompress
+<span class="nc" id="L163">        validBufferBytes = info.parameters.getSstableCompressor().uncompress(compressed, 0, compressed.length - checksumBytes.length, buffer, 0);</span>
+<span class="nc" id="L164">        totalCompressedBytesRead += compressed.length;</span>
+
+        // validate crc randomly
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (this.crcCheckChanceSupplier.get() &gt;= 1d ||</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            this.crcCheckChanceSupplier.get() &gt; ThreadLocalRandom.current().nextDouble())</span>
+        {
+<span class="nc" id="L170">            int checksum = (int) checksumType.of(compressed, 0, compressed.length - checksumBytes.length);</span>
+
+<span class="nc" id="L172">            System.arraycopy(compressed, compressed.length - checksumBytes.length, checksumBytes, 0, checksumBytes.length);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">            if (Ints.fromByteArray(checksumBytes) != checksum)</span>
+<span class="nc" id="L174">                throw new IOException(&quot;CRC unmatched&quot;);</span>
+        }
+
+        // buffer offset is always aligned
+<span class="nc" id="L178">        bufferOffset = current &amp; ~(buffer.length - 1);</span>
+<span class="nc" id="L179">    }</span>
+
+    public long getTotalCompressedBytesRead()
+    {
+<span class="nc" id="L183">        return totalCompressedBytesRead;</span>
+    }
+
+    class Reader extends WrappedRunnable
+    {
+        private final InputStream source;
+        private final Iterator&lt;CompressionMetadata.Chunk&gt; chunks;
+        private final BlockingQueue&lt;byte[]&gt; dataBuffer;
+
+        Reader(InputStream source, CompressionInfo info, BlockingQueue&lt;byte[]&gt; dataBuffer)
+<span class="nc" id="L193">        {</span>
+<span class="nc" id="L194">            this.source = source;</span>
+<span class="nc" id="L195">            this.chunks = Iterators.forArray(info.chunks);</span>
+<span class="nc" id="L196">            this.dataBuffer = dataBuffer;</span>
+<span class="nc" id="L197">        }</span>
+
+        protected void runMayThrow() throws Exception
+        {
+            byte[] compressedWithCRC;
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            while (chunks.hasNext())</span>
+            {
+<span class="nc" id="L204">                CompressionMetadata.Chunk chunk = chunks.next();</span>
+
+<span class="nc" id="L206">                int readLength = chunk.length + 4; // read with CRC</span>
+<span class="nc" id="L207">                compressedWithCRC = new byte[readLength];</span>
+
+<span class="nc" id="L209">                int bufferRead = 0;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                while (bufferRead &lt; readLength)</span>
+                {
+                    try
+                    {
+<span class="nc" id="L214">                        int r = source.read(compressedWithCRC, bufferRead, readLength - bufferRead);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                        if (r &lt; 0)</span>
+                        {
+<span class="nc" id="L217">                            readException = new EOFException(&quot;No chunk available&quot;);</span>
+<span class="nc" id="L218">                            dataBuffer.put(POISON_PILL);</span>
+<span class="nc" id="L219">                            return; // throw exception where we consume dataBuffer</span>
+                        }
+<span class="nc" id="L221">                        bufferRead += r;</span>
+                    }
+<span class="nc" id="L223">                    catch (IOException e)</span>
+                    {
+<span class="nc" id="L225">                        logger.warn(&quot;Error while reading compressed input stream.&quot;, e);</span>
+<span class="nc" id="L226">                        readException = e;</span>
+<span class="nc" id="L227">                        dataBuffer.put(POISON_PILL);</span>
+<span class="nc" id="L228">                        return; // throw exception where we consume dataBuffer</span>
+<span class="nc" id="L229">                    }</span>
+                }
+<span class="nc" id="L231">                dataBuffer.put(compressedWithCRC);</span>
+<span class="nc" id="L232">            }</span>
+<span class="nc" id="L233">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

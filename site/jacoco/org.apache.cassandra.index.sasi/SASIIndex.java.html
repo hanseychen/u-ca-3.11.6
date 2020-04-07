@@ -1,0 +1,353 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SASIIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi</a> &gt; <span class="el_source">SASIIndex.java</span></div><h1>SASIIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi;
+
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.function.BiFunction;
+
+import com.googlecode.concurrenttrees.common.Iterables;
+
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.index.TargetParser;
+import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+import org.apache.cassandra.index.sasi.conf.IndexMode;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder.Mode;
+import org.apache.cassandra.index.sasi.disk.PerSSTableIndexWriter;
+import org.apache.cassandra.index.sasi.plan.QueryPlan;
+import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.notifications.*;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+public class SASIIndex implements Index, INotificationConsumer
+{
+    public final static String USAGE_WARNING = &quot;SASI indexes are experimental and are not recommended for production use.&quot;;
+
+    private static class SASIIndexBuildingSupport implements IndexBuildingSupport
+    {
+        public SecondaryIndexBuilder getIndexBuildTask(ColumnFamilyStore cfs,
+                                                       Set&lt;Index&gt; indexes,
+                                                       Collection&lt;SSTableReader&gt; sstablesToRebuild)
+        {
+<span class="nc" id="L70">            NavigableMap&lt;SSTableReader, Map&lt;ColumnDefinition, ColumnIndex&gt;&gt; sstables = new TreeMap&lt;&gt;((a, b) -&gt; {</span>
+<span class="nc" id="L71">                return Integer.compare(a.descriptor.generation, b.descriptor.generation);</span>
+            });
+
+<span class="nc" id="L74">            indexes.stream()</span>
+<span class="nc" id="L75">                   .filter((i) -&gt; i instanceof SASIIndex)</span>
+<span class="nc" id="L76">                   .forEach((i) -&gt; {</span>
+<span class="nc" id="L77">                       SASIIndex sasi = (SASIIndex) i;</span>
+<span class="nc" id="L78">                       sasi.index.dropData(sstablesToRebuild);</span>
+<span class="nc" id="L79">                       sstablesToRebuild.stream()</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">                                        .filter((sstable) -&gt; !sasi.index.hasSSTable(sstable))</span>
+<span class="nc" id="L81">                                        .forEach((sstable) -&gt; {</span>
+<span class="nc" id="L82">                                            Map&lt;ColumnDefinition, ColumnIndex&gt; toBuild = sstables.get(sstable);</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">                                            if (toBuild == null)</span>
+<span class="nc" id="L84">                                                sstables.put(sstable, (toBuild = new HashMap&lt;&gt;()));</span>
+
+<span class="nc" id="L86">                                            toBuild.put(sasi.index.getDefinition(), sasi.index);</span>
+<span class="nc" id="L87">                                        });</span>
+<span class="nc" id="L88">                   });</span>
+
+<span class="nc" id="L90">            return new SASIIndexBuilder(cfs, sstables);</span>
+        }
+    }
+
+<span class="nc" id="L94">    private static final SASIIndexBuildingSupport INDEX_BUILDER_SUPPORT = new SASIIndexBuildingSupport();</span>
+
+    private final ColumnFamilyStore baseCfs;
+    private final IndexMetadata config;
+    private final ColumnIndex index;
+
+    public SASIIndex(ColumnFamilyStore baseCfs, IndexMetadata config)
+<span class="nc" id="L101">    {</span>
+<span class="nc" id="L102">        this.baseCfs = baseCfs;</span>
+<span class="nc" id="L103">        this.config = config;</span>
+
+<span class="nc" id="L105">        ColumnDefinition column = TargetParser.parse(baseCfs.metadata, config).left;</span>
+<span class="nc" id="L106">        this.index = new ColumnIndex(baseCfs.metadata.getKeyValidator(), column, config);</span>
+
+<span class="nc" id="L108">        Tracker tracker = baseCfs.getTracker();</span>
+<span class="nc" id="L109">        tracker.subscribe(this);</span>
+
+<span class="nc" id="L111">        SortedMap&lt;SSTableReader, Map&lt;ColumnDefinition, ColumnIndex&gt;&gt; toRebuild = new TreeMap&lt;&gt;((a, b)</span>
+<span class="nc" id="L112">                                                -&gt; Integer.compare(a.descriptor.generation, b.descriptor.generation));</span>
+
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        for (SSTableReader sstable : index.init(tracker.getView().liveSSTables()))</span>
+        {
+<span class="nc" id="L116">            Map&lt;ColumnDefinition, ColumnIndex&gt; perSSTable = toRebuild.get(sstable);</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">            if (perSSTable == null)</span>
+<span class="nc" id="L118">                toRebuild.put(sstable, (perSSTable = new HashMap&lt;&gt;()));</span>
+
+<span class="nc" id="L120">            perSSTable.put(index.getDefinition(), index);</span>
+<span class="nc" id="L121">        }</span>
+
+<span class="nc" id="L123">        CompactionManager.instance.submitIndexBuild(new SASIIndexBuilder(baseCfs, toRebuild));</span>
+<span class="nc" id="L124">    }</span>
+
+    /**
+     * Called via reflection at {@link IndexMetadata#validateCustomIndexOptions}
+     */
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options, CFMetaData cfm)
+    {
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (!(cfm.partitioner instanceof Murmur3Partitioner))</span>
+<span class="nc" id="L132">            throw new ConfigurationException(&quot;SASI only supports Murmur3Partitioner.&quot;);</span>
+
+<span class="nc" id="L134">        String targetColumn = options.get(&quot;target&quot;);</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (targetColumn == null)</span>
+<span class="nc" id="L136">            throw new ConfigurationException(&quot;unknown target column&quot;);</span>
+
+<span class="nc" id="L138">        Pair&lt;ColumnDefinition, IndexTarget.Type&gt; target = TargetParser.parse(cfm, targetColumn);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (target == null)</span>
+<span class="nc" id="L140">            throw new ConfigurationException(&quot;failed to retrieve target column for: &quot; + targetColumn);</span>
+
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (target.left.isComplex())</span>
+<span class="nc" id="L143">            throw new ConfigurationException(&quot;complex columns are not yet supported by SASI&quot;);</span>
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (target.left.isPartitionKey())</span>
+<span class="nc" id="L146">            throw new ConfigurationException(&quot;partition key columns are not yet supported by SASI&quot;);</span>
+
+<span class="nc" id="L148">        IndexMode.validateAnalyzer(options, target.left);</span>
+
+<span class="nc" id="L150">        IndexMode mode = IndexMode.getMode(target.left, options);</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (mode.mode == Mode.SPARSE)</span>
+        {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (mode.isLiteral)</span>
+<span class="nc" id="L154">                throw new ConfigurationException(&quot;SPARSE mode is only supported on non-literal columns.&quot;);</span>
+
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (mode.isAnalyzed)</span>
+<span class="nc" id="L157">                throw new ConfigurationException(&quot;SPARSE mode doesn't support analyzers.&quot;);</span>
+        }
+
+<span class="nc" id="L160">        return Collections.emptyMap();</span>
+    }
+
+    public void register(IndexRegistry registry)
+    {
+<span class="nc" id="L165">        registry.registerIndex(this);</span>
+<span class="nc" id="L166">    }</span>
+
+    public IndexMetadata getIndexMetadata()
+    {
+<span class="nc" id="L170">        return config;</span>
+    }
+
+    public Callable&lt;?&gt; getInitializationTask()
+    {
+<span class="nc" id="L175">        return null;</span>
+    }
+
+    public Callable&lt;?&gt; getMetadataReloadTask(IndexMetadata indexMetadata)
+    {
+<span class="nc" id="L180">        return null;</span>
+    }
+
+    public Callable&lt;?&gt; getBlockingFlushTask()
+    {
+<span class="nc" id="L185">        return null; // SASI indexes are flushed along side memtable</span>
+    }
+
+    public Callable&lt;?&gt; getInvalidateTask()
+    {
+<span class="nc" id="L190">        return getTruncateTask(FBUtilities.timestampMicros());</span>
+    }
+
+    public Callable&lt;?&gt; getTruncateTask(long truncatedAt)
+    {
+<span class="nc" id="L195">        return () -&gt; {</span>
+<span class="nc" id="L196">            index.dropData(truncatedAt);</span>
+<span class="nc" id="L197">            return null;</span>
+        };
+    }
+
+    public boolean shouldBuildBlocking()
+    {
+<span class="nc" id="L203">        return true;</span>
+    }
+
+    public Optional&lt;ColumnFamilyStore&gt; getBackingTable()
+    {
+<span class="nc" id="L208">        return Optional.empty();</span>
+    }
+
+    public boolean indexes(PartitionColumns columns)
+    {
+<span class="nc" id="L213">        return columns.contains(index.getDefinition());</span>
+    }
+
+    public boolean dependsOn(ColumnDefinition column)
+    {
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        return index.getDefinition().compareTo(column) == 0;</span>
+    }
+
+    public boolean supportsExpression(ColumnDefinition column, Operator operator)
+    {
+<span class="nc bnc" id="L223" title="All 4 branches missed.">        return dependsOn(column) &amp;&amp; index.supports(operator);</span>
+    }
+
+    public AbstractType&lt;?&gt; customExpressionValueType()
+    {
+<span class="nc" id="L228">        return null;</span>
+    }
+
+    public RowFilter getPostIndexQueryFilter(RowFilter filter)
+    {
+<span class="nc" id="L233">        return filter.withoutExpressions();</span>
+    }
+
+    public long getEstimatedResultRows()
+    {
+        // this is temporary (until proper QueryPlan is integrated into Cassandra)
+        // and allows us to priority SASI indexes if any in the query since they
+        // are going to be more efficient, to query and intersect, than built-in indexes.
+<span class="nc" id="L241">        return Long.MIN_VALUE;</span>
+    }
+
+    public void validate(PartitionUpdate update) throws InvalidRequestException
+<span class="nc" id="L245">    {}</span>
+
+    public Indexer indexerFor(DecoratedKey key, PartitionColumns columns, int nowInSec, OpOrder.Group opGroup, IndexTransaction.Type transactionType)
+    {
+<span class="nc" id="L249">        return new Indexer()</span>
+<span class="nc" id="L250">        {</span>
+            public void begin()
+<span class="nc" id="L252">            {}</span>
+
+            public void partitionDelete(DeletionTime deletionTime)
+<span class="nc" id="L255">            {}</span>
+
+            public void rangeTombstone(RangeTombstone tombstone)
+<span class="nc" id="L258">            {}</span>
+
+            public void insertRow(Row row)
+            {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                if (isNewData())</span>
+<span class="nc" id="L263">                    adjustMemtableSize(index.index(key, row), opGroup);</span>
+<span class="nc" id="L264">            }</span>
+
+            public void updateRow(Row oldRow, Row newRow)
+            {
+<span class="nc" id="L268">                insertRow(newRow);</span>
+<span class="nc" id="L269">            }</span>
+
+            public void removeRow(Row row)
+<span class="nc" id="L272">            {}</span>
+
+            public void finish()
+<span class="nc" id="L275">            {}</span>
+
+            // we are only interested in the data from Memtable
+            // everything else is going to be handled by SSTableWriter observers
+            private boolean isNewData()
+            {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                return transactionType == IndexTransaction.Type.UPDATE;</span>
+            }
+
+            public void adjustMemtableSize(long additionalSpace, OpOrder.Group opGroup)
+            {
+<span class="nc" id="L286">                baseCfs.getTracker().getView().getCurrentMemtable().getAllocator().onHeap().allocate(additionalSpace, opGroup);</span>
+<span class="nc" id="L287">            }</span>
+        };
+    }
+
+    public Searcher searcherFor(ReadCommand command) throws InvalidRequestException
+    {
+<span class="nc" id="L293">        CFMetaData config = command.metadata();</span>
+<span class="nc" id="L294">        ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(config.cfId);</span>
+<span class="nc" id="L295">        return controller -&gt; new QueryPlan(cfs, command, DatabaseDescriptor.getRangeRpcTimeout()).execute(controller);</span>
+    }
+
+    public SSTableFlushObserver getFlushObserver(Descriptor descriptor, OperationType opType)
+    {
+<span class="nc" id="L300">        return newWriter(baseCfs.metadata.getKeyValidator(), descriptor, Collections.singletonMap(index.getDefinition(), index), opType);</span>
+    }
+
+    public BiFunction&lt;PartitionIterator, ReadCommand, PartitionIterator&gt; postProcessorFor(ReadCommand command)
+    {
+<span class="nc" id="L305">        return (partitionIterator, readCommand) -&gt; partitionIterator;</span>
+    }
+
+    public IndexBuildingSupport getBuildTaskSupport()
+    {
+<span class="nc" id="L310">        return INDEX_BUILDER_SUPPORT;</span>
+    }
+
+    public void handleNotification(INotification notification, Object sender)
+    {
+        // unfortunately, we can only check the type of notification via instanceof :(
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (notification instanceof SSTableAddedNotification)</span>
+        {
+<span class="nc" id="L318">            SSTableAddedNotification notice = (SSTableAddedNotification) notification;</span>
+<span class="nc" id="L319">            index.update(Collections.&lt;SSTableReader&gt;emptyList(), Iterables.toList(notice.added));</span>
+<span class="nc" id="L320">        }</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        else if (notification instanceof SSTableListChangedNotification)</span>
+        {
+<span class="nc" id="L323">            SSTableListChangedNotification notice = (SSTableListChangedNotification) notification;</span>
+<span class="nc" id="L324">            index.update(notice.removed, notice.added);</span>
+<span class="nc" id="L325">        }</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        else if (notification instanceof MemtableRenewedNotification)</span>
+        {
+<span class="nc" id="L328">            index.switchMemtable();</span>
+        }
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        else if (notification instanceof MemtableSwitchedNotification)</span>
+        {
+<span class="nc" id="L332">            index.switchMemtable(((MemtableSwitchedNotification) notification).memtable);</span>
+        }
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        else if (notification instanceof MemtableDiscardedNotification)</span>
+        {
+<span class="nc" id="L336">            index.discardMemtable(((MemtableDiscardedNotification) notification).memtable);</span>
+        }
+<span class="nc" id="L338">    }</span>
+
+    public ColumnIndex getIndex()
+    {
+<span class="nc" id="L342">        return index;</span>
+    }
+
+    protected static PerSSTableIndexWriter newWriter(AbstractType&lt;?&gt; keyValidator,
+                                                     Descriptor descriptor,
+                                                     Map&lt;ColumnDefinition, ColumnIndex&gt; indexes,
+                                                     OperationType opType)
+    {
+<span class="nc" id="L350">        return new PerSSTableIndexWriter(keyValidator, descriptor, opType, indexes);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

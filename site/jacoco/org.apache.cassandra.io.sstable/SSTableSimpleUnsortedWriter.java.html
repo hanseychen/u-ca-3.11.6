@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableSimpleUnsortedWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTableSimpleUnsortedWriter.java</span></div><h1>SSTableSimpleUnsortedWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Throwables;
+
+import io.netty.util.concurrent.FastThreadLocalThread;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.UnfilteredSerializer;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+/**
+ * A SSTable writer that doesn't assume rows are in sorted order.
+ * &lt;p&gt;
+ * This writer buffers rows in memory and then write them all in sorted order.
+ * To avoid loading the entire data set in memory, the amount of rows buffered
+ * is configurable. Each time the threshold is met, one SSTable will be
+ * created (and the buffer be reseted).
+ *
+ * @see SSTableSimpleWriter
+ */
+<span class="nc bnc" id="L49" title="All 2 branches missed.">class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter</span>
+{
+<span class="nc" id="L51">    private static final Buffer SENTINEL = new Buffer();</span>
+
+<span class="nc" id="L53">    private Buffer buffer = new Buffer();</span>
+    private final long bufferSize;
+    private long currentSize;
+
+    // Used to compute the row serialized size
+    private final SerializationHeader header;
+
+<span class="nc" id="L60">    private final BlockingQueue&lt;Buffer&gt; writeQueue = new SynchronousQueue&lt;Buffer&gt;();</span>
+<span class="nc" id="L61">    private final DiskWriter diskWriter = new DiskWriter();</span>
+
+    SSTableSimpleUnsortedWriter(File directory, CFMetaData metadata, PartitionColumns columns, long bufferSizeInMB)
+    {
+<span class="nc" id="L65">        super(directory, metadata, columns);</span>
+<span class="nc" id="L66">        this.bufferSize = bufferSizeInMB * 1024L * 1024L;</span>
+<span class="nc" id="L67">        this.header = new SerializationHeader(true, metadata, columns, EncodingStats.NO_STATS);</span>
+<span class="nc" id="L68">        diskWriter.start();</span>
+<span class="nc" id="L69">    }</span>
+
+    PartitionUpdate getUpdateFor(DecoratedKey key)
+    {
+<span class="nc bnc" id="L73" title="All 4 branches missed.">        assert key != null;</span>
+
+<span class="nc" id="L75">        PartitionUpdate previous = buffer.get(key);</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">        if (previous == null)</span>
+        {
+<span class="nc" id="L78">            previous = createPartitionUpdate(key);</span>
+<span class="nc" id="L79">            currentSize += PartitionUpdate.serializer.serializedSize(previous, formatType.info.getLatestVersion().correspondingMessagingVersion());</span>
+<span class="nc" id="L80">            previous.allowNewUpdates();</span>
+<span class="nc" id="L81">            buffer.put(key, previous);</span>
+        }
+<span class="nc" id="L83">        return previous;</span>
+    }
+
+    private void countRow(Row row)
+    {
+        // Note that the accounting of a row is a bit inaccurate (it doesn't take some of the file format optimization into account)
+        // and the maintaining of the bufferSize is in general not perfect. This has always been the case for this class but we should
+        // improve that. In particular, what we count is closer to the serialized value, but it's debatable that it's the right thing
+        // to count since it will take a lot more space in memory and the bufferSize if first and foremost used to avoid OOM when
+        // using this writer.
+<span class="nc" id="L93">        currentSize += UnfilteredSerializer.serializer.serializedSize(row, header, 0, formatType.info.getLatestVersion().correspondingMessagingVersion());</span>
+<span class="nc" id="L94">    }</span>
+
+    private void maybeSync() throws SyncException
+    {
+        try
+        {
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            if (currentSize &gt; bufferSize)</span>
+<span class="nc" id="L101">                sync();</span>
+        }
+<span class="nc" id="L103">        catch (IOException e)</span>
+        {
+            // addColumn does not throw IOException but we want to report this to the user,
+            // so wrap it in a temporary RuntimeException that we'll catch in rawAddRow above.
+<span class="nc" id="L107">            throw new SyncException(e);</span>
+<span class="nc" id="L108">        }</span>
+<span class="nc" id="L109">    }</span>
+
+    private PartitionUpdate createPartitionUpdate(DecoratedKey key)
+    {
+<span class="nc" id="L113">        return new PartitionUpdate(metadata, key, columns, 4)</span>
+<span class="nc" id="L114">        {</span>
+            @Override
+            public void add(Row row)
+            {
+<span class="nc" id="L118">                super.add(row);</span>
+<span class="nc" id="L119">                countRow(row);</span>
+<span class="nc" id="L120">                maybeSync();</span>
+<span class="nc" id="L121">            }</span>
+        };
+    }
+
+    @Override
+    public void close() throws IOException
+    {
+<span class="nc" id="L128">        sync();</span>
+<span class="nc" id="L129">        put(SENTINEL);</span>
+        try
+        {
+<span class="nc" id="L132">            diskWriter.join();</span>
+<span class="nc" id="L133">            checkForWriterException();</span>
+        }
+<span class="nc" id="L135">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L137">            throw new RuntimeException(e);</span>
+<span class="nc" id="L138">        }</span>
+
+<span class="nc" id="L140">        checkForWriterException();</span>
+<span class="nc" id="L141">    }</span>
+
+    protected void sync() throws IOException
+    {
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (buffer.isEmpty())</span>
+<span class="nc" id="L146">            return;</span>
+
+<span class="nc" id="L148">        put(buffer);</span>
+<span class="nc" id="L149">        buffer = new Buffer();</span>
+<span class="nc" id="L150">        currentSize = 0;</span>
+<span class="nc" id="L151">    }</span>
+
+    private void put(Buffer buffer) throws IOException
+    {
+        while (true)
+        {
+<span class="nc" id="L157">            checkForWriterException();</span>
+            try
+            {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">                if (writeQueue.offer(buffer, 1, TimeUnit.SECONDS))</span>
+<span class="nc" id="L161">                    break;</span>
+            }
+<span class="nc" id="L163">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L165">                throw new RuntimeException(e);</span>
+<span class="nc" id="L166">            }</span>
+        }
+<span class="nc" id="L168">    }</span>
+
+    private void checkForWriterException() throws IOException
+    {
+        // slightly lame way to report exception from the writer, but that should be good enough
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (diskWriter.exception != null)</span>
+        {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            if (diskWriter.exception instanceof IOException)</span>
+<span class="nc" id="L176">                throw (IOException) diskWriter.exception;</span>
+            else
+<span class="nc" id="L178">                throw Throwables.propagate(diskWriter.exception);</span>
+        }
+<span class="nc" id="L180">    }</span>
+
+    static class SyncException extends RuntimeException
+    {
+        SyncException(IOException ioe)
+        {
+<span class="nc" id="L186">            super(ioe);</span>
+<span class="nc" id="L187">        }</span>
+    }
+
+    //// typedef
+<span class="nc" id="L191">    static class Buffer extends TreeMap&lt;DecoratedKey, PartitionUpdate&gt; {}</span>
+
+<span class="nc" id="L193">    private class DiskWriter extends FastThreadLocalThread</span>
+    {
+<span class="nc" id="L195">        volatile Throwable exception = null;</span>
+
+        public void run()
+        {
+            while (true)
+            {
+                try
+                {
+<span class="nc" id="L203">                    Buffer b = writeQueue.take();</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                    if (b == SENTINEL)</span>
+<span class="nc" id="L205">                        return;</span>
+
+<span class="nc" id="L207">                        try (SSTableTxnWriter writer = createWriter())</span>
+                    {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                        for (Map.Entry&lt;DecoratedKey, PartitionUpdate&gt; entry : b.entrySet())</span>
+<span class="nc" id="L210">                            writer.append(entry.getValue().unfilteredIterator());</span>
+<span class="nc" id="L211">                        writer.finish(false);</span>
+                    }
+                }
+<span class="nc" id="L214">                catch (Throwable e)</span>
+                {
+<span class="nc" id="L216">                    JVMStabilityInspector.inspectThrowable(e);</span>
+                    // Keep only the first exception
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                    if (exception == null)</span>
+<span class="nc" id="L219">                        exception = e;</span>
+<span class="nc" id="L220">                }</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

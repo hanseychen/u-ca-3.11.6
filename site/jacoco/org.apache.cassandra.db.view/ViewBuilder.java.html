@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ViewBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">ViewBuilder.java</span></div><h1>ViewBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.view;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionInfo;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.compaction.CompactionInfo.Unit;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.repair.SystemDistributedKeyspace;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+public class ViewBuilder extends CompactionInfo.Holder
+{
+    private final ColumnFamilyStore baseCfs;
+    private final View view;
+    private final UUID compactionId;
+<span class="nc" id="L63">    private volatile Token prevToken = null;</span>
+
+<span class="nc" id="L65">    private static final Logger logger = LoggerFactory.getLogger(ViewBuilder.class);</span>
+
+    public ViewBuilder(ColumnFamilyStore baseCfs, View view)
+<span class="nc" id="L68">    {</span>
+<span class="nc" id="L69">        this.baseCfs = baseCfs;</span>
+<span class="nc" id="L70">        this.view = view;</span>
+<span class="nc" id="L71">        compactionId = UUIDGen.getTimeUUID();</span>
+<span class="nc" id="L72">    }</span>
+
+    private void buildKey(DecoratedKey key)
+    {
+<span class="nc" id="L76">        ReadQuery selectQuery = view.getReadQuery();</span>
+
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        if (!selectQuery.selectsKey(key))</span>
+        {
+<span class="nc" id="L80">            logger.trace(&quot;Skipping {}, view query filters&quot;, key);</span>
+<span class="nc" id="L81">            return;</span>
+        }
+
+<span class="nc" id="L84">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L85">        SinglePartitionReadCommand command = view.getSelectStatement().internalReadForView(key, nowInSec);</span>
+
+        // We're rebuilding everything from what's on disk, so we read everything, consider that as new updates
+        // and pretend that there is nothing pre-existing.
+<span class="nc" id="L89">        UnfilteredRowIterator empty = UnfilteredRowIterators.noRowsIterator(baseCfs.metadata, key, Rows.EMPTY_STATIC_ROW, DeletionTime.LIVE, false);</span>
+
+<span class="nc" id="L91">        try (ReadExecutionController orderGroup = command.executionController();</span>
+<span class="nc" id="L92">             UnfilteredRowIterator data = UnfilteredPartitionIterators.getOnlyElement(command.executeLocally(orderGroup), command))</span>
+        {
+<span class="nc" id="L94">            Iterator&lt;Collection&lt;Mutation&gt;&gt; mutations = baseCfs.keyspace.viewManager</span>
+<span class="nc" id="L95">                                                      .forTable(baseCfs.metadata)</span>
+<span class="nc" id="L96">                                                      .generateViewUpdates(Collections.singleton(view), data, empty, nowInSec, true);</span>
+
+<span class="nc" id="L98">            AtomicLong noBase = new AtomicLong(Long.MAX_VALUE);</span>
+<span class="nc" id="L99">            mutations.forEachRemaining(m -&gt; StorageProxy.mutateMV(key.getKey(), m, true, noBase, System.nanoTime()));</span>
+        }
+<span class="nc" id="L101">    }</span>
+
+    public void run()
+    {
+<span class="nc" id="L105">        logger.debug(&quot;Starting view builder for {}.{}&quot;, baseCfs.metadata.ksName, view.name);</span>
+<span class="nc" id="L106">        logger.trace(&quot;Running view builder for {}.{}&quot;, baseCfs.metadata.ksName, view.name);</span>
+<span class="nc" id="L107">        UUID localHostId = SystemKeyspace.getLocalHostId();</span>
+<span class="nc" id="L108">        String ksname = baseCfs.metadata.ksName, viewName = view.name;</span>
+
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        if (SystemKeyspace.isViewBuilt(ksname, viewName))</span>
+        {
+<span class="nc" id="L112">            logger.debug(&quot;View already marked built for {}.{}&quot;, baseCfs.metadata.ksName, view.name);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (!SystemKeyspace.isViewStatusReplicated(ksname, viewName))</span>
+<span class="nc" id="L114">                updateDistributed(ksname, viewName, localHostId);</span>
+<span class="nc" id="L115">            return;</span>
+        }
+
+<span class="nc" id="L118">        Iterable&lt;Range&lt;Token&gt;&gt; ranges = StorageService.instance.getLocalRanges(baseCfs.metadata.ksName);</span>
+
+<span class="nc" id="L120">        final Pair&lt;Integer, Token&gt; buildStatus = SystemKeyspace.getViewBuildStatus(ksname, viewName);</span>
+        Token lastToken;
+        Function&lt;org.apache.cassandra.db.lifecycle.View, Iterable&lt;SSTableReader&gt;&gt; function;
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (buildStatus == null)</span>
+        {
+<span class="nc" id="L125">            logger.debug(&quot;Starting new view build. flushing base table {}.{}&quot;, baseCfs.metadata.ksName, baseCfs.name);</span>
+<span class="nc" id="L126">            lastToken = null;</span>
+
+            //We don't track the generation number anymore since if a rebuild is stopped and
+            //restarted the max generation filter may yield no sstables due to compactions.
+            //We only care about max generation *during* a build, not across builds.
+            //see CASSANDRA-13405
+<span class="nc" id="L132">            SystemKeyspace.beginViewBuild(ksname, viewName, 0);</span>
+        }
+        else
+        {
+<span class="nc" id="L136">            lastToken = buildStatus.right;</span>
+<span class="nc" id="L137">            logger.debug(&quot;Resuming view build from token {}. flushing base table {}.{}&quot;, lastToken, baseCfs.metadata.ksName, baseCfs.name);</span>
+        }
+
+<span class="nc" id="L140">        baseCfs.forceBlockingFlush();</span>
+<span class="nc" id="L141">        function = org.apache.cassandra.db.lifecycle.View.selectFunction(SSTableSet.CANONICAL);</span>
+
+<span class="nc" id="L143">        prevToken = lastToken;</span>
+<span class="nc" id="L144">        long keysBuilt = 0;</span>
+<span class="nc" id="L145">        try (Refs&lt;SSTableReader&gt; sstables = baseCfs.selectAndReference(function).refs;</span>
+<span class="nc" id="L146">             ReducingKeyIterator iter = new ReducingKeyIterator(sstables))</span>
+        {
+<span class="nc" id="L148">            SystemDistributedKeyspace.startViewBuild(ksname, viewName, localHostId);</span>
+<span class="nc bnc" id="L149" title="All 4 branches missed.">            while (!isStopRequested() &amp;&amp; iter.hasNext())</span>
+            {
+<span class="nc" id="L151">                DecoratedKey key = iter.next();</span>
+<span class="nc" id="L152">                Token token = key.getToken();</span>
+<span class="nc bnc" id="L153" title="All 4 branches missed.">                if (lastToken == null || lastToken.compareTo(token) &lt; 0)</span>
+                {
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                    for (Range&lt;Token&gt; range : ranges)</span>
+                    {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                        if (range.contains(token))</span>
+                        {
+<span class="nc" id="L159">                            buildKey(key);</span>
+<span class="nc" id="L160">                            ++keysBuilt;</span>
+
+<span class="nc bnc" id="L162" title="All 4 branches missed.">                            if (prevToken == null || prevToken.compareTo(token) != 0)</span>
+                            {
+<span class="nc" id="L164">                                SystemKeyspace.updateViewBuildStatus(ksname, viewName, key.getToken());</span>
+<span class="nc" id="L165">                                prevToken = token;</span>
+                            }
+                        }
+<span class="nc" id="L168">                    }</span>
+
+<span class="nc" id="L170">                    lastToken = null;</span>
+                }
+<span class="nc" id="L172">            }</span>
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (!isStopRequested())</span>
+            {
+<span class="nc" id="L176">                logger.debug(&quot;Marking view({}.{}) as built covered {} keys &quot;, ksname, viewName, keysBuilt);</span>
+<span class="nc" id="L177">                SystemKeyspace.finishViewBuildStatus(ksname, viewName);</span>
+<span class="nc" id="L178">                updateDistributed(ksname, viewName, localHostId);</span>
+            }
+            else
+            {
+<span class="nc" id="L182">                logger.debug(&quot;Stopped build for view({}.{}) after covering {} keys&quot;, ksname, viewName, keysBuilt);</span>
+            }
+        }
+<span class="nc" id="L185">        catch (Exception e)</span>
+        {
+<span class="nc" id="L187">            ScheduledExecutors.nonPeriodicTasks.schedule(() -&gt; CompactionManager.instance.submitViewBuilder(this),</span>
+                                                         5,
+                                                         TimeUnit.MINUTES);
+<span class="nc" id="L190">            logger.warn(&quot;Materialized View failed to complete, sleeping 5 minutes before restarting&quot;, e);</span>
+<span class="nc" id="L191">        }</span>
+<span class="nc" id="L192">    }</span>
+
+    private void updateDistributed(String ksname, String viewName, UUID localHostId)
+    {
+        try
+        {
+<span class="nc" id="L198">            SystemDistributedKeyspace.successfulViewBuild(ksname, viewName, localHostId);</span>
+<span class="nc" id="L199">            SystemKeyspace.setViewBuiltReplicated(ksname, viewName);</span>
+        }
+<span class="nc" id="L201">        catch (Exception e)</span>
+        {
+<span class="nc" id="L203">            ScheduledExecutors.nonPeriodicTasks.schedule(() -&gt; CompactionManager.instance.submitViewBuilder(this),</span>
+                                                         5,
+                                                         TimeUnit.MINUTES);
+<span class="nc" id="L206">            logger.warn(&quot;Failed to updated the distributed status of view, sleeping 5 minutes before retrying&quot;, e);</span>
+<span class="nc" id="L207">        }</span>
+<span class="nc" id="L208">    }</span>
+
+    public CompactionInfo getCompactionInfo()
+    {
+<span class="nc" id="L212">        long rangesCompleted = 0, rangesTotal = 0;</span>
+<span class="nc" id="L213">        Token lastToken = prevToken;</span>
+
+        // This approximation is not very accurate, but since we do not have a method which allows us to calculate the
+        // percentage of a range covered by a second range, this is the best approximation that we can calculate.
+        // Instead, we just count the total number of ranges that haven't been seen by the node (we use the order of
+        // the tokens to determine whether they have been seen yet or not), and the total number of ranges that a node
+        // has.
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : StorageService.instance.getLocalRanges(baseCfs.keyspace.getName()))</span>
+        {
+<span class="nc" id="L222">            rangesTotal++;</span>
+<span class="nc bnc" id="L223" title="All 4 branches missed.">             if ((lastToken != null) &amp;&amp; lastToken.compareTo(range.right) &gt; 0)</span>
+<span class="nc" id="L224">                 rangesCompleted++;</span>
+<span class="nc" id="L225">          }</span>
+<span class="nc" id="L226">         return new CompactionInfo(baseCfs.metadata, OperationType.VIEW_BUILD, rangesCompleted, rangesTotal, Unit.RANGES, compactionId);</span>
+    }
+
+    public boolean isGlobal()
+    {
+<span class="nc" id="L231">        return false;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

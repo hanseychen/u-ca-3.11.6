@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NetworkTopologyStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.locator</a> &gt; <span class="el_source">NetworkTopologyStrategy.java</span></div><h1>NetworkTopologyStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.locator;
+
+import java.net.InetAddress;
+import java.util.*;
+import java.util.Map.Entry;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.TokenMetadata.Topology;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+import com.google.common.collect.ImmutableMultimap;
+import com.google.common.collect.Multimap;
+
+/**
+ * &lt;p&gt;
+ * This Replication Strategy takes a property file that gives the intended
+ * replication factor in each datacenter.  The sum total of the datacenter
+ * replication factor values should be equal to the keyspace replication
+ * factor.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * So for example, if the keyspace replication factor is 6, the
+ * datacenter replication factors could be 3, 2, and 1 - so 3 replicas in
+ * one datacenter, 2 in another, and 1 in another - totalling 6.
+ * &lt;/p&gt;
+ * This class also caches the Endpoints and invalidates the cache if there is a
+ * change in the number of tokens.
+ */
+<span class="nc bnc" id="L51" title="All 2 branches missed.">public class NetworkTopologyStrategy extends AbstractReplicationStrategy</span>
+{
+    private final Map&lt;String, Integer&gt; datacenters;
+<span class="nc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(NetworkTopologyStrategy.class);</span>
+
+    public NetworkTopologyStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map&lt;String, String&gt; configOptions) throws ConfigurationException
+    {
+<span class="nc" id="L58">        super(keyspaceName, tokenMetadata, snitch, configOptions);</span>
+
+<span class="nc" id="L60">        Map&lt;String, Integer&gt; newDatacenters = new HashMap&lt;String, Integer&gt;();</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">        if (configOptions != null)</span>
+        {
+<span class="nc bnc" id="L63" title="All 2 branches missed.">            for (Entry&lt;String, String&gt; entry : configOptions.entrySet())</span>
+            {
+<span class="nc" id="L65">                String dc = entry.getKey();</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">                if (dc.equalsIgnoreCase(&quot;replication_factor&quot;))</span>
+<span class="nc" id="L67">                    throw new ConfigurationException(&quot;replication_factor is an option for SimpleStrategy, not NetworkTopologyStrategy&quot;);</span>
+<span class="nc" id="L68">                Integer replicas = Integer.valueOf(entry.getValue());</span>
+<span class="nc" id="L69">                newDatacenters.put(dc, replicas);</span>
+<span class="nc" id="L70">            }</span>
+        }
+
+<span class="nc" id="L73">        datacenters = Collections.unmodifiableMap(newDatacenters);</span>
+<span class="nc" id="L74">        logger.trace(&quot;Configured datacenter replicas are {}&quot;, FBUtilities.toString(datacenters));</span>
+<span class="nc" id="L75">    }</span>
+
+    /**
+     * Endpoint adder applying the replication rules for a given DC.
+     */
+<span class="nc bnc" id="L80" title="All 2 branches missed.">    private static final class DatacenterEndpoints</span>
+    {
+        /** List accepted endpoints get pushed into. */
+        Set&lt;InetAddress&gt; endpoints;
+        /**
+         * Racks encountered so far. Replicas are put into separate racks while possible.
+         * For efficiency the set is shared between the instances, using the location pair (dc, rack) to make sure
+         * clashing names aren't a problem.
+         */
+        Set&lt;Pair&lt;String, String&gt;&gt; racks;
+
+        /** Number of replicas left to fill from this DC. */
+        int rfLeft;
+        int acceptableRackRepeats;
+
+        DatacenterEndpoints(int rf, int rackCount, int nodeCount, Set&lt;InetAddress&gt; endpoints, Set&lt;Pair&lt;String, String&gt;&gt; racks)
+<span class="nc" id="L96">        {</span>
+<span class="nc" id="L97">            this.endpoints = endpoints;</span>
+<span class="nc" id="L98">            this.racks = racks;</span>
+            // If there aren't enough nodes in this DC to fill the RF, the number of nodes is the effective RF.
+<span class="nc" id="L100">            this.rfLeft = Math.min(rf, nodeCount);</span>
+            // If there aren't enough racks in this DC to fill the RF, we'll still use at least one node from each rack,
+            // and the difference is to be filled by the first encountered nodes.
+<span class="nc" id="L103">            acceptableRackRepeats = rf - rackCount;</span>
+<span class="nc" id="L104">        }</span>
+
+        /**
+         * Attempts to add an endpoint to the replicas for this datacenter, adding to the endpoints set if successful.
+         * Returns true if the endpoint was added, and this datacenter does not require further replicas.
+         */
+        boolean addEndpointAndCheckIfDone(InetAddress ep, Pair&lt;String,String&gt; location)
+        {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            if (done())</span>
+<span class="nc" id="L113">                return false;</span>
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (racks.add(location))</span>
+            {
+                // New rack.
+<span class="nc" id="L118">                --rfLeft;</span>
+<span class="nc" id="L119">                boolean added = endpoints.add(ep);</span>
+<span class="nc bnc" id="L120" title="All 4 branches missed.">                assert added;</span>
+<span class="nc" id="L121">                return done();</span>
+            }
+<span class="nc bnc" id="L123" title="All 2 branches missed.">            if (acceptableRackRepeats &lt;= 0)</span>
+                // There must be rfLeft distinct racks left, do not add any more rack repeats.
+<span class="nc" id="L125">                return false;</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">            if (!endpoints.add(ep))</span>
+                // Cannot repeat a node.
+<span class="nc" id="L128">                return false;</span>
+            // Added a node that is from an already met rack to match RF when there aren't enough racks.
+<span class="nc" id="L130">            --acceptableRackRepeats;</span>
+<span class="nc" id="L131">            --rfLeft;</span>
+<span class="nc" id="L132">            return done();</span>
+        }
+
+        boolean done()
+        {
+<span class="nc bnc" id="L137" title="All 4 branches missed.">            assert rfLeft &gt;= 0;</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            return rfLeft == 0;</span>
+        }
+    }
+
+    /**
+     * calculate endpoints in one pass through the tokens by tracking our progress in each DC.
+     */
+    public List&lt;InetAddress&gt; calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata)
+    {
+        // we want to preserve insertion order so that the first added endpoint becomes primary
+<span class="nc" id="L148">        Set&lt;InetAddress&gt; replicas = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L149">        Set&lt;Pair&lt;String, String&gt;&gt; seenRacks = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L151">        Topology topology = tokenMetadata.getTopology();</span>
+        // all endpoints in each DC, so we can check when we have exhausted all the members of a DC
+<span class="nc" id="L153">        Multimap&lt;String, InetAddress&gt; allEndpoints = topology.getDatacenterEndpoints();</span>
+        // all racks in a DC so we can check when we have exhausted all racks in a DC
+<span class="nc" id="L155">        Map&lt;String, ImmutableMultimap&lt;String, InetAddress&gt;&gt; racks = topology.getDatacenterRacks();</span>
+<span class="nc bnc" id="L156" title="All 6 branches missed.">        assert !allEndpoints.isEmpty() &amp;&amp; !racks.isEmpty() : &quot;not aware of any cluster members&quot;;</span>
+
+<span class="nc" id="L158">        int dcsToFill = 0;</span>
+<span class="nc" id="L159">        Map&lt;String, DatacenterEndpoints&gt; dcs = new HashMap&lt;&gt;(datacenters.size() * 2);</span>
+
+        // Create a DatacenterEndpoints object for each non-empty DC.
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        for (Map.Entry&lt;String, Integer&gt; en : datacenters.entrySet())</span>
+        {
+<span class="nc" id="L164">            String dc = en.getKey();</span>
+<span class="nc" id="L165">            int rf = en.getValue();</span>
+<span class="nc" id="L166">            int nodeCount = sizeOrZero(allEndpoints.get(dc));</span>
+
+<span class="nc bnc" id="L168" title="All 4 branches missed.">            if (rf &lt;= 0 || nodeCount &lt;= 0)</span>
+<span class="nc" id="L169">                continue;</span>
+
+<span class="nc" id="L171">            DatacenterEndpoints dcEndpoints = new DatacenterEndpoints(rf, sizeOrZero(racks.get(dc)), nodeCount, replicas, seenRacks);</span>
+<span class="nc" id="L172">            dcs.put(dc, dcEndpoints);</span>
+<span class="nc" id="L173">            ++dcsToFill;</span>
+<span class="nc" id="L174">        }</span>
+
+<span class="nc" id="L176">        Iterator&lt;Token&gt; tokenIter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), searchToken, false);</span>
+<span class="nc bnc" id="L177" title="All 4 branches missed.">        while (dcsToFill &gt; 0 &amp;&amp; tokenIter.hasNext())</span>
+        {
+<span class="nc" id="L179">            Token next = tokenIter.next();</span>
+<span class="nc" id="L180">            InetAddress ep = tokenMetadata.getEndpoint(next);</span>
+<span class="nc" id="L181">            Pair&lt;String, String&gt; location = topology.getLocation(ep);</span>
+<span class="nc" id="L182">            DatacenterEndpoints dcEndpoints = dcs.get(location.left);</span>
+<span class="nc bnc" id="L183" title="All 4 branches missed.">            if (dcEndpoints != null &amp;&amp; dcEndpoints.addEndpointAndCheckIfDone(ep, location))</span>
+<span class="nc" id="L184">                --dcsToFill;</span>
+<span class="nc" id="L185">        }</span>
+<span class="nc" id="L186">        return new ArrayList&lt;&gt;(replicas);</span>
+    }
+
+    private int sizeOrZero(Multimap&lt;?, ?&gt; collection)
+    {
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        return collection != null ? collection.asMap().size() : 0;</span>
+    }
+
+    private int sizeOrZero(Collection&lt;?&gt; collection)
+    {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        return collection != null ? collection.size() : 0;</span>
+    }
+
+    public int getReplicationFactor()
+    {
+<span class="nc" id="L201">        int total = 0;</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        for (int repFactor : datacenters.values())</span>
+<span class="nc" id="L203">            total += repFactor;</span>
+<span class="nc" id="L204">        return total;</span>
+    }
+
+    public int getReplicationFactor(String dc)
+    {
+<span class="nc" id="L209">        Integer replicas = datacenters.get(dc);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        return replicas == null ? 0 : replicas;</span>
+    }
+
+    public Set&lt;String&gt; getDatacenters()
+    {
+<span class="nc" id="L215">        return datacenters.keySet();</span>
+    }
+
+    public void validateOptions() throws ConfigurationException
+    {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (Entry&lt;String, String&gt; e : this.configOptions.entrySet())</span>
+        {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (e.getKey().equalsIgnoreCase(&quot;replication_factor&quot;))</span>
+<span class="nc" id="L223">                throw new ConfigurationException(&quot;replication_factor is an option for SimpleStrategy, not NetworkTopologyStrategy&quot;);</span>
+<span class="nc" id="L224">            validateReplicationFactor(e.getValue());</span>
+<span class="nc" id="L225">        }</span>
+<span class="nc" id="L226">    }</span>
+
+    @Override
+    public boolean hasSameSettings(AbstractReplicationStrategy other)
+    {
+<span class="nc bnc" id="L231" title="All 4 branches missed.">        return super.hasSameSettings(other) &amp;&amp; ((NetworkTopologyStrategy) other).datacenters.equals(datacenters);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

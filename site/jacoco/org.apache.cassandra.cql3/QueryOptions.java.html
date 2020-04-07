@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QueryOptions.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3</a> &gt; <span class="el_source">QueryOptions.java</span></div><h1>QueryOptions.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.ImmutableList;
+
+import io.netty.buffer.ByteBuf;
+
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.CBCodec;
+import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.ProtocolException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Options for a query.
+ */
+<span class="fc" id="L42">public abstract class QueryOptions</span>
+{
+<span class="fc" id="L44">    public static final QueryOptions DEFAULT = new DefaultQueryOptions(ConsistencyLevel.ONE,</span>
+<span class="fc" id="L45">                                                                       Collections.&lt;ByteBuffer&gt;emptyList(),</span>
+                                                                       false,
+<span class="fc" id="L47">                                                                       SpecificOptions.DEFAULT,</span>
+                                                                       ProtocolVersion.CURRENT);
+
+<span class="fc" id="L50">    public static final CBCodec&lt;QueryOptions&gt; codec = new Codec();</span>
+
+    // A cache of bind values parsed as JSON, see getJsonColumnValue for details.
+    private List&lt;Map&lt;ColumnIdentifier, Term&gt;&gt; jsonValuesCache;
+
+    public static QueryOptions fromThrift(ConsistencyLevel consistency, List&lt;ByteBuffer&gt; values)
+    {
+<span class="nc" id="L57">        return new DefaultQueryOptions(consistency, values, false, SpecificOptions.DEFAULT, ProtocolVersion.V3);</span>
+    }
+
+    public static QueryOptions forInternalCalls(ConsistencyLevel consistency, List&lt;ByteBuffer&gt; values)
+    {
+<span class="fc" id="L62">        return new DefaultQueryOptions(consistency, values, false, SpecificOptions.DEFAULT, ProtocolVersion.V3);</span>
+    }
+
+    public static QueryOptions forInternalCalls(List&lt;ByteBuffer&gt; values)
+    {
+<span class="nc" id="L67">        return new DefaultQueryOptions(ConsistencyLevel.ONE, values, false, SpecificOptions.DEFAULT, ProtocolVersion.V3);</span>
+    }
+
+    public static QueryOptions forProtocolVersion(ProtocolVersion protocolVersion)
+    {
+<span class="nc" id="L72">        return new DefaultQueryOptions(null, null, true, null, protocolVersion);</span>
+    }
+
+    public static QueryOptions create(ConsistencyLevel consistency, List&lt;ByteBuffer&gt; values, boolean skipMetadata, int pageSize, PagingState pagingState, ConsistencyLevel serialConsistency, ProtocolVersion version)
+    {
+<span class="nc" id="L77">        return new DefaultQueryOptions(consistency, values, skipMetadata, new SpecificOptions(pageSize, pagingState, serialConsistency, Long.MIN_VALUE), version);</span>
+    }
+
+    public static QueryOptions addColumnSpecifications(QueryOptions options, List&lt;ColumnSpecification&gt; columnSpecs)
+    {
+<span class="nc" id="L82">        return new OptionsWithColumnSpecifications(options, columnSpecs);</span>
+    }
+
+    public abstract ConsistencyLevel getConsistency();
+    public abstract List&lt;ByteBuffer&gt; getValues();
+    public abstract boolean skipMetadata();
+
+    /**
+     * Returns the term corresponding to column {@code columnName} in the JSON value of bind index {@code bindIndex}.
+     *
+     * This is functionally equivalent to:
+     *   {@code Json.parseJson(UTF8Type.instance.getSerializer().deserialize(getValues().get(bindIndex)), expectedReceivers).get(columnName)}
+     * but this cache the result of parsing the JSON so that while this might be called for multiple columns on the same {@code bindIndex}
+     * value, the underlying JSON value is only parsed/processed once.
+     *
+     * Note: this is a bit more involved in CQL specifics than this class generally is but we as we need to cache this per-query and in an object
+     * that is available when we bind values, this is the easier place to have this.
+     *
+     * @param bindIndex the index of the bind value that should be interpreted as a JSON value.
+     * @param columnName the name of the column we want the value of.
+     * @param expectedReceivers the columns expected in the JSON value at index {@code bindIndex}. This is only used when parsing the
+     * json initially and no check is done afterwards. So in practice, any call of this method on the same QueryOptions object and with the same
+     * {@code bindIndx} values should use the same value for this parameter, but this isn't validated in any way.
+     *
+     * @return the value correspong to column {@code columnName} in the (JSON) bind value at index {@code bindIndex}. This may return null if the
+     * JSON value has no value for this column.
+     */
+    public Term getJsonColumnValue(int bindIndex, ColumnIdentifier columnName, Collection&lt;ColumnDefinition&gt; expectedReceivers) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        if (jsonValuesCache == null)</span>
+<span class="nc" id="L112">            jsonValuesCache = new ArrayList&lt;&gt;(Collections.&lt;Map&lt;ColumnIdentifier, Term&gt;&gt;nCopies(getValues().size(), null));</span>
+
+<span class="nc" id="L114">        Map&lt;ColumnIdentifier, Term&gt; jsonValue = jsonValuesCache.get(bindIndex);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (jsonValue == null)</span>
+        {
+<span class="nc" id="L117">            ByteBuffer value = getValues().get(bindIndex);</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">            if (value == null)</span>
+<span class="nc" id="L119">                throw new InvalidRequestException(&quot;Got null for INSERT JSON values&quot;);</span>
+
+<span class="nc" id="L121">            jsonValue = Json.parseJson(UTF8Type.instance.getSerializer().deserialize(value), expectedReceivers);</span>
+<span class="nc" id="L122">            jsonValuesCache.set(bindIndex, jsonValue);</span>
+        }
+
+<span class="nc" id="L125">        return jsonValue.get(columnName);</span>
+    }
+
+    /**
+     * Tells whether or not this &lt;code&gt;QueryOptions&lt;/code&gt; contains the column specifications for the bound variables.
+     * &lt;p&gt;The column specifications will be present only for prepared statements.&lt;/p&gt;
+     * @return &lt;code&gt;true&lt;/code&gt; this &lt;code&gt;QueryOptions&lt;/code&gt; contains the column specifications for the bound
+     * variables, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public boolean hasColumnSpecifications()
+    {
+<span class="nc" id="L136">        return false;</span>
+    }
+
+    /**
+     * Returns the column specifications for the bound variables (&lt;i&gt;optional operation&lt;/i&gt;).
+     *
+     * &lt;p&gt;The column specifications will be present only for prepared statements.&lt;/p&gt;
+     *
+     * &lt;p&gt;Invoke the {@link hasColumnSpecifications} method before invoking this method in order to ensure that this
+     * &lt;code&gt;QueryOptions&lt;/code&gt; contains the column specifications.&lt;/p&gt;
+     *
+     * @return the option names
+     * @throws UnsupportedOperationException If this &lt;code&gt;QueryOptions&lt;/code&gt; does not contains the column
+     * specifications.
+     */
+    public ImmutableList&lt;ColumnSpecification&gt; getColumnSpecifications()
+    {
+<span class="nc" id="L153">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**  The pageSize for this query. Will be {@code &lt;= 0} if not relevant for the query.  */
+    public int getPageSize()
+    {
+<span class="fc" id="L159">        return getSpecificOptions().pageSize;</span>
+    }
+
+    /** The paging state for this query, or null if not relevant. */
+    public PagingState getPagingState()
+    {
+<span class="nc" id="L165">        return getSpecificOptions().state;</span>
+    }
+
+    /**  Serial consistency for conditional updates. */
+    public ConsistencyLevel getSerialConsistency()
+    {
+<span class="nc" id="L171">        return getSpecificOptions().serialConsistency;</span>
+    }
+
+    public long getTimestamp(QueryState state)
+    {
+<span class="fc" id="L176">        long tstamp = getSpecificOptions().timestamp;</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        return tstamp != Long.MIN_VALUE ? tstamp : state.getTimestamp();</span>
+    }
+
+    /**
+     * The protocol version for the query. Will be 3 if the object don't come from
+     * a native protocol request (i.e. it's been allocated locally or by CQL-over-thrift).
+     */
+    public abstract ProtocolVersion getProtocolVersion();
+
+    // Mainly for the sake of BatchQueryOptions
+    abstract SpecificOptions getSpecificOptions();
+
+    public QueryOptions prepare(List&lt;ColumnSpecification&gt; specs)
+    {
+<span class="fc" id="L191">        return this;</span>
+    }
+
+    static class DefaultQueryOptions extends QueryOptions
+    {
+        private final ConsistencyLevel consistency;
+        private final List&lt;ByteBuffer&gt; values;
+        private final boolean skipMetadata;
+
+        private final SpecificOptions options;
+
+        private final transient ProtocolVersion protocolVersion;
+
+        DefaultQueryOptions(ConsistencyLevel consistency, List&lt;ByteBuffer&gt; values, boolean skipMetadata, SpecificOptions options, ProtocolVersion protocolVersion)
+<span class="fc" id="L205">        {</span>
+<span class="fc" id="L206">            this.consistency = consistency;</span>
+<span class="fc" id="L207">            this.values = values;</span>
+<span class="fc" id="L208">            this.skipMetadata = skipMetadata;</span>
+<span class="fc" id="L209">            this.options = options;</span>
+<span class="fc" id="L210">            this.protocolVersion = protocolVersion;</span>
+<span class="fc" id="L211">        }</span>
+
+        public ConsistencyLevel getConsistency()
+        {
+<span class="fc" id="L215">            return consistency;</span>
+        }
+
+        public List&lt;ByteBuffer&gt; getValues()
+        {
+<span class="fc" id="L220">            return values;</span>
+        }
+
+        public boolean skipMetadata()
+        {
+<span class="nc" id="L225">            return skipMetadata;</span>
+        }
+
+        public ProtocolVersion getProtocolVersion()
+        {
+<span class="fc" id="L230">            return protocolVersion;</span>
+        }
+
+        SpecificOptions getSpecificOptions()
+        {
+<span class="fc" id="L235">            return options;</span>
+        }
+    }
+
+    static class QueryOptionsWrapper extends QueryOptions
+    {
+        protected final QueryOptions wrapped;
+
+        QueryOptionsWrapper(QueryOptions wrapped)
+<span class="nc" id="L244">        {</span>
+<span class="nc" id="L245">            this.wrapped = wrapped;</span>
+<span class="nc" id="L246">        }</span>
+
+        public List&lt;ByteBuffer&gt; getValues()
+        {
+<span class="nc" id="L250">            return this.wrapped.getValues();</span>
+        }
+
+        public ConsistencyLevel getConsistency()
+        {
+<span class="nc" id="L255">            return wrapped.getConsistency();</span>
+        }
+
+        public boolean skipMetadata()
+        {
+<span class="nc" id="L260">            return wrapped.skipMetadata();</span>
+        }
+
+        public ProtocolVersion getProtocolVersion()
+        {
+<span class="nc" id="L265">            return wrapped.getProtocolVersion();</span>
+        }
+
+        SpecificOptions getSpecificOptions()
+        {
+<span class="nc" id="L270">            return wrapped.getSpecificOptions();</span>
+        }
+
+        @Override
+        public QueryOptions prepare(List&lt;ColumnSpecification&gt; specs)
+        {
+<span class="nc" id="L276">            wrapped.prepare(specs);</span>
+<span class="nc" id="L277">            return this;</span>
+        }
+    }
+
+    /**
+     * &lt;code&gt;QueryOptions&lt;/code&gt; decorator that provides access to the column specifications.
+     */
+    static class OptionsWithColumnSpecifications extends QueryOptionsWrapper
+    {
+        private final ImmutableList&lt;ColumnSpecification&gt; columnSpecs;
+
+        OptionsWithColumnSpecifications(QueryOptions wrapped, List&lt;ColumnSpecification&gt; columnSpecs)
+        {
+<span class="nc" id="L290">            super(wrapped);</span>
+<span class="nc" id="L291">            this.columnSpecs = ImmutableList.copyOf(columnSpecs);</span>
+<span class="nc" id="L292">        }</span>
+
+        @Override
+        public boolean hasColumnSpecifications()
+        {
+<span class="nc" id="L297">            return true;</span>
+        }
+
+        @Override
+        public ImmutableList&lt;ColumnSpecification&gt; getColumnSpecifications()
+        {
+<span class="nc" id="L303">            return columnSpecs;</span>
+        }
+    }
+
+<span class="nc bnc" id="L307" title="All 2 branches missed.">    static class OptionsWithNames extends QueryOptionsWrapper</span>
+    {
+        private final List&lt;String&gt; names;
+        private List&lt;ByteBuffer&gt; orderedValues;
+
+        OptionsWithNames(DefaultQueryOptions wrapped, List&lt;String&gt; names)
+        {
+<span class="nc" id="L314">            super(wrapped);</span>
+<span class="nc" id="L315">            this.names = names;</span>
+<span class="nc" id="L316">        }</span>
+
+        @Override
+        public QueryOptions prepare(List&lt;ColumnSpecification&gt; specs)
+        {
+<span class="nc" id="L321">            super.prepare(specs);</span>
+
+<span class="nc" id="L323">            orderedValues = new ArrayList&lt;ByteBuffer&gt;(specs.size());</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            for (int i = 0; i &lt; specs.size(); i++)</span>
+            {
+<span class="nc" id="L326">                String name = specs.get(i).name.toString();</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                for (int j = 0; j &lt; names.size(); j++)</span>
+                {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                    if (name.equals(names.get(j)))</span>
+                    {
+<span class="nc" id="L331">                        orderedValues.add(wrapped.getValues().get(j));</span>
+<span class="nc" id="L332">                        break;</span>
+                    }
+                }
+            }
+<span class="nc" id="L336">            return this;</span>
+        }
+
+        @Override
+        public List&lt;ByteBuffer&gt; getValues()
+        {
+<span class="nc bnc" id="L342" title="All 4 branches missed.">            assert orderedValues != null; // We should have called prepare first!</span>
+<span class="nc" id="L343">            return orderedValues;</span>
+        }
+    }
+
+    // Options that are likely to not be present in most queries
+    static class SpecificOptions
+    {
+<span class="fc" id="L350">        private static final SpecificOptions DEFAULT = new SpecificOptions(-1, null, null, Long.MIN_VALUE);</span>
+
+        private final int pageSize;
+        private final PagingState state;
+        private final ConsistencyLevel serialConsistency;
+        private final long timestamp;
+
+        private SpecificOptions(int pageSize, PagingState state, ConsistencyLevel serialConsistency, long timestamp)
+<span class="fc" id="L358">        {</span>
+<span class="fc" id="L359">            this.pageSize = pageSize;</span>
+<span class="fc" id="L360">            this.state = state;</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            this.serialConsistency = serialConsistency == null ? ConsistencyLevel.SERIAL : serialConsistency;</span>
+<span class="fc" id="L362">            this.timestamp = timestamp;</span>
+<span class="fc" id="L363">        }</span>
+    }
+
+    private static class Codec implements CBCodec&lt;QueryOptions&gt;
+    {
+<span class="nc" id="L368">        private enum Flag</span>
+        {
+            // The order of that enum matters!!
+<span class="nc" id="L371">            VALUES,</span>
+<span class="nc" id="L372">            SKIP_METADATA,</span>
+<span class="nc" id="L373">            PAGE_SIZE,</span>
+<span class="nc" id="L374">            PAGING_STATE,</span>
+<span class="nc" id="L375">            SERIAL_CONSISTENCY,</span>
+<span class="nc" id="L376">            TIMESTAMP,</span>
+<span class="nc" id="L377">            NAMES_FOR_VALUES;</span>
+
+<span class="nc" id="L379">            private static final Flag[] ALL_VALUES = values();</span>
+
+            public static EnumSet&lt;Flag&gt; deserialize(int flags)
+            {
+<span class="nc" id="L383">                EnumSet&lt;Flag&gt; set = EnumSet.noneOf(Flag.class);</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                for (int n = 0; n &lt; ALL_VALUES.length; n++)</span>
+                {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">                    if ((flags &amp; (1 &lt;&lt; n)) != 0)</span>
+<span class="nc" id="L387">                        set.add(ALL_VALUES[n]);</span>
+                }
+<span class="nc" id="L389">                return set;</span>
+            }
+
+            public static int serialize(EnumSet&lt;Flag&gt; flags)
+            {
+<span class="nc" id="L394">                int i = 0;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                for (Flag flag : flags)</span>
+<span class="nc" id="L396">                    i |= 1 &lt;&lt; flag.ordinal();</span>
+<span class="nc" id="L397">                return i;</span>
+            }
+        }
+
+        public QueryOptions decode(ByteBuf body, ProtocolVersion version)
+        {
+<span class="nc" id="L403">            ConsistencyLevel consistency = CBUtil.readConsistencyLevel(body);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            EnumSet&lt;Flag&gt; flags = Flag.deserialize(version.isGreaterOrEqualTo(ProtocolVersion.V5)</span>
+<span class="nc" id="L405">                                                   ? (int)body.readUnsignedInt()</span>
+<span class="nc" id="L406">                                                   : (int)body.readUnsignedByte());</span>
+
+<span class="nc" id="L408">            List&lt;ByteBuffer&gt; values = Collections.&lt;ByteBuffer&gt;emptyList();</span>
+<span class="nc" id="L409">            List&lt;String&gt; names = null;</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (flags.contains(Flag.VALUES))</span>
+            {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                if (flags.contains(Flag.NAMES_FOR_VALUES))</span>
+                {
+<span class="nc" id="L414">                    Pair&lt;List&lt;String&gt;, List&lt;ByteBuffer&gt;&gt; namesAndValues = CBUtil.readNameAndValueList(body, version);</span>
+<span class="nc" id="L415">                    names = namesAndValues.left;</span>
+<span class="nc" id="L416">                    values = namesAndValues.right;</span>
+<span class="nc" id="L417">                }</span>
+                else
+                {
+<span class="nc" id="L420">                    values = CBUtil.readValueList(body, version);</span>
+                }
+            }
+
+<span class="nc" id="L424">            boolean skipMetadata = flags.contains(Flag.SKIP_METADATA);</span>
+<span class="nc" id="L425">            flags.remove(Flag.VALUES);</span>
+<span class="nc" id="L426">            flags.remove(Flag.SKIP_METADATA);</span>
+
+<span class="nc" id="L428">            SpecificOptions options = SpecificOptions.DEFAULT;</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (!flags.isEmpty())</span>
+            {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                int pageSize = flags.contains(Flag.PAGE_SIZE) ? body.readInt() : -1;</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                PagingState pagingState = flags.contains(Flag.PAGING_STATE) ? PagingState.deserialize(CBUtil.readValue(body), version) : null;</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                ConsistencyLevel serialConsistency = flags.contains(Flag.SERIAL_CONSISTENCY) ? CBUtil.readConsistencyLevel(body) : ConsistencyLevel.SERIAL;</span>
+<span class="nc" id="L434">                long timestamp = Long.MIN_VALUE;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">                if (flags.contains(Flag.TIMESTAMP))</span>
+                {
+<span class="nc" id="L437">                    long ts = body.readLong();</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                    if (ts == Long.MIN_VALUE)</span>
+<span class="nc" id="L439">                        throw new ProtocolException(String.format(&quot;Out of bound timestamp, must be in [%d, %d] (got %d)&quot;, Long.MIN_VALUE + 1, Long.MAX_VALUE, ts));</span>
+<span class="nc" id="L440">                    timestamp = ts;</span>
+                }
+
+<span class="nc" id="L443">                options = new SpecificOptions(pageSize, pagingState, serialConsistency, timestamp);</span>
+            }
+<span class="nc" id="L445">            DefaultQueryOptions opts = new DefaultQueryOptions(consistency, values, skipMetadata, options, version);</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            return names == null ? opts : new OptionsWithNames(opts, names);</span>
+        }
+
+        public void encode(QueryOptions options, ByteBuf dest, ProtocolVersion version)
+        {
+<span class="nc" id="L451">            CBUtil.writeConsistencyLevel(options.getConsistency(), dest);</span>
+
+<span class="nc" id="L453">            EnumSet&lt;Flag&gt; flags = gatherFlags(options);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))</span>
+<span class="nc" id="L455">                dest.writeInt(Flag.serialize(flags));</span>
+            else
+<span class="nc" id="L457">                dest.writeByte((byte)Flag.serialize(flags));</span>
+
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            if (flags.contains(Flag.VALUES))</span>
+<span class="nc" id="L460">                CBUtil.writeValueList(options.getValues(), dest);</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            if (flags.contains(Flag.PAGE_SIZE))</span>
+<span class="nc" id="L462">                dest.writeInt(options.getPageSize());</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (flags.contains(Flag.PAGING_STATE))</span>
+<span class="nc" id="L464">                CBUtil.writeValue(options.getPagingState().serialize(version), dest);</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (flags.contains(Flag.SERIAL_CONSISTENCY))</span>
+<span class="nc" id="L466">                CBUtil.writeConsistencyLevel(options.getSerialConsistency(), dest);</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (flags.contains(Flag.TIMESTAMP))</span>
+<span class="nc" id="L468">                dest.writeLong(options.getSpecificOptions().timestamp);</span>
+
+            // Note that we don't really have to bother with NAMES_FOR_VALUES server side,
+            // and in fact we never really encode QueryOptions, only decode them, so we
+            // don't bother.
+<span class="nc" id="L473">        }</span>
+
+        public int encodedSize(QueryOptions options, ProtocolVersion version)
+        {
+<span class="nc" id="L477">            int size = 0;</span>
+
+<span class="nc" id="L479">            size += CBUtil.sizeOfConsistencyLevel(options.getConsistency());</span>
+
+<span class="nc" id="L481">            EnumSet&lt;Flag&gt; flags = gatherFlags(options);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            size += (version.isGreaterOrEqualTo(ProtocolVersion.V5) ? 4 : 1);</span>
+
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (flags.contains(Flag.VALUES))</span>
+<span class="nc" id="L485">                size += CBUtil.sizeOfValueList(options.getValues());</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            if (flags.contains(Flag.PAGE_SIZE))</span>
+<span class="nc" id="L487">                size += 4;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            if (flags.contains(Flag.PAGING_STATE))</span>
+<span class="nc" id="L489">                size += CBUtil.sizeOfValue(options.getPagingState().serializedSize(version));</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (flags.contains(Flag.SERIAL_CONSISTENCY))</span>
+<span class="nc" id="L491">                size += CBUtil.sizeOfConsistencyLevel(options.getSerialConsistency());</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">            if (flags.contains(Flag.TIMESTAMP))</span>
+<span class="nc" id="L493">                size += 8;</span>
+
+<span class="nc" id="L495">            return size;</span>
+        }
+
+        private EnumSet&lt;Flag&gt; gatherFlags(QueryOptions options)
+        {
+<span class="nc" id="L500">            EnumSet&lt;Flag&gt; flags = EnumSet.noneOf(Flag.class);</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            if (options.getValues().size() &gt; 0)</span>
+<span class="nc" id="L502">                flags.add(Flag.VALUES);</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            if (options.skipMetadata())</span>
+<span class="nc" id="L504">                flags.add(Flag.SKIP_METADATA);</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">            if (options.getPageSize() &gt;= 0)</span>
+<span class="nc" id="L506">                flags.add(Flag.PAGE_SIZE);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            if (options.getPagingState() != null)</span>
+<span class="nc" id="L508">                flags.add(Flag.PAGING_STATE);</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (options.getSerialConsistency() != ConsistencyLevel.SERIAL)</span>
+<span class="nc" id="L510">                flags.add(Flag.SERIAL_CONSISTENCY);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            if (options.getSpecificOptions().timestamp != Long.MIN_VALUE)</span>
+<span class="nc" id="L512">                flags.add(Flag.TIMESTAMP);</span>
+<span class="nc" id="L513">            return flags;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

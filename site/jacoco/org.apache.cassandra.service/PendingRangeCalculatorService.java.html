@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PendingRangeCalculatorService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">PendingRangeCalculatorService.java</span></div><h1>PendingRangeCalculatorService.java</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service;
+
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.utils.ExecutorUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdownNow;
+
+public class PendingRangeCalculatorService
+{
+<span class="fc" id="L43">    public static final PendingRangeCalculatorService instance = new PendingRangeCalculatorService();</span>
+
+<span class="fc" id="L45">    private static Logger logger = LoggerFactory.getLogger(PendingRangeCalculatorService.class);</span>
+
+    // the executor will only run a single range calculation at a time while keeping at most one task queued in order
+    // to trigger an update only after the most recent state change and not for each update individually
+<span class="fc" id="L49">    private final JMXEnabledThreadPoolExecutor executor = new JMXEnabledThreadPoolExecutor(1, Integer.MAX_VALUE, TimeUnit.SECONDS,</span>
+            new LinkedBlockingQueue&lt;&gt;(1), new NamedThreadFactory(&quot;PendingRangeCalculator&quot;), &quot;internal&quot;);
+
+<span class="fc" id="L52">    private AtomicInteger updateJobs = new AtomicInteger(0);</span>
+
+    public PendingRangeCalculatorService()
+<span class="fc" id="L55">    {</span>
+<span class="fc" id="L56">        executor.setRejectedExecutionHandler(new RejectedExecutionHandler()</span>
+<span class="fc" id="L57">        {</span>
+            public void rejectedExecution(Runnable r, ThreadPoolExecutor e)
+            {
+<span class="nc" id="L60">                PendingRangeCalculatorService.instance.finishUpdate();</span>
+<span class="nc" id="L61">            }</span>
+        }
+        );
+<span class="fc" id="L64">    }</span>
+
+    private static class PendingRangeTask implements Runnable
+    {
+        public void run()
+        {
+            try
+            {
+<span class="fc" id="L72">                long start = System.currentTimeMillis();</span>
+<span class="fc" id="L73">                List&lt;String&gt; keyspaces = Schema.instance.getNonLocalStrategyKeyspaces();</span>
+<span class="fc bfc" id="L74" title="All 2 branches covered.">                for (String keyspaceName : keyspaces)</span>
+<span class="fc" id="L75">                    calculatePendingRanges(Keyspace.open(keyspaceName).getReplicationStrategy(), keyspaceName);</span>
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L77">                    logger.trace(&quot;Finished PendingRangeTask for {} keyspaces in {}ms&quot;, keyspaces.size(), System.currentTimeMillis() - start);</span>
+            }
+            finally
+            {
+<span class="fc" id="L81">                PendingRangeCalculatorService.instance.finishUpdate();</span>
+            }
+<span class="fc" id="L83">        }</span>
+    }
+
+    private void finishUpdate()
+    {
+<span class="fc" id="L88">        updateJobs.decrementAndGet();</span>
+<span class="fc" id="L89">    }</span>
+
+    public void update()
+    {
+<span class="fc" id="L93">        updateJobs.incrementAndGet();</span>
+<span class="fc" id="L94">        executor.submit(new PendingRangeTask());</span>
+<span class="fc" id="L95">    }</span>
+
+    public void blockUntilFinished()
+    {
+        // We want to be sure the job we're blocking for is actually finished and we can't trust the TPE's active job count
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        while (updateJobs.get() &gt; 0)</span>
+        {
+            try
+            {
+<span class="nc" id="L104">                Thread.sleep(100);</span>
+            }
+<span class="nc" id="L106">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L108">                throw new RuntimeException(e);</span>
+<span class="nc" id="L109">            }</span>
+        }
+<span class="nc" id="L111">    }</span>
+
+
+    // public &amp; static for testing purposes
+    public static void calculatePendingRanges(AbstractReplicationStrategy strategy, String keyspaceName)
+    {
+<span class="fc" id="L117">        StorageService.instance.getTokenMetadata().calculatePendingRanges(strategy, keyspaceName);</span>
+<span class="fc" id="L118">    }</span>
+
+    @VisibleForTesting
+    public void shutdownExecutor(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L123">        ExecutorUtils.shutdownNowAndWait(timeout, unit, executor);</span>
+<span class="nc" id="L124">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

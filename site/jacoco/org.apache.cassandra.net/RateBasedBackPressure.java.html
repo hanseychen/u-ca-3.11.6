@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RateBasedBackPressure.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">RateBasedBackPressure.java</span></div><h1>RateBasedBackPressure.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.net.InetAddress;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.SystemTimeSource;
+import org.apache.cassandra.utils.TimeSource;
+import org.apache.cassandra.utils.concurrent.IntervalLock;
+
+/**
+ * Back-pressure algorithm based on rate limiting according to the ratio between incoming and outgoing rates, computed
+ * over a sliding time window with size equal to write RPC timeout.
+ */
+public class RateBasedBackPressure implements BackPressureStrategy&lt;RateBasedBackPressureState&gt;
+{
+    static final String HIGH_RATIO = &quot;high_ratio&quot;;
+    static final String FACTOR = &quot;factor&quot;;
+    static final String FLOW = &quot;flow&quot;;
+    private static final String BACK_PRESSURE_HIGH_RATIO = &quot;0.90&quot;;
+    private static final String BACK_PRESSURE_FACTOR = &quot;5&quot;;
+    private static final String BACK_PRESSURE_FLOW = &quot;FAST&quot;;
+
+<span class="fc" id="L55">    private static final Logger logger = LoggerFactory.getLogger(RateBasedBackPressure.class);</span>
+<span class="fc" id="L56">    private static final NoSpamLogger tenSecsNoSpamLogger = NoSpamLogger.getLogger(logger, 10, TimeUnit.SECONDS);</span>
+<span class="fc" id="L57">    private static final NoSpamLogger oneMinNoSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+
+    protected final TimeSource timeSource;
+    protected final double highRatio;
+    protected final int factor;
+    protected final Flow flow;
+    protected final long windowSize;
+
+<span class="fc" id="L65">    private final Cache&lt;Set&lt;RateBasedBackPressureState&gt;, IntervalRateLimiter&gt; rateLimiters =</span>
+<span class="fc" id="L66">            CacheBuilder.newBuilder().expireAfterAccess(1, TimeUnit.HOURS).build();</span>
+
+<span class="fc" id="L68">    enum Flow</span>
+    {
+<span class="fc" id="L70">        FAST,</span>
+<span class="fc" id="L71">        SLOW</span>
+    }
+
+    public static ParameterizedClass withDefaultParams()
+    {
+<span class="nc" id="L76">        return new ParameterizedClass(RateBasedBackPressure.class.getName(),</span>
+<span class="nc" id="L77">                                      ImmutableMap.of(HIGH_RATIO, BACK_PRESSURE_HIGH_RATIO,</span>
+                                                      FACTOR, BACK_PRESSURE_FACTOR,
+                                                      FLOW, BACK_PRESSURE_FLOW));
+    }
+
+    public RateBasedBackPressure(Map&lt;String, Object&gt; args)
+    {
+<span class="fc" id="L84">        this(args, new SystemTimeSource(), DatabaseDescriptor.getWriteRpcTimeout());</span>
+<span class="fc" id="L85">    }</span>
+
+    @VisibleForTesting
+    public RateBasedBackPressure(Map&lt;String, Object&gt; args, TimeSource timeSource, long windowSize)
+<span class="fc" id="L89">    {</span>
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">        if (args.size() != 3)</span>
+        {
+<span class="nc" id="L92">            throw new IllegalArgumentException(RateBasedBackPressure.class.getCanonicalName()</span>
+                    + &quot; requires 3 arguments: high ratio, back-pressure factor and flow type.&quot;);
+        }
+
+        try
+        {
+<span class="fc" id="L98">            highRatio = Double.parseDouble(args.getOrDefault(HIGH_RATIO, &quot;&quot;).toString().trim());</span>
+<span class="fc" id="L99">            factor = Integer.parseInt(args.getOrDefault(FACTOR, &quot;&quot;).toString().trim());</span>
+<span class="fc" id="L100">            flow = Flow.valueOf(args.getOrDefault(FLOW, &quot;&quot;).toString().trim().toUpperCase());</span>
+        }
+<span class="nc" id="L102">        catch (Exception ex)</span>
+        {
+<span class="nc" id="L104">            throw new IllegalArgumentException(ex.getMessage(), ex);</span>
+<span class="fc" id="L105">        }</span>
+
+<span class="pc bpc" id="L107" title="2 of 4 branches missed.">        if (highRatio &lt;= 0 || highRatio &gt; 1)</span>
+        {
+<span class="nc" id="L109">            throw new IllegalArgumentException(&quot;Back-pressure high ratio must be &gt; 0 and &lt;= 1&quot;);</span>
+        }
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">        if (factor &lt; 1)</span>
+        {
+<span class="nc" id="L113">            throw new IllegalArgumentException(&quot;Back-pressure factor must be &gt;= 1&quot;);</span>
+        }
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">        if (windowSize &lt; 10)</span>
+        {
+<span class="nc" id="L117">            throw new IllegalArgumentException(&quot;Back-pressure window size must be &gt;= 10&quot;);</span>
+        }
+
+<span class="fc" id="L120">        this.timeSource = timeSource;</span>
+<span class="fc" id="L121">        this.windowSize = windowSize;</span>
+
+<span class="fc" id="L123">        logger.info(&quot;Initialized back-pressure with high ratio: {}, factor: {}, flow: {}, window size: {}.&quot;,</span>
+<span class="fc" id="L124">                    highRatio, factor, flow, windowSize);</span>
+<span class="fc" id="L125">    }</span>
+
+    @Override
+    public void apply(Set&lt;RateBasedBackPressureState&gt; states, long timeout, TimeUnit unit)
+    {
+        // Go through the back-pressure states, try updating each of them and collect min/max rates:
+<span class="nc" id="L131">        boolean isUpdated = false;</span>
+<span class="nc" id="L132">        double minRateLimit = Double.POSITIVE_INFINITY;</span>
+<span class="nc" id="L133">        double maxRateLimit = Double.NEGATIVE_INFINITY;</span>
+<span class="nc" id="L134">        double minIncomingRate = Double.POSITIVE_INFINITY;</span>
+<span class="nc" id="L135">        RateLimiter currentMin = null;</span>
+<span class="nc" id="L136">        RateLimiter currentMax = null;</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        for (RateBasedBackPressureState backPressure : states)</span>
+        {
+            // Get the incoming/outgoing rates:
+<span class="nc" id="L140">            double incomingRate = backPressure.incomingRate.get(TimeUnit.SECONDS);</span>
+<span class="nc" id="L141">            double outgoingRate = backPressure.outgoingRate.get(TimeUnit.SECONDS);</span>
+            // Compute the min incoming rate:
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            if (incomingRate &lt; minIncomingRate)</span>
+<span class="nc" id="L144">                minIncomingRate = incomingRate;</span>
+
+            // Try acquiring the interval lock:
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if (backPressure.tryIntervalLock(windowSize))</span>
+            {
+                // If acquired, proceed updating thi back-pressure state rate limit:
+<span class="nc" id="L150">                isUpdated = true;</span>
+                try
+                {
+<span class="nc" id="L153">                    RateLimiter limiter = backPressure.rateLimiter;</span>
+
+                    // If we have sent any outgoing requests during this time window, go ahead with rate limiting
+                    // (this is safe against concurrent back-pressure state updates thanks to the rw-locking in
+                    // RateBasedBackPressureState):
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                    if (outgoingRate &gt; 0)</span>
+                    {
+                        // Compute the incoming/outgoing ratio:
+<span class="nc" id="L161">                        double actualRatio = incomingRate / outgoingRate;</span>
+
+                        // If the ratio is above the high mark, try growing by the back-pressure factor:
+<span class="nc" id="L164">                        double limiterRate = limiter.getRate();</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                        if (actualRatio &gt;= highRatio)</span>
+                        {
+                            // Only if the outgoing rate is able to keep up with the rate increase:
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                            if (limiterRate &lt;= outgoingRate)</span>
+                            {
+<span class="nc" id="L170">                                double newRate = limiterRate + ((limiterRate * factor) / 100);</span>
+<span class="nc bnc" id="L171" title="All 4 branches missed.">                                if (newRate &gt; 0 &amp;&amp; newRate != Double.POSITIVE_INFINITY)</span>
+                                {
+<span class="nc" id="L173">                                    limiter.setRate(newRate);</span>
+                                }
+<span class="nc" id="L175">                            }</span>
+                        }
+                        // If below, set the rate limiter at the incoming rate, decreased by factor:
+                        else
+                        {
+                            // Only if the new rate is actually less than the actual rate:
+<span class="nc" id="L181">                            double newRate = incomingRate - ((incomingRate * factor) / 100);</span>
+<span class="nc bnc" id="L182" title="All 4 branches missed.">                            if (newRate &gt; 0 &amp;&amp; newRate &lt; limiterRate)</span>
+                            {
+<span class="nc" id="L184">                                limiter.setRate(newRate);</span>
+                            }
+                        }
+<span class="nc bnc" id="L187" title="All 2 branches missed.">                        if (logger.isTraceEnabled())</span>
+                        {
+<span class="nc" id="L189">                            logger.trace(&quot;Back-pressure state for {}: incoming rate {}, outgoing rate {}, ratio {}, rate limiting {}&quot;,</span>
+<span class="nc" id="L190">                                         backPressure.getHost(), incomingRate, outgoingRate, actualRatio, limiter.getRate());</span>
+                        }
+<span class="nc" id="L192">                    }</span>
+                    // Otherwise reset the rate limiter:
+                    else
+                    {
+<span class="nc" id="L196">                        limiter.setRate(Double.POSITIVE_INFINITY);</span>
+                    }
+
+                    // Housekeeping: pruning windows and resetting the last check timestamp!
+<span class="nc" id="L200">                    backPressure.incomingRate.prune();</span>
+<span class="nc" id="L201">                    backPressure.outgoingRate.prune();</span>
+                }
+                finally
+                {
+<span class="nc" id="L205">                    backPressure.releaseIntervalLock();</span>
+                }
+            }
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (backPressure.rateLimiter.getRate() &lt;= minRateLimit)</span>
+            {
+<span class="nc" id="L210">                minRateLimit = backPressure.rateLimiter.getRate();</span>
+<span class="nc" id="L211">                currentMin = backPressure.rateLimiter;</span>
+            }
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (backPressure.rateLimiter.getRate() &gt;= maxRateLimit)</span>
+            {
+<span class="nc" id="L215">                maxRateLimit = backPressure.rateLimiter.getRate();</span>
+<span class="nc" id="L216">                currentMax = backPressure.rateLimiter;</span>
+            }
+<span class="nc" id="L218">        }</span>
+
+        // Now find the rate limiter corresponding to the replica group represented by these back-pressure states:
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (!states.isEmpty())</span>
+        {
+            try
+            {
+                // Get the rate limiter:
+<span class="nc" id="L226">                IntervalRateLimiter rateLimiter = rateLimiters.get(states, () -&gt; new IntervalRateLimiter(timeSource));</span>
+
+                // If the back-pressure was updated and we acquire the interval lock for the rate limiter of this group:
+<span class="nc bnc" id="L229" title="All 4 branches missed.">                if (isUpdated &amp;&amp; rateLimiter.tryIntervalLock(windowSize))</span>
+                {
+                    try
+                    {
+                        // Update the rate limiter value based on the configured flow:
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                        if (flow.equals(Flow.FAST))</span>
+<span class="nc" id="L235">                            rateLimiter.limiter = currentMax;</span>
+                        else
+<span class="nc" id="L237">                            rateLimiter.limiter = currentMin;</span>
+
+<span class="nc" id="L239">                        tenSecsNoSpamLogger.info(&quot;{} currently applied for remote replicas: {}&quot;, rateLimiter.limiter, states);</span>
+                    }
+                    finally
+                    {
+<span class="nc" id="L243">                        rateLimiter.releaseIntervalLock();</span>
+                    }
+                }
+                // Assigning a single rate limiter per replica group once per window size allows the back-pressure rate
+                // limiting to be stable within the group itself.
+
+                // Finally apply the rate limit with a max pause time equal to the provided timeout minus the
+                // response time computed from the incoming rate, to reduce the number of client timeouts by taking into
+                // account how long it could take to process responses after back-pressure:
+<span class="nc" id="L252">                long responseTimeInNanos = (long) (TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS) / minIncomingRate);</span>
+<span class="nc" id="L253">                doRateLimit(rateLimiter.limiter, Math.max(0, TimeUnit.NANOSECONDS.convert(timeout, unit) - responseTimeInNanos));</span>
+            }
+<span class="nc" id="L255">            catch (ExecutionException ex)</span>
+            {
+<span class="nc" id="L257">                throw new IllegalStateException(ex);</span>
+<span class="nc" id="L258">            }</span>
+        }
+<span class="nc" id="L260">    }</span>
+
+    @Override
+    public RateBasedBackPressureState newState(InetAddress host)
+    {
+<span class="fc" id="L265">        return new RateBasedBackPressureState(host, timeSource, windowSize);</span>
+    }
+
+    @VisibleForTesting
+    RateLimiter getRateLimiterForReplicaGroup(Set&lt;RateBasedBackPressureState&gt; states)
+    {
+<span class="nc" id="L271">        IntervalRateLimiter rateLimiter = rateLimiters.getIfPresent(states);</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        return rateLimiter != null ? rateLimiter.limiter : RateLimiter.create(Double.POSITIVE_INFINITY);</span>
+    }
+
+    @VisibleForTesting
+    boolean doRateLimit(RateLimiter rateLimiter, long timeoutInNanos)
+    {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        if (!rateLimiter.tryAcquire(1, timeoutInNanos, TimeUnit.NANOSECONDS))</span>
+        {
+<span class="nc" id="L280">            timeSource.sleepUninterruptibly(timeoutInNanos, TimeUnit.NANOSECONDS);</span>
+<span class="nc" id="L281">            oneMinNoSpamLogger.info(&quot;Cannot apply {} due to exceeding write timeout, pausing {} nanoseconds instead.&quot;,</span>
+<span class="nc" id="L282">                                    rateLimiter, timeoutInNanos);</span>
+
+<span class="nc" id="L284">            return false;</span>
+        }
+
+<span class="nc" id="L287">        return true;</span>
+    }
+
+    private static class IntervalRateLimiter extends IntervalLock
+    {
+<span class="nc" id="L292">        public volatile RateLimiter limiter = RateLimiter.create(Double.POSITIVE_INFINITY);</span>
+
+        IntervalRateLimiter(TimeSource timeSource)
+        {
+<span class="nc" id="L296">            super(timeSource);</span>
+<span class="nc" id="L297">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

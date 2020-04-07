@@ -1,0 +1,523 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompressionMetadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.compress</a> &gt; <span class="el_source">CompressionMetadata.java</span></div><h1>CompressionMetadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.compress;
+
+import java.io.BufferedOutputStream;
+import java.io.DataInput;
+import java.io.DataInputStream;
+import java.io.DataOutput;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.SortedSet;
+import java.util.TreeSet;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.primitives.Longs;
+
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.Memory;
+import org.apache.cassandra.io.util.SafeMemory;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Transactional;
+import org.apache.cassandra.utils.concurrent.Ref;
+
+/**
+ * Holds metadata about compressed file
+ */
+public class CompressionMetadata
+{
+    // dataLength can represent either the true length of the file
+    // or some shorter value, in the case we want to impose a shorter limit on readers
+    // (when early opening, we want to ensure readers cannot read past fully written sections)
+    public final long dataLength;
+    public final long compressedFileLength;
+    private final Memory chunkOffsets;
+    private final long chunkOffsetsSize;
+    public final String indexFilePath;
+    public final CompressionParams parameters;
+    public final ChecksumType checksumType;
+
+    /**
+     * Create metadata about given compressed file including uncompressed data length, chunk size
+     * and list of the chunk offsets of the compressed data.
+     *
+     * This is an expensive operation! Don't create more than one for each
+     * sstable.
+     *
+     * @param dataFilePath Path to the compressed file
+     *
+     * @return metadata about given compressed file.
+     */
+    public static CompressionMetadata create(String dataFilePath)
+    {
+<span class="nc" id="L89">        Descriptor desc = Descriptor.fromFilename(dataFilePath);</span>
+<span class="nc" id="L90">        return new CompressionMetadata(desc.filenameFor(Component.COMPRESSION_INFO), new File(dataFilePath).length(), desc.version.compressedChecksumType());</span>
+    }
+
+    @VisibleForTesting
+    public CompressionMetadata(String indexFilePath, long compressedLength, ChecksumType checksumType)
+<span class="nc" id="L95">    {</span>
+<span class="nc" id="L96">        this.indexFilePath = indexFilePath;</span>
+<span class="nc" id="L97">        this.checksumType = checksumType;</span>
+
+<span class="nc" id="L99">        try (DataInputStream stream = new DataInputStream(new FileInputStream(indexFilePath)))</span>
+        {
+<span class="nc" id="L101">            String compressorName = stream.readUTF();</span>
+<span class="nc" id="L102">            int optionCount = stream.readInt();</span>
+<span class="nc" id="L103">            Map&lt;String, String&gt; options = new HashMap&lt;&gt;(optionCount);</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            for (int i = 0; i &lt; optionCount; ++i)</span>
+            {
+<span class="nc" id="L106">                String key = stream.readUTF();</span>
+<span class="nc" id="L107">                String value = stream.readUTF();</span>
+<span class="nc" id="L108">                options.put(key, value);</span>
+            }
+<span class="nc" id="L110">            int chunkLength = stream.readInt();</span>
+            try
+            {
+<span class="nc" id="L113">                parameters = new CompressionParams(compressorName, chunkLength, options);</span>
+            }
+<span class="nc" id="L115">            catch (ConfigurationException e)</span>
+            {
+<span class="nc" id="L117">                throw new RuntimeException(&quot;Cannot create CompressionParams for stored parameters&quot;, e);</span>
+<span class="nc" id="L118">            }</span>
+
+<span class="nc" id="L120">            dataLength = stream.readLong();</span>
+<span class="nc" id="L121">            compressedFileLength = compressedLength;</span>
+<span class="nc" id="L122">            chunkOffsets = readChunkOffsets(stream);</span>
+        }
+<span class="nc" id="L124">        catch (FileNotFoundException e)</span>
+        {
+<span class="nc" id="L126">            throw new RuntimeException(e);</span>
+        }
+<span class="nc" id="L128">        catch (IOException e)</span>
+        {
+<span class="nc" id="L130">            throw new CorruptSSTableException(e, indexFilePath);</span>
+<span class="nc" id="L131">        }</span>
+
+<span class="nc" id="L133">        this.chunkOffsetsSize = chunkOffsets.size();</span>
+<span class="nc" id="L134">    }</span>
+
+    private CompressionMetadata(String filePath, CompressionParams parameters, SafeMemory offsets, long offsetsSize, long dataLength, long compressedLength, ChecksumType checksumType)
+<span class="fc" id="L137">    {</span>
+<span class="fc" id="L138">        this.indexFilePath = filePath;</span>
+<span class="fc" id="L139">        this.parameters = parameters;</span>
+<span class="fc" id="L140">        this.dataLength = dataLength;</span>
+<span class="fc" id="L141">        this.compressedFileLength = compressedLength;</span>
+<span class="fc" id="L142">        this.chunkOffsets = offsets;</span>
+<span class="fc" id="L143">        this.chunkOffsetsSize = offsetsSize;</span>
+<span class="fc" id="L144">        this.checksumType = checksumType;</span>
+<span class="fc" id="L145">    }</span>
+
+    public ICompressor compressor()
+    {
+<span class="fc" id="L149">        return parameters.getSstableCompressor();</span>
+    }
+
+    public int chunkLength()
+    {
+<span class="fc" id="L154">        return parameters.chunkLength();</span>
+    }
+
+    /**
+     * Returns the amount of memory in bytes used off heap.
+     * @return the amount of memory in bytes used off heap
+     */
+    public long offHeapSize()
+    {
+<span class="nc" id="L163">        return chunkOffsets.size();</span>
+    }
+
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L168">        identities.add(chunkOffsets);</span>
+<span class="nc" id="L169">    }</span>
+
+    /**
+     * Read offsets of the individual chunks from the given input.
+     *
+     * @param input Source of the data.
+     *
+     * @return collection of the chunk offsets.
+     */
+    private Memory readChunkOffsets(DataInput input)
+    {
+        final int chunkCount;
+        try
+        {
+<span class="nc" id="L183">            chunkCount = input.readInt();</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (chunkCount &lt;= 0)</span>
+<span class="nc" id="L185">                throw new IOException(&quot;Compressed file with 0 chunks encountered: &quot; + input);</span>
+        }
+<span class="nc" id="L187">        catch (IOException e)</span>
+        {
+<span class="nc" id="L189">            throw new FSReadError(e, indexFilePath);</span>
+<span class="nc" id="L190">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L193">        Memory offsets = Memory.allocate(chunkCount * 8L);</span>
+<span class="nc" id="L194">        int i = 0;</span>
+        try
+        {
+
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            for (i = 0; i &lt; chunkCount; i++)</span>
+            {
+<span class="nc" id="L200">                offsets.setLong(i * 8L, input.readLong());</span>
+            }
+
+<span class="nc" id="L203">            return offsets;</span>
+        }
+<span class="nc" id="L205">        catch (IOException e)</span>
+        {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (offsets != null)</span>
+<span class="nc" id="L208">                offsets.close();</span>
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (e instanceof EOFException)</span>
+            {
+<span class="nc" id="L212">                String msg = String.format(&quot;Corrupted Index File %s: read %d but expected %d chunks.&quot;,</span>
+<span class="nc" id="L213">                                           indexFilePath, i, chunkCount);</span>
+<span class="nc" id="L214">                throw new CorruptSSTableException(new IOException(msg, e), indexFilePath);</span>
+            }
+<span class="nc" id="L216">            throw new FSReadError(e, indexFilePath);</span>
+        }
+    }
+
+    /**
+     * Get a chunk of compressed data (offset, length) corresponding to given position
+     *
+     * @param position Position in the file.
+     * @return pair of chunk offset and length.
+     */
+    public Chunk chunkFor(long position)
+    {
+        // position of the chunk
+<span class="fc" id="L229">        int idx = 8 * (int) (position / parameters.chunkLength());</span>
+
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        if (idx &gt;= chunkOffsetsSize)</span>
+<span class="nc" id="L232">            throw new CorruptSSTableException(new EOFException(), indexFilePath);</span>
+
+<span class="fc" id="L234">        long chunkOffset = chunkOffsets.getLong(idx);</span>
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">        long nextChunkOffset = (idx + 8 == chunkOffsetsSize)</span>
+                                ? compressedFileLength
+<span class="pc" id="L237">                                : chunkOffsets.getLong(idx + 8);</span>
+
+<span class="fc" id="L239">        return new Chunk(chunkOffset, (int) (nextChunkOffset - chunkOffset - 4)); // &quot;4&quot; bytes reserved for checksum</span>
+    }
+
+    /**
+     * @param sections Collection of sections in uncompressed file. Should not contain sections that overlap each other.
+     * @return Total chunk size in bytes for given sections including checksum.
+     */
+    public long getTotalSizeForSections(Collection&lt;Pair&lt;Long, Long&gt;&gt; sections)
+    {
+<span class="nc" id="L248">        long size = 0;</span>
+<span class="nc" id="L249">        long lastOffset = -1;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        for (Pair&lt;Long, Long&gt; section : sections)</span>
+        {
+<span class="nc" id="L252">            int startIndex = (int) (section.left / parameters.chunkLength());</span>
+<span class="nc" id="L253">            int endIndex = (int) (section.right / parameters.chunkLength());</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            endIndex = section.right % parameters.chunkLength() == 0 ? endIndex - 1 : endIndex;</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            for (int i = startIndex; i &lt;= endIndex; i++)</span>
+            {
+<span class="nc" id="L257">                long offset = i * 8L;</span>
+<span class="nc" id="L258">                long chunkOffset = chunkOffsets.getLong(offset);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                if (chunkOffset &gt; lastOffset)</span>
+                {
+<span class="nc" id="L261">                    lastOffset = chunkOffset;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                    long nextChunkOffset = offset + 8 == chunkOffsetsSize</span>
+                                                   ? compressedFileLength
+<span class="nc" id="L264">                                                   : chunkOffsets.getLong(offset + 8);</span>
+<span class="nc" id="L265">                    size += (nextChunkOffset - chunkOffset);</span>
+                }
+            }
+<span class="nc" id="L268">        }</span>
+<span class="nc" id="L269">        return size;</span>
+    }
+
+    /**
+     * @param sections Collection of sections in uncompressed file
+     * @return Array of chunks which corresponds to given sections of uncompressed file, sorted by chunk offset
+     */
+    public Chunk[] getChunksForSections(Collection&lt;Pair&lt;Long, Long&gt;&gt; sections)
+    {
+        // use SortedSet to eliminate duplicates and sort by chunk offset
+<span class="nc" id="L279">        SortedSet&lt;Chunk&gt; offsets = new TreeSet&lt;Chunk&gt;(new Comparator&lt;Chunk&gt;()</span>
+<span class="nc" id="L280">        {</span>
+            public int compare(Chunk o1, Chunk o2)
+            {
+<span class="nc" id="L283">                return Longs.compare(o1.offset, o2.offset);</span>
+            }
+        });
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        for (Pair&lt;Long, Long&gt; section : sections)</span>
+        {
+<span class="nc" id="L288">            int startIndex = (int) (section.left / parameters.chunkLength());</span>
+<span class="nc" id="L289">            int endIndex = (int) (section.right / parameters.chunkLength());</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            endIndex = section.right % parameters.chunkLength() == 0 ? endIndex - 1 : endIndex;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            for (int i = startIndex; i &lt;= endIndex; i++)</span>
+            {
+<span class="nc" id="L293">                long offset = i * 8L;</span>
+<span class="nc" id="L294">                long chunkOffset = chunkOffsets.getLong(offset);</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                long nextChunkOffset = offset + 8 == chunkOffsetsSize</span>
+                                     ? compressedFileLength
+<span class="nc" id="L297">                                     : chunkOffsets.getLong(offset + 8);</span>
+<span class="nc" id="L298">                offsets.add(new Chunk(chunkOffset, (int) (nextChunkOffset - chunkOffset - 4))); // &quot;4&quot; bytes reserved for checksum</span>
+            }
+<span class="nc" id="L300">        }</span>
+<span class="nc" id="L301">        return offsets.toArray(new Chunk[offsets.size()]);</span>
+    }
+
+    public void close()
+    {
+<span class="fc" id="L306">        chunkOffsets.close();</span>
+<span class="fc" id="L307">    }</span>
+
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">    public static class Writer extends Transactional.AbstractTransactional implements Transactional</span>
+    {
+        // path to the file
+        private final CompressionParams parameters;
+        private final String filePath;
+<span class="fc" id="L314">        private int maxCount = 100;</span>
+<span class="fc" id="L315">        private SafeMemory offsets = new SafeMemory(maxCount * 8L);</span>
+<span class="fc" id="L316">        private int count = 0;</span>
+
+        // provided by user when setDescriptor
+        private long dataLength, chunkCount;
+
+        private Writer(CompressionParams parameters, String path)
+<span class="fc" id="L322">        {</span>
+<span class="fc" id="L323">            this.parameters = parameters;</span>
+<span class="fc" id="L324">            filePath = path;</span>
+<span class="fc" id="L325">        }</span>
+
+        public static Writer open(CompressionParams parameters, String path)
+        {
+<span class="fc" id="L329">            return new Writer(parameters, path);</span>
+        }
+
+        public void addOffset(long offset)
+        {
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">            if (count == maxCount)</span>
+            {
+<span class="nc" id="L336">                SafeMemory newOffsets = offsets.copy((maxCount *= 2L) * 8L);</span>
+<span class="nc" id="L337">                offsets.close();</span>
+<span class="nc" id="L338">                offsets = newOffsets;</span>
+            }
+<span class="fc" id="L340">            offsets.setLong(8L * count++, offset);</span>
+<span class="fc" id="L341">        }</span>
+
+        private void writeHeader(DataOutput out, long dataLength, int chunks)
+        {
+            try
+            {
+<span class="fc" id="L347">                out.writeUTF(parameters.getSstableCompressor().getClass().getSimpleName());</span>
+<span class="fc" id="L348">                out.writeInt(parameters.getOtherOptions().size());</span>
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">                for (Map.Entry&lt;String, String&gt; entry : parameters.getOtherOptions().entrySet())</span>
+                {
+<span class="nc" id="L351">                    out.writeUTF(entry.getKey());</span>
+<span class="nc" id="L352">                    out.writeUTF(entry.getValue());</span>
+<span class="nc" id="L353">                }</span>
+
+                // store the length of the chunk
+<span class="fc" id="L356">                out.writeInt(parameters.chunkLength());</span>
+                // store position and reserve a place for uncompressed data length and chunks count
+<span class="fc" id="L358">                out.writeLong(dataLength);</span>
+<span class="fc" id="L359">                out.writeInt(chunks);</span>
+            }
+<span class="nc" id="L361">            catch (IOException e)</span>
+            {
+<span class="nc" id="L363">                throw new FSWriteError(e, filePath);</span>
+<span class="fc" id="L364">            }</span>
+<span class="fc" id="L365">        }</span>
+
+        // we've written everything; wire up some final metadata state
+        public Writer finalizeLength(long dataLength, int chunkCount)
+        {
+<span class="fc" id="L370">            this.dataLength = dataLength;</span>
+<span class="fc" id="L371">            this.chunkCount = chunkCount;</span>
+<span class="fc" id="L372">            return this;</span>
+        }
+
+        public void doPrepare()
+        {
+<span class="pc bpc" id="L377" title="2 of 4 branches missed.">            assert chunkCount == count;</span>
+
+            // finalize the size of memory used if it won't now change;
+            // unnecessary if already correct size
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">            if (offsets.size() != count * 8L)</span>
+            {
+<span class="fc" id="L383">                SafeMemory tmp = offsets;</span>
+<span class="fc" id="L384">                offsets = offsets.copy(count * 8L);</span>
+<span class="fc" id="L385">                tmp.free();</span>
+            }
+
+            // flush the data to disk
+<span class="fc" id="L389">            try (FileOutputStream fos = new FileOutputStream(filePath);</span>
+<span class="fc" id="L390">                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(fos)))</span>
+            {
+<span class="fc" id="L392">                writeHeader(out, dataLength, count);</span>
+<span class="fc bfc" id="L393" title="All 2 branches covered.">                for (int i = 0; i &lt; count; i++)</span>
+<span class="fc" id="L394">                    out.writeLong(offsets.getLong(i * 8L));</span>
+
+<span class="fc" id="L396">                out.flush();</span>
+<span class="fc" id="L397">                fos.getFD().sync();</span>
+            }
+<span class="nc" id="L399">            catch (IOException e)</span>
+            {
+<span class="nc" id="L401">                throw Throwables.propagate(e);</span>
+<span class="fc" id="L402">            }</span>
+<span class="fc" id="L403">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public CompressionMetadata open(long dataLength, long compressedLength)
+        {
+<span class="fc" id="L408">            SafeMemory offsets = this.offsets.sharedCopy();</span>
+
+            // calculate how many entries we need, if our dataLength is truncated
+<span class="fc" id="L411">            int count = (int) (dataLength / parameters.chunkLength());</span>
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">            if (dataLength % parameters.chunkLength() != 0)</span>
+<span class="fc" id="L413">                count++;</span>
+
+<span class="pc bpc" id="L415" title="2 of 4 branches missed.">            assert count &gt; 0;</span>
+            // grab our actual compressed length from the next offset from our the position we're opened to
+<span class="fc bfc" id="L417" title="All 2 branches covered.">            if (count &lt; this.count)</span>
+<span class="fc" id="L418">                compressedLength = offsets.getLong(count * 8L);</span>
+
+<span class="fc" id="L420">            return new CompressionMetadata(filePath, parameters, offsets, count * 8L, dataLength, compressedLength, ChecksumType.CRC32);</span>
+        }
+
+        /**
+         * Get a chunk offset by it's index.
+         *
+         * @param chunkIndex Index of the chunk.
+         *
+         * @return offset of the chunk in the compressed file.
+         */
+        public long chunkOffsetBy(int chunkIndex)
+        {
+<span class="nc" id="L432">            return offsets.getLong(chunkIndex * 8L);</span>
+        }
+
+        /**
+         * Reset the writer so that the next chunk offset written will be the
+         * one of {@code chunkIndex}.
+         *
+         * @param chunkIndex the next index to write
+         */
+        public void resetAndTruncate(int chunkIndex)
+        {
+<span class="nc" id="L443">            count = chunkIndex;</span>
+<span class="nc" id="L444">        }</span>
+
+        protected Throwable doPostCleanup(Throwable failed)
+        {
+<span class="fc" id="L448">            return offsets.close(failed);</span>
+        }
+
+        protected Throwable doCommit(Throwable accumulate)
+        {
+<span class="fc" id="L453">            return accumulate;</span>
+        }
+
+        protected Throwable doAbort(Throwable accumulate)
+        {
+<span class="nc" id="L458">            return accumulate;</span>
+        }
+    }
+
+    /**
+     * Holds offset and length of the file chunk
+     */
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">    public static class Chunk</span>
+    {
+<span class="fc" id="L467">        public static final IVersionedSerializer&lt;Chunk&gt; serializer = new ChunkSerializer();</span>
+
+        public final long offset;
+        public final int length;
+
+        public Chunk(long offset, int length)
+<span class="fc" id="L473">        {</span>
+<span class="pc bpc" id="L474" title="2 of 4 branches missed.">            assert(length &gt; 0);</span>
+
+<span class="fc" id="L476">            this.offset = offset;</span>
+<span class="fc" id="L477">            this.length = length;</span>
+<span class="fc" id="L478">        }</span>
+
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L483" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L485">            Chunk chunk = (Chunk) o;</span>
+<span class="nc bnc" id="L486" title="All 4 branches missed.">            return length == chunk.length &amp;&amp; offset == chunk.offset;</span>
+        }
+
+        public int hashCode()
+        {
+<span class="nc" id="L491">            int result = (int) (offset ^ (offset &gt;&gt;&gt; 32));</span>
+<span class="nc" id="L492">            result = 31 * result + length;</span>
+<span class="nc" id="L493">            return result;</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L498">            return String.format(&quot;Chunk&lt;offset: %d, length: %d&gt;&quot;, offset, length);</span>
+        }
+    }
+
+<span class="fc" id="L502">    static class ChunkSerializer implements IVersionedSerializer&lt;Chunk&gt;</span>
+    {
+        public void serialize(Chunk chunk, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L506">            out.writeLong(chunk.offset);</span>
+<span class="nc" id="L507">            out.writeInt(chunk.length);</span>
+<span class="nc" id="L508">        }</span>
+
+        public Chunk deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L512">            return new Chunk(in.readLong(), in.readInt());</span>
+        }
+
+        public long serializedSize(Chunk chunk, int version)
+        {
+<span class="nc" id="L517">            long size = TypeSizes.sizeof(chunk.offset);</span>
+<span class="nc" id="L518">            size += TypeSizes.sizeof(chunk.length);</span>
+<span class="nc" id="L519">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

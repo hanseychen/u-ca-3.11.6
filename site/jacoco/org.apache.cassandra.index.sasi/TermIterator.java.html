@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TermIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi</a> &gt; <span class="el_source">TermIterator.java</span></div><h1>TermIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi;
+
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
+import org.apache.cassandra.index.sasi.disk.Token;
+import org.apache.cassandra.index.sasi.plan.Expression;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.io.util.FileUtils;
+
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class TermIterator extends RangeIterator&lt;Long, Token&gt;
+{
+<span class="nc" id="L44">    private static final Logger logger = LoggerFactory.getLogger(TermIterator.class);</span>
+
+<span class="nc" id="L46">    private static final FastThreadLocal&lt;ExecutorService&gt; SEARCH_EXECUTOR = new FastThreadLocal&lt;ExecutorService&gt;()</span>
+<span class="nc" id="L47">    {</span>
+        public ExecutorService initialValue()
+        {
+<span class="nc" id="L50">            final String currentThread = Thread.currentThread().getName();</span>
+<span class="nc" id="L51">            final int concurrencyFactor = DatabaseDescriptor.searchConcurrencyFactor();</span>
+
+<span class="nc" id="L53">            logger.info(&quot;Search Concurrency Factor is set to {} for {}&quot;, concurrencyFactor, currentThread);</span>
+
+<span class="nc bnc" id="L55" title="All 2 branches missed.">            return (concurrencyFactor &lt;= 1)</span>
+<span class="nc" id="L56">                    ? MoreExecutors.newDirectExecutorService()</span>
+<span class="nc" id="L57">                    : Executors.newFixedThreadPool(concurrencyFactor, new ThreadFactory()</span>
+<span class="nc" id="L58">            {</span>
+<span class="nc" id="L59">                public final AtomicInteger count = new AtomicInteger();</span>
+
+                public Thread newThread(Runnable task)
+                {
+<span class="nc" id="L63">                    return NamedThreadFactory.createThread(task, currentThread + &quot;-SEARCH-&quot; + count.incrementAndGet(), true);</span>
+                }
+            });
+        }
+    };
+
+    private final Expression expression;
+
+    private final RangeIterator&lt;Long, Token&gt; union;
+    private final Set&lt;SSTableIndex&gt; referencedIndexes;
+
+    private TermIterator(Expression e,
+                         RangeIterator&lt;Long, Token&gt; union,
+                         Set&lt;SSTableIndex&gt; referencedIndexes)
+    {
+<span class="nc" id="L78">        super(union.getMinimum(), union.getMaximum(), union.getCount());</span>
+
+<span class="nc" id="L80">        this.expression = e;</span>
+<span class="nc" id="L81">        this.union = union;</span>
+<span class="nc" id="L82">        this.referencedIndexes = referencedIndexes;</span>
+<span class="nc" id="L83">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public static TermIterator build(final Expression e, Set&lt;SSTableIndex&gt; perSSTableIndexes)
+    {
+<span class="nc" id="L88">        final List&lt;RangeIterator&lt;Long, Token&gt;&gt; tokens = new CopyOnWriteArrayList&lt;&gt;();</span>
+<span class="nc" id="L89">        final AtomicLong tokenCount = new AtomicLong(0);</span>
+
+<span class="nc" id="L91">        RangeIterator&lt;Long, Token&gt; memtableIterator = e.index.searchMemtable(e);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (memtableIterator != null)</span>
+        {
+<span class="nc" id="L94">            tokens.add(memtableIterator);</span>
+<span class="nc" id="L95">            tokenCount.addAndGet(memtableIterator.getCount());</span>
+        }
+
+<span class="nc" id="L98">        final Set&lt;SSTableIndex&gt; referencedIndexes = new CopyOnWriteArraySet&lt;&gt;();</span>
+
+        try
+        {
+<span class="nc" id="L102">            final CountDownLatch latch = new CountDownLatch(perSSTableIndexes.size());</span>
+<span class="nc" id="L103">            final ExecutorService searchExecutor = SEARCH_EXECUTOR.get();</span>
+
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            for (final SSTableIndex index : perSSTableIndexes)</span>
+            {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">                if (e.getOp() == Expression.Op.PREFIX &amp;&amp;</span>
+<span class="nc bnc" id="L108" title="All 4 branches missed.">                    index.mode() == OnDiskIndexBuilder.Mode.CONTAINS &amp;&amp; !index.hasMarkedPartials())</span>
+<span class="nc" id="L109">                    throw new UnsupportedOperationException(String.format(&quot;The index %s has not yet been upgraded &quot; +</span>
+                                                                          &quot;to support prefix queries in CONTAINS mode. &quot; +
+                                                                          &quot;Wait for compaction or rebuild the index.&quot;,
+<span class="nc" id="L112">                                                                          index.getPath()));</span>
+
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">                if (!index.reference())</span>
+                {
+<span class="nc" id="L117">                    latch.countDown();</span>
+<span class="nc" id="L118">                    continue;</span>
+                }
+
+                // add to referenced right after the reference was acquired,
+                // that helps to release index if something goes bad inside of the search
+<span class="nc" id="L123">                referencedIndexes.add(index);</span>
+
+<span class="nc" id="L125">                searchExecutor.submit((Runnable) () -&gt; {</span>
+                    try
+                    {
+<span class="nc" id="L128">                        e.checkpoint();</span>
+
+<span class="nc" id="L130">                        RangeIterator&lt;Long, Token&gt; keyIterator = index.search(e);</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                        if (keyIterator == null)</span>
+                        {
+<span class="nc" id="L133">                            releaseIndex(referencedIndexes, index);</span>
+<span class="nc" id="L134">                            return;</span>
+                        }
+
+<span class="nc" id="L137">                        tokens.add(keyIterator);</span>
+<span class="nc" id="L138">                        tokenCount.getAndAdd(keyIterator.getCount());</span>
+                    }
+<span class="nc" id="L140">                    catch (Throwable e1)</span>
+                    {
+<span class="nc" id="L142">                        releaseIndex(referencedIndexes, index);</span>
+
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                        if (logger.isDebugEnabled())</span>
+<span class="nc" id="L145">                            logger.debug(String.format(&quot;Failed search an index %s, skipping.&quot;, index.getPath()), e1);</span>
+                    }
+                    finally
+                    {
+<span class="nc" id="L149">                        latch.countDown();</span>
+                    }
+<span class="nc" id="L151">                });</span>
+<span class="nc" id="L152">            }</span>
+
+<span class="nc" id="L154">            Uninterruptibles.awaitUninterruptibly(latch);</span>
+
+            // checkpoint right away after all indexes complete search because we might have crossed the quota
+<span class="nc" id="L157">            e.checkpoint();</span>
+
+<span class="nc" id="L159">            RangeIterator&lt;Long, Token&gt; ranges = RangeUnionIterator.build(tokens);</span>
+<span class="nc" id="L160">            return new TermIterator(e, ranges, referencedIndexes);</span>
+        }
+<span class="nc" id="L162">        catch (Throwable ex)</span>
+        {
+            // if execution quota was exceeded while opening indexes or something else happened
+            // local (yet to be tracked) indexes should be released first before re-throwing exception
+<span class="nc" id="L166">            referencedIndexes.forEach(TermIterator::releaseQuietly);</span>
+
+<span class="nc" id="L168">            throw ex;</span>
+        }
+    }
+
+    protected Token computeNext()
+    {
+        try
+        {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            return union.hasNext() ? union.next() : endOfData();</span>
+        }
+        finally
+        {
+<span class="nc" id="L180">            expression.checkpoint();</span>
+        }
+    }
+
+    protected void performSkipTo(Long nextToken)
+    {
+        try
+        {
+<span class="nc" id="L188">            union.skipTo(nextToken);</span>
+        }
+        finally
+        {
+<span class="nc" id="L192">            expression.checkpoint();</span>
+        }
+<span class="nc" id="L194">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L198">        FileUtils.closeQuietly(union);</span>
+<span class="nc" id="L199">        referencedIndexes.forEach(TermIterator::releaseQuietly);</span>
+<span class="nc" id="L200">        referencedIndexes.clear();</span>
+<span class="nc" id="L201">    }</span>
+
+    private static void releaseIndex(Set&lt;SSTableIndex&gt; indexes, SSTableIndex index)
+    {
+<span class="nc" id="L205">        indexes.remove(index);</span>
+<span class="nc" id="L206">        releaseQuietly(index);</span>
+<span class="nc" id="L207">    }</span>
+
+    private static void releaseQuietly(SSTableIndex index)
+    {
+        try
+        {
+<span class="nc" id="L213">            index.release();</span>
+        }
+<span class="nc" id="L215">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L217">            logger.error(String.format(&quot;Failed to release index %s&quot;, index.getPath()), e);</span>
+<span class="nc" id="L218">        }</span>
+<span class="nc" id="L219">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

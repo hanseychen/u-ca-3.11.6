@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IndexSummaryBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">IndexSummaryBuilder.java</span></div><h1>IndexSummaryBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.IOException;
+import java.nio.ByteOrder;
+import java.util.Map;
+import java.util.TreeMap;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.util.Memory;
+import org.apache.cassandra.io.util.SafeMemoryWriter;
+
+import static org.apache.cassandra.io.sstable.Downsampling.BASE_SAMPLING_LEVEL;
+
+<span class="pc bpc" id="L37" title="1 of 2 branches missed.">public class IndexSummaryBuilder implements AutoCloseable</span>
+{
+<span class="fc" id="L39">    private static final Logger logger = LoggerFactory.getLogger(IndexSummaryBuilder.class);</span>
+
+    static final String defaultExpectedKeySizeName = Config.PROPERTY_PREFIX + &quot;index_summary_expected_key_size&quot;;
+<span class="fc" id="L42">    static long defaultExpectedKeySize = Long.valueOf(System.getProperty(defaultExpectedKeySizeName, &quot;64&quot;));</span>
+
+    // the offset in the keys memory region to look for a given summary boundary
+    private final SafeMemoryWriter offsets;
+    private final SafeMemoryWriter entries;
+
+    private final int minIndexInterval;
+    private final int samplingLevel;
+    private final int[] startPoints;
+<span class="fc" id="L51">    private long keysWritten = 0;</span>
+<span class="fc" id="L52">    private long indexIntervalMatches = 0;</span>
+    private long nextSamplePosition;
+
+    // for each ReadableBoundary, we map its dataLength property to itself, permitting us to lookup the
+    // last readable boundary from the perspective of the data file
+    // [data file position limit] =&gt; [ReadableBoundary]
+<span class="fc" id="L58">    private TreeMap&lt;Long, ReadableBoundary&gt; lastReadableByData = new TreeMap&lt;&gt;();</span>
+    // for each ReadableBoundary, we map its indexLength property to itself, permitting us to lookup the
+    // last readable boundary from the perspective of the index file
+    // [index file position limit] =&gt; [ReadableBoundary]
+<span class="fc" id="L62">    private TreeMap&lt;Long, ReadableBoundary&gt; lastReadableByIndex = new TreeMap&lt;&gt;();</span>
+    // the last synced data file position
+    private long dataSyncPosition;
+    // the last synced index file position
+    private long indexSyncPosition;
+
+    // the last summary interval boundary that is fully readable in both data and index files
+    private ReadableBoundary lastReadableBoundary;
+
+    /**
+     * Represents a boundary that is guaranteed fully readable in the summary, index file and data file.
+     * The key contained is the last key readable if the index and data files have been flushed to the
+     * stored lengths.
+     */
+    public static class ReadableBoundary
+    {
+        public final DecoratedKey lastKey;
+        public final long indexLength;
+        public final long dataLength;
+        public final int summaryCount;
+        public final long entriesLength;
+        public ReadableBoundary(DecoratedKey lastKey, long indexLength, long dataLength, int summaryCount, long entriesLength)
+<span class="nc" id="L84">        {</span>
+<span class="nc" id="L85">            this.lastKey = lastKey;</span>
+<span class="nc" id="L86">            this.indexLength = indexLength;</span>
+<span class="nc" id="L87">            this.dataLength = dataLength;</span>
+<span class="nc" id="L88">            this.summaryCount = summaryCount;</span>
+<span class="nc" id="L89">            this.entriesLength = entriesLength;</span>
+<span class="nc" id="L90">        }</span>
+    }
+
+    /**
+     * Build an index summary builder.
+     *
+     * @param expectedKeys - the number of keys we expect in the sstable
+     * @param minIndexInterval - the minimum interval between entries selected for sampling
+     * @param samplingLevel - the level at which entries are sampled
+     */
+    public IndexSummaryBuilder(long expectedKeys, int minIndexInterval, int samplingLevel)
+<span class="fc" id="L101">    {</span>
+<span class="fc" id="L102">        this.samplingLevel = samplingLevel;</span>
+<span class="fc" id="L103">        this.startPoints = Downsampling.getStartPoints(BASE_SAMPLING_LEVEL, samplingLevel);</span>
+
+<span class="fc" id="L105">        long expectedEntrySize = getEntrySize(defaultExpectedKeySize);</span>
+<span class="fc" id="L106">        long maxExpectedEntries = expectedKeys / minIndexInterval;</span>
+<span class="fc" id="L107">        long maxExpectedEntriesSize = maxExpectedEntries * expectedEntrySize;</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        if (maxExpectedEntriesSize &gt; Integer.MAX_VALUE)</span>
+        {
+            // that's a _lot_ of keys, and a very low min index interval
+<span class="nc" id="L111">            int effectiveMinInterval = (int) Math.ceil((double)(expectedKeys * expectedEntrySize) / Integer.MAX_VALUE);</span>
+<span class="nc" id="L112">            maxExpectedEntries = expectedKeys / effectiveMinInterval;</span>
+<span class="nc" id="L113">            maxExpectedEntriesSize = maxExpectedEntries * expectedEntrySize;</span>
+<span class="nc bnc" id="L114" title="All 4 branches missed.">            assert maxExpectedEntriesSize &lt;= Integer.MAX_VALUE : maxExpectedEntriesSize;</span>
+<span class="nc" id="L115">            logger.warn(&quot;min_index_interval of {} is too low for {} expected keys of avg size {}; using interval of {} instead&quot;,</span>
+<span class="nc" id="L116">                        minIndexInterval, expectedKeys, defaultExpectedKeySize, effectiveMinInterval);</span>
+<span class="nc" id="L117">            this.minIndexInterval = effectiveMinInterval;</span>
+<span class="nc" id="L118">        }</span>
+        else
+        {
+<span class="fc" id="L121">            this.minIndexInterval = minIndexInterval;</span>
+        }
+
+        // for initializing data structures, adjust our estimates based on the sampling level
+<span class="fc" id="L125">        maxExpectedEntries = Math.max(1, (maxExpectedEntries * samplingLevel) / BASE_SAMPLING_LEVEL);</span>
+<span class="fc" id="L126">        offsets = new SafeMemoryWriter(4 * maxExpectedEntries).order(ByteOrder.nativeOrder());</span>
+<span class="fc" id="L127">        entries = new SafeMemoryWriter(expectedEntrySize * maxExpectedEntries).order(ByteOrder.nativeOrder());</span>
+
+        // the summary will always contain the first index entry (downsampling will never remove it)
+<span class="fc" id="L130">        nextSamplePosition = 0;</span>
+<span class="fc" id="L131">        indexIntervalMatches++;</span>
+<span class="fc" id="L132">    }</span>
+
+    /**
+     * Given a key, return how long the serialized index summary entry will be.
+     */
+    private static long getEntrySize(DecoratedKey key)
+    {
+<span class="fc" id="L139">        return getEntrySize(key.getKey().remaining());</span>
+    }
+
+    /**
+     * Given a key size, return how long the serialized index summary entry will be, that is add 8 bytes to
+     * accomodate for the size of the position.
+     */
+    private static long getEntrySize(long keySize)
+    {
+<span class="fc" id="L148">        return keySize + TypeSizes.sizeof(0L);</span>
+    }
+
+    // the index file has been flushed to the provided position; stash it and use that to recalculate our max readable boundary
+    public void markIndexSynced(long upToPosition)
+    {
+<span class="fc" id="L154">        indexSyncPosition = upToPosition;</span>
+<span class="fc" id="L155">        refreshReadableBoundary();</span>
+<span class="fc" id="L156">    }</span>
+
+    // the data file has been flushed to the provided position; stash it and use that to recalculate our max readable boundary
+    public void markDataSynced(long upToPosition)
+    {
+<span class="fc" id="L161">        dataSyncPosition = upToPosition;</span>
+<span class="fc" id="L162">        refreshReadableBoundary();</span>
+<span class="fc" id="L163">    }</span>
+
+    private void refreshReadableBoundary()
+    {
+        // grab the readable boundary prior to the given position in either the data or index file
+<span class="fc" id="L168">        Map.Entry&lt;?, ReadableBoundary&gt; byData = lastReadableByData.floorEntry(dataSyncPosition);</span>
+<span class="fc" id="L169">        Map.Entry&lt;?, ReadableBoundary&gt; byIndex = lastReadableByIndex.floorEntry(indexSyncPosition);</span>
+<span class="pc bpc" id="L170" title="3 of 4 branches missed.">        if (byData == null || byIndex == null)</span>
+<span class="fc" id="L171">            return;</span>
+
+        // take the lowest of the two, and stash it
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        lastReadableBoundary = byIndex.getValue().indexLength &lt; byData.getValue().indexLength</span>
+<span class="nc" id="L175">                               ? byIndex.getValue() : byData.getValue();</span>
+
+        // clear our data prior to this, since we no longer need it
+<span class="nc" id="L178">        lastReadableByData.headMap(lastReadableBoundary.dataLength, false).clear();</span>
+<span class="nc" id="L179">        lastReadableByIndex.headMap(lastReadableBoundary.indexLength, false).clear();</span>
+<span class="nc" id="L180">    }</span>
+
+    public ReadableBoundary getLastReadableBoundary()
+    {
+<span class="nc" id="L184">        return lastReadableBoundary;</span>
+    }
+
+    public IndexSummaryBuilder maybeAddEntry(DecoratedKey decoratedKey, long indexStart) throws IOException
+    {
+<span class="nc" id="L189">        return maybeAddEntry(decoratedKey, indexStart, 0, 0);</span>
+    }
+
+    /**
+     *
+     * @param decoratedKey the key for this record
+     * @param indexStart the position in the index file this record begins
+     * @param indexEnd the position in the index file we need to be able to read to (exclusive) to read this record
+     * @param dataEnd the position in the data file we need to be able to read to (exclusive) to read this record
+     *                a value of 0 indicates we are not tracking readable boundaries
+     */
+    public IndexSummaryBuilder maybeAddEntry(DecoratedKey decoratedKey, long indexStart, long indexEnd, long dataEnd) throws IOException
+    {
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        if (keysWritten == nextSamplePosition)</span>
+        {
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">            if ((entries.length() + getEntrySize(decoratedKey)) &lt;= Integer.MAX_VALUE)</span>
+            {
+<span class="fc" id="L206">                offsets.writeInt((int) entries.length());</span>
+<span class="fc" id="L207">                entries.write(decoratedKey.getKey());</span>
+<span class="fc" id="L208">                entries.writeLong(indexStart);</span>
+<span class="fc" id="L209">                setNextSamplePosition(keysWritten);</span>
+            }
+            else
+            {
+                // we cannot fully sample this sstable due to too much memory in the index summary, so let's tell the user
+<span class="nc" id="L214">                logger.error(&quot;Memory capacity of index summary exceeded (2GB), index summary will not cover full sstable, &quot; +</span>
+                             &quot;you should increase min_sampling_level&quot;);
+            }
+        }
+<span class="pc bpc" id="L218" title="2 of 4 branches missed.">        else if (dataEnd != 0 &amp;&amp; keysWritten + 1 == nextSamplePosition)</span>
+        {
+            // this is the last key in this summary interval, so stash it
+<span class="nc" id="L221">            ReadableBoundary boundary = new ReadableBoundary(decoratedKey, indexEnd, dataEnd, (int) (offsets.length() / 4), entries.length());</span>
+<span class="nc" id="L222">            lastReadableByData.put(dataEnd, boundary);</span>
+<span class="nc" id="L223">            lastReadableByIndex.put(indexEnd, boundary);</span>
+        }
+
+<span class="fc" id="L226">        keysWritten++;</span>
+<span class="fc" id="L227">        return this;</span>
+    }
+
+    // calculate the next key we will store to our summary
+    private void setNextSamplePosition(long position)
+    {
+        tryAgain: while (true)
+        {
+<span class="fc" id="L235">            position += minIndexInterval;</span>
+<span class="fc" id="L236">            long test = indexIntervalMatches++;</span>
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">            for (int start : startPoints)</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                if ((test - start) % BASE_SAMPLING_LEVEL == 0)</span>
+<span class="nc" id="L239">                    continue tryAgain;</span>
+
+<span class="fc" id="L241">            nextSamplePosition = position;</span>
+<span class="fc" id="L242">            return;</span>
+        }
+    }
+
+    public void prepareToCommit()
+    {
+        // this method should only be called when we've finished appending records, so we truncate the
+        // memory we're using to the exact amount required to represent it before building our summary
+<span class="fc" id="L250">        entries.trim();</span>
+<span class="fc" id="L251">        offsets.trim();</span>
+<span class="fc" id="L252">    }</span>
+
+    public IndexSummary build(IPartitioner partitioner)
+    {
+<span class="fc" id="L256">        return build(partitioner, null);</span>
+    }
+
+    // build the summary up to the provided boundary; this is backed by shared memory between
+    // multiple invocations of this build method
+    public IndexSummary build(IPartitioner partitioner, ReadableBoundary boundary)
+    {
+<span class="pc bpc" id="L263" title="2 of 4 branches missed.">        assert entries.length() &gt; 0;</span>
+
+<span class="fc" id="L265">        int count = (int) (offsets.length() / 4);</span>
+<span class="fc" id="L266">        long entriesLength = entries.length();</span>
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">        if (boundary != null)</span>
+        {
+<span class="nc" id="L269">            count = boundary.summaryCount;</span>
+<span class="nc" id="L270">            entriesLength = boundary.entriesLength;</span>
+        }
+
+<span class="fc" id="L273">        int sizeAtFullSampling = (int) Math.ceil(keysWritten / (double) minIndexInterval);</span>
+<span class="pc bpc" id="L274" title="2 of 4 branches missed.">        assert count &gt; 0;</span>
+<span class="fc" id="L275">        return new IndexSummary(partitioner, offsets.currentBuffer().sharedCopy(),</span>
+<span class="fc" id="L276">                                count, entries.currentBuffer().sharedCopy(), entriesLength,</span>
+                                sizeAtFullSampling, minIndexInterval, samplingLevel);
+    }
+
+    // close the builder and release any associated memory
+    public void close()
+    {
+<span class="nc" id="L283">        entries.close();</span>
+<span class="nc" id="L284">        offsets.close();</span>
+<span class="nc" id="L285">    }</span>
+
+    public Throwable close(Throwable accumulate)
+    {
+<span class="fc" id="L289">        accumulate = entries.close(accumulate);</span>
+<span class="fc" id="L290">        accumulate = offsets.close(accumulate);</span>
+<span class="fc" id="L291">        return accumulate;</span>
+    }
+
+    static int entriesAtSamplingLevel(int samplingLevel, int maxSummarySize)
+    {
+<span class="nc" id="L296">        return (int) Math.ceil((samplingLevel * maxSummarySize) / (double) BASE_SAMPLING_LEVEL);</span>
+    }
+
+    static int calculateSamplingLevel(int currentSamplingLevel, int currentNumEntries, long targetNumEntries, int minIndexInterval, int maxIndexInterval)
+    {
+        // effective index interval == (BASE_SAMPLING_LEVEL / samplingLevel) * minIndexInterval
+        // so we can just solve for minSamplingLevel here:
+        // maxIndexInterval == (BASE_SAMPLING_LEVEL / minSamplingLevel) * minIndexInterval
+<span class="nc" id="L304">        int effectiveMinSamplingLevel = Math.max(1, (int) Math.ceil((BASE_SAMPLING_LEVEL * minIndexInterval) / (double) maxIndexInterval));</span>
+
+        // Algebraic explanation for calculating the new sampling level (solve for newSamplingLevel):
+        // originalNumEntries = (baseSamplingLevel / currentSamplingLevel) * currentNumEntries
+        // newSpaceUsed = (newSamplingLevel / baseSamplingLevel) * originalNumEntries
+        // newSpaceUsed = (newSamplingLevel / baseSamplingLevel) * (baseSamplingLevel / currentSamplingLevel) * currentNumEntries
+        // newSpaceUsed = (newSamplingLevel / currentSamplingLevel) * currentNumEntries
+        // (newSpaceUsed * currentSamplingLevel) / currentNumEntries = newSamplingLevel
+<span class="nc" id="L312">        int newSamplingLevel = (int) (targetNumEntries * currentSamplingLevel) / currentNumEntries;</span>
+<span class="nc" id="L313">        return Math.min(BASE_SAMPLING_LEVEL, Math.max(effectiveMinSamplingLevel, newSamplingLevel));</span>
+    }
+
+    /**
+     * Downsamples an existing index summary to a new sampling level.
+     * @param existing an existing IndexSummary
+     * @param newSamplingLevel the target level for the new IndexSummary.  This must be less than the current sampling
+     *                         level for `existing`.
+     * @param partitioner the partitioner used for the index summary
+     * @return a new IndexSummary
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public static IndexSummary downsample(IndexSummary existing, int newSamplingLevel, int minIndexInterval, IPartitioner partitioner)
+    {
+        // To downsample the old index summary, we'll go through (potentially) several rounds of downsampling.
+        // Conceptually, each round starts at position X and then removes every Nth item.  The value of X follows
+        // a particular pattern to evenly space out the items that we remove.  The value of N decreases by one each
+        // round.
+
+<span class="nc" id="L332">        int currentSamplingLevel = existing.getSamplingLevel();</span>
+<span class="nc bnc" id="L333" title="All 4 branches missed.">        assert currentSamplingLevel &gt; newSamplingLevel;</span>
+<span class="nc bnc" id="L334" title="All 4 branches missed.">        assert minIndexInterval == existing.getMinIndexInterval();</span>
+
+        // calculate starting indexes for downsampling rounds
+<span class="nc" id="L337">        int[] startPoints = Downsampling.getStartPoints(currentSamplingLevel, newSamplingLevel);</span>
+
+        // calculate new off-heap size
+<span class="nc" id="L340">        int newKeyCount = existing.size();</span>
+<span class="nc" id="L341">        long newEntriesLength = existing.getEntriesLength();</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        for (int start : startPoints)</span>
+        {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">            for (int j = start; j &lt; existing.size(); j += currentSamplingLevel)</span>
+            {
+<span class="nc" id="L346">                newKeyCount--;</span>
+<span class="nc" id="L347">                long length = existing.getEndInSummary(j) - existing.getPositionInSummary(j);</span>
+<span class="nc" id="L348">                newEntriesLength -= length;</span>
+            }
+        }
+
+<span class="nc" id="L352">        Memory oldEntries = existing.getEntries();</span>
+<span class="nc" id="L353">        Memory newOffsets = Memory.allocate(newKeyCount * 4);</span>
+<span class="nc" id="L354">        Memory newEntries = Memory.allocate(newEntriesLength);</span>
+
+        // Copy old entries to our new Memory.
+<span class="nc" id="L357">        int i = 0;</span>
+<span class="nc" id="L358">        int newEntriesOffset = 0;</span>
+        outer:
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        for (int oldSummaryIndex = 0; oldSummaryIndex &lt; existing.size(); oldSummaryIndex++)</span>
+        {
+            // to determine if we can skip this entry, go through the starting points for our downsampling rounds
+            // and see if the entry's index is covered by that round
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            for (int start : startPoints)</span>
+            {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                if ((oldSummaryIndex - start) % currentSamplingLevel == 0)</span>
+<span class="nc" id="L367">                    continue outer;</span>
+            }
+
+            // write the position of the actual entry in the index summary (4 bytes)
+<span class="nc" id="L371">            newOffsets.setInt(i * 4, newEntriesOffset);</span>
+<span class="nc" id="L372">            i++;</span>
+<span class="nc" id="L373">            long start = existing.getPositionInSummary(oldSummaryIndex);</span>
+<span class="nc" id="L374">            long length = existing.getEndInSummary(oldSummaryIndex) - start;</span>
+<span class="nc" id="L375">            newEntries.put(newEntriesOffset, oldEntries, start, length);</span>
+<span class="nc" id="L376">            newEntriesOffset += length;</span>
+        }
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        assert newEntriesOffset == newEntriesLength;</span>
+<span class="nc" id="L379">        return new IndexSummary(partitioner, newOffsets, newKeyCount, newEntries, newEntriesLength,</span>
+<span class="nc" id="L380">                                existing.getMaxNumberOfEntries(), minIndexInterval, newSamplingLevel);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

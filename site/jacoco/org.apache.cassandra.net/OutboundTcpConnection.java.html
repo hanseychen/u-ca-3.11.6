@@ -1,0 +1,688 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundTcpConnection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundTcpConnection.java</span></div><h1>OutboundTcpConnection.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.DataInputStream;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
+import java.util.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.Checksum;
+
+import javax.net.ssl.SSLHandshakeException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocalThread;
+import net.jpountz.lz4.LZ4BlockOutputStream;
+import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.xxhash.XXHashFactory;
+
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
+import org.apache.cassandra.io.util.WrappedDataOutputStreamPlus;
+import org.apache.cassandra.tracing.TraceState;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.CoalescingStrategies;
+import org.apache.cassandra.utils.CoalescingStrategies.Coalescable;
+import org.apache.cassandra.utils.CoalescingStrategies.CoalescingStrategy;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.NanoTimeToCurrentTimeMillis;
+import org.apache.cassandra.utils.UUIDGen;
+import org.xerial.snappy.SnappyOutputStream;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+public class OutboundTcpConnection extends FastThreadLocalThread
+{
+<span class="fc" id="L72">    private static final Logger logger = LoggerFactory.getLogger(OutboundTcpConnection.class);</span>
+
+    private static final String PREFIX = Config.PROPERTY_PREFIX;
+
+    /*
+     * Enabled/disable TCP_NODELAY for intradc connections. Defaults to enabled.
+     */
+    private static final String INTRADC_TCP_NODELAY_PROPERTY = PREFIX + &quot;otc_intradc_tcp_nodelay&quot;;
+<span class="fc" id="L80">    private static final boolean INTRADC_TCP_NODELAY = Boolean.parseBoolean(System.getProperty(INTRADC_TCP_NODELAY_PROPERTY, &quot;true&quot;));</span>
+
+    /*
+     * Size of buffer in output stream
+     */
+    private static final String BUFFER_SIZE_PROPERTY = PREFIX + &quot;otc_buffer_size&quot;;
+<span class="fc" id="L86">    private static final int BUFFER_SIZE = Integer.getInteger(BUFFER_SIZE_PROPERTY, 1024 * 64);</span>
+
+    public static final int MAX_COALESCED_MESSAGES = 128;
+
+    private static CoalescingStrategy newCoalescingStrategy(String displayName)
+    {
+<span class="fc" id="L92">        return CoalescingStrategies.newCoalescingStrategy(DatabaseDescriptor.getOtcCoalescingStrategy(),</span>
+<span class="fc" id="L93">                                                          DatabaseDescriptor.getOtcCoalescingWindow(),</span>
+                                                          logger,
+                                                          displayName);
+    }
+
+    static
+    {
+<span class="fc" id="L100">        String strategy = DatabaseDescriptor.getOtcCoalescingStrategy();</span>
+<span class="pc bpc" id="L101" title="2 of 3 branches missed.">        switch (strategy)</span>
+        {
+        case &quot;TIMEHORIZON&quot;:
+<span class="nc" id="L104">            break;</span>
+        case &quot;MOVINGAVERAGE&quot;:
+        case &quot;FIXED&quot;:
+        case &quot;DISABLED&quot;:
+<span class="fc" id="L108">            logger.info(&quot;OutboundTcpConnection using coalescing strategy {}&quot;, strategy);</span>
+<span class="fc" id="L109">            break;</span>
+            default:
+                //Check that it can be loaded
+<span class="nc" id="L112">                newCoalescingStrategy(&quot;dummy&quot;);</span>
+        }
+
+<span class="fc" id="L115">        int coalescingWindow = DatabaseDescriptor.getOtcCoalescingWindow();</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        if (coalescingWindow != Config.otc_coalescing_window_us_default)</span>
+<span class="nc" id="L117">            logger.info(&quot;OutboundTcpConnection coalescing window set to {}μs&quot;, coalescingWindow);</span>
+
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">        if (coalescingWindow &lt; 0)</span>
+<span class="nc" id="L120">            throw new ExceptionInInitializerError(</span>
+                    &quot;Value provided for coalescing window must be greater than 0: &quot; + coalescingWindow);
+
+<span class="fc" id="L123">        int otc_backlog_expiration_interval_in_ms = DatabaseDescriptor.getOtcBacklogExpirationInterval();</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">        if (otc_backlog_expiration_interval_in_ms != Config.otc_backlog_expiration_interval_ms_default)</span>
+<span class="nc" id="L125">            logger.info(&quot;OutboundTcpConnection backlog expiration interval set to to {}ms&quot;, otc_backlog_expiration_interval_in_ms);</span>
+    }
+
+<span class="fc" id="L128">    private static final MessageOut&lt;?&gt; CLOSE_SENTINEL = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE);</span>
+<span class="fc" id="L129">    private volatile boolean isStopped = false;</span>
+
+    private static final int OPEN_RETRY_DELAY = 100; // ms between retries
+    public static final int WAIT_FOR_VERSION_MAX_TIME = 5000;
+    private static final int NO_VERSION = Integer.MIN_VALUE;
+
+    static final int LZ4_HASH_SEED = 0x9747b28c;
+
+<span class="fc" id="L137">    private final BlockingQueue&lt;QueuedMessage&gt; backlog = new LinkedBlockingQueue&lt;&gt;();</span>
+    private static final String BACKLOG_PURGE_SIZE_PROPERTY = PREFIX + &quot;otc_backlog_purge_size&quot;;
+    @VisibleForTesting
+<span class="fc" id="L140">    static final int BACKLOG_PURGE_SIZE = Integer.getInteger(BACKLOG_PURGE_SIZE_PROPERTY, 1024);</span>
+<span class="fc" id="L141">    private final AtomicBoolean backlogExpirationActive = new AtomicBoolean(false);</span>
+    private volatile long backlogNextExpirationTime;
+
+    private final OutboundTcpConnectionPool poolReference;
+
+    private final CoalescingStrategy cs;
+    private DataOutputStreamPlus out;
+    private Socket socket;
+    private volatile long completed;
+<span class="fc" id="L150">    private final AtomicLong dropped = new AtomicLong();</span>
+<span class="fc" id="L151">    private volatile int currentMsgBufferCount = 0;</span>
+    private volatile int targetVersion;
+
+    public OutboundTcpConnection(OutboundTcpConnectionPool pool, String name)
+    {
+<span class="fc" id="L156">        super(&quot;MessagingService-Outgoing-&quot; + pool.endPoint() + &quot;-&quot; + name);</span>
+<span class="fc" id="L157">        this.poolReference = pool;</span>
+<span class="fc" id="L158">        cs = newCoalescingStrategy(pool.endPoint().getHostAddress());</span>
+
+        // We want to use the most precise version we know because while there is version detection on connect(),
+        // the target version might be accessed by the pool (in getConnection()) before we actually connect (as we
+        // connect when the first message is submitted). Note however that the only case where we'll connect
+        // without knowing the true version of a node is if that node is a seed (otherwise, we can't know a node
+        // unless it has been gossiped to us or it has connected to us and in both case this sets the version) and
+        // in that case we won't rely on that targetVersion before we're actually connected and so the version
+        // detection in connect() will do its job.
+<span class="fc" id="L167">        targetVersion = MessagingService.instance().getVersion(pool.endPoint());</span>
+<span class="fc" id="L168">    }</span>
+
+    private static boolean isLocalDC(InetAddress targetHost)
+    {
+<span class="fc" id="L172">        String remoteDC = DatabaseDescriptor.getEndpointSnitch().getDatacenter(targetHost);</span>
+<span class="fc" id="L173">        String localDC = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());</span>
+<span class="fc" id="L174">        return remoteDC.equals(localDC);</span>
+    }
+
+    public void enqueue(MessageOut&lt;?&gt; message, int id)
+    {
+<span class="fc" id="L179">        long nanoTime = System.nanoTime();</span>
+<span class="fc" id="L180">        expireMessages(nanoTime);</span>
+        try
+        {
+<span class="fc" id="L183">            backlog.put(new QueuedMessage(message, id, nanoTime));</span>
+        }
+<span class="nc" id="L185">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L187">            throw new AssertionError(e);</span>
+<span class="fc" id="L188">        }</span>
+<span class="fc" id="L189">    }</span>
+
+    /**
+     * This is a helper method for unit testing. Disclaimer: Do not use this method outside unit tests, as
+     * this method is iterating the queue which can be an expensive operation (CPU time, queue locking).
+     * 
+     * @return true, if the queue contains at least one expired element
+     */
+    @VisibleForTesting // (otherwise = VisibleForTesting.NONE)
+    boolean backlogContainsExpiredMessages(long nowNanos)
+    {
+<span class="nc" id="L200">        return backlog.stream().anyMatch(entry -&gt; entry.isTimedOut(nowNanos));</span>
+    }
+
+    void closeSocket(boolean destroyThread)
+    {
+<span class="fc" id="L205">        logger.debug(&quot;Enqueuing socket close for {}&quot;, poolReference.endPoint());</span>
+<span class="fc" id="L206">        isStopped = destroyThread; // Exit loop to stop the thread</span>
+<span class="fc" id="L207">        backlog.clear();</span>
+        // in the &quot;destroyThread = true&quot; case, enqueuing the sentinel is important mostly to unblock the backlog.take()
+        // (via the CoalescingStrategy) in case there's a data race between this method enqueuing the sentinel
+        // and run() clearing the backlog on connection failure.
+<span class="fc" id="L211">        enqueue(CLOSE_SENTINEL, -1);</span>
+<span class="fc" id="L212">    }</span>
+
+    void softCloseSocket()
+    {
+<span class="nc" id="L216">        enqueue(CLOSE_SENTINEL, -1);</span>
+<span class="nc" id="L217">    }</span>
+
+    public int getTargetVersion()
+    {
+<span class="fc" id="L221">        return targetVersion;</span>
+    }
+
+    public void run()
+    {
+<span class="fc" id="L226">        final int drainedMessageSize = MAX_COALESCED_MESSAGES;</span>
+        // keeping list (batch) size small for now; that way we don't have an unbounded array (that we never resize)
+<span class="fc" id="L228">        final List&lt;QueuedMessage&gt; drainedMessages = new ArrayList&lt;&gt;(drainedMessageSize);</span>
+
+        outer:
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        while (!isStopped)</span>
+        {
+            try
+            {
+<span class="fc" id="L235">                cs.coalesce(backlog, drainedMessages, drainedMessageSize);</span>
+            }
+<span class="nc" id="L237">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L239">                throw new AssertionError(e);</span>
+<span class="fc" id="L240">            }</span>
+
+<span class="fc" id="L242">            int count = currentMsgBufferCount = drainedMessages.size();</span>
+
+            //The timestamp of the first message has already been provided to the coalescing strategy
+            //so skip logging it.
+            inner:
+<span class="fc bfc" id="L247" title="All 2 branches covered.">            for (QueuedMessage qm : drainedMessages)</span>
+            {
+                try
+                {
+<span class="fc" id="L251">                    MessageOut&lt;?&gt; m = qm.message;</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">                    if (m == CLOSE_SENTINEL)</span>
+                    {
+<span class="fc" id="L254">                        disconnect();</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">                        if (isStopped)</span>
+<span class="nc" id="L256">                            break outer;</span>
+<span class="fc" id="L257">                        continue;</span>
+                    }
+
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">                    if (qm.isTimedOut(System.nanoTime()))</span>
+<span class="nc" id="L261">                        dropped.incrementAndGet();</span>
+<span class="pc bpc" id="L262" title="1 of 4 branches missed.">                    else if (socket != null || connect())</span>
+<span class="fc bfc" id="L263" title="All 4 branches covered.">                        writeConnected(qm, count == 1 &amp;&amp; backlog.isEmpty());</span>
+                    else
+                    {
+                        // Not connected! Clear out the queue, else gossip messages back up. Update dropped
+                        // statistics accordingly. Hint: The statistics may be slightly too low, if messages
+                        // are added between the calls of backlog.size() and backlog.clear()
+<span class="nc" id="L269">                        dropped.addAndGet(backlog.size());</span>
+<span class="nc" id="L270">                        backlog.clear();</span>
+<span class="nc" id="L271">                        currentMsgBufferCount = 0;</span>
+<span class="nc" id="L272">                        break inner;</span>
+                    }
+                }
+<span class="nc" id="L275">                catch (Exception e)</span>
+                {
+<span class="nc" id="L277">                    JVMStabilityInspector.inspectThrowable(e);</span>
+                    // really shouldn't get here, as exception handling in writeConnected() is reasonably robust
+                    // but we want to catch anything bad we don't drop the messages in the current batch
+<span class="nc" id="L280">                    logger.error(&quot;error processing a message intended for {}&quot;, poolReference.endPoint(), e);</span>
+<span class="fc" id="L281">                }</span>
+<span class="fc" id="L282">                currentMsgBufferCount = --count;</span>
+<span class="fc" id="L283">            }</span>
+            // Update dropped statistics by the number of unprocessed drainedMessages
+<span class="fc" id="L285">            dropped.addAndGet(currentMsgBufferCount);</span>
+<span class="fc" id="L286">            drainedMessages.clear();</span>
+<span class="fc" id="L287">        }</span>
+<span class="nc" id="L288">    }</span>
+
+    public int getPendingMessages()
+    {
+<span class="nc" id="L292">        return backlog.size() + currentMsgBufferCount;</span>
+    }
+
+    public long getCompletedMesssages()
+    {
+<span class="nc" id="L297">        return completed;</span>
+    }
+
+    public long getDroppedMessages()
+    {
+<span class="nc" id="L302">        return dropped.get();</span>
+    }
+
+    private boolean shouldCompressConnection()
+    {
+        // assumes version &gt;= 1.2
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">        return DatabaseDescriptor.internodeCompression() == Config.InternodeCompression.all</span>
+<span class="pc bpc" id="L309" title="2 of 4 branches missed.">               || (DatabaseDescriptor.internodeCompression() == Config.InternodeCompression.dc &amp;&amp; !isLocalDC(poolReference.endPoint()));</span>
+    }
+
+    private void writeConnected(QueuedMessage qm, boolean flush)
+    {
+        try
+        {
+<span class="fc" id="L316">            byte[] sessionBytes = qm.message.parameters.get(Tracing.TRACE_HEADER);</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">            if (sessionBytes != null)</span>
+            {
+<span class="nc" id="L319">                UUID sessionId = UUIDGen.getUUID(ByteBuffer.wrap(sessionBytes));</span>
+<span class="nc" id="L320">                TraceState state = Tracing.instance.get(sessionId);</span>
+<span class="nc" id="L321">                String message = String.format(&quot;Sending %s message to %s&quot;, qm.message.verb, poolReference.endPoint());</span>
+                // session may have already finished; see CASSANDRA-5668
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (state == null)</span>
+                {
+<span class="nc" id="L325">                    byte[] traceTypeBytes = qm.message.parameters.get(Tracing.TRACE_TYPE);</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                    Tracing.TraceType traceType = traceTypeBytes == null ? Tracing.TraceType.QUERY : Tracing.TraceType.deserialize(traceTypeBytes[0]);</span>
+<span class="nc" id="L327">                    Tracing.instance.trace(ByteBuffer.wrap(sessionBytes), message, traceType.getTTL());</span>
+<span class="nc" id="L328">                }</span>
+                else
+                {
+<span class="nc" id="L331">                    state.trace(message);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                    if (qm.message.verb == MessagingService.Verb.REQUEST_RESPONSE)</span>
+<span class="nc" id="L333">                        Tracing.instance.doneWithNonLocalSession(state);</span>
+                }
+            }
+
+<span class="fc" id="L337">            long timestampMillis = NanoTimeToCurrentTimeMillis.convert(qm.timestampNanos);</span>
+<span class="fc" id="L338">            writeInternal(qm.message, qm.id, timestampMillis);</span>
+
+<span class="fc" id="L340">            completed++;</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">            if (flush)</span>
+<span class="fc" id="L342">                out.flush();</span>
+        }
+<span class="nc" id="L344">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L346">            JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L347">            disconnect();</span>
+<span class="nc bnc" id="L348" title="All 4 branches missed.">            if (e instanceof IOException || e.getCause() instanceof IOException)</span>
+            {
+<span class="nc" id="L350">                logger.debug(&quot;Error writing to {}&quot;, poolReference.endPoint(), e);</span>
+
+                // If we haven't retried this message yet, put it back on the queue to retry after re-connecting.
+                // See CASSANDRA-5393 and CASSANDRA-12192.
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                if (qm.shouldRetry())</span>
+                {
+                    try
+                    {
+<span class="nc" id="L358">                        backlog.put(new RetriedQueuedMessage(qm));</span>
+                    }
+<span class="nc" id="L360">                    catch (InterruptedException e1)</span>
+                    {
+<span class="nc" id="L362">                        throw new AssertionError(e1);</span>
+<span class="nc" id="L363">                    }</span>
+                }
+            }
+            else
+            {
+                // Non IO exceptions are likely a programming error so let's not silence them
+<span class="nc" id="L369">                logger.error(&quot;error writing to {}&quot;, poolReference.endPoint(), e);</span>
+            }
+<span class="fc" id="L371">        }</span>
+<span class="fc" id="L372">    }</span>
+
+    private void writeInternal(MessageOut&lt;?&gt; message, int id, long timestamp) throws IOException
+    {
+<span class="fc" id="L376">        out.writeInt(MessagingService.PROTOCOL_MAGIC);</span>
+
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">        if (targetVersion &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L379">            out.writeUTF(String.valueOf(id));</span>
+        else
+<span class="fc" id="L381">            out.writeInt(id);</span>
+
+        // int cast cuts off the high-order half of the timestamp, which we can assume remains
+        // the same between now and when the recipient reconstructs it.
+<span class="fc" id="L385">        out.writeInt((int) timestamp);</span>
+<span class="fc" id="L386">        message.serialize(out, targetVersion);</span>
+<span class="fc" id="L387">    }</span>
+
+    private static void writeHeader(DataOutput out, int version, boolean compressionEnabled) throws IOException
+    {
+        // 2 bits: unused.  used to be &quot;serializer type,&quot; which was always Binary
+        // 1 bit: compression
+        // 1 bit: streaming mode
+        // 3 bits: unused
+        // 8 bits: version
+        // 15 bits: unused
+<span class="fc" id="L397">        int header = 0;</span>
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">        if (compressionEnabled)</span>
+<span class="nc" id="L399">            header |= 4;</span>
+<span class="fc" id="L400">        header |= (version &lt;&lt; 8);</span>
+<span class="fc" id="L401">        out.writeInt(header);</span>
+<span class="fc" id="L402">    }</span>
+
+    private void disconnect()
+    {
+<span class="fc bfc" id="L406" title="All 2 branches covered.">        if (socket != null)</span>
+        {
+            try
+            {
+<span class="fc" id="L410">                socket.close();</span>
+<span class="fc" id="L411">                logger.debug(&quot;Socket to {} closed&quot;, poolReference.endPoint());</span>
+            }
+<span class="nc" id="L413">            catch (IOException e)</span>
+            {
+<span class="nc" id="L415">                logger.debug(&quot;Exception closing connection to {}&quot;, poolReference.endPoint(), e);</span>
+<span class="fc" id="L416">            }</span>
+<span class="fc" id="L417">            out = null;</span>
+<span class="fc" id="L418">            socket = null;</span>
+        }
+<span class="fc" id="L420">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private boolean connect()
+    {
+<span class="fc" id="L425">        logger.debug(&quot;Attempting to connect to {}&quot;, poolReference.endPoint());</span>
+
+<span class="fc" id="L427">        long start = System.nanoTime();</span>
+<span class="fc" id="L428">        long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getRpcTimeout());</span>
+<span class="pc bpc" id="L429" title="2 of 4 branches missed.">        while (System.nanoTime() - start &lt; timeout &amp;&amp; !isStopped)</span>
+        {
+<span class="fc" id="L431">            targetVersion = MessagingService.instance().getVersion(poolReference.endPoint());</span>
+            try
+            {
+<span class="fc" id="L434">                socket = poolReference.newSocket();</span>
+<span class="fc" id="L435">                socket.setKeepAlive(true);</span>
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">                if (isLocalDC(poolReference.endPoint()))</span>
+                {
+<span class="fc" id="L438">                    socket.setTcpNoDelay(INTRADC_TCP_NODELAY);</span>
+                }
+                else
+                {
+<span class="nc" id="L442">                    socket.setTcpNoDelay(DatabaseDescriptor.getInterDCTcpNoDelay());</span>
+                }
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">                if (DatabaseDescriptor.getInternodeSendBufferSize() &gt; 0)</span>
+                {
+                    try
+                    {
+<span class="nc" id="L448">                        socket.setSendBufferSize(DatabaseDescriptor.getInternodeSendBufferSize());</span>
+                    }
+<span class="nc" id="L450">                    catch (SocketException se)</span>
+                    {
+<span class="nc" id="L452">                        logger.warn(&quot;Failed to set send buffer size on internode socket.&quot;, se);</span>
+<span class="nc" id="L453">                    }</span>
+                }
+
+                // SocketChannel may be null when using SSL
+<span class="fc" id="L457">                WritableByteChannel ch = socket.getChannel();</span>
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">                out = new BufferedDataOutputStreamPlus(ch != null ? ch : Channels.newChannel(socket.getOutputStream()), BUFFER_SIZE);</span>
+
+<span class="fc" id="L460">                out.writeInt(MessagingService.PROTOCOL_MAGIC);</span>
+<span class="fc" id="L461">                writeHeader(out, targetVersion, shouldCompressConnection());</span>
+<span class="fc" id="L462">                out.flush();</span>
+
+<span class="fc" id="L464">                DataInputStream in = new DataInputStream(socket.getInputStream());</span>
+<span class="fc" id="L465">                int maxTargetVersion = handshakeVersion(in);</span>
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">                if (maxTargetVersion == NO_VERSION)</span>
+                {
+                    // no version is returned, so disconnect an try again: we will either get
+                    // a different target version (targetVersion &lt; MessagingService.VERSION_12)
+                    // or if the same version the handshake will finally succeed
+<span class="nc" id="L471">                    logger.trace(&quot;Target max version is {}; no version information yet, will retry&quot;, maxTargetVersion);</span>
+<span class="nc" id="L472">                    disconnect();</span>
+<span class="nc" id="L473">                    continue;</span>
+                }
+                else
+                {
+<span class="fc" id="L477">                    MessagingService.instance().setVersion(poolReference.endPoint(), maxTargetVersion);</span>
+                }
+
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">                if (targetVersion &gt; maxTargetVersion)</span>
+                {
+<span class="nc" id="L482">                    logger.trace(&quot;Target max version is {}; will reconnect with that version&quot;, maxTargetVersion);</span>
+                    try
+                    {
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                        if (DatabaseDescriptor.getSeeds().contains(poolReference.endPoint()))</span>
+<span class="nc" id="L486">                            logger.warn(&quot;Seed gossip version is {}; will not connect with that version&quot;, maxTargetVersion);</span>
+                    }
+<span class="nc" id="L488">                    catch (Throwable e)</span>
+                    {
+                        // If invalid yaml has been added to the config since startup, getSeeds() will throw an AssertionError
+                        // Additionally, third party seed providers may throw exceptions if network is flakey
+                        // Regardless of what's thrown, we must catch it, disconnect, and try again
+<span class="nc" id="L493">                        JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L494">                        logger.warn(&quot;Configuration error prevented outbound connection: {}&quot;, e.getLocalizedMessage());</span>
+                    }
+                    finally
+                    {
+<span class="nc" id="L498">                        disconnect();</span>
+<span class="nc" id="L499">                        return false;</span>
+                    }
+                }
+
+<span class="pc bpc" id="L503" title="3 of 4 branches missed.">                if (targetVersion &lt; maxTargetVersion &amp;&amp; targetVersion &lt; MessagingService.current_version)</span>
+                {
+<span class="nc" id="L505">                    logger.trace(&quot;Detected higher max version {} (using {}); will reconnect when queued messages are done&quot;,</span>
+<span class="nc" id="L506">                                 maxTargetVersion, targetVersion);</span>
+<span class="nc" id="L507">                    softCloseSocket();</span>
+                }
+
+<span class="fc" id="L510">                out.writeInt(MessagingService.current_version);</span>
+<span class="fc" id="L511">                CompactEndpointSerializationHelper.serialize(FBUtilities.getBroadcastAddress(), out);</span>
+<span class="pc bpc" id="L512" title="1 of 2 branches missed.">                if (shouldCompressConnection())</span>
+                {
+<span class="nc" id="L514">                    out.flush();</span>
+<span class="nc" id="L515">                    logger.trace(&quot;Upgrading OutputStream to {} to be compressed&quot;, poolReference.endPoint());</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                    if (targetVersion &lt; MessagingService.VERSION_21)</span>
+                    {
+                        // Snappy is buffered, so no need for extra buffering output stream
+<span class="nc" id="L519">                        out = new WrappedDataOutputStreamPlus(new SnappyOutputStream(socket.getOutputStream()));</span>
+                    }
+                    else
+                    {
+                        // TODO: custom LZ4 OS that supports BB write methods
+<span class="nc" id="L524">                        LZ4Compressor compressor = LZ4Factory.fastestInstance().fastCompressor();</span>
+<span class="nc" id="L525">                        Checksum checksum = XXHashFactory.fastestInstance().newStreamingHash32(LZ4_HASH_SEED).asChecksum();</span>
+<span class="nc" id="L526">                        out = new WrappedDataOutputStreamPlus(new LZ4BlockOutputStream(socket.getOutputStream(),</span>
+                                                                            1 &lt;&lt; 14,  // 16k block size
+                                                                            compressor,
+                                                                            checksum,
+                                                                            true)); // no async flushing
+                    }
+                }
+<span class="fc" id="L533">                logger.debug(&quot;Done connecting to {}&quot;, poolReference.endPoint());</span>
+<span class="fc" id="L534">                return true;</span>
+            }
+<span class="nc" id="L536">            catch (SSLHandshakeException e)</span>
+            {
+<span class="nc" id="L538">                logger.error(&quot;SSL handshake error for outbound connection to &quot; + socket, e);</span>
+<span class="nc" id="L539">                disconnect();</span>
+                // SSL errors won't be recoverable within timeout period so we'll just abort
+<span class="nc" id="L541">                return false;</span>
+            }
+<span class="nc" id="L543">            catch (IOException e)</span>
+            {
+<span class="nc" id="L545">                disconnect();</span>
+<span class="nc" id="L546">                logger.debug(&quot;Unable to connect to {}&quot;, poolReference.endPoint(), e);</span>
+<span class="nc" id="L547">                Uninterruptibles.sleepUninterruptibly(OPEN_RETRY_DELAY, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L548">            }</span>
+        }
+<span class="nc" id="L550">        return false;</span>
+    }
+
+    private int handshakeVersion(final DataInputStream inputStream)
+    {
+<span class="fc" id="L555">        final AtomicInteger version = new AtomicInteger(NO_VERSION);</span>
+<span class="fc" id="L556">        final CountDownLatch versionLatch = new CountDownLatch(1);</span>
+<span class="fc" id="L557">        NamedThreadFactory.createThread(() -&gt;</span>
+        {
+            try
+            {
+<span class="fc" id="L561">                logger.info(&quot;Handshaking version with {}&quot;, poolReference.endPoint());</span>
+<span class="fc" id="L562">                version.set(inputStream.readInt());</span>
+            }
+<span class="nc" id="L564">            catch (IOException ex)</span>
+            {
+<span class="nc" id="L566">                final String msg = &quot;Cannot handshake version with &quot; + poolReference.endPoint();</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L568">                    logger.trace(msg, ex);</span>
+                else
+<span class="nc" id="L570">                    logger.info(msg);</span>
+            }
+            finally
+            {
+                //unblock the waiting thread on either success or fail
+<span class="fc" id="L575">                versionLatch.countDown();</span>
+            }
+<span class="fc" id="L577">        }, &quot;HANDSHAKE-&quot; + poolReference.endPoint()).start();</span>
+
+        try
+        {
+<span class="fc" id="L581">            versionLatch.await(WAIT_FOR_VERSION_MAX_TIME, TimeUnit.MILLISECONDS);</span>
+        }
+<span class="nc" id="L583">        catch (InterruptedException ex)</span>
+        {
+<span class="nc" id="L585">            throw new AssertionError(ex);</span>
+<span class="fc" id="L586">        }</span>
+<span class="fc" id="L587">        return version.get();</span>
+    }
+
+    /**
+     * Expire elements from the queue if the queue is pretty full and expiration is not already in progress.
+     * This method will only remove droppable expired entries. If no such element exists, nothing is removed from the queue.
+     * 
+     * @param timestampNanos The current time as from System.nanoTime()
+     */
+    @VisibleForTesting
+    void expireMessages(long timestampNanos)
+    {
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">        if (backlog.size() &lt;= BACKLOG_PURGE_SIZE)</span>
+<span class="fc" id="L600">            return; // Plenty of space</span>
+
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (backlogNextExpirationTime - timestampNanos &gt; 0)</span>
+<span class="nc" id="L603">            return; // Expiration is not due.</span>
+
+        /**
+         * Expiration is an expensive process. Iterating the queue locks the queue for both writes and
+         * reads during iter.next() and iter.remove(). Thus letting only a single Thread do expiration.
+         */
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        if (backlogExpirationActive.compareAndSet(false, true))</span>
+        {
+            try
+            {
+<span class="nc" id="L613">                Iterator&lt;QueuedMessage&gt; iter = backlog.iterator();</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                while (iter.hasNext())</span>
+                {
+<span class="nc" id="L616">                    QueuedMessage qm = iter.next();</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                    if (!qm.droppable)</span>
+<span class="nc" id="L618">                        continue;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                    if (!qm.isTimedOut(timestampNanos))</span>
+<span class="nc" id="L620">                        continue;</span>
+<span class="nc" id="L621">                    iter.remove();</span>
+<span class="nc" id="L622">                    dropped.incrementAndGet();</span>
+<span class="nc" id="L623">                }</span>
+
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+                {
+<span class="nc" id="L627">                    long duration = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - timestampNanos);</span>
+<span class="nc" id="L628">                    logger.trace(&quot;Expiration of {} took {}μs&quot;, getName(), duration);</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L633">                long backlogExpirationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getOtcBacklogExpirationInterval());</span>
+<span class="nc" id="L634">                backlogNextExpirationTime = timestampNanos + backlogExpirationIntervalNanos;</span>
+<span class="nc" id="L635">                backlogExpirationActive.set(false);</span>
+            }
+        }
+<span class="nc" id="L638">    }</span>
+
+    /** messages that have not been retried yet */
+    private static class QueuedMessage implements Coalescable
+    {
+        final MessageOut&lt;?&gt; message;
+        final int id;
+        final long timestampNanos;
+        final boolean droppable;
+
+        QueuedMessage(MessageOut&lt;?&gt; message, int id, long timestampNanos)
+<span class="fc" id="L649">        {</span>
+<span class="fc" id="L650">            this.message = message;</span>
+<span class="fc" id="L651">            this.id = id;</span>
+<span class="fc" id="L652">            this.timestampNanos = timestampNanos;</span>
+<span class="fc" id="L653">            this.droppable = MessagingService.DROPPABLE_VERBS.contains(message.verb);</span>
+<span class="fc" id="L654">        }</span>
+
+        /** don't drop a non-droppable message just because it's timestamp is expired */
+        boolean isTimedOut(long nowNanos)
+        {
+<span class="fc" id="L659">            long messageTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(message.getTimeout());</span>
+<span class="pc bpc" id="L660" title="1 of 4 branches missed.">            return droppable &amp;&amp; nowNanos - timestampNanos  &gt; messageTimeoutNanos;</span>
+        }
+
+        boolean shouldRetry()
+        {
+            // retry all messages once
+<span class="nc" id="L666">            return true;</span>
+        }
+
+        public long timestampNanos()
+        {
+<span class="nc" id="L671">            return timestampNanos;</span>
+        }
+    }
+
+    private static class RetriedQueuedMessage extends QueuedMessage
+    {
+        RetriedQueuedMessage(QueuedMessage msg)
+        {
+<span class="nc" id="L679">            super(msg.message, msg.id, msg.timestampNanos);</span>
+<span class="nc" id="L680">        }</span>
+
+        boolean shouldRetry()
+        {
+<span class="nc" id="L684">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

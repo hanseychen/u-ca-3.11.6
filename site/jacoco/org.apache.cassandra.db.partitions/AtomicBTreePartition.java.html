@@ -1,0 +1,384 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AtomicBTreePartition.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.partitions</a> &gt; <span class="el_source">AtomicBTreePartition.java</span></div><h1>AtomicBTreePartition.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.partitions;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.SearchIterator;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
+import org.apache.cassandra.utils.concurrent.Locks;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.HeapAllocator;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
+
+/**
+ * A thread-safe and atomic Partition implementation.
+ *
+ * Operations (in particular addAll) on this implementation are atomic and
+ * isolated (in the sense of ACID). Typically a addAll is guaranteed that no
+ * other thread can see the state where only parts but not all rows have
+ * been added.
+ */
+public class AtomicBTreePartition extends AbstractBTreePartition
+{
+<span class="fc" id="L53">    public static final long EMPTY_SIZE = ObjectSizes.measure(new AtomicBTreePartition(CFMetaData.createFake(&quot;keyspace&quot;, &quot;table&quot;),</span>
+<span class="fc" id="L54">                                                                                       DatabaseDescriptor.getPartitioner().decorateKey(ByteBuffer.allocate(1)),</span>
+                                                                                       null));
+
+    // Reserved values for wasteTracker field. These values must not be consecutive (see avoidReservedValues)
+    private static final int TRACKER_NEVER_WASTED = 0;
+    private static final int TRACKER_PESSIMISTIC_LOCKING = Integer.MAX_VALUE;
+
+    // The granularity with which we track wasted allocation/work; we round up
+    private static final int ALLOCATION_GRANULARITY_BYTES = 1024;
+    // The number of bytes we have to waste in excess of our acceptable realtime rate of waste (defined below)
+    private static final long EXCESS_WASTE_BYTES = 10 * 1024 * 1024L;
+    private static final int EXCESS_WASTE_OFFSET = (int) (EXCESS_WASTE_BYTES / ALLOCATION_GRANULARITY_BYTES);
+    // Note this is a shift, because dividing a long time and then picking the low 32 bits doesn't give correct rollover behavior
+    private static final int CLOCK_SHIFT = 17;
+    // CLOCK_GRANULARITY = 1^9ns &gt;&gt; CLOCK_SHIFT == 132us == (1/7.63)ms
+
+<span class="fc" id="L70">    private static final AtomicIntegerFieldUpdater&lt;AtomicBTreePartition&gt; wasteTrackerUpdater = AtomicIntegerFieldUpdater.newUpdater(AtomicBTreePartition.class, &quot;wasteTracker&quot;);</span>
+<span class="fc" id="L71">    private static final AtomicReferenceFieldUpdater&lt;AtomicBTreePartition, Holder&gt; refUpdater = AtomicReferenceFieldUpdater.newUpdater(AtomicBTreePartition.class, Holder.class, &quot;ref&quot;);</span>
+
+    /**
+     * (clock + allocation) granularity are combined to give us an acceptable (waste) allocation rate that is defined by
+     * the passage of real time of ALLOCATION_GRANULARITY_BYTES/CLOCK_GRANULARITY, or in this case 7.63Kb/ms, or 7.45Mb/s
+     *
+     * in wasteTracker we maintain within EXCESS_WASTE_OFFSET before the current time; whenever we waste bytes
+     * we increment the current value if it is within this window, and set it to the min of the window plus our waste
+     * otherwise.
+     */
+<span class="fc" id="L81">    private volatile int wasteTracker = TRACKER_NEVER_WASTED;</span>
+
+    private final MemtableAllocator allocator;
+    private volatile Holder ref;
+
+    public AtomicBTreePartition(CFMetaData metadata, DecoratedKey partitionKey, MemtableAllocator allocator)
+    {
+        // involved in potential bug? partition columns may be a subset if we alter columns while it's in memtable
+<span class="fc" id="L89">        super(metadata, partitionKey);</span>
+<span class="fc" id="L90">        this.allocator = allocator;</span>
+<span class="fc" id="L91">        this.ref = EMPTY;</span>
+<span class="fc" id="L92">    }</span>
+
+    protected Holder holder()
+    {
+<span class="fc" id="L96">        return ref;</span>
+    }
+
+    protected boolean canHaveShadowedData()
+    {
+<span class="fc" id="L101">        return true;</span>
+    }
+
+    /**
+     * Adds a given update to this in-memtable partition.
+     *
+     * @return an array containing first the difference in size seen after merging the updates, and second the minimum
+     * time detla between updates.
+     */
+    public long[] addAllWithSizeDelta(final PartitionUpdate update, OpOrder.Group writeOp, UpdateTransaction indexer)
+    {
+<span class="fc" id="L112">        RowUpdater updater = new RowUpdater(this, allocator, writeOp, indexer);</span>
+<span class="fc" id="L113">        DeletionInfo inputDeletionInfoCopy = null;</span>
+<span class="fc" id="L114">        boolean monitorOwned = false;</span>
+        try
+        {
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">            if (usePessimisticLocking())</span>
+            {
+<span class="nc" id="L119">                Locks.monitorEnterUnsafe(this);</span>
+<span class="nc" id="L120">                monitorOwned = true;</span>
+            }
+
+<span class="fc" id="L123">            indexer.start();</span>
+
+            while (true)
+            {
+<span class="fc" id="L127">                Holder current = ref;</span>
+<span class="fc" id="L128">                updater.ref = current;</span>
+<span class="fc" id="L129">                updater.reset();</span>
+
+<span class="fc bfc" id="L131" title="All 2 branches covered.">                if (!update.deletionInfo().getPartitionDeletion().isLive())</span>
+<span class="fc" id="L132">                    indexer.onPartitionDeletion(update.deletionInfo().getPartitionDeletion());</span>
+
+<span class="fc bfc" id="L134" title="All 2 branches covered.">                if (update.deletionInfo().hasRanges())</span>
+<span class="fc" id="L135">                    update.deletionInfo().rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);</span>
+
+                DeletionInfo deletionInfo;
+<span class="fc bfc" id="L138" title="All 2 branches covered.">                if (update.deletionInfo().mayModify(current.deletionInfo))</span>
+                {
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                    if (inputDeletionInfoCopy == null)</span>
+<span class="fc" id="L141">                        inputDeletionInfoCopy = update.deletionInfo().copy(HeapAllocator.instance);</span>
+
+<span class="fc" id="L143">                    deletionInfo = current.deletionInfo.mutableCopy().add(inputDeletionInfoCopy);</span>
+<span class="fc" id="L144">                    updater.allocated(deletionInfo.unsharedHeapSize() - current.deletionInfo.unsharedHeapSize());</span>
+                }
+                else
+                {
+<span class="fc" id="L148">                    deletionInfo = current.deletionInfo;</span>
+                }
+
+<span class="fc" id="L151">                PartitionColumns columns = update.columns().mergeTo(current.columns);</span>
+<span class="fc" id="L152">                Row newStatic = update.staticRow();</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">                Row staticRow = newStatic.isEmpty()</span>
+                              ? current.staticRow
+<span class="pc bnc" id="L155" title="All 2 branches missed.">                              : (current.staticRow.isEmpty() ? updater.apply(newStatic) : updater.apply(current.staticRow, newStatic));</span>
+<span class="fc" id="L156">                Object[] tree = BTree.update(current.tree, update.metadata().comparator, update, update.rowCount(), updater);</span>
+<span class="fc" id="L157">                EncodingStats newStats = current.stats.mergeWith(update.stats());</span>
+
+<span class="fc bfc" id="L159" title="All 4 branches covered.">                if (tree != null &amp;&amp; refUpdater.compareAndSet(this, current, new Holder(columns, tree, deletionInfo, staticRow, newStats)))</span>
+                {
+<span class="fc" id="L161">                    updater.finish();</span>
+<span class="fc" id="L162">                    return new long[]{ updater.dataSize, updater.colUpdateTimeDelta };</span>
+                }
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">                else if (!monitorOwned)</span>
+                {
+<span class="fc" id="L166">                    boolean shouldLock = usePessimisticLocking();</span>
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">                    if (!shouldLock)</span>
+                    {
+<span class="fc" id="L169">                        shouldLock = updateWastedAllocationTracker(updater.heapSize);</span>
+                    }
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">                    if (shouldLock)</span>
+                    {
+<span class="nc" id="L173">                        Locks.monitorEnterUnsafe(this);</span>
+<span class="nc" id="L174">                        monitorOwned = true;</span>
+                    }
+                }
+<span class="fc" id="L177">            }</span>
+        }
+        finally
+        {
+<span class="fc" id="L181">            indexer.commit();</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">            if (monitorOwned)</span>
+<span class="nc" id="L183">                Locks.monitorExitUnsafe(this);</span>
+        }
+    }
+
+    @Override
+    public DeletionInfo deletionInfo()
+    {
+<span class="fc" id="L190">        return allocator.ensureOnHeap().applyToDeletionInfo(super.deletionInfo());</span>
+    }
+
+    @Override
+    public Row staticRow()
+    {
+<span class="nc" id="L196">        return allocator.ensureOnHeap().applyToStatic(super.staticRow());</span>
+    }
+
+    @Override
+    public DecoratedKey partitionKey()
+    {
+<span class="fc" id="L202">        return allocator.ensureOnHeap().applyToPartitionKey(super.partitionKey());</span>
+    }
+
+    @Override
+    public Row getRow(Clustering clustering)
+    {
+<span class="nc" id="L208">        return allocator.ensureOnHeap().applyToRow(super.getRow(clustering));</span>
+    }
+
+    @Override
+    public Row lastRow()
+    {
+<span class="nc" id="L214">        return allocator.ensureOnHeap().applyToRow(super.lastRow());</span>
+    }
+
+    @Override
+    public SearchIterator&lt;Clustering, Row&gt; searchIterator(ColumnFilter columns, boolean reversed)
+    {
+<span class="fc" id="L220">        return allocator.ensureOnHeap().applyToPartition(super.searchIterator(columns, reversed));</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, Slices slices, boolean reversed)
+    {
+<span class="fc" id="L226">        return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator(selection, slices, reversed));</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator unfilteredIterator()
+    {
+<span class="fc" id="L232">        return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator());</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator unfilteredIterator(Holder current, ColumnFilter selection, Slices slices, boolean reversed)
+    {
+<span class="fc" id="L238">        return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator(current, selection, slices, reversed));</span>
+    }
+
+    @Override
+    public Iterator&lt;Row&gt; iterator()
+    {
+<span class="nc" id="L244">        return allocator.ensureOnHeap().applyToPartition(super.iterator());</span>
+    }
+
+    public boolean usePessimisticLocking()
+    {
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">        return wasteTracker == TRACKER_PESSIMISTIC_LOCKING;</span>
+    }
+
+    /**
+     * Update the wasted allocation tracker state based on newly wasted allocation information
+     *
+     * @param wastedBytes the number of bytes wasted by this thread
+     * @return true if the caller should now proceed with pessimistic locking because the waste limit has been reached
+     */
+    private boolean updateWastedAllocationTracker(long wastedBytes)
+    {
+        // Early check for huge allocation that exceeds the limit
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">        if (wastedBytes &lt; EXCESS_WASTE_BYTES)</span>
+        {
+            // We round up to ensure work &lt; granularity are still accounted for
+<span class="fc" id="L264">            int wastedAllocation = ((int) (wastedBytes + ALLOCATION_GRANULARITY_BYTES - 1)) / ALLOCATION_GRANULARITY_BYTES;</span>
+
+            int oldTrackerValue;
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">            while (TRACKER_PESSIMISTIC_LOCKING != (oldTrackerValue = wasteTracker))</span>
+            {
+                // Note this time value has an arbitrary offset, but is a constant rate 32 bit counter (that may wrap)
+<span class="fc" id="L270">                int time = (int) (System.nanoTime() &gt;&gt;&gt; CLOCK_SHIFT);</span>
+<span class="fc" id="L271">                int delta = oldTrackerValue - time;</span>
+<span class="pc bpc" id="L272" title="1 of 6 branches missed.">                if (oldTrackerValue == TRACKER_NEVER_WASTED || delta &gt;= 0 || delta &lt; -EXCESS_WASTE_OFFSET)</span>
+<span class="fc" id="L273">                    delta = -EXCESS_WASTE_OFFSET;</span>
+<span class="fc" id="L274">                delta += wastedAllocation;</span>
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">                if (delta &gt;= 0)</span>
+<span class="nc" id="L276">                    break;</span>
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">                if (wasteTrackerUpdater.compareAndSet(this, oldTrackerValue, avoidReservedValues(time + delta)))</span>
+<span class="fc" id="L278">                    return false;</span>
+<span class="nc" id="L279">            }</span>
+        }
+        // We have definitely reached our waste limit so set the state if it isn't already
+<span class="nc" id="L282">        wasteTrackerUpdater.set(this, TRACKER_PESSIMISTIC_LOCKING);</span>
+        // And tell the caller to proceed with pessimistic locking
+<span class="nc" id="L284">        return true;</span>
+    }
+
+    private static int avoidReservedValues(int wasteTracker)
+    {
+<span class="pc bpc" id="L289" title="2 of 4 branches missed.">        if (wasteTracker == TRACKER_NEVER_WASTED || wasteTracker == TRACKER_PESSIMISTIC_LOCKING)</span>
+<span class="nc" id="L290">            return wasteTracker + 1;</span>
+<span class="fc" id="L291">        return wasteTracker;</span>
+    }
+
+    // the function we provide to the btree utilities to perform any column replacements
+    private static final class RowUpdater implements UpdateFunction&lt;Row, Row&gt;
+    {
+        final AtomicBTreePartition updating;
+        final MemtableAllocator allocator;
+        final OpOrder.Group writeOp;
+        final UpdateTransaction indexer;
+        final int nowInSec;
+        Holder ref;
+        Row.Builder regularBuilder;
+        long dataSize;
+        long heapSize;
+<span class="fc" id="L306">        long colUpdateTimeDelta = Long.MAX_VALUE;</span>
+        List&lt;Row&gt; inserted; // TODO: replace with walk of aborted BTree
+
+        private RowUpdater(AtomicBTreePartition updating, MemtableAllocator allocator, OpOrder.Group writeOp, UpdateTransaction indexer)
+<span class="fc" id="L310">        {</span>
+<span class="fc" id="L311">            this.updating = updating;</span>
+<span class="fc" id="L312">            this.allocator = allocator;</span>
+<span class="fc" id="L313">            this.writeOp = writeOp;</span>
+<span class="fc" id="L314">            this.indexer = indexer;</span>
+<span class="fc" id="L315">            this.nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="fc" id="L316">        }</span>
+
+        private Row.Builder builder(Clustering clustering)
+        {
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">            boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;</span>
+            // We know we only insert/update one static per PartitionUpdate, so no point in saving the builder
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">            if (isStatic)</span>
+<span class="nc" id="L323">                return allocator.rowBuilder(writeOp);</span>
+
+<span class="fc bfc" id="L325" title="All 2 branches covered.">            if (regularBuilder == null)</span>
+<span class="fc" id="L326">                regularBuilder = allocator.rowBuilder(writeOp);</span>
+<span class="fc" id="L327">            return regularBuilder;</span>
+        }
+
+        public Row apply(Row insert)
+        {
+<span class="fc" id="L332">            Row data = Rows.copy(insert, builder(insert.clustering())).build();</span>
+<span class="fc" id="L333">            indexer.onInserted(insert);</span>
+
+<span class="fc" id="L335">            this.dataSize += data.dataSize();</span>
+<span class="fc" id="L336">            this.heapSize += data.unsharedHeapSizeExcludingData();</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">            if (inserted == null)</span>
+<span class="fc" id="L338">                inserted = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L339">            inserted.add(data);</span>
+<span class="fc" id="L340">            return data;</span>
+        }
+
+        public Row apply(Row existing, Row update)
+        {
+<span class="fc" id="L345">            Row.Builder builder = builder(existing.clustering());</span>
+<span class="fc" id="L346">            colUpdateTimeDelta = Math.min(colUpdateTimeDelta, Rows.merge(existing, update, builder, nowInSec));</span>
+
+<span class="fc" id="L348">            Row reconciled = builder.build();</span>
+
+<span class="fc" id="L350">            indexer.onUpdated(existing, reconciled);</span>
+
+<span class="fc" id="L352">            dataSize += reconciled.dataSize() - existing.dataSize();</span>
+<span class="fc" id="L353">            heapSize += reconciled.unsharedHeapSizeExcludingData() - existing.unsharedHeapSizeExcludingData();</span>
+<span class="fc bfc" id="L354" title="All 2 branches covered.">            if (inserted == null)</span>
+<span class="fc" id="L355">                inserted = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L356">            inserted.add(reconciled);</span>
+
+<span class="fc" id="L358">            return reconciled;</span>
+        }
+
+        protected void reset()
+        {
+<span class="fc" id="L363">            this.dataSize = 0;</span>
+<span class="fc" id="L364">            this.heapSize = 0;</span>
+<span class="fc bfc" id="L365" title="All 2 branches covered.">            if (inserted != null)</span>
+<span class="fc" id="L366">                inserted.clear();</span>
+<span class="fc" id="L367">        }</span>
+        public boolean abortEarly()
+        {
+<span class="fc bfc" id="L370" title="All 2 branches covered.">            return updating.ref != ref;</span>
+        }
+
+        public void allocated(long heapSize)
+        {
+<span class="fc" id="L375">            this.heapSize += heapSize;</span>
+<span class="fc" id="L376">        }</span>
+
+        protected void finish()
+        {
+<span class="fc" id="L380">            allocator.onHeap().adjust(heapSize, writeOp);</span>
+<span class="fc" id="L381">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamingHistogram.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">StreamingHistogram.java</span></div><h1>StreamingHistogram.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import java.io.IOException;
+import java.util.*;
+
+import com.google.common.base.Objects;
+
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+
+/**
+ * Histogram that can be constructed from streaming of data.
+ *
+ * The algorithm is taken from following paper:
+ * Yael Ben-Haim and Elad Tom-Tov, &quot;A Streaming Parallel Decision Tree Algorithm&quot; (2010)
+ * http://jmlr.csail.mit.edu/papers/volume11/ben-haim10a/ben-haim10a.pdf
+ */
+public class StreamingHistogram
+{
+<span class="fc" id="L40">    public static final StreamingHistogramSerializer serializer = new StreamingHistogramSerializer();</span>
+
+    // TreeMap to hold bins of histogram.
+    // The key is a numeric type so we can avoid boxing/unboxing streams of different key types
+    // The value is a unboxed long array always of length == 1
+    // Serialized Histograms always writes with double keys for backwards compatibility
+    private final TreeMap&lt;Number, long[]&gt; bin;
+
+    // maximum bin size for this histogram
+    private final int maxBinSize;
+
+
+    /**
+     * Creates a new histogram with max bin size of maxBinSize
+     * @param maxBinSize maximum number of bins this histogram can have
+     * @param source the existing bins in map form
+     */
+    private StreamingHistogram(int maxBinSize, Map&lt;Number, long[]&gt; source)
+<span class="fc" id="L58">    {</span>
+<span class="fc" id="L59">        this.maxBinSize = maxBinSize;</span>
+<span class="fc" id="L60">        this.bin = new TreeMap&lt;&gt;((o1, o2) -&gt; {</span>
+<span class="pc bpc" id="L61" title="1 of 2 branches missed.">            if (o1.getClass().equals(o2.getClass()))</span>
+<span class="fc" id="L62">                return ((Comparable)o1).compareTo(o2);</span>
+            else
+<span class="nc" id="L64">                return Double.compare(o1.doubleValue(), o2.doubleValue());</span>
+        });
+<span class="fc bfc" id="L66" title="All 2 branches covered.">        for (Map.Entry&lt;Number, long[]&gt; entry : source.entrySet())</span>
+<span class="fc" id="L67">            this.bin.put(entry.getKey(), new long[]{entry.getValue()[0]});</span>
+<span class="fc" id="L68">    }</span>
+    
+    /**
+     * Calculates estimated number of points in interval [-inf,b].
+     *
+     * @param b upper bound of a interval to calculate sum
+     * @return estimated number of points in a interval [-inf,b].
+     */
+    public double sum(double b)
+    {
+<span class="nc" id="L78">        double sum = 0;</span>
+        // find the points pi, pnext which satisfy pi &lt;= b &lt; pnext
+<span class="nc" id="L80">        Map.Entry&lt;Number, long[]&gt; pnext = bin.higherEntry(b);</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">        if (pnext == null)</span>
+        {
+            // if b is greater than any key in this histogram,
+            // just count all appearance and return
+<span class="nc bnc" id="L85" title="All 2 branches missed.">            for (long[] value : bin.values())</span>
+<span class="nc" id="L86">                sum += value[0];</span>
+        }
+        else
+        {
+<span class="nc" id="L90">            Map.Entry&lt;Number, long[]&gt; pi = bin.floorEntry(b);</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            if (pi == null)</span>
+<span class="nc" id="L92">                return 0;</span>
+            // calculate estimated count mb for point b
+<span class="nc" id="L94">            double weight = (b - pi.getKey().doubleValue()) / (pnext.getKey().doubleValue() - pi.getKey().doubleValue());</span>
+<span class="nc" id="L95">            double mb = pi.getValue()[0] + (pnext.getValue()[0] - pi.getValue()[0]) * weight;</span>
+<span class="nc" id="L96">            sum += (pi.getValue()[0] + mb) * weight / 2;</span>
+
+<span class="nc" id="L98">            sum += pi.getValue()[0] / 2.0;</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">            for (long[] value : bin.headMap(pi.getKey(), false).values())</span>
+<span class="nc" id="L100">                sum += value[0];</span>
+        }
+<span class="nc" id="L102">        return sum;</span>
+    }
+
+    public Map&lt;Number, long[]&gt; getAsMap()
+    {
+<span class="fc" id="L107">        return Collections.unmodifiableMap(bin);</span>
+    }
+
+    public static class StreamingHistogramBuilder
+    {
+        // TreeMap to hold bins of histogram.
+        // The key is a numeric type so we can avoid boxing/unboxing streams of different key types
+        // The value is a unboxed long array always of length == 1
+        // Serialized Histograms always writes with double keys for backwards compatibility
+        private final TreeMap&lt;Number, long[]&gt; bin;
+
+        // Keep a second, larger buffer to spool data in, before finalizing it into `bin`
+        private final TreeMap&lt;Number, long[]&gt; spool;
+
+        // maximum bin size for this histogram
+        private final int maxBinSize;
+
+        // maximum size of the spool
+        private final int maxSpoolSize;
+
+        // voluntarily give up resolution for speed
+        private final int roundSeconds;
+
+        /**
+         * Creates a new histogram with max bin size of maxBinSize
+         * @param maxBinSize maximum number of bins this histogram can have
+         */
+        public StreamingHistogramBuilder(int maxBinSize, int maxSpoolSize, int roundSeconds)
+<span class="fc" id="L135">        {</span>
+<span class="fc" id="L136">            this.maxBinSize = maxBinSize;</span>
+<span class="fc" id="L137">            this.maxSpoolSize = maxSpoolSize;</span>
+<span class="fc" id="L138">            this.roundSeconds = roundSeconds;</span>
+<span class="fc" id="L139">            bin = new TreeMap&lt;&gt;((o1, o2) -&gt; {</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                if (o1.getClass().equals(o2.getClass()))</span>
+<span class="fc" id="L141">                    return ((Comparable)o1).compareTo(o2);</span>
+                else
+<span class="nc" id="L143">                    return Double.compare(o1.doubleValue(), o2.doubleValue());</span>
+            });
+<span class="fc" id="L145">            spool = new TreeMap&lt;&gt;((o1, o2) -&gt; {</span>
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">                if (o1.getClass().equals(o2.getClass()))</span>
+<span class="fc" id="L147">                    return ((Comparable)o1).compareTo(o2);</span>
+                else
+<span class="nc" id="L149">                    return Double.compare(o1.doubleValue(), o2.doubleValue());</span>
+            });
+
+<span class="fc" id="L152">        }</span>
+
+        public StreamingHistogram build()
+        {
+<span class="fc" id="L156">            flushHistogram();</span>
+<span class="fc" id="L157">            return new StreamingHistogram(maxBinSize,  bin);</span>
+        }
+
+        /**
+         * Adds new point p to this histogram.
+         * @param p
+         */
+        public void update(Number p)
+        {
+<span class="fc" id="L166">            update(p, 1L);</span>
+<span class="fc" id="L167">        }</span>
+
+        /**
+         * Adds new point p with value m to this histogram.
+         * @param p
+         * @param m
+         */
+        public void update(Number p, long m)
+        {
+<span class="fc" id="L176">            Number d = p.longValue() % this.roundSeconds;</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">            if (d.longValue() &gt; 0)</span>
+<span class="fc" id="L178">                p =p.longValue() + (this.roundSeconds - d.longValue());</span>
+
+<span class="fc" id="L180">            long[] mi = spool.get(p);</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">            if (mi != null)</span>
+            {
+                // we found the same p so increment that counter
+<span class="fc" id="L184">                mi[0] += m;</span>
+            }
+            else
+            {
+<span class="fc" id="L188">                mi = new long[]{m};</span>
+<span class="fc" id="L189">                spool.put(p, mi);</span>
+            }
+
+            // If spool has overflowed, compact it
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">            if(spool.size() &gt; maxSpoolSize)</span>
+<span class="nc" id="L194">                flushHistogram();</span>
+<span class="fc" id="L195">        }</span>
+
+
+
+        /**
+         * Drain the temporary spool into the final bins
+         */
+        public void flushHistogram()
+        {
+<span class="fc bfc" id="L204" title="All 2 branches covered.">            if (spool.size() &gt; 0)</span>
+            {
+                long[] spoolValue;
+                long[] binValue;
+
+                // Iterate over the spool, copying the value into the primary bin map
+                // and compacting that map as necessary
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                for (Map.Entry&lt;Number, long[]&gt; entry : spool.entrySet())</span>
+                {
+<span class="fc" id="L213">                    Number key = entry.getKey();</span>
+<span class="fc" id="L214">                    spoolValue = entry.getValue();</span>
+<span class="fc" id="L215">                    binValue = bin.get(key);</span>
+
+                    // If this value is already in the final histogram bins
+                    // Simply increment and update, otherwise, insert a new long[1] value
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">                    if(binValue != null)</span>
+                    {
+<span class="nc" id="L221">                        binValue[0] += spoolValue[0];</span>
+<span class="nc" id="L222">                        bin.put(key, binValue);</span>
+                    }
+                    else
+                    {
+<span class="fc" id="L226">                        bin.put(key, new long[]{spoolValue[0]});</span>
+                    }
+
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">                    if (bin.size() &gt; maxBinSize)</span>
+                    {
+                        // find points p1, p2 which have smallest difference
+<span class="nc" id="L232">                        Iterator&lt;Number&gt; keys = bin.keySet().iterator();</span>
+<span class="nc" id="L233">                        double p1 = keys.next().doubleValue();</span>
+<span class="nc" id="L234">                        double p2 = keys.next().doubleValue();</span>
+<span class="nc" id="L235">                        double smallestDiff = p2 - p1;</span>
+<span class="nc" id="L236">                        double q1 = p1, q2 = p2;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">                        while (keys.hasNext())</span>
+                        {
+<span class="nc" id="L239">                            p1 = p2;</span>
+<span class="nc" id="L240">                            p2 = keys.next().doubleValue();</span>
+<span class="nc" id="L241">                            double diff = p2 - p1;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                            if (diff &lt; smallestDiff)</span>
+                            {
+<span class="nc" id="L244">                                smallestDiff = diff;</span>
+<span class="nc" id="L245">                                q1 = p1;</span>
+<span class="nc" id="L246">                                q2 = p2;</span>
+                            }
+<span class="nc" id="L248">                        }</span>
+                        // merge those two
+<span class="nc" id="L250">                        long[] a1 = bin.remove(q1);</span>
+<span class="nc" id="L251">                        long[] a2 = bin.remove(q2);</span>
+<span class="nc" id="L252">                        long k1 = a1[0];</span>
+<span class="nc" id="L253">                        long k2 = a2[0];</span>
+
+<span class="nc" id="L255">                        a1[0] += k2;</span>
+<span class="nc" id="L256">                        bin.put((q1 * k1 + q2 * k2) / (k1 + k2), a1);</span>
+
+                    }
+<span class="fc" id="L259">                }</span>
+<span class="fc" id="L260">                spool.clear();</span>
+            }
+<span class="fc" id="L262">        }</span>
+
+        /**
+         * Merges given histogram with this histogram.
+         *
+         * @param other histogram to merge
+         */
+        public void merge(StreamingHistogram other)
+        {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (other == null)</span>
+<span class="nc" id="L272">                return;</span>
+
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            for (Map.Entry&lt;Number, long[]&gt; entry : other.getAsMap().entrySet())</span>
+<span class="nc" id="L275">                update(entry.getKey(), entry.getValue()[0]);</span>
+<span class="nc" id="L276">        }</span>
+    }
+
+<span class="fc" id="L279">    public static class StreamingHistogramSerializer implements ISerializer&lt;StreamingHistogram&gt;</span>
+    {
+        public void serialize(StreamingHistogram histogram, DataOutputPlus out) throws IOException
+        {
+<span class="fc" id="L283">            out.writeInt(histogram.maxBinSize);</span>
+<span class="fc" id="L284">            Map&lt;Number, long[]&gt; entries = histogram.getAsMap();</span>
+<span class="fc" id="L285">            out.writeInt(entries.size());</span>
+<span class="fc bfc" id="L286" title="All 2 branches covered.">            for (Map.Entry&lt;Number, long[]&gt; entry : entries.entrySet())</span>
+            {
+<span class="fc" id="L288">                out.writeDouble(entry.getKey().doubleValue());</span>
+<span class="fc" id="L289">                out.writeLong(entry.getValue()[0]);</span>
+<span class="fc" id="L290">            }</span>
+<span class="fc" id="L291">        }</span>
+
+        public StreamingHistogram deserialize(DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L295">            int maxBinSize = in.readInt();</span>
+<span class="nc" id="L296">            int size = in.readInt();</span>
+<span class="nc" id="L297">            Map&lt;Number, long[]&gt; tmp = new HashMap&lt;&gt;(size);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L300">                tmp.put(in.readDouble(), new long[]{in.readLong()});</span>
+            }
+
+<span class="nc" id="L303">            return new StreamingHistogram(maxBinSize, tmp);</span>
+        }
+
+        public long serializedSize(StreamingHistogram histogram)
+        {
+<span class="fc" id="L308">            long size = TypeSizes.sizeof(histogram.maxBinSize);</span>
+<span class="fc" id="L309">            Map&lt;Number, long[]&gt; entries = histogram.getAsMap();</span>
+<span class="fc" id="L310">            size += TypeSizes.sizeof(entries.size());</span>
+            // size of entries = size * (8(double) + 8(long))
+<span class="fc" id="L312">            size += entries.size() * (8L + 8L);</span>
+<span class="fc" id="L313">            return size;</span>
+        }
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (this == o)</span>
+<span class="nc" id="L321">            return true;</span>
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        if (!(o instanceof StreamingHistogram))</span>
+<span class="nc" id="L324">            return false;</span>
+
+<span class="nc" id="L326">        StreamingHistogram that = (StreamingHistogram) o;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        return maxBinSize == that.maxBinSize &amp;&amp;</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">               bin.equals(that.bin);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L334">        return Objects.hashCode(bin.hashCode(), maxBinSize);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

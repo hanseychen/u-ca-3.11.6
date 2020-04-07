@@ -1,0 +1,658 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnDefinition.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.config</a> &gt; <span class="el_source">ColumnDefinition.java</span></div><h1>ColumnDefinition.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.config;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Objects;
+import com.google.common.collect.Collections2;
+
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.selection.Selectable;
+import org.apache.cassandra.cql3.selection.Selector;
+import org.apache.cassandra.cql3.selection.SimpleSelector;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.github.jamm.Unmetered;
+
+<span class="pc bpc" id="L40" title="1 of 2 branches missed.">@Unmetered</span>
+public class ColumnDefinition extends ColumnSpecification implements Selectable, Comparable&lt;ColumnDefinition&gt;
+{
+<span class="fc" id="L43">    public static final Comparator&lt;Object&gt; asymmetricColumnDataComparator =</span>
+<span class="fc" id="L44">        (a, b) -&gt; ((ColumnData) a).column().compareTo((ColumnDefinition) b);</span>
+
+    public static final int NO_POSITION = -1;
+
+<span class="fc" id="L48">    public enum ClusteringOrder</span>
+    {
+<span class="fc" id="L50">        ASC, DESC, NONE</span>
+    }
+
+    /*
+     * The type of CQL3 column this definition represents.
+     * There is 4 main type of CQL3 columns: those parts of the partition key,
+     * those parts of the clustering columns and amongst the others, regular and
+     * static ones.
+     *
+     * Note that thrift only knows about definitions of type REGULAR (and
+     * the ones whose position == NO_POSITION (-1)).
+     */
+<span class="fc" id="L62">    public enum Kind</span>
+    {
+        // NOTE: if adding a new type, must modify comparisonOrder
+<span class="fc" id="L65">        PARTITION_KEY,</span>
+<span class="fc" id="L66">        CLUSTERING,</span>
+<span class="fc" id="L67">        REGULAR,</span>
+<span class="fc" id="L68">        STATIC;</span>
+
+        public boolean isPrimaryKeyKind()
+        {
+<span class="fc bfc" id="L72" title="All 4 branches covered.">            return this == PARTITION_KEY || this == CLUSTERING;</span>
+        }
+
+    }
+
+    public final Kind kind;
+
+    /*
+     * If the column is a partition key or clustering column, its position relative to
+     * other columns of the same kind. Otherwise,  NO_POSITION (-1).
+     *
+     * Note that partition key and clustering columns are numbered separately so
+     * the first clustering column is 0.
+     */
+    private final int position;
+
+    private final Comparator&lt;CellPath&gt; cellPathComparator;
+    private final Comparator&lt;Object&gt; asymmetricCellPathComparator;
+    private final Comparator&lt;? super Cell&gt; cellComparator;
+
+    private int hash;
+
+    /**
+     * These objects are compared frequently, so we encode several of their comparison components
+     * into a single long value so that this can be done efficiently
+     */
+    private final long comparisonOrder;
+
+    private static long comparisonOrder(Kind kind, boolean isComplex, long position, ColumnIdentifier name)
+    {
+<span class="pc bpc" id="L102" title="3 of 6 branches missed.">        assert position &gt;= 0 &amp;&amp; position &lt; 1 &lt;&lt; 12;</span>
+<span class="fc bfc" id="L103" title="All 2 branches covered.">        return   (((long) kind.ordinal()) &lt;&lt; 61)</span>
+               | (isComplex ? 1L &lt;&lt; 60 : 0)
+               | (position &lt;&lt; 48)
+               | (name.prefixComparison &gt;&gt;&gt; 16);
+    }
+
+    public static ColumnDefinition partitionKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType&lt;?&gt; type, int position)
+    {
+<span class="nc" id="L111">        return new ColumnDefinition(cfm, name, type, position, Kind.PARTITION_KEY);</span>
+    }
+
+    public static ColumnDefinition partitionKeyDef(String ksName, String cfName, String name, AbstractType&lt;?&gt; type, int position)
+    {
+<span class="nc" id="L116">        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, position, Kind.PARTITION_KEY);</span>
+    }
+
+    public static ColumnDefinition clusteringDef(CFMetaData cfm, ByteBuffer name, AbstractType&lt;?&gt; type, int position)
+    {
+<span class="nc" id="L121">        return new ColumnDefinition(cfm, name, type, position, Kind.CLUSTERING);</span>
+    }
+
+    public static ColumnDefinition clusteringDef(String ksName, String cfName, String name, AbstractType&lt;?&gt; type, int position)
+    {
+<span class="nc" id="L126">        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true),  type, position, Kind.CLUSTERING);</span>
+    }
+
+    public static ColumnDefinition regularDef(CFMetaData cfm, ByteBuffer name, AbstractType&lt;?&gt; type)
+    {
+<span class="nc" id="L131">        return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.REGULAR);</span>
+    }
+
+    public static ColumnDefinition regularDef(String ksName, String cfName, String name, AbstractType&lt;?&gt; type)
+    {
+<span class="fc" id="L136">        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, NO_POSITION, Kind.REGULAR);</span>
+    }
+
+    public static ColumnDefinition staticDef(CFMetaData cfm, ByteBuffer name, AbstractType&lt;?&gt; type)
+    {
+<span class="nc" id="L141">        return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.STATIC);</span>
+    }
+
+    public static ColumnDefinition staticDef(String ksName, String cfName, String name, AbstractType&lt;?&gt; type)
+    {
+<span class="nc" id="L146">        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, NO_POSITION, Kind.STATIC);</span>
+    }
+
+    public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType&lt;?&gt; type, int position, Kind kind)
+    {
+<span class="nc" id="L151">        this(cfm.ksName,</span>
+             cfm.cfName,
+<span class="nc" id="L153">             ColumnIdentifier.getInterned(name, cfm.getColumnDefinitionNameComparator(kind)),</span>
+             type,
+             position,
+             kind);
+<span class="nc" id="L157">    }</span>
+
+    @VisibleForTesting
+    public ColumnDefinition(String ksName,
+                            String cfName,
+                            ColumnIdentifier name,
+                            AbstractType&lt;?&gt; type,
+                            int position,
+                            Kind kind)
+    {
+<span class="fc" id="L167">        super(ksName, cfName, name, type);</span>
+<span class="pc bpc" id="L168" title="4 of 8 branches missed.">        assert name != null &amp;&amp; type != null &amp;&amp; kind != null;</span>
+<span class="pc bpc" id="L169" title="2 of 8 branches missed.">        assert (position == NO_POSITION) == !kind.isPrimaryKeyKind(); // The position really only make sense for partition and clustering columns (and those must have one),</span>
+                                                                      // so make sure we don't sneak it for something else since it'd breaks equals()
+<span class="fc" id="L171">        this.kind = kind;</span>
+<span class="fc" id="L172">        this.position = position;</span>
+<span class="fc" id="L173">        this.cellPathComparator = makeCellPathComparator(kind, type);</span>
+<span class="fc bfc" id="L174" title="All 2 branches covered.">        this.cellComparator = cellPathComparator == null ? ColumnData.comparator : (a, b) -&gt; cellPathComparator.compare(a.path(), b.path());</span>
+<span class="pc bfc" id="L175" title="All 2 branches covered.">        this.asymmetricCellPathComparator = cellPathComparator == null ? null : (a, b) -&gt; cellPathComparator.compare(((Cell)a).path(), (CellPath) b);</span>
+<span class="fc" id="L176">        this.comparisonOrder = comparisonOrder(kind, isComplex(), Math.max(0, position), name);</span>
+<span class="fc" id="L177">    }</span>
+
+    private static Comparator&lt;CellPath&gt; makeCellPathComparator(Kind kind, AbstractType&lt;?&gt; type)
+    {
+<span class="fc bfc" id="L181" title="All 4 branches covered.">        if (kind.isPrimaryKeyKind() || !type.isMultiCell())</span>
+<span class="fc" id="L182">            return null;</span>
+
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">        AbstractType&lt;?&gt; nameComparator = type.isCollection()</span>
+<span class="pc" id="L185">                                       ? ((CollectionType) type).nameComparator()</span>
+<span class="pc" id="L186">                                       : ((UserType) type).nameComparator();</span>
+
+
+<span class="fc" id="L189">        return new Comparator&lt;CellPath&gt;()</span>
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">        {</span>
+            public int compare(CellPath path1, CellPath path2)
+            {
+<span class="pc bpc" id="L193" title="1 of 4 branches missed.">                if (path1.size() == 0 || path2.size() == 0)</span>
+                {
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">                    if (path1 == CellPath.BOTTOM)</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                        return path2 == CellPath.BOTTOM ? 0 : -1;</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">                    if (path1 == CellPath.TOP)</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                        return path2 == CellPath.TOP ? 0 : 1;</span>
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">                    return path2 == CellPath.BOTTOM ? 1 : -1;</span>
+                }
+
+                // This will get more complicated once we have non-frozen UDT and nested collections
+<span class="pc bpc" id="L203" title="3 of 6 branches missed.">                assert path1.size() == 1 &amp;&amp; path2.size() == 1;</span>
+<span class="fc" id="L204">                return nameComparator.compare(path1.get(0), path2.get(0));</span>
+            }
+        };
+    }
+
+    public ColumnDefinition copy()
+    {
+<span class="fc" id="L211">        return new ColumnDefinition(ksName, cfName, name, type, position, kind);</span>
+    }
+
+    public ColumnDefinition withNewName(ColumnIdentifier newName)
+    {
+<span class="nc" id="L216">        return new ColumnDefinition(ksName, cfName, newName, type, position, kind);</span>
+    }
+
+    public ColumnDefinition withNewType(AbstractType&lt;?&gt; newType)
+    {
+<span class="nc" id="L221">        return new ColumnDefinition(ksName, cfName, name, newType, position, kind);</span>
+    }
+
+    public boolean isPartitionKey()
+    {
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        return kind == Kind.PARTITION_KEY;</span>
+    }
+
+    public boolean isClusteringColumn()
+    {
+<span class="fc bfc" id="L231" title="All 2 branches covered.">        return kind == Kind.CLUSTERING;</span>
+    }
+
+    public boolean isStatic()
+    {
+<span class="fc bfc" id="L236" title="All 2 branches covered.">        return kind == Kind.STATIC;</span>
+    }
+
+    public boolean isRegular()
+    {
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">        return kind == Kind.REGULAR;</span>
+    }
+
+    public ClusteringOrder clusteringOrder()
+    {
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        if (!isClusteringColumn())</span>
+<span class="fc" id="L247">            return ClusteringOrder.NONE;</span>
+
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">        return type.isReversed() ? ClusteringOrder.DESC : ClusteringOrder.ASC;</span>
+    }
+
+    public int position()
+    {
+<span class="fc" id="L254">        return position;</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="fc bfc" id="L260" title="All 2 branches covered.">        if (this == o)</span>
+<span class="fc" id="L261">            return true;</span>
+
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        if (!(o instanceof ColumnDefinition))</span>
+<span class="nc" id="L264">            return false;</span>
+
+<span class="fc" id="L266">        ColumnDefinition cd = (ColumnDefinition) o;</span>
+
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">        return Objects.equal(ksName, cd.ksName)</span>
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">            &amp;&amp; Objects.equal(cfName, cd.cfName)</span>
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">            &amp;&amp; Objects.equal(name, cd.name)</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            &amp;&amp; Objects.equal(type, cd.type)</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            &amp;&amp; Objects.equal(kind, cd.kind)</span>
+<span class="pc bnc" id="L273" title="All 2 branches missed.">            &amp;&amp; Objects.equal(position, cd.position);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+        // This achieves the same as Objects.hashcode, but avoids the object array allocation
+        // which features significantly in the allocation profile and caches the result.
+<span class="fc" id="L281">        int result = hash;</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">        if(result == 0)</span>
+        {
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">            result = 31 + (ksName == null ? 0 : ksName.hashCode());</span>
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">            result = 31 * result + (cfName == null ? 0 : cfName.hashCode());</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">            result = 31 * result + (name == null ? 0 : name.hashCode());</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">            result = 31 * result + (type == null ? 0 : type.hashCode());</span>
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">            result = 31 * result + (kind == null ? 0 : kind.hashCode());</span>
+<span class="fc" id="L289">            result = 31 * result + position;</span>
+<span class="fc" id="L290">            hash = result;</span>
+        }
+<span class="fc" id="L292">        return result;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L298">        return name.toString();</span>
+    }
+
+    public String debugString()
+    {
+<span class="nc" id="L303">        return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L304">                          .add(&quot;name&quot;, name)</span>
+<span class="nc" id="L305">                          .add(&quot;type&quot;, type)</span>
+<span class="nc" id="L306">                          .add(&quot;kind&quot;, kind)</span>
+<span class="nc" id="L307">                          .add(&quot;position&quot;, position)</span>
+<span class="nc" id="L308">                          .toString();</span>
+    }
+
+    public boolean isPrimaryKeyColumn()
+    {
+<span class="fc" id="L313">        return kind.isPrimaryKeyKind();</span>
+    }
+
+    /**
+     * Whether the name of this definition is serialized in the cell nane, i.e. whether
+     * it's not just a non-stored CQL metadata.
+     */
+    public boolean isPartOfCellName(boolean isCQL3Table, boolean isSuper)
+    {
+        // When converting CQL3 tables to thrift, any regular or static column ends up in the cell name.
+        // When it's a compact table however, the REGULAR definition is the name for the cell value of &quot;dynamic&quot;
+        // column (so it's not part of the cell name) and it's static columns that ends up in the cell name.
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (isCQL3Table)</span>
+<span class="nc bnc" id="L326" title="All 4 branches missed.">            return kind == Kind.REGULAR || kind == Kind.STATIC;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        else if (isSuper)</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            return kind == Kind.REGULAR;</span>
+        else
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            return kind == Kind.STATIC;</span>
+    }
+
+    /**
+     * Converts the specified column definitions into column identifiers.
+     *
+     * @param definitions the column definitions to convert.
+     * @return the column identifiers corresponding to the specified definitions
+     */
+    public static Collection&lt;ColumnIdentifier&gt; toIdentifiers(Collection&lt;ColumnDefinition&gt; definitions)
+    {
+<span class="nc" id="L341">        return Collections2.transform(definitions, new Function&lt;ColumnDefinition, ColumnIdentifier&gt;()</span>
+<span class="nc" id="L342">        {</span>
+            @Override
+            public ColumnIdentifier apply(ColumnDefinition columnDef)
+            {
+<span class="nc" id="L346">                return columnDef.name;</span>
+            }
+        });
+    }
+
+    public int compareTo(ColumnDefinition other)
+    {
+<span class="fc bfc" id="L353" title="All 2 branches covered.">        if (this == other)</span>
+<span class="fc" id="L354">            return 0;</span>
+
+<span class="fc bfc" id="L356" title="All 2 branches covered.">        if (comparisonOrder != other.comparisonOrder)</span>
+<span class="fc" id="L357">            return Long.compare(comparisonOrder, other.comparisonOrder);</span>
+
+<span class="fc" id="L359">        return this.name.compareTo(other.name);</span>
+    }
+
+    public Comparator&lt;CellPath&gt; cellPathComparator()
+    {
+<span class="fc" id="L364">        return cellPathComparator;</span>
+    }
+
+    public Comparator&lt;Object&gt; asymmetricCellPathComparator()
+    {
+<span class="nc" id="L369">        return asymmetricCellPathComparator;</span>
+    }
+
+    public Comparator&lt;? super Cell&gt; cellComparator()
+    {
+<span class="fc" id="L374">        return cellComparator;</span>
+    }
+
+    public boolean isComplex()
+    {
+<span class="fc bfc" id="L379" title="All 2 branches covered.">        return cellPathComparator != null;</span>
+    }
+
+    public boolean isSimple()
+    {
+<span class="fc bfc" id="L384" title="All 2 branches covered.">        return !isComplex();</span>
+    }
+
+    public CellPath.Serializer cellPathSerializer()
+    {
+        // Collections are our only complex so far, so keep it simple
+<span class="fc" id="L390">        return CollectionType.cellPathSerializer;</span>
+    }
+
+    public void validateCell(Cell cell)
+    {
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (cell.isTombstone())</span>
+        {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (cell.value().hasRemaining())</span>
+<span class="nc" id="L398">                throw new MarshalException(&quot;A tombstone should not have a value&quot;);</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            if (cell.path() != null)</span>
+<span class="nc" id="L400">                validateCellPath(cell.path());</span>
+        }
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        else if(type.isUDT())</span>
+        {
+            // To validate a non-frozen UDT field, both the path and the value
+            // are needed, the path being an index into an array of value types.
+<span class="nc" id="L406">            ((UserType)type).validateCell(cell);</span>
+        }
+        else
+        {
+<span class="nc" id="L410">            type.validateCellValue(cell.value());</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (cell.path() != null)</span>
+<span class="nc" id="L412">                validateCellPath(cell.path());</span>
+        }
+<span class="nc" id="L414">    }</span>
+
+    private void validateCellPath(CellPath path)
+    {
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (!isComplex())</span>
+<span class="nc" id="L419">            throw new MarshalException(&quot;Only complex cells should have a cell path&quot;);</span>
+
+<span class="nc bnc" id="L421" title="All 4 branches missed.">        assert type.isMultiCell();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        if (type.isCollection())</span>
+<span class="nc" id="L423">            ((CollectionType)type).nameComparator().validate(path.get(0));</span>
+        else
+<span class="nc" id="L425">            ((UserType)type).nameComparator().validate(path.get(0));</span>
+<span class="nc" id="L426">    }</span>
+
+    public static String toCQLString(Iterable&lt;ColumnDefinition&gt; defs)
+    {
+<span class="nc" id="L430">        return toCQLString(defs.iterator());</span>
+    }
+
+    public static String toCQLString(Iterator&lt;ColumnDefinition&gt; defs)
+    {
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if (!defs.hasNext())</span>
+<span class="nc" id="L436">            return &quot;&quot;;</span>
+
+<span class="nc" id="L438">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L439">        sb.append(defs.next().name);</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        while (defs.hasNext())</span>
+<span class="nc" id="L441">            sb.append(&quot;, &quot;).append(defs.next().name);</span>
+<span class="nc" id="L442">        return sb.toString();</span>
+    }
+
+    /**
+     * The type of the cell values for cell belonging to this column.
+     *
+     * This is the same than the column type, except for non-frozen collections where it's the 'valueComparator'
+     * of the collection.
+     * 
+     * This method should not be used to get value type of non-frozon UDT.
+     */
+    public AbstractType&lt;?&gt; cellValueType()
+    {
+<span class="nc bnc" id="L455" title="All 6 branches missed.">        assert !(type instanceof UserType &amp;&amp; type.isMultiCell());</span>
+<span class="nc bnc" id="L456" title="All 4 branches missed.">        return type instanceof CollectionType &amp;&amp; type.isMultiCell()</span>
+<span class="nc" id="L457">                ? ((CollectionType)type).valueComparator()</span>
+                : type;
+    }
+
+
+    public boolean isCounterColumn()
+    {
+<span class="fc bfc" id="L464" title="All 2 branches covered.">        if (type instanceof CollectionType) // for thrift</span>
+<span class="fc" id="L465">            return ((CollectionType) type).valueComparator().isCounter();</span>
+<span class="fc" id="L466">        return type.isCounter();</span>
+    }
+
+    public Selector.Factory newSelectorFactory(CFMetaData cfm, AbstractType&lt;?&gt; expectedType, List&lt;ColumnDefinition&gt; defs, VariableSpecifications boundNames) throws InvalidRequestException
+    {
+<span class="fc" id="L471">        return SimpleSelector.newFactory(this, addAndGetIndex(this, defs));</span>
+    }
+
+    public AbstractType&lt;?&gt; getExactTypeIfKnown(String keyspace)
+    {
+<span class="nc" id="L476">        return type;</span>
+    }
+
+    /**
+     * Because Thrift-created tables may have a non-text comparator, we cannot determine the proper 'key' until
+     * we know the comparator. ColumnDefinition.Raw is a placeholder that can be converted to a real ColumnIdentifier
+     * once the comparator is known with prepare(). This should only be used with identifiers that are actual
+     * column names. See CASSANDRA-8178 for more background.
+     */
+<span class="fc" id="L485">    public static abstract class Raw extends Selectable.Raw</span>
+    {
+        /**
+         * Creates a {@code ColumnDefinition.Raw} from an unquoted identifier string.
+         */
+        public static Raw forUnquoted(String text)
+        {
+<span class="fc" id="L492">            return new Literal(text, false);</span>
+        }
+
+        /**
+         * Creates a {@code ColumnDefinition.Raw} from a quoted identifier string.
+         */
+        public static Raw forQuoted(String text)
+        {
+<span class="nc" id="L500">            return new Literal(text, true);</span>
+        }
+
+        /**
+         * Creates a {@code ColumnDefinition.Raw} from a pre-existing {@code ColumnDefinition}
+         * (useful in the rare cases where we already have the column but need
+         * a {@code ColumnDefinition.Raw} for typing purposes).
+         */
+        public static Raw forColumn(ColumnDefinition column)
+        {
+<span class="nc" id="L510">            return new ForColumn(column);</span>
+        }
+
+        /**
+         * Get the identifier corresponding to this raw column, without assuming this is an
+         * existing column (unlike {@link #prepare}).
+         */
+        public abstract ColumnIdentifier getIdentifier(CFMetaData cfm);
+
+        public abstract String rawText();
+
+        @Override
+        public abstract ColumnDefinition prepare(CFMetaData cfm);
+
+        @Override
+        public boolean processesSelection()
+        {
+<span class="fc" id="L527">            return false;</span>
+        }
+
+        @Override
+        public final int hashCode()
+        {
+<span class="fc" id="L533">            return toString().hashCode();</span>
+        }
+
+        @Override
+        public final boolean equals(Object o)
+        {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            if(!(o instanceof Raw))</span>
+<span class="nc" id="L540">                return false;</span>
+
+<span class="nc" id="L542">            Raw that = (Raw)o;</span>
+<span class="nc" id="L543">            return this.toString().equals(that.toString());</span>
+        }
+
+        private static class Literal extends Raw
+        {
+            private final String text;
+
+            public Literal(String rawText, boolean keepCase)
+<span class="fc" id="L551">            {</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">                this.text =  keepCase ? rawText : rawText.toLowerCase(Locale.US);</span>
+<span class="fc" id="L553">            }</span>
+
+            public ColumnIdentifier getIdentifier(CFMetaData cfm)
+            {
+<span class="nc bnc" id="L557" title="All 2 branches missed.">                if (!cfm.isStaticCompactTable())</span>
+<span class="nc" id="L558">                    return ColumnIdentifier.getInterned(text, true);</span>
+
+<span class="nc" id="L560">                AbstractType&lt;?&gt; thriftColumnNameType = cfm.thriftColumnNameType();</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if (thriftColumnNameType instanceof UTF8Type)</span>
+<span class="nc" id="L562">                    return ColumnIdentifier.getInterned(text, true);</span>
+
+                // We have a Thrift-created table with a non-text comparator. Check if we have a match column, otherwise assume we should use
+                // thriftColumnNameType
+<span class="nc" id="L566">                ByteBuffer bufferName = ByteBufferUtil.bytes(text);</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                for (ColumnDefinition def : cfm.allColumns())</span>
+                {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">                    if (def.name.bytes.equals(bufferName))</span>
+<span class="nc" id="L570">                        return def.name;</span>
+<span class="nc" id="L571">                }</span>
+<span class="nc" id="L572">                return ColumnIdentifier.getInterned(thriftColumnNameType, thriftColumnNameType.fromString(text), text);</span>
+            }
+
+            public ColumnDefinition prepare(CFMetaData cfm)
+            {
+<span class="fc bfc" id="L577" title="All 2 branches covered.">                if (!cfm.isStaticCompactTable())</span>
+<span class="fc" id="L578">                    return find(cfm);</span>
+
+<span class="fc" id="L580">                AbstractType&lt;?&gt; thriftColumnNameType = cfm.thriftColumnNameType();</span>
+<span class="pc bpc" id="L581" title="1 of 2 branches missed.">                if (thriftColumnNameType instanceof UTF8Type)</span>
+<span class="fc" id="L582">                    return find(cfm);</span>
+
+                // We have a Thrift-created table with a non-text comparator. Check if we have a match column, otherwise assume we should use
+                // thriftColumnNameType
+<span class="nc" id="L586">                ByteBuffer bufferName = ByteBufferUtil.bytes(text);</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                for (ColumnDefinition def : cfm.allColumns())</span>
+                {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                    if (def.name.bytes.equals(bufferName))</span>
+<span class="nc" id="L590">                        return def;</span>
+<span class="nc" id="L591">                }</span>
+<span class="nc" id="L592">                return find(thriftColumnNameType.fromString(text), cfm);</span>
+            }
+
+            private ColumnDefinition find(CFMetaData cfm)
+            {
+<span class="fc" id="L597">                return find(ByteBufferUtil.bytes(text), cfm);</span>
+            }
+
+            private ColumnDefinition find(ByteBuffer id, CFMetaData cfm)
+            {
+<span class="fc" id="L602">                ColumnDefinition def = cfm.getColumnDefinitionForCQL(id);</span>
+<span class="pc bpc" id="L603" title="1 of 2 branches missed.">                if (def == null)</span>
+<span class="nc" id="L604">                    throw new InvalidRequestException(String.format(&quot;Undefined column name %s&quot;, toString()));</span>
+<span class="fc" id="L605">                return def;</span>
+            }
+
+            public String rawText()
+            {
+<span class="nc" id="L610">                return text;</span>
+            }
+
+            @Override
+            public String toString()
+            {
+<span class="fc" id="L616">                return ColumnIdentifier.maybeQuote(text);</span>
+            }
+        }
+
+        // Use internally in the rare case where we need a ColumnDefinition.Raw for type-checking but
+        // actually already have the column itself.
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        private static class ForColumn extends Raw</span>
+        {
+            private final ColumnDefinition column;
+
+            private ForColumn(ColumnDefinition column)
+<span class="nc" id="L627">            {</span>
+<span class="nc" id="L628">                this.column = column;</span>
+<span class="nc" id="L629">            }</span>
+
+            public ColumnIdentifier getIdentifier(CFMetaData cfm)
+            {
+<span class="nc" id="L633">                return column.name;</span>
+            }
+
+            public ColumnDefinition prepare(CFMetaData cfm)
+            {
+<span class="nc bnc" id="L638" title="All 4 branches missed.">                assert cfm.getColumnDefinition(column.name) != null; // Sanity check that we're not doing something crazy</span>
+<span class="nc" id="L639">                return column;</span>
+            }
+
+            public String rawText()
+            {
+<span class="nc" id="L644">                return column.name.toString();</span>
+            }
+
+            @Override
+            public String toString()
+            {
+<span class="nc" id="L650">                return column.name.toCQLString();</span>
+            }
+        }
+    }
+
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

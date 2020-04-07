@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MonitoringTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.monitoring</a> &gt; <span class="el_source">MonitoringTask.java</span></div><h1>MonitoringTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.monitoring;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static java.lang.System.getProperty;
+
+/**
+ * A task for monitoring in progress operations, currently only read queries, and aborting them if they time out.
+ * We also log timed out operations, see CASSANDRA-7392.
+ * Since CASSANDRA-12403 we also log queries that were slow.
+ */
+class MonitoringTask
+{
+<span class="nc" id="L50">    private static final String LINE_SEPARATOR = getProperty(&quot;line.separator&quot;);</span>
+<span class="nc" id="L51">    private static final Logger logger = LoggerFactory.getLogger(MonitoringTask.class);</span>
+<span class="nc" id="L52">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 5L, TimeUnit.MINUTES);</span>
+
+    /**
+     * Defines the interval for reporting any operations that have timed out.
+     */
+<span class="nc" id="L57">    private static final int REPORT_INTERVAL_MS = Math.max(0, Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;monitoring_report_interval_ms&quot;, &quot;5000&quot;)));</span>
+
+    /**
+     * Defines the maximum number of unique timed out queries that will be reported in the logs.
+     * Use a negative number to remove any limit.
+     */
+<span class="nc" id="L63">    private static final int MAX_OPERATIONS = Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;monitoring_max_operations&quot;, &quot;50&quot;));</span>
+
+    @VisibleForTesting
+<span class="nc" id="L66">    static MonitoringTask instance = make(REPORT_INTERVAL_MS, MAX_OPERATIONS);</span>
+
+    private final ScheduledFuture&lt;?&gt; reportingTask;
+    private final OperationsQueue failedOperationsQueue;
+    private final OperationsQueue slowOperationsQueue;
+    private long lastLogTime;
+
+
+    @VisibleForTesting
+    static MonitoringTask make(int reportIntervalMillis, int maxTimedoutOperations)
+    {
+<span class="nc bnc" id="L77" title="All 2 branches missed.">        if (instance != null)</span>
+        {
+<span class="nc" id="L79">            instance.cancel();</span>
+<span class="nc" id="L80">            instance = null;</span>
+        }
+
+<span class="nc" id="L83">        return new MonitoringTask(reportIntervalMillis, maxTimedoutOperations);</span>
+    }
+
+    private MonitoringTask(int reportIntervalMillis, int maxOperations)
+<span class="nc" id="L87">    {</span>
+<span class="nc" id="L88">        this.failedOperationsQueue = new OperationsQueue(maxOperations);</span>
+<span class="nc" id="L89">        this.slowOperationsQueue = new OperationsQueue(maxOperations);</span>
+
+<span class="nc" id="L91">        this.lastLogTime = ApproximateTime.currentTimeMillis();</span>
+
+<span class="nc" id="L93">        logger.info(&quot;Scheduling monitoring task with report interval of {} ms, max operations {}&quot;, reportIntervalMillis, maxOperations);</span>
+<span class="nc" id="L94">        this.reportingTask = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(() -&gt; logOperations(ApproximateTime.currentTimeMillis()),</span>
+                                                                                     reportIntervalMillis,
+                                                                                     reportIntervalMillis,
+                                                                                     TimeUnit.MILLISECONDS);
+<span class="nc" id="L98">    }</span>
+
+    public void cancel()
+    {
+<span class="nc" id="L102">        reportingTask.cancel(false);</span>
+<span class="nc" id="L103">    }</span>
+
+    static void addFailedOperation(Monitorable operation, long now)
+    {
+<span class="nc" id="L107">        instance.failedOperationsQueue.offer(new FailedOperation(operation, now));</span>
+<span class="nc" id="L108">    }</span>
+
+    static void addSlowOperation(Monitorable operation, long now)
+    {
+<span class="nc" id="L112">        instance.slowOperationsQueue.offer(new SlowOperation(operation, now));</span>
+<span class="nc" id="L113">    }</span>
+
+    @VisibleForTesting
+    List&lt;String&gt; getFailedOperations()
+    {
+<span class="nc" id="L118">        return getLogMessages(failedOperationsQueue.popOperations());</span>
+    }
+
+    @VisibleForTesting
+    List&lt;String&gt; getSlowOperations()
+    {
+<span class="nc" id="L124">        return getLogMessages(slowOperationsQueue.popOperations());</span>
+    }
+
+    private List&lt;String&gt; getLogMessages(AggregatedOperations operations)
+    {
+<span class="nc" id="L129">        String ret = operations.getLogMessage();</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        return ret.isEmpty() ? Collections.emptyList() : Arrays.asList(ret.split(&quot;\n&quot;));</span>
+    }
+
+    @VisibleForTesting
+    private void logOperations(long now)
+    {
+<span class="nc" id="L136">        logSlowOperations(now);</span>
+<span class="nc" id="L137">        logFailedOperations(now);</span>
+
+<span class="nc" id="L139">        lastLogTime = now;</span>
+<span class="nc" id="L140">    }</span>
+
+    @VisibleForTesting
+    boolean logFailedOperations(long now)
+    {
+<span class="nc" id="L145">        AggregatedOperations failedOperations = failedOperationsQueue.popOperations();</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (!failedOperations.isEmpty())</span>
+        {
+<span class="nc" id="L148">            long elapsed = now - lastLogTime;</span>
+<span class="nc" id="L149">            noSpamLogger.warn(&quot;Some operations timed out, details available at debug level (debug.log)&quot;);</span>
+
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="nc" id="L152">                logger.debug(&quot;{} operations timed out in the last {} msecs:{}{}&quot;,</span>
+<span class="nc" id="L153">                            failedOperations.num(),</span>
+<span class="nc" id="L154">                            elapsed,</span>
+                            LINE_SEPARATOR,
+<span class="nc" id="L156">                            failedOperations.getLogMessage());</span>
+<span class="nc" id="L157">            return true;</span>
+        }
+
+<span class="nc" id="L160">        return false;</span>
+    }
+
+    @VisibleForTesting
+    boolean logSlowOperations(long now)
+    {
+<span class="nc" id="L166">        AggregatedOperations slowOperations = slowOperationsQueue.popOperations();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (!slowOperations.isEmpty())</span>
+        {
+<span class="nc" id="L169">            long elapsed = now - lastLogTime;</span>
+<span class="nc" id="L170">            noSpamLogger.info(&quot;Some operations were slow, details available at debug level (debug.log)&quot;);</span>
+
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="nc" id="L173">                logger.debug(&quot;{} operations were slow in the last {} msecs:{}{}&quot;,</span>
+<span class="nc" id="L174">                             slowOperations.num(),</span>
+<span class="nc" id="L175">                             elapsed,</span>
+                             LINE_SEPARATOR,
+<span class="nc" id="L177">                             slowOperations.getLogMessage());</span>
+<span class="nc" id="L178">            return true;</span>
+        }
+<span class="nc" id="L180">        return false;</span>
+    }
+
+    /**
+     * A wrapper for a queue that can be either bounded, in which case
+     * we increment a counter if we exceed the queue size, or unbounded.
+     */
+    private static final class OperationsQueue
+    {
+        /** The max operations on the queue. If this value is zero then logging is disabled
+         * and the queue will always be empty. If this value is negative then the queue is unbounded.
+         */
+        private final int maxOperations;
+
+        /**
+         * The operations queue, it can be either bounded or unbounded depending on the value of maxOperations.
+         */
+        private final BlockingQueue&lt;Operation&gt; queue;
+
+        /**
+         * If we fail to add an operation to the queue then we increment this value. We reset this value
+         * when the queue is emptied.
+         */
+        private final AtomicLong numDroppedOperations;
+
+        OperationsQueue(int maxOperations)
+<span class="nc" id="L206">        {</span>
+<span class="nc" id="L207">            this.maxOperations = maxOperations;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            this.queue = maxOperations &gt; 0 ? new ArrayBlockingQueue&lt;&gt;(maxOperations) : new LinkedBlockingQueue&lt;&gt;();</span>
+<span class="nc" id="L209">            this.numDroppedOperations = new AtomicLong();</span>
+<span class="nc" id="L210">        }</span>
+
+        /**
+         * Add an operation to the queue, if possible, or increment the dropped counter.
+         *
+         * @param operation - the operations to add
+         */
+        private void offer(Operation operation)
+        {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (maxOperations == 0)</span>
+<span class="nc" id="L220">                return; // logging of operations is disabled</span>
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (!queue.offer(operation))</span>
+<span class="nc" id="L223">                numDroppedOperations.incrementAndGet();</span>
+<span class="nc" id="L224">        }</span>
+
+
+        /**
+         * Return all operations in the queue, aggregated by name, and reset
+         * the counter for dropped operations.
+         *
+         * @return - the aggregated operations
+         */
+        private AggregatedOperations popOperations()
+        {
+<span class="nc" id="L235">            Map&lt;String, Operation&gt; operations = new HashMap&lt;&gt;();</span>
+
+            Operation operation;
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            while((operation = queue.poll()) != null)</span>
+            {
+<span class="nc" id="L240">                Operation existing = operations.get(operation.name());</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                if (existing != null)</span>
+<span class="nc" id="L242">                    existing.add(operation);</span>
+                else
+<span class="nc" id="L244">                    operations.put(operation.name(), operation);</span>
+<span class="nc" id="L245">            }</span>
+<span class="nc" id="L246">            return new AggregatedOperations(operations, numDroppedOperations.getAndSet(0L));</span>
+        }
+    }
+
+    /**
+     * Convert a map of aggregated operations into a log message that
+     * includes the information of whether some operations were dropped.
+     */
+    private static final class AggregatedOperations
+    {
+        private final Map&lt;String, Operation&gt; operations;
+        private final long numDropped;
+
+        AggregatedOperations(Map&lt;String, Operation&gt; operations, long numDropped)
+<span class="nc" id="L260">        {</span>
+<span class="nc" id="L261">            this.operations = operations;</span>
+<span class="nc" id="L262">            this.numDropped = numDropped;</span>
+<span class="nc" id="L263">        }</span>
+
+        public boolean isEmpty()
+        {
+<span class="nc bnc" id="L267" title="All 4 branches missed.">            return operations.isEmpty() &amp;&amp; numDropped == 0;</span>
+        }
+
+        public long num()
+        {
+<span class="nc" id="L272">            return operations.size() + numDropped;</span>
+        }
+
+        String getLogMessage()
+        {
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (isEmpty())</span>
+<span class="nc" id="L278">                return &quot;&quot;;</span>
+
+<span class="nc" id="L280">            final StringBuilder ret = new StringBuilder();</span>
+<span class="nc" id="L281">            operations.values().forEach(o -&gt; addOperation(ret, o));</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            if (numDropped &gt; 0)</span>
+<span class="nc" id="L284">                ret.append(LINE_SEPARATOR)</span>
+<span class="nc" id="L285">                   .append(&quot;... (&quot;)</span>
+<span class="nc" id="L286">                   .append(numDropped)</span>
+<span class="nc" id="L287">                   .append(&quot; were dropped)&quot;);</span>
+
+<span class="nc" id="L289">            return ret.toString();</span>
+        }
+
+        private static void addOperation(StringBuilder ret, Operation operation)
+        {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            if (ret.length() &gt; 0)</span>
+<span class="nc" id="L295">                ret.append(LINE_SEPARATOR);</span>
+
+<span class="nc" id="L297">            ret.append(operation.getLogMessage());</span>
+<span class="nc" id="L298">        }</span>
+    }
+
+    /**
+     * A wrapper class for an operation that either failed (timed-out) or
+     * was reported as slow. Because the same operation (query) may execute
+     * multiple times, we aggregate the number of times an operation with the
+     * same name (CQL query text) is reported and store the average, min and max
+     * times.
+     */
+    protected abstract static class Operation
+    {
+        /** The operation that was reported as slow or timed out */
+        final Monitorable operation;
+
+        /** The number of times the operation was reported */
+        int numTimesReported;
+
+        /** The total time spent by this operation */
+        long totalTime;
+
+        /** The maximum time spent by this operation */
+        long maxTime;
+
+        /** The minimum time spent by this operation */
+        long minTime;
+
+        /** The name of the operation, i.e. the SELECT query CQL,
+         * this is set lazily as it takes time to build the query CQL */
+        private String name;
+
+        Operation(Monitorable operation, long failedAt)
+<span class="nc" id="L330">        {</span>
+<span class="nc" id="L331">            this.operation = operation;</span>
+<span class="nc" id="L332">            numTimesReported = 1;</span>
+<span class="nc" id="L333">            totalTime = failedAt - operation.constructionTime();</span>
+<span class="nc" id="L334">            minTime = totalTime;</span>
+<span class="nc" id="L335">            maxTime = totalTime;</span>
+<span class="nc" id="L336">        }</span>
+
+        public String name()
+        {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (name == null)</span>
+<span class="nc" id="L341">                name = operation.name();</span>
+<span class="nc" id="L342">            return name;</span>
+        }
+
+        void add(Operation operation)
+        {
+<span class="nc" id="L347">            numTimesReported++;</span>
+<span class="nc" id="L348">            totalTime += operation.totalTime;</span>
+<span class="nc" id="L349">            maxTime = Math.max(maxTime, operation.maxTime);</span>
+<span class="nc" id="L350">            minTime = Math.min(minTime, operation.minTime);</span>
+<span class="nc" id="L351">        }</span>
+
+        public abstract String getLogMessage();
+    }
+
+    /**
+     * An operation (query) that timed out.
+     */
+    private final static class FailedOperation extends Operation
+    {
+        FailedOperation(Monitorable operation, long failedAt)
+        {
+<span class="nc" id="L363">            super(operation, failedAt);</span>
+<span class="nc" id="L364">        }</span>
+
+        public String getLogMessage()
+        {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if (numTimesReported == 1)</span>
+<span class="nc" id="L369">                return String.format(&quot;&lt;%s&gt;, total time %d msec, timeout %d %s&quot;,</span>
+<span class="nc" id="L370">                                     name(),</span>
+<span class="nc" id="L371">                                     totalTime,</span>
+<span class="nc" id="L372">                                     operation.timeout(),</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                                     operation.isCrossNode() ? &quot;msec/cross-node&quot; : &quot;msec&quot;);</span>
+            else
+<span class="nc" id="L375">                return String.format(&quot;&lt;%s&gt; timed out %d times, avg/min/max %d/%d/%d msec, timeout %d %s&quot;,</span>
+<span class="nc" id="L376">                                     name(),</span>
+<span class="nc" id="L377">                                     numTimesReported,</span>
+<span class="nc" id="L378">                                     totalTime / numTimesReported,</span>
+<span class="nc" id="L379">                                     minTime,</span>
+<span class="nc" id="L380">                                     maxTime,</span>
+<span class="nc" id="L381">                                     operation.timeout(),</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                                     operation.isCrossNode() ? &quot;msec/cross-node&quot; : &quot;msec&quot;);</span>
+        }
+    }
+
+    /**
+     * An operation (query) that was reported as slow.
+     */
+    private final static class SlowOperation extends Operation
+    {
+        SlowOperation(Monitorable operation, long failedAt)
+        {
+<span class="nc" id="L393">            super(operation, failedAt);</span>
+<span class="nc" id="L394">        }</span>
+
+        public String getLogMessage()
+        {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">            if (numTimesReported == 1)</span>
+<span class="nc" id="L399">                return String.format(&quot;&lt;%s&gt;, time %d msec - slow timeout %d %s&quot;,</span>
+<span class="nc" id="L400">                                     name(),</span>
+<span class="nc" id="L401">                                     totalTime,</span>
+<span class="nc" id="L402">                                     operation.slowTimeout(),</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                                     operation.isCrossNode() ? &quot;msec/cross-node&quot; : &quot;msec&quot;);</span>
+            else
+<span class="nc" id="L405">                return String.format(&quot;&lt;%s&gt;, was slow %d times: avg/min/max %d/%d/%d msec - slow timeout %d %s&quot;,</span>
+<span class="nc" id="L406">                                     name(),</span>
+<span class="nc" id="L407">                                     numTimesReported,</span>
+<span class="nc" id="L408">                                     totalTime / numTimesReported,</span>
+<span class="nc" id="L409">                                     minTime,</span>
+<span class="nc" id="L410">                                     maxTime,</span>
+<span class="nc" id="L411">                                     operation.slowTimeout(),</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                                     operation.isCrossNode() ? &quot;msec/cross-node&quot; : &quot;msec&quot;);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

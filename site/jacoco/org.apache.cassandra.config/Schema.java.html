@@ -1,0 +1,856 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Schema.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.config</a> &gt; <span class="el_source">Schema.java</span></div><h1>Schema.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.config;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cql3.functions.*;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.locator.LocalStrategy;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.utils.ConcurrentBiMap;
+import org.apache.cassandra.utils.Pair;
+
+<span class="pc bpc" id="L46" title="1 of 2 branches missed.">public class Schema</span>
+{
+<span class="fc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(Schema.class);</span>
+
+<span class="fc" id="L50">    public static final Schema instance = new Schema();</span>
+
+    /* metadata map for faster keyspace lookup */
+<span class="fc" id="L53">    private final Map&lt;String, KeyspaceMetadata&gt; keyspaces = new NonBlockingHashMap&lt;&gt;();</span>
+
+    /* Keyspace objects, one per keyspace. Only one instance should ever exist for any given keyspace. */
+<span class="fc" id="L56">    private final Map&lt;String, Keyspace&gt; keyspaceInstances = new NonBlockingHashMap&lt;&gt;();</span>
+
+    /* metadata map for faster ColumnFamily lookup */
+<span class="fc" id="L59">    private final ConcurrentBiMap&lt;Pair&lt;String, String&gt;, UUID&gt; cfIdMap = new ConcurrentBiMap&lt;&gt;();</span>
+
+    private volatile UUID version;
+    private volatile UUID altVersion;
+
+    /**
+     * Initialize empty schema object and load the hardcoded system tables
+     */
+    public Schema()
+<span class="fc" id="L68">    {</span>
+<span class="pc bpc" id="L69" title="3 of 4 branches missed.">        if (DatabaseDescriptor.isDaemonInitialized() || DatabaseDescriptor.isToolInitialized())</span>
+        {
+<span class="fc" id="L71">            load(SchemaKeyspace.metadata());</span>
+<span class="fc" id="L72">            load(SystemKeyspace.metadata());</span>
+        }
+<span class="fc" id="L74">    }</span>
+
+    /**
+     * load keyspace (keyspace) definitions, but do not initialize the keyspace instances.
+     * Schema version may be updated as the result.
+     */
+    public Schema loadFromDisk()
+    {
+<span class="fc" id="L82">        return loadFromDisk(true);</span>
+    }
+
+    /**
+     * Load schema definitions from disk.
+     *
+     * @param updateVersion true if schema version needs to be updated
+     */
+    public Schema loadFromDisk(boolean updateVersion)
+    {
+<span class="fc" id="L92">        load(SchemaKeyspace.fetchNonSystemKeyspaces());</span>
+<span class="pc bpc" id="L93" title="1 of 2 branches missed.">        if (updateVersion)</span>
+<span class="fc" id="L94">            updateVersion();</span>
+<span class="fc" id="L95">        return this;</span>
+    }
+
+    /**
+     * Load up non-system keyspaces
+     *
+     * @param keyspaceDefs The non-system keyspace definitions
+     *
+     * @return self to support chaining calls
+     */
+    public Schema load(Iterable&lt;KeyspaceMetadata&gt; keyspaceDefs)
+    {
+<span class="fc" id="L107">        keyspaceDefs.forEach(this::load);</span>
+<span class="fc" id="L108">        return this;</span>
+    }
+
+    /**
+     * Load specific keyspace into Schema
+     *
+     * @param keyspaceDef The keyspace to load up
+     *
+     * @return self to support chaining calls
+     */
+    public Schema load(KeyspaceMetadata keyspaceDef)
+    {
+<span class="fc" id="L120">        keyspaceDef.tables.forEach(this::load);</span>
+<span class="fc" id="L121">        keyspaceDef.views.forEach(this::load);</span>
+<span class="fc" id="L122">        setKeyspaceMetadata(keyspaceDef);</span>
+<span class="fc" id="L123">        return this;</span>
+    }
+
+    /**
+     * Get keyspace instance by name
+     *
+     * @param keyspaceName The name of the keyspace
+     *
+     * @return Keyspace object or null if keyspace was not found
+     */
+    public Keyspace getKeyspaceInstance(String keyspaceName)
+    {
+<span class="fc" id="L135">        return keyspaceInstances.get(keyspaceName);</span>
+    }
+
+    /**
+     * Retrieve a CFS by name even if that CFS is an index
+     *
+     * An index is identified by looking for '.' in the CF name and separating to find the base table
+     * containing the index
+     * @param ksNameAndCFName
+     * @return The named CFS or null if the keyspace, base table, or index don't exist
+     */
+    public ColumnFamilyStore getColumnFamilyStoreIncludingIndexes(Pair&lt;String, String&gt; ksNameAndCFName)
+    {
+<span class="nc" id="L148">        String ksName = ksNameAndCFName.left;</span>
+<span class="nc" id="L149">        String cfName = ksNameAndCFName.right;</span>
+        Pair&lt;String, String&gt; baseTable;
+
+        /*
+         * Split does special case a one character regex, and it looks like it can detect
+         * if you use two characters to escape '.', but it still allocates a useless array.
+         */
+<span class="nc" id="L156">        int indexOfSeparator = cfName.indexOf('.');</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (indexOfSeparator &gt; -1)</span>
+<span class="nc" id="L158">            baseTable = Pair.create(ksName, cfName.substring(0, indexOfSeparator));</span>
+        else
+<span class="nc" id="L160">            baseTable = ksNameAndCFName;</span>
+
+<span class="nc" id="L162">        UUID cfId = cfIdMap.get(baseTable);</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (cfId == null)</span>
+<span class="nc" id="L164">            return null;</span>
+
+<span class="nc" id="L166">        Keyspace ks = keyspaceInstances.get(ksName);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (ks == null)</span>
+<span class="nc" id="L168">            return null;</span>
+
+<span class="nc" id="L170">        ColumnFamilyStore baseCFS = ks.getColumnFamilyStore(cfId);</span>
+
+        //Not an index
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (indexOfSeparator == -1)</span>
+<span class="nc" id="L174">            return baseCFS;</span>
+
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (baseCFS == null)</span>
+<span class="nc" id="L177">            return null;</span>
+
+<span class="nc" id="L179">        Index index = baseCFS.indexManager.getIndexByName(cfName.substring(indexOfSeparator + 1, cfName.length()));</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        if (index == null)</span>
+<span class="nc" id="L181">            return null;</span>
+
+        //Shouldn't ask for a backing table if there is none so just throw?
+        //Or should it return null?
+<span class="nc" id="L185">        return index.getBackingTable().get();</span>
+    }
+
+    public ColumnFamilyStore getColumnFamilyStoreInstance(UUID cfId)
+    {
+<span class="fc" id="L190">        Pair&lt;String, String&gt; pair = cfIdMap.inverse().get(cfId);</span>
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">        if (pair == null)</span>
+<span class="nc" id="L192">            return null;</span>
+<span class="fc" id="L193">        Keyspace instance = getKeyspaceInstance(pair.left);</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">        if (instance == null)</span>
+<span class="nc" id="L195">            return null;</span>
+<span class="fc" id="L196">        return instance.getColumnFamilyStore(cfId);</span>
+    }
+
+    /**
+     * Store given Keyspace instance to the schema
+     *
+     * @param keyspace The Keyspace instance to store
+     *
+     * @throws IllegalArgumentException if Keyspace is already stored
+     */
+    public void storeKeyspaceInstance(Keyspace keyspace)
+    {
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        if (keyspaceInstances.containsKey(keyspace.getName()))</span>
+<span class="nc" id="L209">            throw new IllegalArgumentException(String.format(&quot;Keyspace %s was already initialized.&quot;, keyspace.getName()));</span>
+
+<span class="fc" id="L211">        keyspaceInstances.put(keyspace.getName(), keyspace);</span>
+<span class="fc" id="L212">    }</span>
+
+    /**
+     * Remove keyspace from schema
+     *
+     * @param keyspaceName The name of the keyspace to remove
+     *
+     * @return removed keyspace instance or null if it wasn't found
+     */
+    public Keyspace removeKeyspaceInstance(String keyspaceName)
+    {
+<span class="nc" id="L223">        return keyspaceInstances.remove(keyspaceName);</span>
+    }
+
+    /**
+     * Remove keyspace definition from system
+     *
+     * @param ksm The keyspace definition to remove
+     */
+    public void clearKeyspaceMetadata(KeyspaceMetadata ksm)
+    {
+<span class="nc" id="L233">        keyspaces.remove(ksm.name);</span>
+<span class="nc" id="L234">    }</span>
+
+    /**
+     * Given a keyspace name and column family name, get the column family
+     * meta data. If the keyspace name or column family name is not valid
+     * this function returns null.
+     *
+     * @param keyspaceName The keyspace name
+     * @param cfName The ColumnFamily name
+     *
+     * @return ColumnFamily Metadata object or null if it wasn't found
+     */
+    public CFMetaData getCFMetaData(String keyspaceName, String cfName)
+    {
+<span class="pc bpc" id="L248" title="2 of 4 branches missed.">        assert keyspaceName != null;</span>
+
+<span class="fc" id="L250">        KeyspaceMetadata ksm = keyspaces.get(keyspaceName);</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">        return ksm == null</span>
+             ? null
+<span class="fc" id="L253">             : ksm.getTableOrViewNullable(cfName);</span>
+    }
+
+    /**
+     * Get ColumnFamily metadata by its identifier
+     *
+     * @param cfId The ColumnFamily identifier
+     *
+     * @return metadata about ColumnFamily
+     */
+    public CFMetaData getCFMetaData(UUID cfId)
+    {
+<span class="fc" id="L265">        Pair&lt;String,String&gt; cf = getCF(cfId);</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        return (cf == null) ? null : getCFMetaData(cf.left, cf.right);</span>
+    }
+
+    public CFMetaData getCFMetaData(Descriptor descriptor)
+    {
+<span class="nc" id="L271">        return getCFMetaData(descriptor.ksname, descriptor.cfname);</span>
+    }
+
+    public int getNumberOfTables()
+    {
+<span class="nc" id="L276">        return cfIdMap.size();</span>
+    }
+
+    public ViewDefinition getView(String keyspaceName, String viewName)
+    {
+<span class="nc bnc" id="L281" title="All 4 branches missed.">        assert keyspaceName != null;</span>
+<span class="nc" id="L282">        KeyspaceMetadata ksm = keyspaces.get(keyspaceName);</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        return (ksm == null) ? null : ksm.views.getNullable(viewName);</span>
+    }
+
+    /**
+     * Get metadata about keyspace by its name
+     *
+     * @param keyspaceName The name of the keyspace
+     *
+     * @return The keyspace metadata or null if it wasn't found
+     */
+    public KeyspaceMetadata getKSMetaData(String keyspaceName)
+    {
+<span class="pc bpc" id="L295" title="2 of 4 branches missed.">        assert keyspaceName != null;</span>
+<span class="fc" id="L296">        return keyspaces.get(keyspaceName);</span>
+    }
+
+    private Set&lt;String&gt; getNonSystemKeyspacesSet()
+    {
+<span class="fc" id="L301">        return Sets.difference(keyspaces.keySet(), SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);</span>
+    }
+
+    /**
+     * @return collection of the non-system keyspaces (note that this count as system only the
+     * non replicated keyspaces, so keyspace like system_traces which are replicated are actually
+     * returned. See getUserKeyspace() below if you don't want those)
+     */
+    public List&lt;String&gt; getNonSystemKeyspaces()
+    {
+<span class="nc" id="L311">        return ImmutableList.copyOf(getNonSystemKeyspacesSet());</span>
+    }
+
+    /**
+     * @return a collection of keyspaces that do not use LocalStrategy for replication
+     */
+    public List&lt;String&gt; getNonLocalStrategyKeyspaces()
+    {
+<span class="fc" id="L319">        return keyspaces.values().stream()</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">                .filter(keyspace -&gt; keyspace.params.replication.klass != LocalStrategy.class)</span>
+<span class="fc" id="L321">                .map(keyspace -&gt; keyspace.name)</span>
+<span class="fc" id="L322">                .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * @return collection of the user defined keyspaces
+     */
+    public List&lt;String&gt; getUserKeyspaces()
+    {
+<span class="fc" id="L330">        return ImmutableList.copyOf(Sets.difference(getNonSystemKeyspacesSet(), SchemaConstants.REPLICATED_SYSTEM_KEYSPACE_NAMES));</span>
+    }
+
+    public Keyspaces getReplicatedKeyspaces()
+    {
+<span class="nc" id="L335">        Keyspaces.Builder builder = Keyspaces.builder();</span>
+
+<span class="nc" id="L337">        keyspaces.values()</span>
+<span class="nc" id="L338">                 .stream()</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                 .filter(k -&gt; !SchemaConstants.isLocalSystemKeyspace(k.name))</span>
+<span class="nc" id="L340">                 .forEach(builder::add);</span>
+
+<span class="nc" id="L342">        return builder.build();</span>
+    }
+
+    /**
+     * Get metadata about keyspace inner ColumnFamilies
+     *
+     * @param keyspaceName The name of the keyspace
+     *
+     * @return metadata about ColumnFamilies the belong to the given keyspace
+     */
+    public Iterable&lt;CFMetaData&gt; getTablesAndViews(String keyspaceName)
+    {
+<span class="pc bpc" id="L354" title="2 of 4 branches missed.">        assert keyspaceName != null;</span>
+<span class="fc" id="L355">        KeyspaceMetadata ksm = keyspaces.get(keyspaceName);</span>
+<span class="pc bpc" id="L356" title="2 of 4 branches missed.">        assert ksm != null;</span>
+<span class="fc" id="L357">        return ksm.tablesAndViews();</span>
+    }
+
+    /**
+     * @return collection of the all keyspace names registered in the system (system and non-system)
+     */
+    public Set&lt;String&gt; getKeyspaces()
+    {
+<span class="fc" id="L365">        return keyspaces.keySet();</span>
+    }
+
+    public Keyspaces getKeyspaces(Set&lt;String&gt; includedKeyspaceNames)
+    {
+<span class="fc" id="L370">        Keyspaces.Builder builder = Keyspaces.builder();</span>
+<span class="fc" id="L371">        keyspaces.values()</span>
+<span class="fc" id="L372">                 .stream()</span>
+<span class="fc" id="L373">                 .filter(k -&gt; includedKeyspaceNames.contains(k.name))</span>
+<span class="fc" id="L374">                 .forEach(builder::add);</span>
+<span class="fc" id="L375">        return builder.build();</span>
+    }
+
+    /**
+     * Update (or insert) new keyspace definition
+     *
+     * @param ksm The metadata about keyspace
+     */
+    public void setKeyspaceMetadata(KeyspaceMetadata ksm)
+    {
+<span class="pc bpc" id="L385" title="2 of 4 branches missed.">        assert ksm != null;</span>
+
+<span class="fc" id="L387">        keyspaces.put(ksm.name, ksm);</span>
+<span class="fc" id="L388">        Keyspace keyspace = getKeyspaceInstance(ksm.name);</span>
+<span class="fc bfc" id="L389" title="All 2 branches covered.">        if (keyspace != null)</span>
+<span class="fc" id="L390">            keyspace.setMetadata(ksm);</span>
+<span class="fc" id="L391">    }</span>
+
+    /* ColumnFamily query/control methods */
+
+    /**
+     * @param cfId The identifier of the ColumnFamily to lookup
+     * @return The (ksname,cfname) pair for the given id, or null if it has been dropped.
+     */
+    public Pair&lt;String,String&gt; getCF(UUID cfId)
+    {
+<span class="fc" id="L401">        return cfIdMap.inverse().get(cfId);</span>
+    }
+
+    /**
+     * @param ksAndCFName The identifier of the ColumnFamily to lookup
+     * @return true if the KS and CF pair is a known one, false otherwise.
+     */
+    public boolean hasCF(Pair&lt;String, String&gt; ksAndCFName)
+    {
+<span class="nc" id="L410">        return cfIdMap.containsKey(ksAndCFName);</span>
+    }
+
+    /**
+     * Lookup keyspace/ColumnFamily identifier
+     *
+     * @param ksName The keyspace name
+     * @param cfName The ColumnFamily name
+     *
+     * @return The id for the given (ksname,cfname) pair, or null if it has been dropped.
+     */
+    public UUID getId(String ksName, String cfName)
+    {
+<span class="fc" id="L423">        return cfIdMap.get(Pair.create(ksName, cfName));</span>
+    }
+
+    /**
+     * Load individual ColumnFamily Definition to the schema
+     * (to make ColumnFamily lookup faster)
+     *
+     * @param cfm The ColumnFamily definition to load
+     */
+    public void load(CFMetaData cfm)
+    {
+<span class="fc" id="L434">        Pair&lt;String, String&gt; key = Pair.create(cfm.ksName, cfm.cfName);</span>
+
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">        if (cfIdMap.containsKey(key))</span>
+<span class="nc" id="L437">            throw new RuntimeException(String.format(&quot;Attempting to load already loaded table %s.%s&quot;, cfm.ksName, cfm.cfName));</span>
+
+<span class="fc" id="L439">        logger.debug(&quot;Adding {} to cfIdMap&quot;, cfm);</span>
+<span class="fc" id="L440">        cfIdMap.put(key, cfm.cfId);</span>
+<span class="fc" id="L441">    }</span>
+
+    /**
+     * Load individual View Definition to the schema
+     * (to make View lookup faster)
+     *
+     * @param view The View definition to load
+     */
+    public void load(ViewDefinition view)
+    {
+<span class="nc" id="L451">        CFMetaData cfm = view.metadata;</span>
+<span class="nc" id="L452">        Pair&lt;String, String&gt; key = Pair.create(cfm.ksName, cfm.cfName);</span>
+
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        if (cfIdMap.containsKey(key))</span>
+<span class="nc" id="L455">            throw new RuntimeException(String.format(&quot;Attempting to load already loaded view %s.%s&quot;, cfm.ksName, cfm.cfName));</span>
+
+<span class="nc" id="L457">        logger.debug(&quot;Adding {} to cfIdMap&quot;, cfm);</span>
+<span class="nc" id="L458">        cfIdMap.put(key, cfm.cfId);</span>
+<span class="nc" id="L459">    }</span>
+
+    /**
+     * Used for ColumnFamily data eviction out from the schema
+     *
+     * @param cfm The ColumnFamily Definition to evict
+     */
+    public void unload(CFMetaData cfm)
+    {
+<span class="fc" id="L468">        cfIdMap.remove(Pair.create(cfm.ksName, cfm.cfName));</span>
+<span class="fc" id="L469">    }</span>
+
+    /**
+     * Used for View eviction from the schema
+     *
+     * @param view The view definition to evict
+     */
+    private void unload(ViewDefinition view)
+    {
+<span class="nc" id="L478">        cfIdMap.remove(Pair.create(view.ksName, view.viewName));</span>
+<span class="nc" id="L479">    }</span>
+
+    /* Function helpers */
+
+    /**
+     * Get all function overloads with the specified name
+     *
+     * @param name fully qualified function name
+     * @return an empty list if the keyspace or the function name are not found;
+     *         a non-empty collection of {@link Function} otherwise
+     */
+    public Collection&lt;Function&gt; getFunctions(FunctionName name)
+    {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        if (!name.hasKeyspace())</span>
+<span class="nc" id="L493">            throw new IllegalArgumentException(String.format(&quot;Function name must be fully quallified: got %s&quot;, name));</span>
+
+<span class="nc" id="L495">        KeyspaceMetadata ksm = getKSMetaData(name.keyspace);</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        return ksm == null</span>
+<span class="nc" id="L497">             ? Collections.emptyList()</span>
+<span class="nc" id="L498">             : ksm.functions.get(name);</span>
+    }
+
+    /**
+     * Find the function with the specified name
+     *
+     * @param name fully qualified function name
+     * @param argTypes function argument types
+     * @return an empty {@link Optional} if the keyspace or the function name are not found;
+     *         a non-empty optional of {@link Function} otherwise
+     */
+    public Optional&lt;Function&gt; findFunction(FunctionName name, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+    {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (!name.hasKeyspace())</span>
+<span class="nc" id="L512">            throw new IllegalArgumentException(String.format(&quot;Function name must be fully quallified: got %s&quot;, name));</span>
+
+<span class="nc" id="L514">        KeyspaceMetadata ksm = getKSMetaData(name.keyspace);</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        return ksm == null</span>
+<span class="nc" id="L516">             ? Optional.empty()</span>
+<span class="nc" id="L517">             : ksm.functions.find(name, argTypes);</span>
+    }
+
+    /* Version control */
+
+    /**
+     * The schema version to announce.
+     * This will be either the &quot;real&quot; schema version including the {@code cdc} column,
+     * if no node in the cluster is running at 3.0, or a 3.0 compatible
+     * schema version, with the {@code cdc} column excluded, if at least one node is
+     * running 3.0.
+     *
+     * @return &quot;current&quot; schema version
+     */
+    public UUID getVersion()
+    {
+<span class="pc bpc" id="L533" title="1 of 4 branches missed.">        return Gossiper.instance.isEnabled() &amp;&amp; Gossiper.instance.isAnyNodeOn30()</span>
+               ? altVersion
+               : version;
+    }
+
+    /**
+     * The 3.11 schema version, always includes the {@code cdc} column.
+     */
+    public UUID getRealVersion()
+    {
+<span class="fc" id="L543">        return version;</span>
+    }
+
+    /**
+     * The &quot;alternative&quot; schema version, compatible to 3.0, always excludes the
+     * {@code cdc} column.
+     */
+    public UUID getAltVersion()
+    {
+<span class="fc" id="L552">        return altVersion;</span>
+    }
+
+    /**
+     * Checks whether the given schema version is the same as the current local schema
+     * version, either the 3.0 compatible or &quot;real&quot; one.
+     */
+    public boolean isSameVersion(UUID schemaVersion)
+    {
+<span class="pc bpc" id="L561" title="1 of 2 branches missed.">        return schemaVersion != null</span>
+<span class="pc bpc" id="L562" title="3 of 4 branches missed.">               &amp;&amp; (schemaVersion.equals(version) || schemaVersion.equals(altVersion));</span>
+    }
+
+    /**
+     * Checks whether the current schema is empty.
+     */
+    public boolean isEmpty()
+    {
+<span class="nc" id="L570">        return SchemaConstants.emptyVersion.equals(version);</span>
+    }
+
+    /**
+     * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
+     * will be converted into UUID which would act as content-based version of the schema.
+     *
+     * 3.11 note: we calculate the &quot;real&quot; schema version and the 3.0 compatible schema
+     * version here.
+     */
+    public void updateVersion()
+    {
+<span class="fc" id="L582">        Pair&lt;UUID, UUID&gt; mixedVersions = SchemaKeyspace.calculateSchemaDigest();</span>
+<span class="fc" id="L583">        version = mixedVersions.left;</span>
+<span class="fc" id="L584">        altVersion = mixedVersions.right;</span>
+<span class="fc" id="L585">        SystemKeyspace.updateSchemaVersion(getVersion());</span>
+<span class="fc" id="L586">    }</span>
+
+    /**
+     * Like updateVersion, but also announces via gossip
+     *
+     * 3.11 note: we announce the &quot;current&quot; schema version, which can be either the 3.0
+     * compatible one, if at least one node is still running 3.0, or the &quot;real&quot; schema version.
+     */
+    public void updateVersionAndAnnounce()
+    {
+<span class="fc" id="L596">        updateVersion();</span>
+<span class="fc" id="L597">        UUID current = getVersion();</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">        MigrationManager.passiveAnnounce(current, current == getAltVersion());</span>
+<span class="fc" id="L599">    }</span>
+
+    /**
+     * Clear all KS/CF metadata and reset version.
+     */
+    public synchronized void clear()
+    {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        for (String keyspaceName : getNonSystemKeyspaces())</span>
+        {
+<span class="nc" id="L608">            KeyspaceMetadata ksm = getKSMetaData(keyspaceName);</span>
+<span class="nc" id="L609">            ksm.tables.forEach(this::unload);</span>
+<span class="nc" id="L610">            ksm.views.forEach(this::unload);</span>
+<span class="nc" id="L611">            clearKeyspaceMetadata(ksm);</span>
+<span class="nc" id="L612">        }</span>
+
+<span class="nc" id="L614">        updateVersionAndAnnounce();</span>
+<span class="nc" id="L615">    }</span>
+
+    public void addKeyspace(KeyspaceMetadata ksm)
+    {
+<span class="pc bpc" id="L619" title="2 of 4 branches missed.">        assert getKSMetaData(ksm.name) == null;</span>
+<span class="fc" id="L620">        load(ksm);</span>
+
+<span class="fc" id="L622">        Keyspace.open(ksm.name);</span>
+<span class="fc" id="L623">        MigrationManager.instance.notifyCreateKeyspace(ksm);</span>
+<span class="fc" id="L624">    }</span>
+
+    public void updateKeyspace(String ksName, KeyspaceParams newParams)
+    {
+<span class="nc" id="L628">        KeyspaceMetadata ksm = update(ksName, ks -&gt; ks.withSwapped(newParams));</span>
+<span class="nc" id="L629">        MigrationManager.instance.notifyUpdateKeyspace(ksm);</span>
+<span class="nc" id="L630">    }</span>
+
+    public void dropKeyspace(String ksName)
+    {
+<span class="nc" id="L634">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);</span>
+<span class="nc" id="L635">        String snapshotName = Keyspace.getTimestampedSnapshotNameWithPrefix(ksName, ColumnFamilyStore.SNAPSHOT_DROP_PREFIX);</span>
+
+<span class="nc" id="L637">        CompactionManager.instance.interruptCompactionFor(ksm.tablesAndViews(), true);</span>
+
+<span class="nc" id="L639">        Keyspace keyspace = Keyspace.open(ksm.name);</span>
+
+        // remove all cfs from the keyspace instance.
+<span class="nc" id="L642">        List&lt;UUID&gt; droppedCfs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        for (CFMetaData cfm : ksm.tablesAndViews())</span>
+        {
+<span class="nc" id="L645">            ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfm.cfName);</span>
+
+<span class="nc" id="L647">            unload(cfm);</span>
+
+<span class="nc bnc" id="L649" title="All 2 branches missed.">            if (DatabaseDescriptor.isAutoSnapshot())</span>
+<span class="nc" id="L650">                cfs.snapshot(snapshotName);</span>
+<span class="nc" id="L651">            Keyspace.open(ksm.name).dropCf(cfm.cfId);</span>
+
+<span class="nc" id="L653">            droppedCfs.add(cfm.cfId);</span>
+<span class="nc" id="L654">        }</span>
+
+        // remove the keyspace from the static instances.
+<span class="nc" id="L657">        Keyspace.clear(ksm.name);</span>
+<span class="nc" id="L658">        clearKeyspaceMetadata(ksm);</span>
+
+<span class="nc" id="L660">        Keyspace.writeOrder.awaitNewBarrier();</span>
+
+        // force a new segment in the CL
+<span class="nc" id="L663">        CommitLog.instance.forceRecycleAllSegments(droppedCfs);</span>
+
+<span class="nc" id="L665">        MigrationManager.instance.notifyDropKeyspace(ksm);</span>
+<span class="nc" id="L666">    }</span>
+
+    public void addTable(CFMetaData cfm)
+    {
+<span class="pc bpc" id="L670" title="2 of 4 branches missed.">        assert getCFMetaData(cfm.ksName, cfm.cfName) == null;</span>
+
+        // Make sure the keyspace is initialized
+        // and init the new CF before switching the KSM to the new one
+        // to avoid races as in CASSANDRA-10761
+<span class="fc" id="L675">        Keyspace.open(cfm.ksName).initCf(cfm, true);</span>
+        // Update the keyspaces map with the updated metadata
+<span class="fc" id="L677">        update(cfm.ksName, ks -&gt; ks.withSwapped(ks.tables.with(cfm)));</span>
+        // Update the table ID &lt;-&gt; table name map (cfIdMap)
+<span class="fc" id="L679">        load(cfm);</span>
+<span class="fc" id="L680">        MigrationManager.instance.notifyCreateColumnFamily(cfm);</span>
+<span class="fc" id="L681">    }</span>
+
+    public void updateTable(CFMetaData table)
+    {
+<span class="nc" id="L685">        CFMetaData current = getCFMetaData(table.ksName, table.cfName);</span>
+<span class="nc bnc" id="L686" title="All 4 branches missed.">        assert current != null;</span>
+<span class="nc" id="L687">        boolean changeAffectsStatements = current.apply(table);</span>
+
+<span class="nc" id="L689">        Keyspace keyspace = Keyspace.open(current.ksName);</span>
+<span class="nc" id="L690">        keyspace.getColumnFamilyStore(current.cfName).reload();</span>
+<span class="nc" id="L691">        MigrationManager.instance.notifyUpdateColumnFamily(current, changeAffectsStatements);</span>
+<span class="nc" id="L692">    }</span>
+
+    public void dropTable(String ksName, String tableName)
+    {
+<span class="nc" id="L696">        KeyspaceMetadata oldKsm = getKSMetaData(ksName);</span>
+<span class="nc bnc" id="L697" title="All 4 branches missed.">        assert oldKsm != null;</span>
+<span class="nc" id="L698">        ColumnFamilyStore cfs = Keyspace.open(ksName).getColumnFamilyStore(tableName);</span>
+<span class="nc bnc" id="L699" title="All 4 branches missed.">        assert cfs != null;</span>
+
+        // make sure all the indexes are dropped, or else.
+<span class="nc" id="L702">        cfs.indexManager.markAllIndexesRemoved();</span>
+
+        // reinitialize the keyspace.
+<span class="nc" id="L705">        CFMetaData cfm = oldKsm.tables.get(tableName).get();</span>
+<span class="nc" id="L706">        KeyspaceMetadata newKsm = oldKsm.withSwapped(oldKsm.tables.without(tableName));</span>
+
+<span class="nc" id="L708">        unload(cfm);</span>
+<span class="nc" id="L709">        setKeyspaceMetadata(newKsm);</span>
+
+<span class="nc" id="L711">        CompactionManager.instance.interruptCompactionFor(Collections.singleton(cfm), true);</span>
+
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (DatabaseDescriptor.isAutoSnapshot())</span>
+<span class="nc" id="L714">            cfs.snapshot(Keyspace.getTimestampedSnapshotNameWithPrefix(cfs.name, ColumnFamilyStore.SNAPSHOT_DROP_PREFIX));</span>
+<span class="nc" id="L715">        Keyspace.open(ksName).dropCf(cfm.cfId);</span>
+<span class="nc" id="L716">        MigrationManager.instance.notifyDropColumnFamily(cfm);</span>
+
+<span class="nc" id="L718">        CommitLog.instance.forceRecycleAllSegments(Collections.singleton(cfm.cfId));</span>
+<span class="nc" id="L719">    }</span>
+
+    public void addView(ViewDefinition view)
+    {
+<span class="nc bnc" id="L723" title="All 4 branches missed.">        assert getCFMetaData(view.ksName, view.viewName) == null;</span>
+
+<span class="nc" id="L725">        Keyspace keyspace = Keyspace.open(view.ksName);</span>
+
+        // Make sure the keyspace is initialized and initialize the table.
+<span class="nc" id="L728">        keyspace.initCf(view.metadata, true);</span>
+        // Update the keyspaces map with the updated metadata
+<span class="nc" id="L730">        update(view.ksName, ks -&gt; ks.withSwapped(ks.views.with(view)));</span>
+        // Update the table ID &lt;-&gt; table name map (cfIdMap)
+<span class="nc" id="L732">        load(view);</span>
+
+<span class="nc" id="L734">        keyspace.viewManager.reload();</span>
+<span class="nc" id="L735">        MigrationManager.instance.notifyCreateView(view);</span>
+<span class="nc" id="L736">    }</span>
+
+    public void updateView(ViewDefinition view)
+    {
+<span class="nc" id="L740">        ViewDefinition current = getKSMetaData(view.ksName).views.get(view.viewName).get();</span>
+<span class="nc" id="L741">        boolean changeAffectsStatements = current.metadata.apply(view.metadata);</span>
+
+<span class="nc" id="L743">        Keyspace keyspace = Keyspace.open(current.ksName);</span>
+<span class="nc" id="L744">        keyspace.getColumnFamilyStore(current.viewName).reload();</span>
+<span class="nc" id="L745">        Keyspace.open(current.ksName).viewManager.update(current.viewName);</span>
+<span class="nc" id="L746">        MigrationManager.instance.notifyUpdateView(current, changeAffectsStatements);</span>
+<span class="nc" id="L747">    }</span>
+
+    public void dropView(String ksName, String viewName)
+    {
+<span class="nc" id="L751">        KeyspaceMetadata oldKsm = getKSMetaData(ksName);</span>
+<span class="nc bnc" id="L752" title="All 4 branches missed.">        assert oldKsm != null;</span>
+<span class="nc" id="L753">        ColumnFamilyStore cfs = Keyspace.open(ksName).getColumnFamilyStore(viewName);</span>
+<span class="nc bnc" id="L754" title="All 4 branches missed.">        assert cfs != null;</span>
+
+        // make sure all the indexes are dropped, or else.
+<span class="nc" id="L757">        cfs.indexManager.markAllIndexesRemoved();</span>
+
+        // reinitialize the keyspace.
+<span class="nc" id="L760">        ViewDefinition view = oldKsm.views.get(viewName).get();</span>
+<span class="nc" id="L761">        KeyspaceMetadata newKsm = oldKsm.withSwapped(oldKsm.views.without(viewName));</span>
+
+<span class="nc" id="L763">        unload(view);</span>
+<span class="nc" id="L764">        setKeyspaceMetadata(newKsm);</span>
+
+<span class="nc" id="L766">        CompactionManager.instance.interruptCompactionFor(Collections.singleton(view.metadata), true);</span>
+
+<span class="nc bnc" id="L768" title="All 2 branches missed.">        if (DatabaseDescriptor.isAutoSnapshot())</span>
+<span class="nc" id="L769">            cfs.snapshot(Keyspace.getTimestampedSnapshotName(cfs.name));</span>
+<span class="nc" id="L770">        Keyspace.open(ksName).dropCf(view.metadata.cfId);</span>
+<span class="nc" id="L771">        Keyspace.open(ksName).viewManager.reload();</span>
+<span class="nc" id="L772">        MigrationManager.instance.notifyDropView(view);</span>
+
+<span class="nc" id="L774">        CommitLog.instance.forceRecycleAllSegments(Collections.singleton(view.metadata.cfId));</span>
+<span class="nc" id="L775">    }</span>
+
+    public void addType(UserType ut)
+    {
+<span class="nc" id="L779">        update(ut.keyspace, ks -&gt; ks.withSwapped(ks.types.with(ut)));</span>
+<span class="nc" id="L780">        MigrationManager.instance.notifyCreateUserType(ut);</span>
+<span class="nc" id="L781">    }</span>
+
+    public void updateType(UserType ut)
+    {
+<span class="nc" id="L785">        update(ut.keyspace, ks -&gt; ks.withSwapped(ks.types.without(ut.name).with(ut)));</span>
+<span class="nc" id="L786">        MigrationManager.instance.notifyUpdateUserType(ut);</span>
+<span class="nc" id="L787">    }</span>
+
+    public void dropType(UserType ut)
+    {
+<span class="nc" id="L791">        update(ut.keyspace, ks -&gt; ks.withSwapped(ks.types.without(ut.name)));</span>
+<span class="nc" id="L792">        MigrationManager.instance.notifyDropUserType(ut);</span>
+<span class="nc" id="L793">    }</span>
+
+    public void addFunction(UDFunction udf)
+    {
+<span class="nc" id="L797">        update(udf.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.with(udf)));</span>
+<span class="nc" id="L798">        MigrationManager.instance.notifyCreateFunction(udf);</span>
+<span class="nc" id="L799">    }</span>
+
+    public void updateFunction(UDFunction udf)
+    {
+<span class="nc" id="L803">        update(udf.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.without(udf.name(), udf.argTypes()).with(udf)));</span>
+<span class="nc" id="L804">        MigrationManager.instance.notifyUpdateFunction(udf);</span>
+<span class="nc" id="L805">    }</span>
+
+    public void dropFunction(UDFunction udf)
+    {
+<span class="nc" id="L809">        update(udf.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.without(udf.name(), udf.argTypes())));</span>
+<span class="nc" id="L810">        MigrationManager.instance.notifyDropFunction(udf);</span>
+<span class="nc" id="L811">    }</span>
+
+    public void addAggregate(UDAggregate uda)
+    {
+<span class="nc" id="L815">        update(uda.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.with(uda)));</span>
+<span class="nc" id="L816">        MigrationManager.instance.notifyCreateAggregate(uda);</span>
+<span class="nc" id="L817">    }</span>
+
+    public void updateAggregate(UDAggregate uda)
+    {
+<span class="nc" id="L821">        update(uda.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.without(uda.name(), uda.argTypes()).with(uda)));</span>
+<span class="nc" id="L822">        MigrationManager.instance.notifyUpdateAggregate(uda);</span>
+<span class="nc" id="L823">    }</span>
+
+    public void dropAggregate(UDAggregate uda)
+    {
+<span class="nc" id="L827">        update(uda.name().keyspace, ks -&gt; ks.withSwapped(ks.functions.without(uda.name(), uda.argTypes())));</span>
+<span class="nc" id="L828">        MigrationManager.instance.notifyDropAggregate(uda);</span>
+<span class="nc" id="L829">    }</span>
+
+    private synchronized KeyspaceMetadata update(String keyspaceName, java.util.function.Function&lt;KeyspaceMetadata, KeyspaceMetadata&gt; transformation)
+    {
+<span class="fc" id="L833">        KeyspaceMetadata current = getKSMetaData(keyspaceName);</span>
+<span class="pc bpc" id="L834" title="1 of 2 branches missed.">        if (current == null)</span>
+<span class="nc" id="L835">            throw new IllegalStateException(String.format(&quot;Keyspace %s doesn't exist&quot;, keyspaceName));</span>
+
+<span class="fc" id="L837">        KeyspaceMetadata transformed = transformation.apply(current);</span>
+<span class="fc" id="L838">        setKeyspaceMetadata(transformed);</span>
+
+<span class="fc" id="L840">        return transformed;</span>
+    }
+
+    /**
+     * Converts the given schema version to a string. Returns {@code unknown}, if {@code version} is {@code null}
+     * or {@code &quot;(empty)&quot;}, if {@code version} refers to an {@link SchemaConstants#emptyVersion empty) schema.
+     */
+    public static String schemaVersionToString(UUID version)
+    {
+<span class="pc bpc" id="L849" title="1 of 2 branches missed.">        return version == null</span>
+               ? &quot;unknown&quot;
+<span class="fc bfc" id="L851" title="All 2 branches covered.">               : SchemaConstants.emptyVersion.equals(version)</span>
+                 ? &quot;(empty)&quot;
+<span class="fc" id="L853">                 : version.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsDispatchExecutor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsDispatchExecutor.java</span></div><h1>HintsDispatchExecutor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.File;
+import java.net.InetAddress;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.service.StorageService;
+
+/**
+ * A multi-threaded (by default) executor for dispatching hints.
+ *
+ * Most of dispatch is triggered by {@link HintsDispatchTrigger} running every ~10 seconds.
+ */
+final class HintsDispatchExecutor
+{
+<span class="fc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(HintsDispatchExecutor.class);</span>
+
+    private final File hintsDirectory;
+    private final ExecutorService executor;
+    private final AtomicBoolean isPaused;
+    private final Function&lt;InetAddress, Boolean&gt; isAlive;
+    private final Map&lt;UUID, Future&gt; scheduledDispatches;
+
+    HintsDispatchExecutor(File hintsDirectory, int maxThreads, AtomicBoolean isPaused, Function&lt;InetAddress, Boolean&gt; isAlive)
+<span class="fc" id="L57">    {</span>
+<span class="fc" id="L58">        this.hintsDirectory = hintsDirectory;</span>
+<span class="fc" id="L59">        this.isPaused = isPaused;</span>
+<span class="fc" id="L60">        this.isAlive = isAlive;</span>
+
+<span class="fc" id="L62">        scheduledDispatches = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L63">        executor = new JMXEnabledThreadPoolExecutor(maxThreads, 1, TimeUnit.MINUTES,</span>
+                                                    new LinkedBlockingQueue&lt;&gt;(),
+                                                    new NamedThreadFactory(&quot;HintsDispatcher&quot;, Thread.MIN_PRIORITY),
+                                                    &quot;internal&quot;);
+<span class="fc" id="L67">    }</span>
+
+    /*
+     * It's safe to terminate dispatch in process and to deschedule dispatch.
+     */
+    void shutdownBlocking()
+    {
+<span class="nc" id="L74">        scheduledDispatches.clear();</span>
+<span class="nc" id="L75">        executor.shutdownNow();</span>
+        try
+        {
+<span class="nc" id="L78">            executor.awaitTermination(1, TimeUnit.MINUTES);</span>
+        }
+<span class="nc" id="L80">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L82">            throw new AssertionError(e);</span>
+<span class="nc" id="L83">        }</span>
+<span class="nc" id="L84">    }</span>
+
+    boolean isScheduled(HintsStore store)
+    {
+<span class="nc" id="L88">        return scheduledDispatches.containsKey(store.hostId);</span>
+    }
+
+    Future dispatch(HintsStore store)
+    {
+<span class="nc" id="L93">        return dispatch(store, store.hostId);</span>
+    }
+
+    Future dispatch(HintsStore store, UUID hostId)
+    {
+        /*
+         * It is safe to perform dispatch for the same host id concurrently in two or more threads,
+         * however there is nothing to win from it - so we don't.
+         *
+         * Additionally, having just one dispatch task per host id ensures that we'll never violate our per-destination
+         * rate limit, without having to share a ratelimiter between threads.
+         *
+         * It also simplifies reasoning about dispatch sessions.
+         */
+<span class="nc" id="L107">        return scheduledDispatches.computeIfAbsent(hostId, uuid -&gt; executor.submit(new DispatchHintsTask(store, hostId)));</span>
+    }
+
+    Future transfer(HintsCatalog catalog, Supplier&lt;UUID&gt; hostIdSupplier)
+    {
+<span class="nc" id="L112">        return executor.submit(new TransferHintsTask(catalog, hostIdSupplier));</span>
+    }
+
+    void completeDispatchBlockingly(HintsStore store)
+    {
+<span class="nc" id="L117">        Future future = scheduledDispatches.get(store.hostId);</span>
+        try
+        {
+<span class="nc bnc" id="L120" title="All 2 branches missed.">            if (future != null)</span>
+<span class="nc" id="L121">                future.get();</span>
+        }
+<span class="nc" id="L123">        catch (ExecutionException | InterruptedException e)</span>
+        {
+<span class="nc" id="L125">            throw new RuntimeException(e);</span>
+<span class="nc" id="L126">        }</span>
+<span class="nc" id="L127">    }</span>
+
+    void interruptDispatch(UUID hostId)
+    {
+<span class="nc" id="L131">        Future future = scheduledDispatches.remove(hostId);</span>
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (null != future)</span>
+<span class="nc" id="L134">            future.cancel(true);</span>
+<span class="nc" id="L135">    }</span>
+
+    private final class TransferHintsTask implements Runnable
+    {
+        private final HintsCatalog catalog;
+
+        /*
+         * Supplies target hosts to stream to. Generally returns the one the DynamicSnitch thinks is closest.
+         * We use a supplier here to be able to get a new host if the current one dies during streaming.
+         */
+        private final Supplier&lt;UUID&gt; hostIdSupplier;
+
+        private TransferHintsTask(HintsCatalog catalog, Supplier&lt;UUID&gt; hostIdSupplier)
+<span class="nc" id="L148">        {</span>
+<span class="nc" id="L149">            this.catalog = catalog;</span>
+<span class="nc" id="L150">            this.hostIdSupplier = hostIdSupplier;</span>
+<span class="nc" id="L151">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="nc" id="L156">            UUID hostId = hostIdSupplier.get();</span>
+<span class="nc" id="L157">            InetAddress address = StorageService.instance.getEndpointForHostId(hostId);</span>
+<span class="nc" id="L158">            logger.info(&quot;Transferring all hints to {}: {}&quot;, address, hostId);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (transfer(hostId))</span>
+<span class="nc" id="L160">                return;</span>
+
+<span class="nc" id="L162">            logger.warn(&quot;Failed to transfer all hints to {}: {}; will retry in {} seconds&quot;, address, hostId, 10);</span>
+
+            try
+            {
+<span class="nc" id="L166">                TimeUnit.SECONDS.sleep(10);</span>
+            }
+<span class="nc" id="L168">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L170">                throw new RuntimeException(e);</span>
+<span class="nc" id="L171">            }</span>
+
+<span class="nc" id="L173">            hostId = hostIdSupplier.get();</span>
+<span class="nc" id="L174">            logger.info(&quot;Transferring all hints to {}: {}&quot;, address, hostId);</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            if (!transfer(hostId))</span>
+            {
+<span class="nc" id="L177">                logger.error(&quot;Failed to transfer all hints to {}: {}&quot;, address, hostId);</span>
+<span class="nc" id="L178">                throw new RuntimeException(&quot;Failed to transfer all hints to &quot; + hostId);</span>
+            }
+<span class="nc" id="L180">        }</span>
+
+        private boolean transfer(UUID hostId)
+        {
+<span class="nc" id="L184">            catalog.stores()</span>
+<span class="nc" id="L185">                   .map(store -&gt; new DispatchHintsTask(store, hostId))</span>
+<span class="nc" id="L186">                   .forEach(Runnable::run);</span>
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">            return !catalog.hasFiles();</span>
+        }
+    }
+
+    private final class DispatchHintsTask implements Runnable
+    {
+        private final HintsStore store;
+        private final UUID hostId;
+        private final RateLimiter rateLimiter;
+
+        DispatchHintsTask(HintsStore store, UUID hostId)
+<span class="nc" id="L199">        {</span>
+<span class="nc" id="L200">            this.store = store;</span>
+<span class="nc" id="L201">            this.hostId = hostId;</span>
+
+            // rate limit is in bytes per second. Uses Double.MAX_VALUE if disabled (set to 0 in cassandra.yaml).
+            // max rate is scaled by the number of nodes in the cluster (CASSANDRA-5272).
+            // the goal is to bound maximum hints traffic going towards a particular node from the rest of the cluster,
+            // not total outgoing hints traffic from this node - this is why the rate limiter is not shared between
+            // all the dispatch tasks (as there will be at most one dispatch task for a particular host id at a time).
+<span class="nc" id="L208">            int nodesCount = Math.max(1, StorageService.instance.getTokenMetadata().getAllEndpoints().size() - 1);</span>
+<span class="nc" id="L209">            int throttleInKB = DatabaseDescriptor.getHintedHandoffThrottleInKB() / nodesCount;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            this.rateLimiter = RateLimiter.create(throttleInKB == 0 ? Double.MAX_VALUE : throttleInKB * 1024);</span>
+<span class="nc" id="L211">        }</span>
+
+        public void run()
+        {
+            try
+            {
+<span class="nc" id="L217">                dispatch();</span>
+            }
+            finally
+            {
+<span class="nc" id="L221">                scheduledDispatches.remove(hostId);</span>
+            }
+<span class="nc" id="L223">        }</span>
+
+        private void dispatch()
+        {
+            while (true)
+            {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                if (isPaused.get())</span>
+<span class="nc" id="L230">                    break;</span>
+
+<span class="nc" id="L232">                HintsDescriptor descriptor = store.poll();</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                if (descriptor == null)</span>
+<span class="nc" id="L234">                    break;</span>
+
+                try
+                {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                    if (!dispatch(descriptor))</span>
+<span class="nc" id="L239">                        break;</span>
+                }
+<span class="nc" id="L241">                catch (FSReadError e)</span>
+                {
+<span class="nc" id="L243">                    logger.error(&quot;Failed to dispatch hints file {}: file is corrupted ({})&quot;, descriptor.fileName(), e);</span>
+<span class="nc" id="L244">                    store.cleanUp(descriptor);</span>
+<span class="nc" id="L245">                    store.blacklist(descriptor);</span>
+<span class="nc" id="L246">                    throw e;</span>
+<span class="nc" id="L247">                }</span>
+<span class="nc" id="L248">            }</span>
+<span class="nc" id="L249">        }</span>
+
+        /*
+         * Will return true if dispatch was successful, false if we hit a failure (destination node went down, for example).
+         */
+        private boolean dispatch(HintsDescriptor descriptor)
+        {
+<span class="nc" id="L256">            logger.trace(&quot;Dispatching hints file {}&quot;, descriptor.fileName());</span>
+
+<span class="nc" id="L258">            InetAddress address = StorageService.instance.getEndpointForHostId(hostId);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            if (address != null)</span>
+<span class="nc" id="L260">                return deliver(descriptor, address);</span>
+
+            // address == null means the target no longer exist; find new home for each hint entry.
+<span class="nc" id="L263">            convert(descriptor);</span>
+<span class="nc" id="L264">            return true;</span>
+        }
+
+        private boolean deliver(HintsDescriptor descriptor, InetAddress address)
+        {
+<span class="nc" id="L269">            File file = new File(hintsDirectory, descriptor.fileName());</span>
+<span class="nc" id="L270">            InputPosition offset = store.getDispatchOffset(descriptor);</span>
+
+<span class="nc bnc" id="L272" title="All 4 branches missed.">            BooleanSupplier shouldAbort = () -&gt; !isAlive.apply(address) || isPaused.get();</span>
+<span class="nc" id="L273">            try (HintsDispatcher dispatcher = HintsDispatcher.create(file, rateLimiter, address, descriptor.hostId, shouldAbort))</span>
+            {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">                if (offset != null)</span>
+<span class="nc" id="L276">                    dispatcher.seek(offset);</span>
+
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                if (dispatcher.dispatch())</span>
+                {
+<span class="nc" id="L280">                    store.delete(descriptor);</span>
+<span class="nc" id="L281">                    store.cleanUp(descriptor);</span>
+<span class="nc" id="L282">                    logger.info(&quot;Finished hinted handoff of file {} to endpoint {}: {}&quot;, descriptor.fileName(), address, hostId);</span>
+<span class="nc" id="L283">                    return true;</span>
+                }
+                else
+                {
+<span class="nc" id="L287">                    store.markDispatchOffset(descriptor, dispatcher.dispatchPosition());</span>
+<span class="nc" id="L288">                    store.offerFirst(descriptor);</span>
+<span class="nc" id="L289">                    logger.info(&quot;Finished hinted handoff of file {} to endpoint {}: {}, partially&quot;, descriptor.fileName(), address, hostId);</span>
+<span class="nc" id="L290">                    return false;</span>
+                }
+            }
+        }
+
+        // for each hint in the hints file for a node that isn't part of the ring anymore, write RF hints for each replica
+        private void convert(HintsDescriptor descriptor)
+        {
+<span class="nc" id="L298">            File file = new File(hintsDirectory, descriptor.fileName());</span>
+
+<span class="nc" id="L300">            try (HintsReader reader = HintsReader.open(file, rateLimiter))</span>
+            {
+<span class="nc" id="L302">                reader.forEach(page -&gt; page.hintsIterator().forEachRemaining(HintsService.instance::writeForAllReplicas));</span>
+<span class="nc" id="L303">                store.delete(descriptor);</span>
+<span class="nc" id="L304">                store.cleanUp(descriptor);</span>
+<span class="nc" id="L305">                logger.info(&quot;Finished converting hints file {}&quot;, descriptor.fileName());</span>
+            }
+<span class="nc" id="L307">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

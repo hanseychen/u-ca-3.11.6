@@ -1,0 +1,443 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FileHandle.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">FileHandle.java</span></div><h1>FileHandle.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.util;
+
+import java.util.Objects;
+import java.util.Optional;
+
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cache.ChunkCache;
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.utils.NativeLibrary;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.RefCounted;
+import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+
+/**
+ * {@link FileHandle} provides access to a file for reading, including the ones written by various {@link SequentialWriter}
+ * instances, and it is typically used by {@link org.apache.cassandra.io.sstable.format.SSTableReader}.
+ *
+ * Use {@link FileHandle.Builder} to create an instance, and call {@link #createReader()} (and its variants) to
+ * access the readers for the underlying file.
+ *
+ * You can use {@link Builder#complete()} several times during its lifecycle with different {@code overrideLength}(i.e. early opening file).
+ * For that reason, the builder keeps a reference to the file channel and makes a copy for each {@link Builder#complete()} call.
+ * Therefore, it is important to close the {@link Builder} when it is no longer needed, as well as any {@link FileHandle}
+ * instances.
+ */
+public class FileHandle extends SharedCloseableImpl
+{
+<span class="fc" id="L51">    private static final Logger logger = LoggerFactory.getLogger(FileHandle.class);</span>
+
+    public final ChannelProxy channel;
+
+    public final long onDiskLength;
+
+    /*
+     * Rebufferer factory to use when constructing RandomAccessReaders
+     */
+    private final RebuffererFactory rebuffererFactory;
+
+    /*
+     * Optional CompressionMetadata when dealing with compressed file
+     */
+    private final Optional&lt;CompressionMetadata&gt; compressionMetadata;
+
+    private FileHandle(Cleanup cleanup,
+                       ChannelProxy channel,
+                       RebuffererFactory rebuffererFactory,
+                       CompressionMetadata compressionMetadata,
+                       long onDiskLength)
+    {
+<span class="fc" id="L73">        super(cleanup);</span>
+<span class="fc" id="L74">        this.rebuffererFactory = rebuffererFactory;</span>
+<span class="fc" id="L75">        this.channel = channel;</span>
+<span class="fc" id="L76">        this.compressionMetadata = Optional.ofNullable(compressionMetadata);</span>
+<span class="fc" id="L77">        this.onDiskLength = onDiskLength;</span>
+<span class="fc" id="L78">    }</span>
+
+    private FileHandle(FileHandle copy)
+    {
+<span class="nc" id="L82">        super(copy);</span>
+<span class="nc" id="L83">        channel = copy.channel;</span>
+<span class="nc" id="L84">        rebuffererFactory = copy.rebuffererFactory;</span>
+<span class="nc" id="L85">        compressionMetadata = copy.compressionMetadata;</span>
+<span class="nc" id="L86">        onDiskLength = copy.onDiskLength;</span>
+<span class="nc" id="L87">    }</span>
+
+    /**
+     * @return Path to the file this factory is referencing
+     */
+    public String path()
+    {
+<span class="fc" id="L94">        return channel.filePath();</span>
+    }
+
+    public long dataLength()
+    {
+<span class="fc" id="L99">        return compressionMetadata.map(c -&gt; c.dataLength).orElseGet(rebuffererFactory::fileLength);</span>
+    }
+
+    public RebuffererFactory rebuffererFactory()
+    {
+<span class="nc" id="L104">        return rebuffererFactory;</span>
+    }
+
+    public Optional&lt;CompressionMetadata&gt; compressionMetadata()
+    {
+<span class="fc" id="L109">        return compressionMetadata;</span>
+    }
+
+    @Override
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L115">        super.addTo(identities);</span>
+<span class="nc" id="L116">        compressionMetadata.ifPresent(metadata -&gt; metadata.addTo(identities));</span>
+<span class="nc" id="L117">    }</span>
+
+    @Override
+    public FileHandle sharedCopy()
+    {
+<span class="nc" id="L122">        return new FileHandle(this);</span>
+    }
+
+    /**
+     * Create {@link RandomAccessReader} with configured method of reading content of the file.
+     *
+     * @return RandomAccessReader for the file
+     */
+    public RandomAccessReader createReader()
+    {
+<span class="fc" id="L132">        return createReader(null);</span>
+    }
+
+    /**
+     * Create {@link RandomAccessReader} with configured method of reading content of the file.
+     * Reading from file will be rate limited by given {@link RateLimiter}.
+     *
+     * @param limiter RateLimiter to use for rate limiting read
+     * @return RandomAccessReader for the file
+     */
+    public RandomAccessReader createReader(RateLimiter limiter)
+    {
+<span class="fc" id="L144">        return new RandomAccessReader(instantiateRebufferer(limiter));</span>
+    }
+
+    public FileDataInput createReader(long position)
+    {
+<span class="fc" id="L149">        RandomAccessReader reader = createReader();</span>
+<span class="fc" id="L150">        reader.seek(position);</span>
+<span class="fc" id="L151">        return reader;</span>
+    }
+
+    /**
+     * Drop page cache from start to given {@code before}.
+     *
+     * @param before uncompressed position from start of the file to be dropped from cache. if 0, to end of file.
+     */
+    public void dropPageCache(long before)
+    {
+<span class="nc" id="L161">        long position = compressionMetadata.map(metadata -&gt; {</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (before &gt;= metadata.dataLength)</span>
+<span class="nc" id="L163">                return 0L;</span>
+            else
+<span class="nc" id="L165">                return metadata.chunkFor(before).offset;</span>
+<span class="nc" id="L166">        }).orElse(before);</span>
+<span class="nc" id="L167">        NativeLibrary.trySkipCache(channel.getFileDescriptor(), 0, position, path());</span>
+<span class="nc" id="L168">    }</span>
+
+    private Rebufferer instantiateRebufferer(RateLimiter limiter)
+    {
+<span class="fc" id="L172">        Rebufferer rebufferer = rebuffererFactory.instantiateRebufferer();</span>
+
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">        if (limiter != null)</span>
+<span class="nc" id="L175">            rebufferer = new LimitingRebufferer(rebufferer, limiter, DiskOptimizationStrategy.MAX_BUFFER_SIZE);</span>
+<span class="fc" id="L176">        return rebufferer;</span>
+    }
+
+    /**
+     * Perform clean up of all resources held by {@link FileHandle}.
+     */
+    private static class Cleanup implements RefCounted.Tidy
+    {
+        final ChannelProxy channel;
+        final RebuffererFactory rebufferer;
+        final CompressionMetadata compressionMetadata;
+        final Optional&lt;ChunkCache&gt; chunkCache;
+
+        private Cleanup(ChannelProxy channel,
+                        RebuffererFactory rebufferer,
+                        CompressionMetadata compressionMetadata,
+                        ChunkCache chunkCache)
+<span class="fc" id="L193">        {</span>
+<span class="fc" id="L194">            this.channel = channel;</span>
+<span class="fc" id="L195">            this.rebufferer = rebufferer;</span>
+<span class="fc" id="L196">            this.compressionMetadata = compressionMetadata;</span>
+<span class="fc" id="L197">            this.chunkCache = Optional.ofNullable(chunkCache);</span>
+<span class="fc" id="L198">        }</span>
+
+        public String name()
+        {
+<span class="fc" id="L202">            return channel.filePath();</span>
+        }
+
+        public void tidy()
+        {
+<span class="fc" id="L207">            chunkCache.ifPresent(cache -&gt; cache.invalidateFile(name()));</span>
+            try
+            {
+<span class="fc bfc" id="L210" title="All 2 branches covered.">                if (compressionMetadata != null)</span>
+                {
+<span class="fc" id="L212">                    compressionMetadata.close();</span>
+                }
+            }
+            finally
+            {
+                try
+                {
+<span class="fc" id="L219">                    channel.close();</span>
+                }
+                finally
+                {
+<span class="fc" id="L223">                    rebufferer.close();</span>
+                }
+            }
+<span class="fc" id="L226">        }</span>
+    }
+
+    /**
+     * Configures how the file will be read (compressed, mmapped, use cache etc.)
+     */
+    public static class Builder implements AutoCloseable
+    {
+        private final String path;
+
+        private ChannelProxy channel;
+        private CompressionMetadata compressionMetadata;
+        private MmappedRegions regions;
+        private ChunkCache chunkCache;
+<span class="pc" id="L240">        private int bufferSize = RandomAccessReader.DEFAULT_BUFFER_SIZE;</span>
+<span class="pc" id="L241">        private BufferType bufferType = BufferType.OFF_HEAP;</span>
+
+<span class="pc" id="L243">        private boolean mmapped = false;</span>
+<span class="pc" id="L244">        private boolean compressed = false;</span>
+
+        public Builder(String path)
+<span class="fc" id="L247">        {</span>
+<span class="fc" id="L248">            this.path = path;</span>
+<span class="fc" id="L249">        }</span>
+
+        public Builder(ChannelProxy channel)
+<span class="nc" id="L252">        {</span>
+<span class="nc" id="L253">            this.channel = channel;</span>
+<span class="nc" id="L254">            this.path = channel.filePath();</span>
+<span class="nc" id="L255">        }</span>
+
+        public Builder compressed(boolean compressed)
+        {
+<span class="fc" id="L259">            this.compressed = compressed;</span>
+<span class="fc" id="L260">            return this;</span>
+        }
+
+        /**
+         * Set {@link ChunkCache} to use.
+         *
+         * @param chunkCache ChunkCache object to use for caching
+         * @return this object
+         */
+        public Builder withChunkCache(ChunkCache chunkCache)
+        {
+<span class="fc" id="L271">            this.chunkCache = chunkCache;</span>
+<span class="fc" id="L272">            return this;</span>
+        }
+
+        /**
+         * Provide {@link CompressionMetadata} to use when reading compressed file.
+         *
+         * @param metadata CompressionMetadata to use
+         * @return this object
+         */
+        public Builder withCompressionMetadata(CompressionMetadata metadata)
+        {
+<span class="fc" id="L283">            this.compressed = Objects.nonNull(metadata);</span>
+<span class="fc" id="L284">            this.compressionMetadata = metadata;</span>
+<span class="fc" id="L285">            return this;</span>
+        }
+
+        /**
+         * Set whether to use mmap for reading
+         *
+         * @param mmapped true if using mmap
+         * @return this instance
+         */
+        public Builder mmapped(boolean mmapped)
+        {
+<span class="fc" id="L296">            this.mmapped = mmapped;</span>
+<span class="fc" id="L297">            return this;</span>
+        }
+
+        /**
+         * Set the buffer size to use (if appropriate).
+         *
+         * @param bufferSize Buffer size in bytes
+         * @return this instance
+         */
+        public Builder bufferSize(int bufferSize)
+        {
+<span class="fc" id="L308">            this.bufferSize = bufferSize;</span>
+<span class="fc" id="L309">            return this;</span>
+        }
+
+        /**
+         * Set the buffer type (on heap or off heap) to use (if appropriate).
+         *
+         * @param bufferType Buffer type to use
+         * @return this instance
+         */
+        public Builder bufferType(BufferType bufferType)
+        {
+<span class="nc" id="L320">            this.bufferType = bufferType;</span>
+<span class="nc" id="L321">            return this;</span>
+        }
+
+        /**
+         * Complete building {@link FileHandle} without overriding file length.
+         *
+         * @see #complete(long)
+         */
+        public FileHandle complete()
+        {
+<span class="fc" id="L331">            return complete(-1L);</span>
+        }
+
+        /**
+         * Complete building {@link FileHandle} with the given length, which overrides the file length.
+         *
+         * @param overrideLength Override file length (in bytes) so that read cannot go further than this value.
+         *                       If the value is less than or equal to 0, then the value is ignored.
+         * @return Built file
+         */
+        @SuppressWarnings(&quot;resource&quot;)
+        public FileHandle complete(long overrideLength)
+        {
+<span class="fc bfc" id="L344" title="All 2 branches covered.">            if (channel == null)</span>
+            {
+<span class="fc" id="L346">                channel = new ChannelProxy(path);</span>
+            }
+
+<span class="fc" id="L349">            ChannelProxy channelCopy = channel.sharedCopy();</span>
+            try
+            {
+<span class="pc bpc" id="L352" title="1 of 4 branches missed.">                if (compressed &amp;&amp; compressionMetadata == null)</span>
+<span class="nc" id="L353">                    compressionMetadata = CompressionMetadata.create(channelCopy.filePath());</span>
+
+<span class="pc bpc" id="L355" title="1 of 4 branches missed.">                long length = overrideLength &gt; 0 ? overrideLength : compressed ? compressionMetadata.compressedFileLength : channelCopy.size();</span>
+
+                RebuffererFactory rebuffererFactory;
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">                if (mmapped)</span>
+                {
+<span class="fc bfc" id="L360" title="All 2 branches covered.">                    if (compressed)</span>
+                    {
+<span class="fc" id="L362">                        regions = MmappedRegions.map(channelCopy, compressionMetadata);</span>
+<span class="fc" id="L363">                        rebuffererFactory = maybeCached(new CompressedChunkReader.Mmap(channelCopy, compressionMetadata,</span>
+                                                                                       regions));
+                    }
+                    else
+                    {
+<span class="fc" id="L368">                        updateRegions(channelCopy, length);</span>
+<span class="fc" id="L369">                        rebuffererFactory = new MmapRebufferer(channelCopy, length, regions.sharedCopy());</span>
+                    }
+                }
+                else
+                {
+<span class="nc" id="L374">                    regions = null;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                    if (compressed)</span>
+                    {
+<span class="nc" id="L377">                        rebuffererFactory = maybeCached(new CompressedChunkReader.Standard(channelCopy, compressionMetadata));</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L381">                        int chunkSize = DiskOptimizationStrategy.roundForCaching(bufferSize, ChunkCache.roundUp);</span>
+<span class="nc" id="L382">                        rebuffererFactory = maybeCached(new SimpleChunkReader(channelCopy, length, bufferType, chunkSize));</span>
+                    }
+                }
+<span class="fc" id="L385">                Cleanup cleanup = new Cleanup(channelCopy, rebuffererFactory, compressionMetadata, chunkCache);</span>
+<span class="fc" id="L386">                return new FileHandle(cleanup, channelCopy, rebuffererFactory, compressionMetadata, length);</span>
+            }
+<span class="nc" id="L388">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L390">                channelCopy.close();</span>
+<span class="nc" id="L391">                throw t;</span>
+            }
+        }
+
+        public Throwable close(Throwable accumulate)
+        {
+<span class="pc bpc" id="L397" title="1 of 4 branches missed.">            if (!compressed &amp;&amp; regions != null)</span>
+<span class="fc" id="L398">                accumulate = regions.close(accumulate);</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">            if (channel != null)</span>
+<span class="fc" id="L400">                return channel.close(accumulate);</span>
+
+<span class="nc" id="L402">            return accumulate;</span>
+        }
+
+        public void close()
+        {
+<span class="nc" id="L407">            maybeFail(close(null));</span>
+<span class="nc" id="L408">        }</span>
+
+        private RebuffererFactory maybeCached(ChunkReader reader)
+        {
+<span class="pc bpc" id="L412" title="2 of 4 branches missed.">            if (chunkCache != null &amp;&amp; chunkCache.capacity() &gt; 0)</span>
+<span class="fc" id="L413">                return chunkCache.wrap(reader);</span>
+<span class="nc" id="L414">            return reader;</span>
+        }
+
+        private void updateRegions(ChannelProxy channel, long length)
+        {
+<span class="pc bpc" id="L419" title="1 of 4 branches missed.">            if (regions != null &amp;&amp; !regions.isValid(channel))</span>
+            {
+<span class="nc" id="L421">                Throwable err = regions.close(null);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                if (err != null)</span>
+<span class="nc" id="L423">                    logger.error(&quot;Failed to close mapped regions&quot;, err);</span>
+
+<span class="nc" id="L425">                regions = null;</span>
+            }
+
+<span class="fc bfc" id="L428" title="All 2 branches covered.">            if (regions == null)</span>
+<span class="fc" id="L429">                regions = MmappedRegions.map(channel, length);</span>
+            else
+<span class="fc" id="L431">                regions.extend(length);</span>
+<span class="fc" id="L432">        }</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L438">        return getClass().getSimpleName() + &quot;(path='&quot; + path() + '\'' +</span>
+<span class="nc" id="L439">               &quot;, length=&quot; + rebuffererFactory.fileLength() +</span>
+               ')';
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

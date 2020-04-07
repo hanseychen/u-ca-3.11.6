@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RepairSession.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">RepairSession.java</span></div><h1>RepairSession.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.repair;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.*;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MerkleTrees;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Coordinates the (active) repair of a list of non overlapping token ranges.
+ *
+ * A given RepairSession repairs a set of replicas for a given set of ranges on a list
+ * of column families. For each of the column family to repair, RepairSession
+ * creates a {@link RepairJob} that handles the repair of that CF.
+ *
+ * A given RepairJob has the 2 main phases:
+ * &lt;ol&gt;
+ *   &lt;li&gt;Validation phase: the job requests merkle trees from each of the replica involves
+ *      ({@link org.apache.cassandra.repair.ValidationTask}) and waits until all trees are received (in
+ *      validationComplete()).
+ *   &lt;/li&gt;
+ *   &lt;li&gt;Synchronization phase: once all trees are received, the job compares each tree with
+ *      all the others and creates a {@link SyncTask} for each diverging replica. If there are differences
+ *      between 2 trees, the concerned SyncTask stream the differences between the 2 endpoints concerned.
+ *   &lt;/li&gt;
+ * &lt;/ol&gt;
+ * The job is done once all its SyncTasks are done (i.e. have either computed no differences
+ * or the streaming they started is done (syncComplete())).
+ *
+ * A given session will execute the first phase (validation phase) of each of it's job
+ * sequentially. In other words, it will start the first job and only start the next one
+ * once that first job validation phase is complete. This is done so that the replica only
+ * create one merkle tree per range at a time, which is our way to ensure that such creation starts
+ * roughly at the same time on every node (see CASSANDRA-2816). However the synchronization
+ * phases are allowed to run concurrently (with each other and with validation phases).
+ *
+ * A given RepairJob has 2 modes: either sequential or not (RepairParallelism). If sequential,
+ * it will requests merkle tree creation from each replica in sequence (though in that case
+ * we still first send a message to each node to flush and snapshot data so each merkle tree
+ * creation is still done on similar data, even if the actual creation is not
+ * done simulatneously). If not sequential, all merkle tree are requested in parallel.
+ * Similarly, if a job is sequential, it will handle one SyncTask at a time, but will handle
+ * all of them in parallel otherwise.
+ */
+<span class="nc bnc" id="L79" title="All 2 branches missed.">public class RepairSession extends AbstractFuture&lt;RepairSessionResult&gt; implements IEndpointStateChangeSubscriber,</span>
+                                                                                 IFailureDetectionEventListener
+{
+<span class="nc" id="L82">    private static Logger logger = LoggerFactory.getLogger(RepairSession.class);</span>
+
+    public final UUID parentRepairSession;
+    /** Repair session ID */
+    private final UUID id;
+    public final String keyspace;
+    private final String[] cfnames;
+    public final RepairParallelism parallelismDegree;
+    public final boolean pullRepair;
+    /** Range to repair */
+    public final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+    public final Set&lt;InetAddress&gt; endpoints;
+    public final long repairedAt;
+
+<span class="nc" id="L96">    private final AtomicBoolean isFailed = new AtomicBoolean(false);</span>
+
+    // Each validation task waits response from replica in validating ConcurrentMap (keyed by CF name and endpoint address)
+<span class="nc" id="L99">    private final ConcurrentMap&lt;Pair&lt;RepairJobDesc, InetAddress&gt;, ValidationTask&gt; validating = new ConcurrentHashMap&lt;&gt;();</span>
+    // Remote syncing jobs wait response in syncingTasks map
+<span class="nc" id="L101">    private final ConcurrentMap&lt;Pair&lt;RepairJobDesc, NodePair&gt;, RemoteSyncTask&gt; syncingTasks = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // Tasks(snapshot, validate request, differencing, ...) are run on taskExecutor
+    public final ListeningExecutorService taskExecutor;
+
+<span class="nc" id="L106">    private volatile boolean terminated = false;</span>
+
+    /**
+     * Create new repair session.
+     *
+     * @param parentRepairSession the parent sessions id
+     * @param id this sessions id
+     * @param ranges ranges to repair
+     * @param keyspace name of keyspace
+     * @param parallelismDegree specifies the degree of parallelism when calculating the merkle trees
+     * @param endpoints the data centers that should be part of the repair; null for all DCs
+     * @param repairedAt when the repair occurred (millis)
+     * @param pullRepair true if the repair should be one way (from remote host to this host and only applicable between two hosts--see RepairOption)
+     * @param cfnames names of columnfamilies
+     */
+    public RepairSession(UUID parentRepairSession,
+                         UUID id,
+                         Collection&lt;Range&lt;Token&gt;&gt; ranges,
+                         String keyspace,
+                         RepairParallelism parallelismDegree,
+                         Set&lt;InetAddress&gt; endpoints,
+                         long repairedAt,
+                         boolean pullRepair,
+                         String... cfnames)
+<span class="nc" id="L130">    {</span>
+<span class="nc bnc" id="L131" title="All 4 branches missed.">        assert cfnames.length &gt; 0 : &quot;Repairing no column families seems pointless, doesn't it&quot;;</span>
+
+<span class="nc" id="L133">        this.parentRepairSession = parentRepairSession;</span>
+<span class="nc" id="L134">        this.id = id;</span>
+<span class="nc" id="L135">        this.parallelismDegree = parallelismDegree;</span>
+<span class="nc" id="L136">        this.keyspace = keyspace;</span>
+<span class="nc" id="L137">        this.cfnames = cfnames;</span>
+<span class="nc" id="L138">        this.ranges = ranges;</span>
+<span class="nc" id="L139">        this.endpoints = endpoints;</span>
+<span class="nc" id="L140">        this.repairedAt = repairedAt;</span>
+<span class="nc" id="L141">        this.pullRepair = pullRepair;</span>
+<span class="nc" id="L142">        this.taskExecutor = MoreExecutors.listeningDecorator(createExecutor());</span>
+<span class="nc" id="L143">    }</span>
+
+    @VisibleForTesting
+    protected DebuggableThreadPoolExecutor createExecutor()
+    {
+<span class="nc" id="L148">        return DebuggableThreadPoolExecutor.createCachedThreadpoolWithMaxSize(&quot;RepairJobTask&quot;);</span>
+    }
+
+    public UUID getId()
+    {
+<span class="nc" id="L153">        return id;</span>
+    }
+
+    public Collection&lt;Range&lt;Token&gt;&gt; getRanges()
+    {
+<span class="nc" id="L158">        return ranges;</span>
+    }
+
+    public void waitForValidation(Pair&lt;RepairJobDesc, InetAddress&gt; key, ValidationTask task)
+    {
+<span class="nc" id="L163">        validating.put(key, task);</span>
+<span class="nc" id="L164">    }</span>
+
+    public void waitForSync(Pair&lt;RepairJobDesc, NodePair&gt; key, RemoteSyncTask task)
+    {
+<span class="nc" id="L168">        syncingTasks.put(key, task);</span>
+<span class="nc" id="L169">    }</span>
+
+    /**
+     * Receive merkle tree response or failed response from {@code endpoint} for current repair job.
+     *
+     * @param desc repair job description
+     * @param endpoint endpoint that sent merkle tree
+     * @param trees calculated merkle trees, or null if validation failed
+     */
+    public void validationComplete(RepairJobDesc desc, InetAddress endpoint, MerkleTrees trees)
+    {
+<span class="nc" id="L180">        ValidationTask task = validating.remove(Pair.create(desc, endpoint));</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (task == null)</span>
+        {
+<span class="nc bnc" id="L183" title="All 4 branches missed.">            assert terminated;</span>
+<span class="nc" id="L184">            return;</span>
+        }
+
+<span class="nc" id="L187">        String message = String.format(&quot;Received merkle tree for %s from %s&quot;, desc.columnFamily, endpoint);</span>
+<span class="nc" id="L188">        logger.info(&quot;[repair #{}] {}&quot;, getId(), message);</span>
+<span class="nc" id="L189">        Tracing.traceRepair(message);</span>
+<span class="nc" id="L190">        task.treesReceived(trees);</span>
+<span class="nc" id="L191">    }</span>
+
+    /**
+     * Notify this session that sync completed/failed with given {@code NodePair}.
+     *
+     * @param desc synced repair job
+     * @param nodes nodes that completed sync
+     * @param success true if sync succeeded
+     */
+    public void syncComplete(RepairJobDesc desc, NodePair nodes, boolean success)
+    {
+<span class="nc" id="L202">        RemoteSyncTask task = syncingTasks.get(Pair.create(desc, nodes));</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (task == null)</span>
+        {
+<span class="nc bnc" id="L205" title="All 4 branches missed.">            assert terminated;</span>
+<span class="nc" id="L206">            return;</span>
+        }
+
+<span class="nc" id="L209">        logger.debug(&quot;[repair #{}] Repair completed between {} and {} on {}&quot;, getId(), nodes.endpoint1, nodes.endpoint2, desc.columnFamily);</span>
+<span class="nc" id="L210">        task.syncComplete(success);</span>
+<span class="nc" id="L211">    }</span>
+
+    @VisibleForTesting
+    Map&lt;Pair&lt;RepairJobDesc, NodePair&gt;, RemoteSyncTask&gt; getSyncingTasks()
+    {
+<span class="nc" id="L216">        return Collections.unmodifiableMap(syncingTasks);</span>
+    }
+
+    private String repairedNodes()
+    {
+<span class="nc" id="L221">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L222">        sb.append(FBUtilities.getBroadcastAddress());</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        for (InetAddress ep : endpoints)</span>
+<span class="nc" id="L224">            sb.append(&quot;, &quot;).append(ep);</span>
+<span class="nc" id="L225">        return sb.toString();</span>
+    }
+
+    /**
+     * Start RepairJob on given ColumnFamilies.
+     *
+     * This first validates if all replica are available, and if they are,
+     * creates RepairJobs and submit to run on given executor.
+     *
+     * @param executor Executor to run validation
+     */
+    public void start(ListeningExecutorService executor)
+    {
+        String message;
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (terminated)</span>
+<span class="nc" id="L240">            return;</span>
+
+<span class="nc" id="L242">        logger.info(&quot;[repair #{}] new session: will sync {} on range {} for {}.{}&quot;, getId(), repairedNodes(), ranges, keyspace, Arrays.toString(cfnames));</span>
+<span class="nc" id="L243">        Tracing.traceRepair(&quot;Syncing range {}&quot;, ranges);</span>
+<span class="nc" id="L244">        SystemDistributedKeyspace.startRepairs(getId(), parentRepairSession, keyspace, cfnames, ranges, endpoints);</span>
+
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if (endpoints.isEmpty())</span>
+        {
+<span class="nc" id="L248">            logger.info(&quot;[repair #{}] {}&quot;, getId(), message = String.format(&quot;No neighbors to repair with on range %s: session completed&quot;, ranges));</span>
+<span class="nc" id="L249">            Tracing.traceRepair(message);</span>
+<span class="nc" id="L250">            set(new RepairSessionResult(id, keyspace, ranges, Lists.&lt;RepairResult&gt;newArrayList()));</span>
+<span class="nc" id="L251">            SystemDistributedKeyspace.failRepairs(getId(), keyspace, cfnames, new RuntimeException(message));</span>
+<span class="nc" id="L252">            return;</span>
+        }
+
+        // Checking all nodes are live
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        for (InetAddress endpoint : endpoints)</span>
+        {
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (!FailureDetector.instance.isAlive(endpoint))</span>
+            {
+<span class="nc" id="L260">                message = String.format(&quot;Cannot proceed on repair because a neighbor (%s) is dead: session failed&quot;, endpoint);</span>
+<span class="nc" id="L261">                logger.error(&quot;[repair #{}] {}&quot;, getId(), message);</span>
+<span class="nc" id="L262">                Exception e = new IOException(message);</span>
+<span class="nc" id="L263">                setException(e);</span>
+<span class="nc" id="L264">                SystemDistributedKeyspace.failRepairs(getId(), keyspace, cfnames, e);</span>
+<span class="nc" id="L265">                return;</span>
+            }
+<span class="nc" id="L267">        }</span>
+
+        // Create and submit RepairJob for each ColumnFamily
+<span class="nc" id="L270">        List&lt;ListenableFuture&lt;RepairResult&gt;&gt; jobs = new ArrayList&lt;&gt;(cfnames.length);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        for (String cfname : cfnames)</span>
+        {
+<span class="nc" id="L273">            RepairJob job = new RepairJob(this, cfname);</span>
+<span class="nc" id="L274">            executor.execute(job);</span>
+<span class="nc" id="L275">            jobs.add(job);</span>
+        }
+
+        // When all RepairJobs are done without error, cleanup and set the final result
+<span class="nc" id="L279">        Futures.addCallback(Futures.allAsList(jobs), new FutureCallback&lt;List&lt;RepairResult&gt;&gt;()</span>
+<span class="nc" id="L280">        {</span>
+            public void onSuccess(List&lt;RepairResult&gt; results)
+            {
+                // this repair session is completed
+<span class="nc" id="L284">                logger.info(&quot;[repair #{}] {}&quot;, getId(), &quot;Session completed successfully&quot;);</span>
+<span class="nc" id="L285">                Tracing.traceRepair(&quot;Completed sync of range {}&quot;, ranges);</span>
+<span class="nc" id="L286">                set(new RepairSessionResult(id, keyspace, ranges, results));</span>
+
+<span class="nc" id="L288">                taskExecutor.shutdown();</span>
+                // mark this session as terminated
+<span class="nc" id="L290">                terminate();</span>
+<span class="nc" id="L291">            }</span>
+
+            public void onFailure(Throwable t)
+            {
+<span class="nc" id="L295">                logger.error(String.format(&quot;[repair #%s] Session completed with the following error&quot;, getId()), t);</span>
+<span class="nc" id="L296">                Tracing.traceRepair(&quot;Session completed with the following error: {}&quot;, t);</span>
+<span class="nc" id="L297">                forceShutdown(t);</span>
+<span class="nc" id="L298">            }</span>
+        });
+<span class="nc" id="L300">    }</span>
+
+    public void terminate()
+    {
+<span class="nc" id="L304">        terminated = true;</span>
+<span class="nc" id="L305">        validating.clear();</span>
+<span class="nc" id="L306">        syncingTasks.clear();</span>
+<span class="nc" id="L307">    }</span>
+
+    /**
+     * clear all RepairJobs and terminate this session.
+     *
+     * @param reason Cause of error for shutdown
+     */
+    public void forceShutdown(Throwable reason)
+    {
+<span class="nc" id="L316">        setException(reason);</span>
+<span class="nc" id="L317">        taskExecutor.shutdownNow();</span>
+<span class="nc" id="L318">        terminate();</span>
+<span class="nc" id="L319">    }</span>
+
+<span class="nc" id="L321">    public void onJoin(InetAddress endpoint, EndpointState epState) {}</span>
+<span class="nc" id="L322">    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}</span>
+<span class="nc" id="L323">    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}</span>
+<span class="nc" id="L324">    public void onAlive(InetAddress endpoint, EndpointState state) {}</span>
+<span class="nc" id="L325">    public void onDead(InetAddress endpoint, EndpointState state) {}</span>
+
+    public void onRemove(InetAddress endpoint)
+    {
+<span class="nc" id="L329">        convict(endpoint, Double.MAX_VALUE);</span>
+<span class="nc" id="L330">    }</span>
+
+    public void onRestart(InetAddress endpoint, EndpointState epState)
+    {
+<span class="nc" id="L334">        convict(endpoint, Double.MAX_VALUE);</span>
+<span class="nc" id="L335">    }</span>
+
+    public void convict(InetAddress endpoint, double phi)
+    {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (!endpoints.contains(endpoint))</span>
+<span class="nc" id="L340">            return;</span>
+
+        // We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost.
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (phi &lt; 2 * DatabaseDescriptor.getPhiConvictThreshold())</span>
+<span class="nc" id="L344">            return;</span>
+
+        // Though unlikely, it is possible to arrive here multiple time and we
+        // want to avoid print an error message twice
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (!isFailed.compareAndSet(false, true))</span>
+<span class="nc" id="L349">            return;</span>
+
+<span class="nc" id="L351">        Exception exception = new IOException(String.format(&quot;Endpoint %s died&quot;, endpoint));</span>
+<span class="nc" id="L352">        logger.error(String.format(&quot;[repair #%s] session completed with the following error&quot;, getId()), exception);</span>
+        // If a node failed, we stop everything (though there could still be some activity in the background)
+<span class="nc" id="L354">        forceShutdown(exception);</span>
+<span class="nc" id="L355">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

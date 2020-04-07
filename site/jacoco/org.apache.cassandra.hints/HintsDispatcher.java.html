@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsDispatcher.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsDispatcher.java</span></div><h1>HintsDispatcher.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.File;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
+
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.metrics.HintsServiceMetrics;
+import org.apache.cassandra.net.IAsyncCallbackWithFailure;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.concurrent.SimpleCondition;
+
+/**
+ * Dispatches a single hints file to a specified node in a batched manner.
+ *
+ * Uses either {@link EncodedHintMessage} - when dispatching hints into a node with the same messaging version as the hints file,
+ * or {@link HintMessage}, when conversion is required.
+ */
+final class HintsDispatcher implements AutoCloseable
+{
+<span class="nc" id="L47">    private static final Logger logger = LoggerFactory.getLogger(HintsDispatcher.class);</span>
+
+<span class="nc" id="L49">    private enum Action { CONTINUE, ABORT }</span>
+
+    private final HintsReader reader;
+    private final UUID hostId;
+    private final InetAddress address;
+    private final int messagingVersion;
+    private final BooleanSupplier abortRequested;
+
+    private InputPosition currentPagePosition;
+
+    private HintsDispatcher(HintsReader reader, UUID hostId, InetAddress address, int messagingVersion, BooleanSupplier abortRequested)
+<span class="nc" id="L60">    {</span>
+<span class="nc" id="L61">        currentPagePosition = null;</span>
+
+<span class="nc" id="L63">        this.reader = reader;</span>
+<span class="nc" id="L64">        this.hostId = hostId;</span>
+<span class="nc" id="L65">        this.address = address;</span>
+<span class="nc" id="L66">        this.messagingVersion = messagingVersion;</span>
+<span class="nc" id="L67">        this.abortRequested = abortRequested;</span>
+<span class="nc" id="L68">    }</span>
+
+    static HintsDispatcher create(File file, RateLimiter rateLimiter, InetAddress address, UUID hostId, BooleanSupplier abortRequested)
+    {
+<span class="nc" id="L72">        int messagingVersion = MessagingService.instance().getVersion(address);</span>
+<span class="nc" id="L73">        return new HintsDispatcher(HintsReader.open(file, rateLimiter), hostId, address, messagingVersion, abortRequested);</span>
+    }
+
+    public void close()
+    {
+<span class="nc" id="L78">        reader.close();</span>
+<span class="nc" id="L79">    }</span>
+
+    void seek(InputPosition position)
+    {
+<span class="nc" id="L83">        reader.seek(position);</span>
+<span class="nc" id="L84">    }</span>
+
+    /**
+     * @return whether or not dispatch completed entirely and successfully
+     */
+    boolean dispatch()
+    {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        for (HintsReader.Page page : reader)</span>
+        {
+<span class="nc" id="L93">            currentPagePosition = page.position;</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            if (dispatch(page) != Action.CONTINUE)</span>
+<span class="nc" id="L95">                return false;</span>
+<span class="nc" id="L96">        }</span>
+
+<span class="nc" id="L98">        return true;</span>
+    }
+
+    /**
+     * @return offset of the first non-delivered page
+     */
+    InputPosition dispatchPosition()
+    {
+<span class="nc" id="L106">        return currentPagePosition;</span>
+    }
+
+
+    // retry in case of a timeout; stop in case of a failure, host going down, or delivery paused
+    private Action dispatch(HintsReader.Page page)
+    {
+<span class="nc" id="L113">        return sendHintsAndAwait(page);</span>
+    }
+
+    private Action sendHintsAndAwait(HintsReader.Page page)
+    {
+<span class="nc" id="L118">        Collection&lt;Callback&gt; callbacks = new ArrayList&lt;&gt;();</span>
+
+        /*
+         * If hints file messaging version matches the version of the target host, we'll use the optimised path -
+         * skipping the redundant decoding/encoding cycle of the already encoded hint.
+         *
+         * If that is not the case, we'll need to perform conversion to a newer (or an older) format, and decoding the hint
+         * is an unavoidable intermediate step.
+         */
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        Action action = reader.descriptor().messagingVersion() == messagingVersion</span>
+<span class="nc" id="L128">                      ? sendHints(page.buffersIterator(), callbacks, this::sendEncodedHint)</span>
+<span class="nc" id="L129">                      : sendHints(page.hintsIterator(), callbacks, this::sendHint);</span>
+
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (action == Action.ABORT)</span>
+<span class="nc" id="L132">            return action;</span>
+
+<span class="nc" id="L134">        boolean hadFailures = false;</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        for (Callback cb : callbacks)</span>
+        {
+<span class="nc" id="L137">            Callback.Outcome outcome = cb.await();</span>
+<span class="nc" id="L138">            updateMetrics(outcome);</span>
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (outcome != Callback.Outcome.SUCCESS)</span>
+<span class="nc" id="L141">                hadFailures = true;</span>
+<span class="nc" id="L142">        }</span>
+
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        return hadFailures ? Action.ABORT : Action.CONTINUE;</span>
+    }
+
+    private void updateMetrics(Callback.Outcome outcome)
+    {
+<span class="nc bnc" id="L149" title="All 4 branches missed.">        switch (outcome)</span>
+        {
+            case SUCCESS:
+<span class="nc" id="L152">                HintsServiceMetrics.hintsSucceeded.mark();</span>
+<span class="nc" id="L153">                break;</span>
+            case FAILURE:
+<span class="nc" id="L155">                HintsServiceMetrics.hintsFailed.mark();</span>
+<span class="nc" id="L156">                break;</span>
+            case TIMEOUT:
+<span class="nc" id="L158">                HintsServiceMetrics.hintsTimedOut.mark();</span>
+                break;
+        }
+<span class="nc" id="L161">    }</span>
+
+    /*
+     * Sending hints in compatibility mode.
+     */
+
+    private &lt;T&gt; Action sendHints(Iterator&lt;T&gt; hints, Collection&lt;Callback&gt; callbacks, Function&lt;T, Callback&gt; sendFunction)
+    {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        while (hints.hasNext())</span>
+        {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">            if (abortRequested.getAsBoolean())</span>
+<span class="nc" id="L172">                return Action.ABORT;</span>
+<span class="nc" id="L173">            callbacks.add(sendFunction.apply(hints.next()));</span>
+        }
+<span class="nc" id="L175">        return Action.CONTINUE;</span>
+    }
+
+    private Callback sendHint(Hint hint)
+    {
+<span class="nc" id="L180">        Callback callback = new Callback();</span>
+<span class="nc" id="L181">        HintMessage message = new HintMessage(hostId, hint);</span>
+<span class="nc" id="L182">        MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);</span>
+<span class="nc" id="L183">        return callback;</span>
+    }
+
+    /*
+     * Sending hints in raw mode.
+     */
+
+    private Callback sendEncodedHint(ByteBuffer hint)
+    {
+<span class="nc" id="L192">        Callback callback = new Callback();</span>
+<span class="nc" id="L193">        EncodedHintMessage message = new EncodedHintMessage(hostId, hint, messagingVersion);</span>
+<span class="nc" id="L194">        MessagingService.instance().sendRRWithFailure(message.createMessageOut(), address, callback);</span>
+<span class="nc" id="L195">        return callback;</span>
+    }
+
+<span class="nc" id="L198">    private static final class Callback implements IAsyncCallbackWithFailure</span>
+    {
+<span class="nc" id="L200">        enum Outcome { SUCCESS, TIMEOUT, FAILURE, INTERRUPTED }</span>
+
+<span class="nc" id="L202">        private final long start = System.nanoTime();</span>
+<span class="nc" id="L203">        private final SimpleCondition condition = new SimpleCondition();</span>
+        private volatile Outcome outcome;
+
+        Outcome await()
+        {
+<span class="nc" id="L208">            long timeout = TimeUnit.MILLISECONDS.toNanos(MessagingService.Verb.HINT.getTimeout()) - (System.nanoTime() - start);</span>
+            boolean timedOut;
+
+            try
+            {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                timedOut = !condition.await(timeout, TimeUnit.NANOSECONDS);</span>
+            }
+<span class="nc" id="L215">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L217">                logger.warn(&quot;Hint dispatch was interrupted&quot;, e);</span>
+<span class="nc" id="L218">                return Outcome.INTERRUPTED;</span>
+<span class="nc" id="L219">            }</span>
+
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            return timedOut ? Outcome.TIMEOUT : outcome;</span>
+        }
+
+        public void onFailure(InetAddress from, RequestFailureReason failureReason)
+        {
+<span class="nc" id="L226">            outcome = Outcome.FAILURE;</span>
+<span class="nc" id="L227">            condition.signalAll();</span>
+<span class="nc" id="L228">        }</span>
+
+        public void response(MessageIn msg)
+        {
+<span class="nc" id="L232">            outcome = Outcome.SUCCESS;</span>
+<span class="nc" id="L233">            condition.signalAll();</span>
+<span class="nc" id="L234">        }</span>
+
+        public boolean isLatencyForSnitch()
+        {
+<span class="nc" id="L238">            return false;</span>
+        }
+
+        @Override
+        public boolean supportsBackPressure()
+        {
+<span class="nc" id="L244">            return true;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

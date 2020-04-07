@@ -1,0 +1,580 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TypeParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.marshal</a> &gt; <span class="el_source">TypeParser.java</span></div><h1>TypeParser.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.marshal;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableMap;
+
+import org.apache.cassandra.cql3.FieldIdentifier;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Parse a string containing an Type definition.
+ */
+public class TypeParser
+{
+    private final String str;
+    private int idx;
+
+    // A cache of parsed string, specially useful for DynamicCompositeType
+<span class="fc" id="L44">    private static volatile ImmutableMap&lt;String, AbstractType&lt;?&gt;&gt; cache = ImmutableMap.of();</span>
+
+<span class="fc" id="L46">    public static final TypeParser EMPTY_PARSER = new TypeParser(&quot;&quot;, 0);</span>
+
+    private TypeParser(String str, int idx)
+<span class="fc" id="L49">    {</span>
+<span class="fc" id="L50">        this.str = str;</span>
+<span class="fc" id="L51">        this.idx = idx;</span>
+<span class="fc" id="L52">    }</span>
+
+    public TypeParser(String str)
+    {
+<span class="nc" id="L56">        this(str, 0);</span>
+<span class="nc" id="L57">    }</span>
+
+    /**
+     * Parse a string containing an type definition.
+     */
+    public static AbstractType&lt;?&gt; parse(String str) throws SyntaxException, ConfigurationException
+    {
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        if (str == null)</span>
+<span class="nc" id="L65">            return BytesType.instance;</span>
+
+        // A single volatile read of 'cache' should not hurt.
+<span class="nc" id="L68">        AbstractType&lt;?&gt; type = cache.get(str);</span>
+
+<span class="nc bnc" id="L70" title="All 2 branches missed.">        if (type != null)</span>
+<span class="nc" id="L71">            return type;</span>
+
+        // This could be simplier (i.e. new TypeParser(str).parse()) but we avoid creating a TypeParser object if not really necessary.
+<span class="nc" id="L74">        int i = 0;</span>
+<span class="nc" id="L75">        i = skipBlank(str, i);</span>
+<span class="nc" id="L76">        int j = i;</span>
+<span class="nc bnc" id="L77" title="All 4 branches missed.">        while (!isEOS(str, i) &amp;&amp; isIdentifierChar(str.charAt(i)))</span>
+<span class="nc" id="L78">            ++i;</span>
+
+<span class="nc bnc" id="L80" title="All 2 branches missed.">        if (i == j)</span>
+<span class="nc" id="L81">            return BytesType.instance;</span>
+
+<span class="nc" id="L83">        String name = str.substring(j, i);</span>
+<span class="nc" id="L84">        i = skipBlank(str, i);</span>
+
+<span class="nc bnc" id="L86" title="All 4 branches missed.">        if (!isEOS(str, i) &amp;&amp; str.charAt(i) == '(')</span>
+<span class="nc" id="L87">            type = getAbstractType(name, new TypeParser(str, i));</span>
+        else
+<span class="nc" id="L89">            type = getAbstractType(name);</span>
+
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        Verify.verify(type != null, &quot;Parsing %s yielded null, which is a bug&quot;, str);</span>
+
+        // Prevent concurrent modification to the map acting as the cache for TypeParser at the expense of
+        // more allocation when the cache needs to be updated, since updates to the cache are rare compared
+        // to the amount of reads.
+        //
+        // Copy the existing cache into a new map and add the parsed AbstractType instance and replace
+        // the cache, if the type is not already in the cache.
+        //
+        // The cache-update is done in a short synchronized block to prevent duplicate instances of AbstractType
+        // for the same string representation.
+<span class="nc" id="L102">        synchronized (TypeParser.class)</span>
+        {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            if (!cache.containsKey(str))</span>
+            {
+<span class="nc" id="L106">                ImmutableMap.Builder&lt;String, AbstractType&lt;?&gt;&gt; builder = ImmutableMap.builder();</span>
+<span class="nc" id="L107">                builder.putAll(cache).put(str, type);</span>
+<span class="nc" id="L108">                cache = builder.build();</span>
+            }
+<span class="nc" id="L110">            return type;</span>
+        }
+    }
+
+    public static AbstractType&lt;?&gt; parse(CharSequence compareWith) throws SyntaxException, ConfigurationException
+    {
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        return parse(compareWith == null ? null : compareWith.toString());</span>
+    }
+
+    /**
+     * Parse an AbstractType from current position of this parser.
+     */
+    public AbstractType&lt;?&gt; parse() throws SyntaxException, ConfigurationException
+    {
+<span class="nc" id="L124">        skipBlank();</span>
+<span class="nc" id="L125">        String name = readNextIdentifier();</span>
+
+<span class="nc" id="L127">        skipBlank();</span>
+<span class="nc bnc" id="L128" title="All 4 branches missed.">        if (!isEOS() &amp;&amp; str.charAt(idx) == '(')</span>
+<span class="nc" id="L129">            return getAbstractType(name, this);</span>
+        else
+<span class="nc" id="L131">            return getAbstractType(name);</span>
+    }
+
+    public Map&lt;String, String&gt; getKeyValueParameters() throws SyntaxException
+    {
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        if (isEOS())</span>
+<span class="nc" id="L137">            return Collections.emptyMap();</span>
+
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (str.charAt(idx) != '(')</span>
+<span class="nc" id="L140">            throw new IllegalStateException();</span>
+
+<span class="nc" id="L142">        Map&lt;String, String&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L143">        ++idx; // skipping '('</span>
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        while (skipBlankAndComma())</span>
+        {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if (str.charAt(idx) == ')')</span>
+            {
+<span class="nc" id="L149">                ++idx;</span>
+<span class="nc" id="L150">                return map;</span>
+            }
+
+<span class="nc" id="L153">            String k = readNextIdentifier();</span>
+<span class="nc" id="L154">            String v = &quot;&quot;;</span>
+<span class="nc" id="L155">            skipBlank();</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (str.charAt(idx) == '=')</span>
+            {
+<span class="nc" id="L158">                ++idx;</span>
+<span class="nc" id="L159">                skipBlank();</span>
+<span class="nc" id="L160">                v = readNextIdentifier();</span>
+            }
+<span class="nc bnc" id="L162" title="All 4 branches missed.">            else if (str.charAt(idx) != ',' &amp;&amp; str.charAt(idx) != ')')</span>
+            {
+<span class="nc" id="L164">                throwSyntaxError(&quot;unexpected character '&quot; + str.charAt(idx) + &quot;'&quot;);</span>
+            }
+<span class="nc" id="L166">            map.put(k, v);</span>
+<span class="nc" id="L167">        }</span>
+<span class="nc" id="L168">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: unexpected end of string&quot;, str, idx));</span>
+    }
+
+    public List&lt;AbstractType&lt;?&gt;&gt; getTypeParameters() throws SyntaxException, ConfigurationException
+    {
+<span class="nc" id="L173">        List&lt;AbstractType&lt;?&gt;&gt; list = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        if (isEOS())</span>
+<span class="nc" id="L176">            return list;</span>
+
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (str.charAt(idx) != '(')</span>
+<span class="nc" id="L179">            throw new IllegalStateException();</span>
+
+<span class="nc" id="L181">        ++idx; // skipping '('</span>
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        while (skipBlankAndComma())</span>
+        {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            if (str.charAt(idx) == ')')</span>
+            {
+<span class="nc" id="L187">                ++idx;</span>
+<span class="nc" id="L188">                return list;</span>
+            }
+
+            try
+            {
+<span class="nc" id="L193">                list.add(parse());</span>
+            }
+<span class="nc" id="L195">            catch (SyntaxException e)</span>
+            {
+<span class="nc" id="L197">                SyntaxException ex = new SyntaxException(String.format(&quot;Exception while parsing '%s' around char %d&quot;, str, idx));</span>
+<span class="nc" id="L198">                ex.initCause(e);</span>
+<span class="nc" id="L199">                throw ex;</span>
+<span class="nc" id="L200">            }</span>
+        }
+<span class="nc" id="L202">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: unexpected end of string&quot;, str, idx));</span>
+    }
+
+    public Map&lt;Byte, AbstractType&lt;?&gt;&gt; getAliasParameters() throws SyntaxException, ConfigurationException
+    {
+<span class="nc" id="L207">        Map&lt;Byte, AbstractType&lt;?&gt;&gt; map = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (isEOS())</span>
+<span class="nc" id="L210">            return map;</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (str.charAt(idx) != '(')</span>
+<span class="nc" id="L213">            throw new IllegalStateException();</span>
+
+<span class="nc" id="L215">        ++idx; // skipping '('</span>
+
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        while (skipBlankAndComma())</span>
+        {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (str.charAt(idx) == ')')</span>
+            {
+<span class="nc" id="L222">                ++idx;</span>
+<span class="nc" id="L223">                return map;</span>
+            }
+
+<span class="nc" id="L226">            String alias = readNextIdentifier();</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            if (alias.length() != 1)</span>
+<span class="nc" id="L228">                throwSyntaxError(&quot;An alias should be a single character&quot;);</span>
+<span class="nc" id="L229">            char aliasChar = alias.charAt(0);</span>
+<span class="nc bnc" id="L230" title="All 4 branches missed.">            if (aliasChar &lt; 33 || aliasChar &gt; 127)</span>
+<span class="nc" id="L231">                throwSyntaxError(&quot;An alias should be a single character in [0..9a..bA..B-+._&amp;]&quot;);</span>
+
+<span class="nc" id="L233">            skipBlank();</span>
+<span class="nc bnc" id="L234" title="All 4 branches missed.">            if (!(str.charAt(idx) == '=' &amp;&amp; str.charAt(idx+1) == '&gt;'))</span>
+<span class="nc" id="L235">                throwSyntaxError(&quot;expecting '=&gt;' token&quot;);</span>
+
+<span class="nc" id="L237">            idx += 2;</span>
+<span class="nc" id="L238">            skipBlank();</span>
+            try
+            {
+<span class="nc" id="L241">                map.put((byte)aliasChar, parse());</span>
+            }
+<span class="nc" id="L243">            catch (SyntaxException e)</span>
+            {
+<span class="nc" id="L245">                SyntaxException ex = new SyntaxException(String.format(&quot;Exception while parsing '%s' around char %d&quot;, str, idx));</span>
+<span class="nc" id="L246">                ex.initCause(e);</span>
+<span class="nc" id="L247">                throw ex;</span>
+<span class="nc" id="L248">            }</span>
+<span class="nc" id="L249">        }</span>
+<span class="nc" id="L250">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: unexpected end of string&quot;, str, idx));</span>
+    }
+
+    public Map&lt;ByteBuffer, CollectionType&gt; getCollectionsParameters() throws SyntaxException, ConfigurationException
+    {
+<span class="nc" id="L255">        Map&lt;ByteBuffer, CollectionType&gt; map = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (isEOS())</span>
+<span class="nc" id="L258">            return map;</span>
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (str.charAt(idx) != '(')</span>
+<span class="nc" id="L261">            throw new IllegalStateException();</span>
+
+<span class="nc" id="L263">        ++idx; // skipping '('</span>
+
+<span class="nc bnc" id="L265" title="All 2 branches missed.">        while (skipBlankAndComma())</span>
+        {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (str.charAt(idx) == ')')</span>
+            {
+<span class="nc" id="L269">                ++idx;</span>
+<span class="nc" id="L270">                return map;</span>
+            }
+
+<span class="nc" id="L273">            ByteBuffer bb = fromHex(readNextIdentifier());</span>
+
+<span class="nc" id="L275">            skipBlank();</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">            if (str.charAt(idx) != ':')</span>
+<span class="nc" id="L277">                throwSyntaxError(&quot;expecting ':' token&quot;);</span>
+
+<span class="nc" id="L279">            ++idx;</span>
+<span class="nc" id="L280">            skipBlank();</span>
+            try
+            {
+<span class="nc" id="L283">                AbstractType&lt;?&gt; type = parse();</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (!(type instanceof CollectionType))</span>
+<span class="nc" id="L285">                    throw new SyntaxException(type + &quot; is not a collection type&quot;);</span>
+<span class="nc" id="L286">                map.put(bb, (CollectionType)type);</span>
+            }
+<span class="nc" id="L288">            catch (SyntaxException e)</span>
+            {
+<span class="nc" id="L290">                SyntaxException ex = new SyntaxException(String.format(&quot;Exception while parsing '%s' around char %d&quot;, str, idx));</span>
+<span class="nc" id="L291">                ex.initCause(e);</span>
+<span class="nc" id="L292">                throw ex;</span>
+<span class="nc" id="L293">            }</span>
+<span class="nc" id="L294">        }</span>
+<span class="nc" id="L295">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: unexpected end of string&quot;, str, idx));</span>
+    }
+
+    private ByteBuffer fromHex(String hex) throws SyntaxException
+    {
+        try
+        {
+<span class="nc" id="L302">            return ByteBufferUtil.hexToBytes(hex);</span>
+        }
+<span class="nc" id="L304">        catch (NumberFormatException e)</span>
+        {
+<span class="nc" id="L306">            throwSyntaxError(e.getMessage());</span>
+<span class="nc" id="L307">            return null;</span>
+        }
+    }
+
+    public Pair&lt;Pair&lt;String, ByteBuffer&gt;, List&lt;Pair&lt;ByteBuffer, AbstractType&gt;&gt;&gt; getUserTypeParameters() throws SyntaxException, ConfigurationException
+    {
+
+<span class="nc bnc" id="L314" title="All 4 branches missed.">        if (isEOS() || str.charAt(idx) != '(')</span>
+<span class="nc" id="L315">            throw new IllegalStateException();</span>
+
+<span class="nc" id="L317">        ++idx; // skipping '('</span>
+
+<span class="nc" id="L319">        skipBlankAndComma();</span>
+<span class="nc" id="L320">        String keyspace = readNextIdentifier();</span>
+<span class="nc" id="L321">        skipBlankAndComma();</span>
+<span class="nc" id="L322">        ByteBuffer typeName = fromHex(readNextIdentifier());</span>
+<span class="nc" id="L323">        List&lt;Pair&lt;ByteBuffer, AbstractType&gt;&gt; defs = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        while (skipBlankAndComma())</span>
+        {
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (str.charAt(idx) == ')')</span>
+            {
+<span class="nc" id="L329">                ++idx;</span>
+<span class="nc" id="L330">                return Pair.create(Pair.create(keyspace, typeName), defs);</span>
+            }
+
+<span class="nc" id="L333">            ByteBuffer name = fromHex(readNextIdentifier());</span>
+<span class="nc" id="L334">            skipBlank();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (str.charAt(idx) != ':')</span>
+<span class="nc" id="L336">                throwSyntaxError(&quot;expecting ':' token&quot;);</span>
+<span class="nc" id="L337">            ++idx;</span>
+<span class="nc" id="L338">            skipBlank();</span>
+            try
+            {
+<span class="nc" id="L341">                AbstractType type = parse();</span>
+<span class="nc" id="L342">                defs.add(Pair.create(name, type));</span>
+            }
+<span class="nc" id="L344">            catch (SyntaxException e)</span>
+            {
+<span class="nc" id="L346">                SyntaxException ex = new SyntaxException(String.format(&quot;Exception while parsing '%s' around char %d&quot;, str, idx));</span>
+<span class="nc" id="L347">                ex.initCause(e);</span>
+<span class="nc" id="L348">                throw ex;</span>
+<span class="nc" id="L349">            }</span>
+<span class="nc" id="L350">        }</span>
+<span class="nc" id="L351">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: unexpected end of string&quot;, str, idx));</span>
+    }
+
+    private static AbstractType&lt;?&gt; getAbstractType(String compareWith) throws ConfigurationException
+    {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        String className = compareWith.contains(&quot;.&quot;) ? compareWith : &quot;org.apache.cassandra.db.marshal.&quot; + compareWith;</span>
+<span class="nc" id="L357">        Class&lt;? extends AbstractType&lt;?&gt;&gt; typeClass = FBUtilities.&lt;AbstractType&lt;?&gt;&gt;classForName(className, &quot;abstract-type&quot;);</span>
+        try
+        {
+<span class="nc" id="L360">            Field field = typeClass.getDeclaredField(&quot;instance&quot;);</span>
+<span class="nc" id="L361">            return (AbstractType&lt;?&gt;) field.get(null);</span>
+        }
+<span class="nc" id="L363">        catch (NoSuchFieldException | IllegalAccessException e)</span>
+        {
+            // Trying with empty parser
+<span class="nc" id="L366">            return getRawAbstractType(typeClass, EMPTY_PARSER);</span>
+        }
+    }
+
+    private static AbstractType&lt;?&gt; getAbstractType(String compareWith, TypeParser parser) throws SyntaxException, ConfigurationException
+    {
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        String className = compareWith.contains(&quot;.&quot;) ? compareWith : &quot;org.apache.cassandra.db.marshal.&quot; + compareWith;</span>
+<span class="nc" id="L373">        Class&lt;? extends AbstractType&lt;?&gt;&gt; typeClass = FBUtilities.&lt;AbstractType&lt;?&gt;&gt;classForName(className, &quot;abstract-type&quot;);</span>
+        try
+        {
+<span class="nc" id="L376">            Method method = typeClass.getDeclaredMethod(&quot;getInstance&quot;, TypeParser.class);</span>
+<span class="nc" id="L377">            return (AbstractType&lt;?&gt;) method.invoke(null, parser);</span>
+        }
+<span class="nc" id="L379">        catch (NoSuchMethodException | IllegalAccessException e)</span>
+        {
+            // Trying to see if we have an instance field and apply the default parameter to it
+<span class="nc" id="L382">            AbstractType&lt;?&gt; type = getRawAbstractType(typeClass);</span>
+<span class="nc" id="L383">            return AbstractType.parseDefaultParameters(type, parser);</span>
+        }
+<span class="nc" id="L385">        catch (InvocationTargetException e)</span>
+        {
+<span class="nc" id="L387">            ConfigurationException ex = new ConfigurationException(&quot;Invalid definition for comparator &quot; + typeClass.getName() + &quot;.&quot;);</span>
+<span class="nc" id="L388">            ex.initCause(e.getTargetException());</span>
+<span class="nc" id="L389">            throw ex;</span>
+        }
+    }
+
+    private static AbstractType&lt;?&gt; getRawAbstractType(Class&lt;? extends AbstractType&lt;?&gt;&gt; typeClass) throws ConfigurationException
+    {
+        try
+        {
+<span class="nc" id="L397">            Field field = typeClass.getDeclaredField(&quot;instance&quot;);</span>
+<span class="nc" id="L398">            return (AbstractType&lt;?&gt;) field.get(null);</span>
+        }
+<span class="nc" id="L400">        catch (NoSuchFieldException | IllegalAccessException e)</span>
+        {
+<span class="nc" id="L402">            throw new ConfigurationException(&quot;Invalid comparator class &quot; + typeClass.getName() + &quot;: must define a public static instance field or a public static method getInstance(TypeParser).&quot;);</span>
+        }
+    }
+
+    private static AbstractType&lt;?&gt; getRawAbstractType(Class&lt;? extends AbstractType&lt;?&gt;&gt; typeClass, TypeParser parser) throws ConfigurationException
+    {
+        try
+        {
+<span class="nc" id="L410">            Method method = typeClass.getDeclaredMethod(&quot;getInstance&quot;, TypeParser.class);</span>
+<span class="nc" id="L411">            return (AbstractType&lt;?&gt;) method.invoke(null, parser);</span>
+        }
+<span class="nc" id="L413">        catch (NoSuchMethodException | IllegalAccessException e)</span>
+        {
+<span class="nc" id="L415">            throw new ConfigurationException(&quot;Invalid comparator class &quot; + typeClass.getName() + &quot;: must define a public static instance field or a public static method getInstance(TypeParser).&quot;);</span>
+        }
+<span class="nc" id="L417">        catch (InvocationTargetException e)</span>
+        {
+<span class="nc" id="L419">            ConfigurationException ex = new ConfigurationException(&quot;Invalid definition for comparator &quot; + typeClass.getName() + &quot;.&quot;);</span>
+<span class="nc" id="L420">            ex.initCause(e.getTargetException());</span>
+<span class="nc" id="L421">            throw ex;</span>
+        }
+    }
+
+    private void throwSyntaxError(String msg) throws SyntaxException
+    {
+<span class="nc" id="L427">        throw new SyntaxException(String.format(&quot;Syntax error parsing '%s' at char %d: %s&quot;, str, idx, msg));</span>
+    }
+
+    private boolean isEOS()
+    {
+<span class="nc" id="L432">        return isEOS(str, idx);</span>
+    }
+
+    private static boolean isEOS(String str, int i)
+    {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        return i &gt;= str.length();</span>
+    }
+
+    private static boolean isBlank(int c)
+    {
+<span class="nc bnc" id="L442" title="All 6 branches missed.">        return c == ' ' || c == '\t' || c == '\n';</span>
+    }
+
+    private void skipBlank()
+    {
+<span class="nc" id="L447">        idx = skipBlank(str, idx);</span>
+<span class="nc" id="L448">    }</span>
+
+    private static int skipBlank(String str, int i)
+    {
+<span class="nc bnc" id="L452" title="All 4 branches missed.">        while (!isEOS(str, i) &amp;&amp; isBlank(str.charAt(i)))</span>
+<span class="nc" id="L453">            ++i;</span>
+
+<span class="nc" id="L455">        return i;</span>
+    }
+
+    // skip all blank and at best one comma, return true if there not EOS
+    private boolean skipBlankAndComma()
+    {
+<span class="nc" id="L461">        boolean commaFound = false;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        while (!isEOS())</span>
+        {
+<span class="nc" id="L464">            int c = str.charAt(idx);</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (c == ',')</span>
+            {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                if (commaFound)</span>
+<span class="nc" id="L468">                    return true;</span>
+                else
+<span class="nc" id="L470">                    commaFound = true;</span>
+            }
+<span class="nc bnc" id="L472" title="All 2 branches missed.">            else if (!isBlank(c))</span>
+            {
+<span class="nc" id="L474">                return true;</span>
+            }
+<span class="nc" id="L476">            ++idx;</span>
+<span class="nc" id="L477">        }</span>
+<span class="nc" id="L478">        return false;</span>
+    }
+
+    /*
+     * [0..9a..bA..B-+._&amp;]
+     */
+    private static boolean isIdentifierChar(int c)
+    {
+<span class="nc bnc" id="L486" title="All 22 branches missed.">        return (c &gt;= '0' &amp;&amp; c &lt;= '9')</span>
+            || (c &gt;= 'a' &amp;&amp; c &lt;= 'z') || (c &gt;= 'A' &amp;&amp; c &lt;= 'Z')
+            || c == '-' || c == '+' || c == '.' || c == '_' || c == '&amp;';
+    }
+
+    // left idx positioned on the character stopping the read
+    public String readNextIdentifier()
+    {
+<span class="nc" id="L494">        int i = idx;</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">        while (!isEOS() &amp;&amp; isIdentifierChar(str.charAt(idx)))</span>
+<span class="nc" id="L496">            ++idx;</span>
+
+<span class="nc" id="L498">        return str.substring(i, idx);</span>
+    }
+
+    /**
+     * Helper function to ease the writing of AbstractType.toString() methods.
+     */
+    public static String stringifyAliasesParameters(Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases)
+    {
+<span class="nc" id="L506">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L507">        sb.append('(');</span>
+<span class="nc" id="L508">        Iterator&lt;Map.Entry&lt;Byte, AbstractType&lt;?&gt;&gt;&gt; iter = aliases.entrySet().iterator();</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">        if (iter.hasNext())</span>
+        {
+<span class="nc" id="L511">            Map.Entry&lt;Byte, AbstractType&lt;?&gt;&gt; entry = iter.next();</span>
+<span class="nc" id="L512">            sb.append((char)(byte)entry.getKey()).append(&quot;=&gt;&quot;).append(entry.getValue());</span>
+        }
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L516">            Map.Entry&lt;Byte, AbstractType&lt;?&gt;&gt; entry = iter.next();</span>
+<span class="nc" id="L517">            sb.append(',').append((char)(byte)entry.getKey()).append(&quot;=&gt;&quot;).append(entry.getValue());</span>
+<span class="nc" id="L518">        }</span>
+<span class="nc" id="L519">        sb.append(')');</span>
+<span class="nc" id="L520">        return sb.toString();</span>
+    }
+
+    /**
+     * Helper function to ease the writing of AbstractType.toString() methods.
+     */
+    public static String stringifyTypeParameters(List&lt;AbstractType&lt;?&gt;&gt; types)
+    {
+<span class="fc" id="L528">        return stringifyTypeParameters(types, false);</span>
+    }
+
+    /**
+     * Helper function to ease the writing of AbstractType.toString() methods.
+     */
+    public static String stringifyTypeParameters(List&lt;AbstractType&lt;?&gt;&gt; types, boolean ignoreFreezing)
+    {
+<span class="fc" id="L536">        StringBuilder sb = new StringBuilder(&quot;(&quot;);</span>
+<span class="fc bfc" id="L537" title="All 2 branches covered.">        for (int i = 0; i &lt; types.size(); i++)</span>
+        {
+<span class="fc bfc" id="L539" title="All 2 branches covered.">            if (i &gt; 0)</span>
+<span class="fc" id="L540">                sb.append(&quot;,&quot;);</span>
+<span class="fc" id="L541">            sb.append(types.get(i).toString(ignoreFreezing));</span>
+        }
+<span class="fc" id="L543">        return sb.append(')').toString();</span>
+    }
+
+    public static String stringifyCollectionsParameters(Map&lt;ByteBuffer, ? extends CollectionType&gt; collections)
+    {
+<span class="nc" id="L548">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L549">        sb.append('(');</span>
+<span class="nc" id="L550">        boolean first = true;</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        for (Map.Entry&lt;ByteBuffer, ? extends CollectionType&gt; entry : collections.entrySet())</span>
+        {
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            if (!first)</span>
+<span class="nc" id="L554">                sb.append(',');</span>
+
+<span class="nc" id="L556">            first = false;</span>
+<span class="nc" id="L557">            sb.append(ByteBufferUtil.bytesToHex(entry.getKey())).append(&quot;:&quot;);</span>
+<span class="nc" id="L558">            sb.append(entry.getValue());</span>
+<span class="nc" id="L559">        }</span>
+<span class="nc" id="L560">        sb.append(')');</span>
+<span class="nc" id="L561">        return sb.toString();</span>
+    }
+
+    public static String stringifyUserTypeParameters(String keysace, ByteBuffer typeName, List&lt;FieldIdentifier&gt; fields,
+                                                     List&lt;AbstractType&lt;?&gt;&gt; columnTypes, boolean ignoreFreezing)
+    {
+<span class="nc" id="L567">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L568">        sb.append('(').append(keysace).append(&quot;,&quot;).append(ByteBufferUtil.bytesToHex(typeName));</span>
+
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        for (int i = 0; i &lt; fields.size(); i++)</span>
+        {
+<span class="nc" id="L572">            sb.append(',');</span>
+<span class="nc" id="L573">            sb.append(ByteBufferUtil.bytesToHex(fields.get(i).bytes)).append(&quot;:&quot;);</span>
+<span class="nc" id="L574">            sb.append(columnTypes.get(i).toString(ignoreFreezing));</span>
+        }
+<span class="nc" id="L576">        sb.append(')');</span>
+<span class="nc" id="L577">        return sb.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

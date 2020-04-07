@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundTcpConnectionPool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundTcpConnectionPool.java</span></div><h1>OutboundTcpConnectionPool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.channels.SocketChannel;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.metrics.ConnectionMetrics;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class OutboundTcpConnectionPool
+{
+<span class="fc" id="L39">    public static final long LARGE_MESSAGE_THRESHOLD =</span>
+<span class="fc" id="L40">            Long.getLong(Config.PROPERTY_PREFIX + &quot;otcp_large_message_threshold&quot;, 1024 * 64);</span>
+
+    // pointer for the real Address.
+    private final InetAddress id;
+    private final CountDownLatch started;
+    public final OutboundTcpConnection smallMessages;
+    public final OutboundTcpConnection largeMessages;
+    public final OutboundTcpConnection gossipMessages;
+
+    // pointer to the reset Address.
+    private InetAddress resetEndpoint;
+    private ConnectionMetrics metrics;
+
+    // back-pressure state linked to this connection:
+    private final BackPressureState backPressureState;
+
+    OutboundTcpConnectionPool(InetAddress remoteEp, BackPressureState backPressureState)
+<span class="fc" id="L57">    {</span>
+<span class="fc" id="L58">        id = remoteEp;</span>
+<span class="fc" id="L59">        resetEndpoint = SystemKeyspace.getPreferredIP(remoteEp);</span>
+<span class="fc" id="L60">        started = new CountDownLatch(1);</span>
+
+<span class="fc" id="L62">        smallMessages = new OutboundTcpConnection(this, &quot;Small&quot;);</span>
+<span class="fc" id="L63">        largeMessages = new OutboundTcpConnection(this, &quot;Large&quot;);</span>
+<span class="fc" id="L64">        gossipMessages = new OutboundTcpConnection(this, &quot;Gossip&quot;);</span>
+
+<span class="fc" id="L66">        this.backPressureState = backPressureState;</span>
+<span class="fc" id="L67">    }</span>
+
+    /**
+     * returns the appropriate connection based on message type.
+     * returns null if a connection could not be established.
+     */
+    OutboundTcpConnection getConnection(MessageOut msg)
+    {
+<span class="fc bfc" id="L75" title="All 2 branches covered.">        if (Stage.GOSSIP == msg.getStage())</span>
+<span class="fc" id="L76">            return gossipMessages;</span>
+<span class="pc bpc" id="L77" title="1 of 2 branches missed.">        return msg.payloadSize(smallMessages.getTargetVersion()) &gt; LARGE_MESSAGE_THRESHOLD</span>
+               ? largeMessages
+               : smallMessages;
+    }
+
+    public BackPressureState getBackPressureState()
+    {
+<span class="nc" id="L84">        return backPressureState;</span>
+    }
+
+    void reset()
+    {
+<span class="fc bfc" id="L89" title="All 2 branches covered.">        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })</span>
+<span class="fc" id="L90">            conn.closeSocket(false);</span>
+<span class="fc" id="L91">    }</span>
+
+    public void resetToNewerVersion(int version)
+    {
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })</span>
+        {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (version &gt; conn.getTargetVersion())</span>
+<span class="nc" id="L98">                conn.softCloseSocket();</span>
+        }
+<span class="nc" id="L100">    }</span>
+
+    /**
+     * reconnect to @param remoteEP (after the current message backlog is exhausted).
+     * Used by Ec2MultiRegionSnitch to force nodes in the same region to communicate over their private IPs.
+     * @param remoteEP
+     */
+    public void reset(InetAddress remoteEP)
+    {
+<span class="nc" id="L109">        SystemKeyspace.updatePreferredIP(id, remoteEP);</span>
+<span class="nc" id="L110">        resetEndpoint = remoteEP;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        for (OutboundTcpConnection conn : new OutboundTcpConnection[] { smallMessages, largeMessages, gossipMessages })</span>
+<span class="nc" id="L112">            conn.softCloseSocket();</span>
+
+        // release previous metrics and create new one with reset address
+<span class="nc" id="L115">        metrics.release();</span>
+<span class="nc" id="L116">        metrics = new ConnectionMetrics(resetEndpoint, this);</span>
+<span class="nc" id="L117">    }</span>
+
+    public long getTimeouts()
+    {
+<span class="nc" id="L121">       return metrics.timeouts.getCount();</span>
+    }
+
+
+    public void incrementTimeout()
+    {
+<span class="nc" id="L127">        metrics.timeouts.mark();</span>
+<span class="nc" id="L128">    }</span>
+
+    public Socket newSocket() throws IOException
+    {
+<span class="fc" id="L132">        return newSocket(endPoint());</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;) // Closing the socket will close the underlying channel.
+    public static Socket newSocket(InetAddress endpoint) throws IOException
+    {
+        // zero means 'bind on any available port.'
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">        if (isEncryptedChannel(endpoint))</span>
+        {
+<span class="nc" id="L141">            return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endpoint, DatabaseDescriptor.getSSLStoragePort());</span>
+        }
+        else
+        {
+<span class="fc" id="L145">            SocketChannel channel = SocketChannel.open();</span>
+<span class="fc" id="L146">            channel.connect(new InetSocketAddress(endpoint, DatabaseDescriptor.getStoragePort()));</span>
+<span class="fc" id="L147">            return channel.socket();</span>
+        }
+    }
+
+    public InetAddress endPoint()
+    {
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">        if (id.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc" id="L154">            return FBUtilities.getLocalAddress();</span>
+<span class="fc" id="L155">        return resetEndpoint;</span>
+    }
+
+    public static boolean isEncryptedChannel(InetAddress address)
+    {
+<span class="fc" id="L160">        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();</span>
+<span class="pc bpc" id="L161" title="4 of 5 branches missed.">        switch (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption)</span>
+        {
+            case none:
+<span class="fc" id="L164">                return false; // if nothing needs to be encrypted then return immediately.</span>
+            case all:
+<span class="nc" id="L166">                break;</span>
+            case dc:
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                if (snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))</span>
+<span class="nc" id="L169">                    return false;</span>
+                break;
+            case rack:
+                // for rack then check if the DC's are the same.
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                if (snitch.getRack(address).equals(snitch.getRack(FBUtilities.getBroadcastAddress()))</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                        &amp;&amp; snitch.getDatacenter(address).equals(snitch.getDatacenter(FBUtilities.getBroadcastAddress())))</span>
+<span class="nc" id="L175">                    return false;</span>
+                break;
+        }
+<span class="nc" id="L178">        return true;</span>
+    }
+
+    public void start()
+    {
+<span class="fc" id="L183">        smallMessages.start();</span>
+<span class="fc" id="L184">        largeMessages.start();</span>
+<span class="fc" id="L185">        gossipMessages.start();</span>
+
+<span class="fc" id="L187">        metrics = new ConnectionMetrics(id, this);</span>
+
+<span class="fc" id="L189">        started.countDown();</span>
+<span class="fc" id="L190">    }</span>
+
+    public void waitForStarted()
+    {
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">        if (started.getCount() == 0)</span>
+<span class="fc" id="L195">            return;</span>
+
+<span class="nc" id="L197">        boolean error = false;</span>
+        try
+        {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (!started.await(1, TimeUnit.MINUTES))</span>
+<span class="nc" id="L201">                error = true;</span>
+        }
+<span class="nc" id="L203">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L205">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L206">            error = true;</span>
+<span class="nc" id="L207">        }</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (error)</span>
+<span class="nc" id="L209">            throw new IllegalStateException(String.format(&quot;Connections to %s are not started!&quot;, id.getHostAddress()));</span>
+<span class="nc" id="L210">    }</span>
+
+    public void close()
+    {
+        // these null guards are simply for tests
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (largeMessages != null)</span>
+<span class="nc" id="L216">            largeMessages.closeSocket(true);</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if (smallMessages != null)</span>
+<span class="nc" id="L218">            smallMessages.closeSocket(true);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (gossipMessages != null)</span>
+<span class="nc" id="L220">            gossipMessages.closeSocket(true);</span>
+
+<span class="nc" id="L222">        metrics.release();</span>
+<span class="nc" id="L223">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

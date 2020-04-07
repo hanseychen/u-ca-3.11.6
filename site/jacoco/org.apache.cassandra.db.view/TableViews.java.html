@@ -1,0 +1,558 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TableViews.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">TableViews.java</span></div><h1>TableViews.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.view;
+
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
+
+/**
+ * Groups all the views for a given table.
+ */
+<span class="pc bpc" id="L44" title="1 of 2 branches missed.">public class TableViews extends AbstractCollection&lt;View&gt;</span>
+{
+    private final CFMetaData baseTableMetadata;
+
+    // We need this to be thread-safe, but the number of times this is changed (when a view is created in the keyspace)
+    // is massively exceeded by the number of times it's read (for every mutation on the keyspace), so a copy-on-write
+    // list is the best option.
+<span class="fc" id="L51">    private final List&lt;View&gt; views = new CopyOnWriteArrayList();</span>
+
+    public TableViews(CFMetaData baseTableMetadata)
+<span class="fc" id="L54">    {</span>
+<span class="fc" id="L55">        this.baseTableMetadata = baseTableMetadata;</span>
+<span class="fc" id="L56">    }</span>
+
+    public int size()
+    {
+<span class="nc" id="L60">        return views.size();</span>
+    }
+
+    public Iterator&lt;View&gt; iterator()
+    {
+<span class="nc" id="L65">        return views.iterator();</span>
+    }
+
+    public boolean contains(String viewName)
+    {
+<span class="nc" id="L70">        return Iterables.any(views, view -&gt; view.name.equals(viewName));</span>
+    }
+
+    public boolean add(View view)
+    {
+        // We should have validated that there is no existing view with this name at this point
+<span class="nc bnc" id="L76" title="All 4 branches missed.">        assert !contains(view.name);</span>
+<span class="nc" id="L77">        return views.add(view);</span>
+    }
+
+    public Iterable&lt;ColumnFamilyStore&gt; allViewsCfs()
+    {
+<span class="nc" id="L82">        Keyspace keyspace = Keyspace.open(baseTableMetadata.ksName);</span>
+<span class="nc" id="L83">        return Iterables.transform(views, view -&gt; keyspace.getColumnFamilyStore(view.getDefinition().viewName));</span>
+    }
+
+    public void forceBlockingFlush()
+    {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        for (ColumnFamilyStore viewCfs : allViewsCfs())</span>
+<span class="nc" id="L89">            viewCfs.forceBlockingFlush();</span>
+<span class="nc" id="L90">    }</span>
+
+    public void dumpMemtables()
+    {
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        for (ColumnFamilyStore viewCfs : allViewsCfs())</span>
+<span class="nc" id="L95">            viewCfs.dumpMemtable();</span>
+<span class="nc" id="L96">    }</span>
+
+    public void truncateBlocking(CommitLogPosition replayAfter, long truncatedAt)
+    {
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        for (ColumnFamilyStore viewCfs : allViewsCfs())</span>
+        {
+<span class="nc" id="L102">            viewCfs.discardSSTables(truncatedAt);</span>
+<span class="nc" id="L103">            SystemKeyspace.saveTruncationRecord(viewCfs, truncatedAt, replayAfter);</span>
+<span class="nc" id="L104">        }</span>
+<span class="nc" id="L105">    }</span>
+
+    public void removeByName(String viewName)
+    {
+<span class="nc" id="L109">        views.removeIf(v -&gt; v.name.equals(viewName));</span>
+<span class="nc" id="L110">    }</span>
+
+    /**
+     * Calculates and pushes updates to the views replicas. The replicas are determined by
+     * {@link ViewUtils#getViewNaturalEndpoint(String, Token, Token)}.
+     *
+     * @param update an update on the base table represented by this object.
+     * @param writeCommitLog whether we should write the commit log for the view updates.
+     * @param baseComplete time from epoch in ms that the local base mutation was (or will be) completed
+     */
+    public void pushViewReplicaUpdates(PartitionUpdate update, boolean writeCommitLog, AtomicLong baseComplete)
+    {
+<span class="nc bnc" id="L122" title="All 4 branches missed.">        assert update.metadata().cfId.equals(baseTableMetadata.cfId);</span>
+
+<span class="nc" id="L124">        Collection&lt;View&gt; views = updatedViews(update);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (views.isEmpty())</span>
+<span class="nc" id="L126">            return;</span>
+
+        // Read modified rows
+<span class="nc" id="L129">        int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L130">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc" id="L131">        SinglePartitionReadCommand command = readExistingRowsCommand(update, views, nowInSec);</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (command == null)</span>
+<span class="nc" id="L133">            return;</span>
+
+<span class="nc" id="L135">        ColumnFamilyStore cfs = Keyspace.openAndGetStore(update.metadata());</span>
+<span class="nc" id="L136">        long start = System.nanoTime();</span>
+        Collection&lt;Mutation&gt; mutations;
+<span class="nc" id="L138">        try (ReadExecutionController orderGroup = command.executionController();</span>
+<span class="nc" id="L139">             UnfilteredRowIterator existings = UnfilteredPartitionIterators.getOnlyElement(command.executeLocally(orderGroup), command);</span>
+<span class="nc" id="L140">             UnfilteredRowIterator updates = update.unfilteredIterator())</span>
+        {
+<span class="nc" id="L142">            mutations = Iterators.getOnlyElement(generateViewUpdates(views, updates, existings, nowInSec, false));</span>
+        }
+<span class="nc" id="L144">        Keyspace.openAndGetStore(update.metadata()).metric.viewReadTime.update(System.nanoTime() - start, TimeUnit.NANOSECONDS);</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (!mutations.isEmpty())</span>
+<span class="nc" id="L147">            StorageProxy.mutateMV(update.partitionKey().getKey(), mutations, writeCommitLog, baseComplete, queryStartNanoTime);</span>
+<span class="nc" id="L148">    }</span>
+
+
+    /**
+     * Given some updates on the base table of this object and the existing values for the rows affected by that update, generates the
+     * mutation to be applied to the provided views.
+     *
+     * @param views the views potentially affected by {@code updates}.
+     * @param updates the base table updates being applied.
+     * @param existings the existing values for the rows affected by {@code updates}. This is used to decide if a view is
+     * obsoleted by the update and should be removed, gather the values for columns that may not be part of the update if
+     * a new view entry needs to be created, and compute the minimal updates to be applied if the view entry isn't changed
+     * but has simply some updated values. This will be empty for view building as we want to assume anything we'll pass
+     * to {@code updates} is new.
+     * @param nowInSec the current time in seconds.
+     * @param separateUpdates, if false, mutation is per partition.
+     * @return the mutations to apply to the {@code views}. This can be empty.
+     */
+    public Iterator&lt;Collection&lt;Mutation&gt;&gt; generateViewUpdates(Collection&lt;View&gt; views,
+                                                              UnfilteredRowIterator updates,
+                                                              UnfilteredRowIterator existings,
+                                                              int nowInSec,
+                                                              boolean separateUpdates)
+    {
+<span class="nc bnc" id="L172" title="All 4 branches missed.">        assert updates.metadata().cfId.equals(baseTableMetadata.cfId);</span>
+
+<span class="nc" id="L174">        List&lt;ViewUpdateGenerator&gt; generators = new ArrayList&lt;&gt;(views.size());</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        for (View view : views)</span>
+<span class="nc" id="L176">            generators.add(new ViewUpdateGenerator(view, updates.partitionKey(), nowInSec));</span>
+
+<span class="nc" id="L178">        DeletionTracker existingsDeletion = new DeletionTracker(existings.partitionLevelDeletion());</span>
+<span class="nc" id="L179">        DeletionTracker updatesDeletion = new DeletionTracker(updates.partitionLevelDeletion());</span>
+
+        /*
+         * We iterate through the updates and the existing rows in parallel. This allows us to know the consequence
+         * on the view of each update.
+         */
+<span class="nc" id="L185">        PeekingIterator&lt;Unfiltered&gt; existingsIter = Iterators.peekingIterator(existings);</span>
+<span class="nc" id="L186">        PeekingIterator&lt;Unfiltered&gt; updatesIter = Iterators.peekingIterator(updates);</span>
+
+<span class="nc bnc" id="L188" title="All 4 branches missed.">        while (existingsIter.hasNext() &amp;&amp; updatesIter.hasNext())</span>
+        {
+<span class="nc" id="L190">            Unfiltered existing = existingsIter.peek();</span>
+<span class="nc" id="L191">            Unfiltered update = updatesIter.peek();</span>
+
+            Row existingRow;
+            Row updateRow;
+<span class="nc" id="L195">            int cmp = baseTableMetadata.comparator.compare(update, existing);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            if (cmp &lt; 0)</span>
+            {
+                // We have an update where there was nothing before
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                if (update.isRangeTombstoneMarker())</span>
+                {
+<span class="nc" id="L201">                    updatesDeletion.update(updatesIter.next());</span>
+<span class="nc" id="L202">                    continue;</span>
+                }
+
+<span class="nc" id="L205">                updateRow = ((Row)updatesIter.next()).withRowDeletion(updatesDeletion.currentDeletion());</span>
+<span class="nc" id="L206">                existingRow = emptyRow(updateRow.clustering(), existingsDeletion.currentDeletion());</span>
+            }
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            else if (cmp &gt; 0)</span>
+            {
+                // We have something existing but no update (which will happen either because it's a range tombstone marker in
+                // existing, or because we've fetched the existing row due to some partition/range deletion in the updates)
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                if (existing.isRangeTombstoneMarker())</span>
+                {
+<span class="nc" id="L214">                    existingsDeletion.update(existingsIter.next());</span>
+<span class="nc" id="L215">                    continue;</span>
+                }
+
+<span class="nc" id="L218">                existingRow = ((Row)existingsIter.next()).withRowDeletion(existingsDeletion.currentDeletion());</span>
+<span class="nc" id="L219">                updateRow = emptyRow(existingRow.clustering(), updatesDeletion.currentDeletion());</span>
+
+                // The way we build the read command used for existing rows, we should always have updatesDeletion.currentDeletion()
+                // that is not live, since we wouldn't have read the existing row otherwise. And we could assert that, but if we ever
+                // change the read method so that it can slightly over-read in some case, that would be an easily avoiding bug lurking,
+                // so we just handle the case.
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                if (updateRow == null)</span>
+<span class="nc" id="L226">                    continue;</span>
+            }
+            else
+            {
+                // We're updating a row that had pre-existing data
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                if (update.isRangeTombstoneMarker())</span>
+                {
+<span class="nc bnc" id="L233" title="All 4 branches missed.">                    assert existing.isRangeTombstoneMarker();</span>
+<span class="nc" id="L234">                    updatesDeletion.update(updatesIter.next());</span>
+<span class="nc" id="L235">                    existingsDeletion.update(existingsIter.next());</span>
+<span class="nc" id="L236">                    continue;</span>
+                }
+
+<span class="nc bnc" id="L239" title="All 4 branches missed.">                assert !existing.isRangeTombstoneMarker();</span>
+<span class="nc" id="L240">                existingRow = ((Row)existingsIter.next()).withRowDeletion(existingsDeletion.currentDeletion());</span>
+<span class="nc" id="L241">                updateRow = ((Row)updatesIter.next()).withRowDeletion(updatesDeletion.currentDeletion());</span>
+            }
+
+<span class="nc" id="L244">            addToViewUpdateGenerators(existingRow, updateRow, generators, nowInSec);</span>
+<span class="nc" id="L245">        }</span>
+
+        // We only care about more existing rows if the update deletion isn't live, i.e. if we had a partition deletion
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (!updatesDeletion.currentDeletion().isLive())</span>
+        {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            while (existingsIter.hasNext())</span>
+            {
+<span class="nc" id="L252">                Unfiltered existing = existingsIter.next();</span>
+                // If it's a range tombstone, we don't care, we're only looking for existing entry that gets deleted by
+                // the new partition deletion
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                if (existing.isRangeTombstoneMarker())</span>
+<span class="nc" id="L256">                    continue;</span>
+
+<span class="nc" id="L258">                Row existingRow = (Row)existing;</span>
+<span class="nc" id="L259">                addToViewUpdateGenerators(existingRow, emptyRow(existingRow.clustering(), updatesDeletion.currentDeletion()), generators, nowInSec);</span>
+<span class="nc" id="L260">            }</span>
+        }
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (separateUpdates)</span>
+        {
+<span class="nc" id="L265">            final Collection&lt;Mutation&gt; firstBuild = buildMutations(baseTableMetadata, generators);</span>
+
+<span class="nc" id="L267">            return new Iterator&lt;Collection&lt;Mutation&gt;&gt;()</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            {</span>
+                // If the previous values are already empty, this update must be either empty or exclusively appending.
+                // In the case we are exclusively appending, we need to drop the build that was passed in and try to build a
+                // new first update instead.
+                // If there are no other updates, next will be null and the iterator will be empty.
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                Collection&lt;Mutation&gt; next = firstBuild.isEmpty()</span>
+<span class="nc" id="L274">                                            ? buildNext()</span>
+                                            : firstBuild;
+
+                private Collection&lt;Mutation&gt; buildNext()
+                {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                    while (updatesIter.hasNext())</span>
+                    {
+<span class="nc" id="L281">                        Unfiltered update = updatesIter.next();</span>
+                        // If it's a range tombstone, it removes nothing pre-exisiting, so we can ignore it for view updates
+<span class="nc bnc" id="L283" title="All 2 branches missed.">                        if (update.isRangeTombstoneMarker())</span>
+<span class="nc" id="L284">                            continue;</span>
+
+<span class="nc" id="L286">                        Row updateRow = (Row) update;</span>
+<span class="nc" id="L287">                        addToViewUpdateGenerators(emptyRow(updateRow.clustering(), existingsDeletion.currentDeletion()),</span>
+                                                  updateRow,
+                                                  generators,
+                                                  nowInSec);
+
+                        // If the updates have been filtered, then we won't have any mutations; we need to make sure that we
+                        // only return if the mutations are empty. Otherwise, we continue to search for an update which is
+                        // not filtered
+<span class="nc" id="L295">                        Collection&lt;Mutation&gt; mutations = buildMutations(baseTableMetadata, generators);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">                        if (!mutations.isEmpty())</span>
+<span class="nc" id="L297">                            return mutations;</span>
+<span class="nc" id="L298">                    }</span>
+
+<span class="nc" id="L300">                    return null;</span>
+                }
+
+                public boolean hasNext()
+                {
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    return next != null;</span>
+                }
+
+                public Collection&lt;Mutation&gt; next()
+                {
+<span class="nc" id="L310">                    Collection&lt;Mutation&gt; mutations = next;</span>
+
+<span class="nc" id="L312">                    next = buildNext();</span>
+
+<span class="nc bnc" id="L314" title="All 4 branches missed.">                    assert !mutations.isEmpty() : &quot;Expected mutations to be non-empty&quot;;</span>
+<span class="nc" id="L315">                    return mutations;</span>
+                }
+            };
+        }
+        else
+        {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            while (updatesIter.hasNext())</span>
+            {
+<span class="nc" id="L323">                Unfiltered update = updatesIter.next();</span>
+                // If it's a range tombstone, it removes nothing pre-exisiting, so we can ignore it for view updates
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (update.isRangeTombstoneMarker())</span>
+<span class="nc" id="L326">                    continue;</span>
+
+<span class="nc" id="L328">                Row updateRow = (Row) update;</span>
+<span class="nc" id="L329">                addToViewUpdateGenerators(emptyRow(updateRow.clustering(), existingsDeletion.currentDeletion()),</span>
+                                          updateRow,
+                                          generators,
+                                          nowInSec);
+<span class="nc" id="L333">            }</span>
+
+<span class="nc" id="L335">            return Iterators.singletonIterator(buildMutations(baseTableMetadata, generators));</span>
+        }
+    }
+
+    /**
+     * Return the views that are potentially updated by the provided updates.
+     *
+     * @param updates the updates applied to the base table.
+     * @return the views affected by {@code updates}.
+     */
+    public Collection&lt;View&gt; updatedViews(PartitionUpdate updates)
+    {
+<span class="fc" id="L347">        List&lt;View&gt; matchingViews = new ArrayList&lt;&gt;(views.size());</span>
+
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">        for (View view : views)</span>
+        {
+<span class="nc" id="L351">            ReadQuery selectQuery = view.getReadQuery();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if (!selectQuery.selectsKey(updates.partitionKey()))</span>
+<span class="nc" id="L353">                continue;</span>
+
+<span class="nc" id="L355">            matchingViews.add(view);</span>
+<span class="nc" id="L356">        }</span>
+<span class="fc" id="L357">        return matchingViews;</span>
+    }
+
+    /**
+     * Returns the command to use to read the existing rows required to generate view updates for the provided base
+     * base updates.
+     *
+     * @param updates the base table updates being applied.
+     * @param views the views potentially affected by {@code updates}.
+     * @param nowInSec the current time in seconds.
+     * @return the command to use to read the base table rows required to generate view updates for {@code updates}.
+     */
+    private SinglePartitionReadCommand readExistingRowsCommand(PartitionUpdate updates, Collection&lt;View&gt; views, int nowInSec)
+    {
+<span class="nc" id="L371">        Slices.Builder sliceBuilder = null;</span>
+<span class="nc" id="L372">        DeletionInfo deletionInfo = updates.deletionInfo();</span>
+<span class="nc" id="L373">        CFMetaData metadata = updates.metadata();</span>
+<span class="nc" id="L374">        DecoratedKey key = updates.partitionKey();</span>
+        // TODO: This is subtle: we need to gather all the slices that we have to fetch between partition del, range tombstones and rows.
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        if (!deletionInfo.isLive())</span>
+        {
+<span class="nc" id="L378">            sliceBuilder = new Slices.Builder(metadata.comparator);</span>
+            // Everything covered by a deletion might invalidate an existing view entry, which means we must read it to know. In practice
+            // though, the views involved might filter some base table clustering columns, in which case we can restrict what we read
+            // using those restrictions.
+            // If there is a partition deletion, then we can simply take each slices from each view select filter. They may overlap but
+            // the Slices.Builder handles that for us. Note that in many case this will just involve reading everything (as soon as any
+            // view involved has no clustering restrictions for instance).
+            // For range tombstone, we should theoretically take the difference between the range tombstoned and the slices selected
+            // by every views, but as we don't an easy way to compute that right now, we keep it simple and just use the tombstoned
+            // range.
+            // TODO: we should improve that latter part.
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (!deletionInfo.getPartitionDeletion().isLive())</span>
+            {
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                for (View view : views)</span>
+<span class="nc" id="L392">                    sliceBuilder.addAll(view.getSelectStatement().clusteringIndexFilterAsSlices());</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L396" title="All 4 branches missed.">                assert deletionInfo.hasRanges();</span>
+<span class="nc" id="L397">                Iterator&lt;RangeTombstone&gt; iter = deletionInfo.rangeIterator(false);</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                while (iter.hasNext())</span>
+<span class="nc" id="L399">                    sliceBuilder.add(iter.next().deletedSlice());</span>
+            }
+        }
+
+        // We need to read every row that is updated, unless we can prove that it has no impact on any view entries.
+
+        // If we had some slices from the deletions above, we'll continue using that. Otherwise, it's more efficient to build
+        // a names query.
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        BTreeSet.Builder&lt;Clustering&gt; namesBuilder = sliceBuilder == null ? BTreeSet.builder(metadata.comparator) : null;</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        for (Row row : updates)</span>
+        {
+            // Don't read the existing state if we can prove the update won't affect any views
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (!affectsAnyViews(key, row, views))</span>
+<span class="nc" id="L412">                continue;</span>
+
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (namesBuilder == null)</span>
+<span class="nc" id="L415">                sliceBuilder.add(Slice.make(row.clustering()));</span>
+            else
+<span class="nc" id="L417">                namesBuilder.add(row.clustering());</span>
+<span class="nc" id="L418">        }</span>
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        NavigableSet&lt;Clustering&gt; names = namesBuilder == null ? null : namesBuilder.build();</span>
+        // If we have a slice builder, it means we had some deletions and we have to read. But if we had
+        // only row updates, it's possible none of them affected the views, in which case we have nothing
+        // to do.
+<span class="nc bnc" id="L424" title="All 4 branches missed.">        if (names != null &amp;&amp; names.isEmpty())</span>
+<span class="nc" id="L425">            return null;</span>
+
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        ClusteringIndexFilter clusteringFilter = names == null</span>
+<span class="nc" id="L428">                                               ? new ClusteringIndexSliceFilter(sliceBuilder.build(), false)</span>
+                                               : new ClusteringIndexNamesFilter(names, false);
+        // since unselected columns also affect view liveness, we need to query all base columns if base and view have same key columns.
+        // If we have more than one view, we should merge the queried columns by each views but to keep it simple we just
+        // include everything. We could change that in the future.
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        ColumnFilter queriedColumns = views.size() == 1 &amp;&amp; metadata.enforceStrictLiveness()</span>
+<span class="nc" id="L434">                                   ? Iterables.getOnlyElement(views).getSelectStatement().queriedColumns()</span>
+<span class="nc" id="L435">                                   : ColumnFilter.all(metadata);</span>
+        // Note that the views could have restrictions on regular columns, but even if that's the case we shouldn't apply those
+        // when we read, because even if an existing row doesn't match the view filter, the update can change that in which
+        // case we'll need to know the existing content. There is also no easy way to merge those RowFilter when we have multiple views.
+        // TODO: we could still make sense to special case for when there is a single view and a small number of updates (and
+        // no deletions). Indeed, in that case we could check whether any of the update modify any of the restricted regular
+        // column, and if that's not the case we could use view filter. We keep it simple for now though.
+<span class="nc" id="L442">        RowFilter rowFilter = RowFilter.NONE;</span>
+<span class="nc" id="L443">        return SinglePartitionReadCommand.create(metadata, nowInSec, queriedColumns, rowFilter, DataLimits.NONE, key, clusteringFilter);</span>
+    }
+
+    private boolean affectsAnyViews(DecoratedKey partitionKey, Row update, Collection&lt;View&gt; views)
+    {
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        for (View view : views)</span>
+        {
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (view.mayBeAffectedBy(partitionKey, update))</span>
+<span class="nc" id="L451">                return true;</span>
+<span class="nc" id="L452">        }</span>
+<span class="nc" id="L453">        return false;</span>
+    }
+
+    /**
+     * Given an existing base row and the update that we're going to apply to this row, generate the modifications
+     * to apply to MVs using the provided {@code ViewUpdateGenerator}s.
+     *
+     * @param existingBaseRow the base table row as it is before an update.
+     * @param updateBaseRow the newly updates made to {@code existingBaseRow}.
+     * @param generators the view update generators to add the new changes to.
+     * @param nowInSec the current time in seconds. Used to decide if data is live or not.
+     */
+    private static void addToViewUpdateGenerators(Row existingBaseRow, Row updateBaseRow, Collection&lt;ViewUpdateGenerator&gt; generators, int nowInSec)
+    {
+        // Having existing empty is useful, it just means we'll insert a brand new entry for updateBaseRow,
+        // but if we have no update at all, we shouldn't get there.
+<span class="nc bnc" id="L469" title="All 4 branches missed.">        assert !updateBaseRow.isEmpty();</span>
+
+        // We allow existingBaseRow to be null, which we treat the same as being empty as an small optimization
+        // to avoid allocating empty row objects when we know there was nothing existing.
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        Row mergedBaseRow = existingBaseRow == null ? updateBaseRow : Rows.merge(existingBaseRow, updateBaseRow, nowInSec);</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        for (ViewUpdateGenerator generator : generators)</span>
+<span class="nc" id="L475">            generator.addBaseTableUpdate(existingBaseRow, mergedBaseRow);</span>
+<span class="nc" id="L476">    }</span>
+
+    private static Row emptyRow(Clustering clustering, DeletionTime deletion)
+    {
+        // Returning null for an empty row is slightly ugly, but the case where there is no pre-existing row is fairly common
+        // (especially when building the view), so we want to avoid a dummy allocation of an empty row every time.
+        // And MultiViewUpdateBuilder knows how to deal with that.
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        return deletion.isLive() ? null : BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(deletion));</span>
+    }
+
+    /**
+     * Extracts (and potentially groups) the mutations generated by the provided view update generator.
+     * Returns the mutation that needs to be done to the views given the base table updates
+     * passed to {@link #addBaseTableUpdate}.
+     *
+     * @param baseTableMetadata the metadata for the base table being updated.
+     * @param generators the generators from which to extract the view mutations from.
+     * @return the mutations created by all the generators in {@code generators}.
+     */
+    private Collection&lt;Mutation&gt; buildMutations(CFMetaData baseTableMetadata, List&lt;ViewUpdateGenerator&gt; generators)
+    {
+        // One view is probably common enough and we can optimize a bit easily
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        if (generators.size() == 1)</span>
+        {
+<span class="nc" id="L500">            ViewUpdateGenerator generator = generators.get(0);</span>
+<span class="nc" id="L501">            Collection&lt;PartitionUpdate&gt; updates = generator.generateViewUpdates();</span>
+<span class="nc" id="L502">            List&lt;Mutation&gt; mutations = new ArrayList&lt;&gt;(updates.size());</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            for (PartitionUpdate update : updates)</span>
+<span class="nc" id="L504">                mutations.add(new Mutation(update));</span>
+
+<span class="nc" id="L506">            generator.clear();</span>
+<span class="nc" id="L507">            return mutations;</span>
+        }
+
+<span class="nc" id="L510">        Map&lt;DecoratedKey, Mutation&gt; mutations = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        for (ViewUpdateGenerator generator : generators)</span>
+        {
+<span class="nc bnc" id="L513" title="All 2 branches missed.">            for (PartitionUpdate update : generator.generateViewUpdates())</span>
+            {
+<span class="nc" id="L515">                DecoratedKey key = update.partitionKey();</span>
+<span class="nc" id="L516">                Mutation mutation = mutations.get(key);</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">                if (mutation == null)</span>
+                {
+<span class="nc" id="L519">                    mutation = new Mutation(baseTableMetadata.ksName, key);</span>
+<span class="nc" id="L520">                    mutations.put(key, mutation);</span>
+                }
+<span class="nc" id="L522">                mutation.add(update);</span>
+<span class="nc" id="L523">            }</span>
+<span class="nc" id="L524">            generator.clear();</span>
+<span class="nc" id="L525">        }</span>
+<span class="nc" id="L526">        return mutations.values();</span>
+    }
+
+    /**
+     * A simple helper that tracks for a given {@code UnfilteredRowIterator} what is the current deletion at any time of the
+     * iteration. It will be the currently open range tombstone deletion if there is one and the partition deletion otherwise.
+     */
+<span class="nc bnc" id="L533" title="All 2 branches missed.">    private static class DeletionTracker</span>
+    {
+        private final DeletionTime partitionDeletion;
+        private DeletionTime deletion;
+
+        public DeletionTracker(DeletionTime partitionDeletion)
+<span class="nc" id="L539">        {</span>
+<span class="nc" id="L540">            this.partitionDeletion = partitionDeletion;</span>
+<span class="nc" id="L541">        }</span>
+
+        public void update(Unfiltered marker)
+        {
+<span class="nc bnc" id="L545" title="All 4 branches missed.">            assert marker instanceof RangeTombstoneMarker;</span>
+<span class="nc" id="L546">            RangeTombstoneMarker rtm = (RangeTombstoneMarker)marker;</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            this.deletion = rtm.isOpen(false)</span>
+<span class="nc" id="L548">                          ? rtm.openDeletionTime(false)</span>
+                          : null;
+<span class="nc" id="L550">        }</span>
+
+        public DeletionTime currentDeletion()
+        {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            return deletion == null ? partitionDeletion : deletion;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeIntersectionIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.utils</a> &gt; <span class="el_source">RangeIntersectionIterator.java</span></div><h1>RangeIntersectionIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.utils;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.PriorityQueue;
+
+import com.google.common.collect.Iterators;
+import org.apache.cassandra.io.util.FileUtils;
+
+import com.google.common.annotations.VisibleForTesting;
+
+@SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L32">public class RangeIntersectionIterator</span>
+{
+<span class="nc" id="L34">    protected enum Strategy</span>
+    {
+<span class="nc" id="L36">        BOUNCE, LOOKUP, ADAPTIVE</span>
+    }
+
+    public static &lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; Builder&lt;K, D&gt; builder()
+    {
+<span class="nc" id="L41">        return builder(Strategy.ADAPTIVE);</span>
+    }
+
+    @VisibleForTesting
+    protected static &lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; Builder&lt;K, D&gt; builder(Strategy strategy)
+    {
+<span class="nc" id="L47">        return new Builder&lt;&gt;(strategy);</span>
+    }
+
+    public static class Builder&lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; extends RangeIterator.Builder&lt;K, D&gt;
+    {
+        private final Strategy strategy;
+
+        public Builder(Strategy strategy)
+        {
+<span class="nc" id="L56">            super(IteratorType.INTERSECTION);</span>
+<span class="nc" id="L57">            this.strategy = strategy;</span>
+<span class="nc" id="L58">        }</span>
+
+        protected RangeIterator&lt;K, D&gt; buildIterator()
+        {
+            // if the range is disjoint or we have an intersection with an empty set,
+            // we can simply return an empty iterator, because it's not going to produce any results.
+<span class="nc bnc" id="L64" title="All 2 branches missed.">            if (statistics.isDisjoint())</span>
+<span class="nc" id="L65">                return new EmptyRangeIterator&lt;&gt;();</span>
+
+<span class="nc bnc" id="L67" title="All 2 branches missed.">            if (rangeCount() == 1)</span>
+<span class="nc" id="L68">                return ranges.poll();</span>
+
+<span class="nc bnc" id="L70" title="All 4 branches missed.">            switch (strategy)</span>
+            {
+                case LOOKUP:
+<span class="nc" id="L73">                    return new LookupIntersectionIterator&lt;&gt;(statistics, ranges);</span>
+
+                case BOUNCE:
+<span class="nc" id="L76">                    return new BounceIntersectionIterator&lt;&gt;(statistics, ranges);</span>
+
+                case ADAPTIVE:
+<span class="nc bnc" id="L79" title="All 2 branches missed.">                    return statistics.sizeRatio() &lt;= 0.01d</span>
+                            ? new LookupIntersectionIterator&lt;&gt;(statistics, ranges)
+                            : new BounceIntersectionIterator&lt;&gt;(statistics, ranges);
+
+                default:
+<span class="nc" id="L84">                    throw new IllegalStateException(&quot;Unknown strategy: &quot; + strategy);</span>
+            }
+        }
+    }
+
+    private static abstract class AbstractIntersectionIterator&lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; extends RangeIterator&lt;K, D&gt;
+    {
+        protected final PriorityQueue&lt;RangeIterator&lt;K, D&gt;&gt; ranges;
+
+        private AbstractIntersectionIterator(Builder.Statistics&lt;K, D&gt; statistics, PriorityQueue&lt;RangeIterator&lt;K, D&gt;&gt; ranges)
+        {
+<span class="nc" id="L95">            super(statistics);</span>
+<span class="nc" id="L96">            this.ranges = ranges;</span>
+<span class="nc" id="L97">        }</span>
+
+        public void close() throws IOException
+        {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">            for (RangeIterator&lt;K, D&gt; range : ranges)</span>
+<span class="nc" id="L102">                FileUtils.closeQuietly(range);</span>
+<span class="nc" id="L103">        }</span>
+    }
+
+    /**
+     * Iterator which performs intersection of multiple ranges by using bouncing (merge-join) technique to identify
+     * common elements in the given ranges. Aforementioned &quot;bounce&quot; works as follows: range queue is poll'ed for the
+     * range with the smallest current token (main loop), that token is used to {@link RangeIterator#skipTo(Comparable)}
+     * other ranges, if token produced by {@link RangeIterator#skipTo(Comparable)} is equal to current &quot;candidate&quot; token,
+     * both get merged together and the same operation is repeated for next range from the queue, if returned token
+     * is not equal than candidate, candidate's range gets put back into the queue and the main loop gets repeated until
+     * next intersection token is found or at least one iterator runs out of tokens.
+     *
+     * This technique is every efficient to jump over gaps in the ranges.
+     *
+     * @param &lt;K&gt; The type used to sort ranges.
+     * @param &lt;D&gt; The container type which is going to be returned by {@link Iterator#next()}.
+     */
+    @VisibleForTesting
+    protected static class BounceIntersectionIterator&lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; extends AbstractIntersectionIterator&lt;K, D&gt;
+    {
+        private BounceIntersectionIterator(Builder.Statistics&lt;K, D&gt; statistics, PriorityQueue&lt;RangeIterator&lt;K, D&gt;&gt; ranges)
+        {
+<span class="nc" id="L125">            super(statistics, ranges);</span>
+<span class="nc" id="L126">        }</span>
+
+        protected D computeNext()
+        {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            while (!ranges.isEmpty())</span>
+            {
+<span class="nc" id="L132">                RangeIterator&lt;K, D&gt; head = ranges.poll();</span>
+
+                // jump right to the beginning of the intersection or return next element
+<span class="nc bnc" id="L135" title="All 2 branches missed.">                if (head.getCurrent().compareTo(getMinimum()) &lt; 0)</span>
+<span class="nc" id="L136">                    head.skipTo(getMinimum());</span>
+
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                D candidate = head.hasNext() ? head.next() : null;</span>
+<span class="nc bnc" id="L139" title="All 4 branches missed.">                if (candidate == null || candidate.get().compareTo(getMaximum()) &gt; 0)</span>
+                {
+<span class="nc" id="L141">                    ranges.add(head);</span>
+<span class="nc" id="L142">                    return endOfData();</span>
+                }
+
+<span class="nc" id="L145">                List&lt;RangeIterator&lt;K, D&gt;&gt; processed = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L147">                boolean intersectsAll = true, exhausted = false;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                while (!ranges.isEmpty())</span>
+                {
+<span class="nc" id="L150">                    RangeIterator&lt;K, D&gt; range = ranges.poll();</span>
+
+                    // found a range which doesn't overlap with one (or possibly more) other range(s)
+<span class="nc bnc" id="L153" title="All 2 branches missed.">                    if (!isOverlapping(head, range))</span>
+                    {
+<span class="nc" id="L155">                        exhausted = true;</span>
+<span class="nc" id="L156">                        intersectsAll = false;</span>
+<span class="nc" id="L157">                        break;</span>
+                    }
+
+<span class="nc" id="L160">                    D point = range.skipTo(candidate.get());</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">                    if (point == null) // other range is exhausted</span>
+                    {
+<span class="nc" id="L164">                        exhausted = true;</span>
+<span class="nc" id="L165">                        intersectsAll = false;</span>
+<span class="nc" id="L166">                        break;</span>
+                    }
+
+<span class="nc" id="L169">                    processed.add(range);</span>
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                    if (candidate.get().equals(point.get()))</span>
+                    {
+<span class="nc" id="L173">                        candidate.merge(point);</span>
+                        // advance skipped range to the next element if any
+<span class="nc" id="L175">                        Iterators.getNext(range, null);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L179">                        intersectsAll = false;</span>
+<span class="nc" id="L180">                        break;</span>
+                    }
+<span class="nc" id="L182">                }</span>
+
+<span class="nc" id="L184">                ranges.add(head);</span>
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                for (RangeIterator&lt;K, D&gt; range : processed)</span>
+<span class="nc" id="L187">                    ranges.add(range);</span>
+
+<span class="nc bnc" id="L189" title="All 2 branches missed.">                if (exhausted)</span>
+<span class="nc" id="L190">                    return endOfData();</span>
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if (intersectsAll)</span>
+<span class="nc" id="L193">                    return candidate;</span>
+<span class="nc" id="L194">            }</span>
+
+<span class="nc" id="L196">            return endOfData();</span>
+        }
+
+        protected void performSkipTo(K nextToken)
+        {
+<span class="nc" id="L201">            List&lt;RangeIterator&lt;K, D&gt;&gt; skipped = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            while (!ranges.isEmpty())</span>
+            {
+<span class="nc" id="L205">                RangeIterator&lt;K, D&gt; range = ranges.poll();</span>
+<span class="nc" id="L206">                range.skipTo(nextToken);</span>
+<span class="nc" id="L207">                skipped.add(range);</span>
+<span class="nc" id="L208">            }</span>
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            for (RangeIterator&lt;K, D&gt; range : skipped)</span>
+<span class="nc" id="L211">                ranges.add(range);</span>
+<span class="nc" id="L212">        }</span>
+    }
+
+    /**
+     * Iterator which performs a linear scan over a primary range (the smallest of the ranges)
+     * and O(log(n)) lookup into secondary ranges using values from the primary iterator.
+     * This technique is efficient when one of the intersection ranges is smaller than others
+     * e.g. ratio 0.01d (default), in such situation scan + lookup is more efficient comparing
+     * to &quot;bounce&quot; merge because &quot;bounce&quot; distance is never going to be big.
+     *
+     * @param &lt;K&gt; The type used to sort ranges.
+     * @param &lt;D&gt; The container type which is going to be returned by {@link Iterator#next()}.
+     */
+    @VisibleForTesting
+    protected static class LookupIntersectionIterator&lt;K extends Comparable&lt;K&gt;, D extends CombinedValue&lt;K&gt;&gt; extends AbstractIntersectionIterator&lt;K, D&gt;
+    {
+        private final RangeIterator&lt;K, D&gt; smallestIterator;
+
+        private LookupIntersectionIterator(Builder.Statistics&lt;K, D&gt; statistics, PriorityQueue&lt;RangeIterator&lt;K, D&gt;&gt; ranges)
+        {
+<span class="nc" id="L232">            super(statistics, ranges);</span>
+
+<span class="nc" id="L234">            smallestIterator = statistics.minRange;</span>
+
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            if (smallestIterator.getCurrent().compareTo(getMinimum()) &lt; 0)</span>
+<span class="nc" id="L237">                smallestIterator.skipTo(getMinimum());</span>
+<span class="nc" id="L238">        }</span>
+
+        protected D computeNext()
+        {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            while (smallestIterator.hasNext())</span>
+            {
+<span class="nc" id="L244">                D candidate = smallestIterator.next();</span>
+<span class="nc" id="L245">                K token = candidate.get();</span>
+
+<span class="nc" id="L247">                boolean intersectsAll = true;</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                for (RangeIterator&lt;K, D&gt; range : ranges)</span>
+                {
+                    // avoid checking against self, much cheaper than changing queue comparator
+                    // to compare based on the size and re-populating such queue.
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                    if (range.equals(smallestIterator))</span>
+<span class="nc" id="L253">                        continue;</span>
+
+                    // found a range which doesn't overlap with one (or possibly more) other range(s)
+<span class="nc bnc" id="L256" title="All 2 branches missed.">                    if (!isOverlapping(smallestIterator, range))</span>
+<span class="nc" id="L257">                        return endOfData();</span>
+
+<span class="nc" id="L259">                    D point = range.skipTo(token);</span>
+
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                    if (point == null) // one of the iterators is exhausted</span>
+<span class="nc" id="L262">                        return endOfData();</span>
+
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                    if (!point.get().equals(token))</span>
+                    {
+<span class="nc" id="L266">                        intersectsAll = false;</span>
+<span class="nc" id="L267">                        break;</span>
+                    }
+
+<span class="nc" id="L270">                    candidate.merge(point);</span>
+<span class="nc" id="L271">                }</span>
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                if (intersectsAll)</span>
+<span class="nc" id="L274">                    return candidate;</span>
+<span class="nc" id="L275">            }</span>
+
+<span class="nc" id="L277">            return endOfData();</span>
+        }
+
+        protected void performSkipTo(K nextToken)
+        {
+<span class="nc" id="L282">            smallestIterator.skipTo(nextToken);</span>
+<span class="nc" id="L283">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

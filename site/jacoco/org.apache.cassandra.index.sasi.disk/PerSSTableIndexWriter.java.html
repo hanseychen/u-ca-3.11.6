@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PerSSTableIndexWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.disk</a> &gt; <span class="el_source">PerSSTableIndexWriter.java</span></div><h1>PerSSTableIndexWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.disk;
+
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.*;
+
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sasi.conf.ColumnIndex;
+import org.apache.cassandra.index.sasi.utils.CombinedTermIterator;
+import org.apache.cassandra.index.sasi.utils.TypeUtil;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class PerSSTableIndexWriter implements SSTableFlushObserver
+{
+<span class="nc" id="L56">    private static final Logger logger = LoggerFactory.getLogger(PerSSTableIndexWriter.class);</span>
+
+    private static final int POOL_SIZE = 8;
+    private static final ThreadPoolExecutor INDEX_FLUSHER_MEMTABLE;
+    private static final ThreadPoolExecutor INDEX_FLUSHER_GENERAL;
+
+    static
+    {
+<span class="nc" id="L64">        INDEX_FLUSHER_GENERAL = new JMXEnabledThreadPoolExecutor(POOL_SIZE, POOL_SIZE, 1, TimeUnit.MINUTES,</span>
+                                                                 new LinkedBlockingQueue&lt;&gt;(),
+                                                                 new NamedThreadFactory(&quot;SASI-General&quot;),
+                                                                 &quot;internal&quot;);
+<span class="nc" id="L68">        INDEX_FLUSHER_GENERAL.allowCoreThreadTimeOut(true);</span>
+
+<span class="nc" id="L70">        INDEX_FLUSHER_MEMTABLE = new JMXEnabledThreadPoolExecutor(POOL_SIZE, POOL_SIZE, 1, TimeUnit.MINUTES,</span>
+                                                                  new LinkedBlockingQueue&lt;&gt;(),
+                                                                  new NamedThreadFactory(&quot;SASI-Memtable&quot;),
+                                                                  &quot;internal&quot;);
+<span class="nc" id="L74">        INDEX_FLUSHER_MEMTABLE.allowCoreThreadTimeOut(true);</span>
+<span class="nc" id="L75">    }</span>
+
+<span class="nc" id="L77">    private final int nowInSec = FBUtilities.nowInSeconds();</span>
+
+    private final Descriptor descriptor;
+    private final OperationType source;
+
+    private final AbstractType&lt;?&gt; keyValidator;
+
+    @VisibleForTesting
+    protected final Map&lt;ColumnDefinition, Index&gt; indexes;
+
+    private DecoratedKey currentKey;
+    private long currentKeyPosition;
+    private boolean isComplete;
+
+    public PerSSTableIndexWriter(AbstractType&lt;?&gt; keyValidator,
+                                 Descriptor descriptor,
+                                 OperationType source,
+                                 Map&lt;ColumnDefinition, ColumnIndex&gt; supportedIndexes)
+<span class="nc" id="L95">    {</span>
+<span class="nc" id="L96">        this.keyValidator = keyValidator;</span>
+<span class="nc" id="L97">        this.descriptor = descriptor;</span>
+<span class="nc" id="L98">        this.source = source;</span>
+<span class="nc" id="L99">        this.indexes = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        for (Map.Entry&lt;ColumnDefinition, ColumnIndex&gt; entry : supportedIndexes.entrySet())</span>
+<span class="nc" id="L101">            indexes.put(entry.getKey(), newIndex(entry.getValue()));</span>
+<span class="nc" id="L102">    }</span>
+
+    public void begin()
+<span class="nc" id="L105">    {}</span>
+
+    public void startPartition(DecoratedKey key, long curPosition)
+    {
+<span class="nc" id="L109">        currentKey = key;</span>
+<span class="nc" id="L110">        currentKeyPosition = curPosition;</span>
+<span class="nc" id="L111">    }</span>
+
+    public void nextUnfilteredCluster(Unfiltered unfiltered)
+    {
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (!unfiltered.isRow())</span>
+<span class="nc" id="L116">            return;</span>
+
+<span class="nc" id="L118">        Row row = (Row) unfiltered;</span>
+
+<span class="nc" id="L120">        indexes.forEach((column, index) -&gt; {</span>
+<span class="nc" id="L121">            ByteBuffer value = ColumnIndex.getValueOf(column, row, nowInSec);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (value == null)</span>
+<span class="nc" id="L123">                return;</span>
+
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            if (index == null)</span>
+<span class="nc" id="L126">                throw new IllegalArgumentException(&quot;No index exists for column &quot; + column.name.toString());</span>
+
+<span class="nc" id="L128">            index.add(value.duplicate(), currentKey, currentKeyPosition);</span>
+<span class="nc" id="L129">        });</span>
+<span class="nc" id="L130">    }</span>
+
+    public void complete()
+    {
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        if (isComplete)</span>
+<span class="nc" id="L135">            return;</span>
+
+<span class="nc" id="L137">        currentKey = null;</span>
+
+        try
+        {
+<span class="nc" id="L141">            CountDownLatch latch = new CountDownLatch(indexes.size());</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">            for (Index index : indexes.values())</span>
+<span class="nc" id="L143">                index.complete(latch);</span>
+
+<span class="nc" id="L145">            Uninterruptibles.awaitUninterruptibly(latch);</span>
+        }
+        finally
+        {
+<span class="nc" id="L149">            indexes.clear();</span>
+<span class="nc" id="L150">            isComplete = true;</span>
+        }
+<span class="nc" id="L152">    }</span>
+
+    public Index getIndex(ColumnDefinition columnDef)
+    {
+<span class="nc" id="L156">        return indexes.get(columnDef);</span>
+    }
+
+    public Descriptor getDescriptor()
+    {
+<span class="nc" id="L161">        return descriptor;</span>
+    }
+
+    @VisibleForTesting
+    protected Index newIndex(ColumnIndex columnIndex)
+    {
+<span class="nc" id="L167">        return new Index(columnIndex);</span>
+    }
+
+    @VisibleForTesting
+    protected class Index
+    {
+        @VisibleForTesting
+        protected final String outputFile;
+
+        private final ColumnIndex columnIndex;
+        private final AbstractAnalyzer analyzer;
+        private final long maxMemorySize;
+
+        @VisibleForTesting
+        protected final Set&lt;Future&lt;OnDiskIndex&gt;&gt; segments;
+<span class="nc" id="L182">        private int segmentNumber = 0;</span>
+
+        private OnDiskIndexBuilder currentBuilder;
+
+        public Index(ColumnIndex columnIndex)
+<span class="nc" id="L187">        {</span>
+<span class="nc" id="L188">            this.columnIndex = columnIndex;</span>
+<span class="nc" id="L189">            this.outputFile = descriptor.filenameFor(columnIndex.getComponent());</span>
+<span class="nc" id="L190">            this.analyzer = columnIndex.getAnalyzer();</span>
+<span class="nc" id="L191">            this.segments = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L192">            this.maxMemorySize = maxMemorySize(columnIndex);</span>
+<span class="nc" id="L193">            this.currentBuilder = newIndexBuilder();</span>
+<span class="nc" id="L194">        }</span>
+
+        public void add(ByteBuffer term, DecoratedKey key, long keyPosition)
+        {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            if (term.remaining() == 0)</span>
+<span class="nc" id="L199">                return;</span>
+
+<span class="nc" id="L201">            boolean isAdded = false;</span>
+
+<span class="nc" id="L203">            analyzer.reset(term);</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            while (analyzer.hasNext())</span>
+            {
+<span class="nc" id="L206">                ByteBuffer token = analyzer.next();</span>
+<span class="nc" id="L207">                int size = token.remaining();</span>
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                if (token.remaining() &gt;= OnDiskIndexBuilder.MAX_TERM_SIZE)</span>
+                {
+<span class="nc" id="L211">                    logger.info(&quot;Rejecting value (size {}, maximum {}) for column {} (analyzed {}) at {} SSTable.&quot;,</span>
+<span class="nc" id="L212">                            FBUtilities.prettyPrintMemory(term.remaining()),</span>
+<span class="nc" id="L213">                            FBUtilities.prettyPrintMemory(OnDiskIndexBuilder.MAX_TERM_SIZE),</span>
+<span class="nc" id="L214">                            columnIndex.getColumnName(),</span>
+<span class="nc" id="L215">                            columnIndex.getMode().isAnalyzed,</span>
+<span class="nc" id="L216">                            descriptor);</span>
+<span class="nc" id="L217">                    continue;</span>
+                }
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                if (!TypeUtil.isValid(token, columnIndex.getValidator()))</span>
+                {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                    if ((token = TypeUtil.tryUpcast(token, columnIndex.getValidator())) == null)</span>
+                    {
+<span class="nc" id="L224">                        logger.info(&quot;({}) Failed to add {} to index for key: {}, value size was {}, validator is {}.&quot;,</span>
+                                    outputFile,
+<span class="nc" id="L226">                                    columnIndex.getColumnName(),</span>
+<span class="nc" id="L227">                                    keyValidator.getString(key.getKey()),</span>
+<span class="nc" id="L228">                                    FBUtilities.prettyPrintMemory(size),</span>
+<span class="nc" id="L229">                                    columnIndex.getValidator());</span>
+<span class="nc" id="L230">                        continue;</span>
+                    }
+                }
+
+<span class="nc" id="L234">                currentBuilder.add(token, key, keyPosition);</span>
+<span class="nc" id="L235">                isAdded = true;</span>
+<span class="nc" id="L236">            }</span>
+
+<span class="nc bnc" id="L238" title="All 4 branches missed.">            if (!isAdded || currentBuilder.estimatedMemoryUse() &lt; maxMemorySize)</span>
+<span class="nc" id="L239">                return; // non of the generated tokens were added to the index or memory size wasn't reached</span>
+
+<span class="nc" id="L241">            segments.add(getExecutor().submit(scheduleSegmentFlush(false)));</span>
+<span class="nc" id="L242">        }</span>
+
+        @VisibleForTesting
+        protected Callable&lt;OnDiskIndex&gt; scheduleSegmentFlush(final boolean isFinal)
+        {
+<span class="nc" id="L247">            final OnDiskIndexBuilder builder = currentBuilder;</span>
+<span class="nc" id="L248">            currentBuilder = newIndexBuilder();</span>
+
+<span class="nc" id="L250">            final String segmentFile = filename(isFinal);</span>
+
+<span class="nc" id="L252">            return () -&gt; {</span>
+<span class="nc" id="L253">                long start = System.nanoTime();</span>
+
+                try
+                {
+<span class="nc" id="L257">                    File index = new File(segmentFile);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                    return builder.finish(index) ? new OnDiskIndex(index, columnIndex.getValidator(), null) : null;</span>
+                }
+<span class="nc" id="L260">                catch (Exception | FSError e)</span>
+                {
+<span class="nc" id="L262">                    logger.error(&quot;Failed to build index segment {}&quot;, segmentFile, e);</span>
+<span class="nc" id="L263">                    return null;</span>
+                }
+                finally
+                {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                    if (!isFinal)</span>
+<span class="nc" id="L268">                        logger.info(&quot;Flushed index segment {}, took {} ms.&quot;, segmentFile, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));</span>
+                }
+            };
+        }
+
+        public void complete(final CountDownLatch latch)
+        {
+<span class="nc" id="L275">            logger.info(&quot;Scheduling index flush to {}&quot;, outputFile);</span>
+
+<span class="nc" id="L277">            getExecutor().submit((Runnable) () -&gt; {</span>
+<span class="nc" id="L278">                long start1 = System.nanoTime();</span>
+
+<span class="nc" id="L280">                OnDiskIndex[] parts = new OnDiskIndex[segments.size() + 1];</span>
+
+                try
+                {
+                    // no parts present, build entire index from memory
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                    if (segments.isEmpty())</span>
+                    {
+<span class="nc" id="L287">                        scheduleSegmentFlush(true).call();</span>
+<span class="nc" id="L288">                        return;</span>
+                    }
+
+                    // parts are present but there is something still in memory, let's flush that inline
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                    if (!currentBuilder.isEmpty())</span>
+                    {
+                        @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L295">                        OnDiskIndex last = scheduleSegmentFlush(false).call();</span>
+<span class="nc" id="L296">                        segments.add(Futures.immediateFuture(last));</span>
+                    }
+
+<span class="nc" id="L299">                    int index = 0;</span>
+<span class="nc" id="L300">                    ByteBuffer combinedMin = null, combinedMax = null;</span>
+
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                    for (Future&lt;OnDiskIndex&gt; f : segments)</span>
+                    {
+                        @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L305">                        OnDiskIndex part = f.get();</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">                        if (part == null)</span>
+<span class="nc" id="L307">                            continue;</span>
+
+<span class="nc" id="L309">                        parts[index++] = part;</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">                        combinedMin = (combinedMin == null || keyValidator.compare(combinedMin, part.minKey()) &gt; 0) ? part.minKey() : combinedMin;</span>
+<span class="nc bnc" id="L311" title="All 4 branches missed.">                        combinedMax = (combinedMax == null || keyValidator.compare(combinedMax, part.maxKey()) &lt; 0) ? part.maxKey() : combinedMax;</span>
+<span class="nc" id="L312">                    }</span>
+
+<span class="nc" id="L314">                    OnDiskIndexBuilder builder = newIndexBuilder();</span>
+<span class="nc" id="L315">                    builder.finish(Pair.create(combinedMin, combinedMax),</span>
+                                   new File(outputFile),
+                                   new CombinedTermIterator(parts));
+                }
+<span class="nc" id="L319">                catch (Exception | FSError e)</span>
+                {
+<span class="nc" id="L321">                    logger.error(&quot;Failed to flush index {}.&quot;, outputFile, e);</span>
+<span class="nc" id="L322">                    FileUtils.delete(outputFile);</span>
+                }
+                finally
+                {
+<span class="nc" id="L326">                    logger.info(&quot;Index flush to {} took {} ms.&quot;, outputFile, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start1));</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                    for (int segment = 0; segment &lt; segmentNumber; segment++)</span>
+                    {
+                        @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L331">                        OnDiskIndex part = parts[segment];</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                        if (part != null)</span>
+<span class="nc" id="L334">                            FileUtils.closeQuietly(part);</span>
+
+<span class="nc" id="L336">                        FileUtils.delete(outputFile + &quot;_&quot; + segment);</span>
+                    }
+
+<span class="nc" id="L339">                    latch.countDown();</span>
+                }
+<span class="nc" id="L341">            });</span>
+<span class="nc" id="L342">        }</span>
+
+        private ExecutorService getExecutor()
+        {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            return source == OperationType.FLUSH ? INDEX_FLUSHER_MEMTABLE : INDEX_FLUSHER_GENERAL;</span>
+        }
+
+        private OnDiskIndexBuilder newIndexBuilder()
+        {
+<span class="nc" id="L351">            return new OnDiskIndexBuilder(keyValidator, columnIndex.getValidator(), columnIndex.getMode().mode);</span>
+        }
+
+        public String filename(boolean isFinal)
+        {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            return outputFile + (isFinal ? &quot;&quot; : &quot;_&quot; + segmentNumber++);</span>
+        }
+    }
+
+    protected long maxMemorySize(ColumnIndex columnIndex)
+    {
+        // 1G for memtable and configuration for compaction
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        return source == OperationType.FLUSH ? 1073741824L : columnIndex.getMode().maxCompactionFlushMemoryInMb;</span>
+    }
+
+    public int hashCode()
+    {
+<span class="nc" id="L368">        return descriptor.hashCode();</span>
+    }
+
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L373" title="All 6 branches missed.">        return !(o == null || !(o instanceof PerSSTableIndexWriter)) &amp;&amp; descriptor.equals(((PerSSTableIndexWriter) o).descriptor);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

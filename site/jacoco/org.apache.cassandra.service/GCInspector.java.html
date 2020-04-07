@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GCInspector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">GCInspector.java</span></div><h1>GCInspector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryUsage;
+import java.lang.reflect.Field;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.management.MBeanServer;
+import javax.management.Notification;
+import javax.management.NotificationListener;
+import javax.management.ObjectName;
+import javax.management.openmbean.CompositeData;
+
+import com.sun.management.GarbageCollectionNotificationInfo;
+import com.sun.management.GcInfo;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.StatusLogger;
+
+public class GCInspector implements NotificationListener, GCInspectorMXBean
+{
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.service:type=GCInspector&quot;;
+<span class="fc" id="L51">    private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);</span>
+<span class="fc" id="L52">    final static long MIN_LOG_DURATION = DatabaseDescriptor.getGCLogThreshold();</span>
+<span class="fc" id="L53">    final static long GC_WARN_THRESHOLD_IN_MS = DatabaseDescriptor.getGCWarnThreshold();</span>
+<span class="pc bpc" id="L54" title="1 of 2 branches missed.">    final static long STAT_THRESHOLD = GC_WARN_THRESHOLD_IN_MS != 0 ? GC_WARN_THRESHOLD_IN_MS : MIN_LOG_DURATION;</span>
+
+    /*
+     * The field from java.nio.Bits that tracks the total number of allocated
+     * bytes of direct memory requires via ByteBuffer.allocateDirect that have not been GCed.
+     */
+    final static Field BITS_TOTAL_CAPACITY;
+
+    static
+    {
+<span class="fc" id="L64">        Field temp = null;</span>
+        try
+        {
+<span class="fc" id="L67">            Class&lt;?&gt; bitsClass = Class.forName(&quot;java.nio.Bits&quot;);</span>
+<span class="fc" id="L68">            Field f = bitsClass.getDeclaredField(&quot;totalCapacity&quot;);</span>
+<span class="fc" id="L69">            f.setAccessible(true);</span>
+<span class="fc" id="L70">            temp = f;</span>
+        }
+<span class="nc" id="L72">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L74">            logger.debug(&quot;Error accessing field of java.nio.Bits&quot;, t);</span>
+            //Don't care, will just return the dummy value -1 if we can't get at the field in this JVM
+<span class="fc" id="L76">        }</span>
+<span class="fc" id="L77">        BITS_TOTAL_CAPACITY = temp;</span>
+<span class="fc" id="L78">    }</span>
+
+    static final class State
+    {
+        final double maxRealTimeElapsed;
+        final double totalRealTimeElapsed;
+        final double sumSquaresRealTimeElapsed;
+        final double totalBytesReclaimed;
+        final double count;
+        final long startNanos;
+
+        State(double extraElapsed, double extraBytes, State prev)
+<span class="fc" id="L90">        {</span>
+<span class="fc" id="L91">            this.totalRealTimeElapsed = prev.totalRealTimeElapsed + extraElapsed;</span>
+<span class="fc" id="L92">            this.totalBytesReclaimed = prev.totalBytesReclaimed + extraBytes;</span>
+<span class="fc" id="L93">            this.sumSquaresRealTimeElapsed = prev.sumSquaresRealTimeElapsed + (extraElapsed * extraElapsed);</span>
+<span class="fc" id="L94">            this.startNanos = prev.startNanos;</span>
+<span class="fc" id="L95">            this.count = prev.count + 1;</span>
+<span class="fc" id="L96">            this.maxRealTimeElapsed = Math.max(prev.maxRealTimeElapsed, extraElapsed);</span>
+<span class="fc" id="L97">        }</span>
+
+        State()
+<span class="fc" id="L100">        {</span>
+<span class="fc" id="L101">            count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0;</span>
+<span class="fc" id="L102">            startNanos = System.nanoTime();</span>
+<span class="fc" id="L103">        }</span>
+    }
+
+    static final class GCState
+    {
+        final GarbageCollectorMXBean gcBean;
+        final boolean assumeGCIsPartiallyConcurrent;
+        final boolean assumeGCIsOldGen;
+        private String[] keys;
+<span class="fc" id="L112">        long lastGcTotalDuration = 0;</span>
+
+
+        GCState(GarbageCollectorMXBean gcBean, boolean assumeGCIsPartiallyConcurrent, boolean assumeGCIsOldGen)
+<span class="fc" id="L116">        {</span>
+<span class="fc" id="L117">            this.gcBean = gcBean;</span>
+<span class="fc" id="L118">            this.assumeGCIsPartiallyConcurrent = assumeGCIsPartiallyConcurrent;</span>
+<span class="fc" id="L119">            this.assumeGCIsOldGen = assumeGCIsOldGen;</span>
+<span class="fc" id="L120">        }</span>
+
+        String[] keys(GarbageCollectionNotificationInfo info)
+        {
+<span class="fc bfc" id="L124" title="All 2 branches covered.">            if (keys != null)</span>
+<span class="fc" id="L125">                return keys;</span>
+
+<span class="fc" id="L127">            keys = info.getGcInfo().getMemoryUsageBeforeGc().keySet().toArray(new String[0]);</span>
+<span class="fc" id="L128">            Arrays.sort(keys);</span>
+
+<span class="fc" id="L130">            return keys;</span>
+        }
+    }
+
+<span class="fc" id="L134">    final AtomicReference&lt;State&gt; state = new AtomicReference&lt;&gt;(new State());</span>
+
+<span class="fc" id="L136">    final Map&lt;String, GCState&gt; gcStates = new HashMap&lt;&gt;();</span>
+
+    public GCInspector()
+<span class="fc" id="L139">    {</span>
+<span class="fc" id="L140">        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();</span>
+
+        try
+        {
+<span class="fc" id="L144">            ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);</span>
+<span class="fc bfc" id="L145" title="All 2 branches covered.">            for (ObjectName name : mbs.queryNames(gcName, null))</span>
+            {
+<span class="fc" id="L147">                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(mbs, name.getCanonicalName(), GarbageCollectorMXBean.class);</span>
+<span class="fc" id="L148">                gcStates.put(gc.getName(), new GCState(gc, assumeGCIsPartiallyConcurrent(gc), assumeGCIsOldGen(gc)));</span>
+<span class="fc" id="L149">            }</span>
+
+<span class="fc" id="L151">            MBeanWrapper.instance.registerMBean(this, new ObjectName(MBEAN_NAME));</span>
+        }
+<span class="nc" id="L153">        catch (Exception e)</span>
+        {
+<span class="nc" id="L155">            throw new RuntimeException(e);</span>
+<span class="fc" id="L156">        }</span>
+<span class="fc" id="L157">    }</span>
+
+    public static void register() throws Exception
+    {
+<span class="fc" id="L161">        GCInspector inspector = new GCInspector();</span>
+<span class="fc" id="L162">        MBeanServer server = ManagementFactory.getPlatformMBeanServer();</span>
+<span class="fc" id="L163">        ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);</span>
+<span class="fc bfc" id="L164" title="All 2 branches covered.">        for (ObjectName name : server.queryNames(gcName, null))</span>
+        {
+<span class="fc" id="L166">            server.addNotificationListener(name, inspector, null, null);</span>
+<span class="fc" id="L167">        }</span>
+<span class="fc" id="L168">    }</span>
+
+    /*
+     * Assume that a GC type is at least partially concurrent and so a side channel method
+     * should be used to calculate application stopped time due to the GC.
+     *
+     * If the GC isn't recognized then assume that is concurrent and we need to do our own calculation
+     * via the the side channel.
+     */
+    private static boolean assumeGCIsPartiallyConcurrent(GarbageCollectorMXBean gc)
+    {
+<span class="pc bpc" id="L179" title="1 of 3 branches missed.">        switch (gc.getName())</span>
+        {
+                //First two are from the serial collector
+            case &quot;Copy&quot;:
+            case &quot;MarkSweepCompact&quot;:
+                //Parallel collector
+            case &quot;PS MarkSweep&quot;:
+            case &quot;PS Scavenge&quot;:
+            case &quot;G1 Young Generation&quot;:
+                //CMS young generation collector
+            case &quot;ParNew&quot;:
+<span class="fc" id="L190">                return false;</span>
+            case &quot;ConcurrentMarkSweep&quot;:
+            case &quot;G1 Old Generation&quot;:
+<span class="fc" id="L193">                return true;</span>
+            default:
+                //Assume possibly concurrent if unsure
+<span class="nc" id="L196">                return true;</span>
+        }
+    }
+
+    /*
+     * Assume that a GC type is an old generation collection so TransactionLogs.rescheduleFailedTasks()
+     * should be invoked.
+     *
+     * Defaults to not invoking TransactionLogs.rescheduleFailedTasks() on unrecognized GC names
+     */
+    private static boolean assumeGCIsOldGen(GarbageCollectorMXBean gc)
+    {
+<span class="pc bpc" id="L208" title="1 of 3 branches missed.">        switch (gc.getName())</span>
+        {
+            case &quot;Copy&quot;:
+            case &quot;PS Scavenge&quot;:
+            case &quot;G1 Young Generation&quot;:
+            case &quot;ParNew&quot;:
+<span class="fc" id="L214">                return false;</span>
+            case &quot;MarkSweepCompact&quot;:
+            case &quot;PS MarkSweep&quot;:
+            case &quot;ConcurrentMarkSweep&quot;:
+            case &quot;G1 Old Generation&quot;:
+<span class="fc" id="L219">                return true;</span>
+            default:
+                //Assume not old gen otherwise, don't call
+                //TransactionLogs.rescheduleFailedTasks()
+<span class="nc" id="L223">                return false;</span>
+        }
+    }
+
+    public void handleNotification(final Notification notification, final Object handback)
+    {
+<span class="fc" id="L229">        String type = notification.getType();</span>
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">        if (type.equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION))</span>
+        {
+            // retrieve the garbage collection notification information
+<span class="fc" id="L233">            CompositeData cd = (CompositeData) notification.getUserData();</span>
+<span class="fc" id="L234">            GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(cd);</span>
+<span class="fc" id="L235">            String gcName = info.getGcName();</span>
+<span class="fc" id="L236">            GcInfo gcInfo = info.getGcInfo();</span>
+
+<span class="fc" id="L238">            long duration = gcInfo.getDuration();</span>
+
+            /*
+             * The duration supplied in the notification info includes more than just
+             * application stopped time for concurrent GCs. Try and do a better job coming up with a good stopped time
+             * value by asking for and tracking cumulative time spent blocked in GC.
+             */
+<span class="fc" id="L245">            GCState gcState = gcStates.get(gcName);</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">            if (gcState.assumeGCIsPartiallyConcurrent)</span>
+            {
+<span class="nc" id="L248">                long previousTotal = gcState.lastGcTotalDuration;</span>
+<span class="nc" id="L249">                long total = gcState.gcBean.getCollectionTime();</span>
+<span class="nc" id="L250">                gcState.lastGcTotalDuration = total;</span>
+<span class="nc" id="L251">                duration = total - previousTotal; // may be zero for a really fast collection</span>
+            }
+
+<span class="fc" id="L254">            StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L255">            sb.append(info.getGcName()).append(&quot; GC in &quot;).append(duration).append(&quot;ms.  &quot;);</span>
+<span class="fc" id="L256">            long bytes = 0;</span>
+<span class="fc" id="L257">            Map&lt;String, MemoryUsage&gt; beforeMemoryUsage = gcInfo.getMemoryUsageBeforeGc();</span>
+<span class="fc" id="L258">            Map&lt;String, MemoryUsage&gt; afterMemoryUsage = gcInfo.getMemoryUsageAfterGc();</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">            for (String key : gcState.keys(info))</span>
+            {
+<span class="fc" id="L261">                MemoryUsage before = beforeMemoryUsage.get(key);</span>
+<span class="fc" id="L262">                MemoryUsage after = afterMemoryUsage.get(key);</span>
+<span class="pc bpc" id="L263" title="1 of 4 branches missed.">                if (after != null &amp;&amp; after.getUsed() != before.getUsed())</span>
+                {
+<span class="fc" id="L265">                    sb.append(key).append(&quot;: &quot;).append(before.getUsed());</span>
+<span class="fc" id="L266">                    sb.append(&quot; -&gt; &quot;);</span>
+<span class="fc" id="L267">                    sb.append(after.getUsed());</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">                    if (!key.equals(gcState.keys[gcState.keys.length - 1]))</span>
+<span class="fc" id="L269">                        sb.append(&quot;; &quot;);</span>
+<span class="fc" id="L270">                    bytes += before.getUsed() - after.getUsed();</span>
+                }
+            }
+
+            while (true)
+            {
+<span class="fc" id="L276">                State prev = state.get();</span>
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">                if (state.compareAndSet(prev, new State(duration, bytes, prev)))</span>
+<span class="fc" id="L278">                    break;</span>
+<span class="nc" id="L279">            }</span>
+
+<span class="fc" id="L281">            String st = sb.toString();</span>
+<span class="pc bpc" id="L282" title="2 of 4 branches missed.">            if (GC_WARN_THRESHOLD_IN_MS != 0 &amp;&amp; duration &gt; GC_WARN_THRESHOLD_IN_MS)</span>
+<span class="nc" id="L283">                logger.warn(st);</span>
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">            else if (duration &gt; MIN_LOG_DURATION)</span>
+<span class="nc" id="L285">                logger.info(st);</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">            else if (logger.isTraceEnabled())</span>
+<span class="nc" id="L287">                logger.trace(st);</span>
+
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">            if (duration &gt; STAT_THRESHOLD)</span>
+<span class="nc" id="L290">                StatusLogger.log();</span>
+
+            // if we just finished an old gen collection and we're still using a lot of memory, try to reduce the pressure
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">            if (gcState.assumeGCIsOldGen)</span>
+<span class="nc" id="L294">                LifecycleTransaction.rescheduleFailedDeletions();</span>
+        }
+<span class="fc" id="L296">    }</span>
+
+    public State getTotalSinceLastCheck()
+    {
+<span class="nc" id="L300">        return state.getAndSet(new State());</span>
+    }
+
+    public double[] getAndResetStats()
+    {
+<span class="nc" id="L305">        State state = getTotalSinceLastCheck();</span>
+<span class="nc" id="L306">        double[] r = new double[7];</span>
+<span class="nc" id="L307">        r[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startNanos);</span>
+<span class="nc" id="L308">        r[1] = state.maxRealTimeElapsed;</span>
+<span class="nc" id="L309">        r[2] = state.totalRealTimeElapsed;</span>
+<span class="nc" id="L310">        r[3] = state.sumSquaresRealTimeElapsed;</span>
+<span class="nc" id="L311">        r[4] = state.totalBytesReclaimed;</span>
+<span class="nc" id="L312">        r[5] = state.count;</span>
+<span class="nc" id="L313">        r[6] = getAllocatedDirectMemory();</span>
+
+<span class="nc" id="L315">        return r;</span>
+    }
+
+    private static long getAllocatedDirectMemory()
+    {
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (BITS_TOTAL_CAPACITY == null) return -1;</span>
+        try
+        {
+<span class="nc" id="L323">            return BITS_TOTAL_CAPACITY.getLong(null);</span>
+        }
+<span class="nc" id="L325">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L327">            logger.trace(&quot;Error accessing field of java.nio.Bits&quot;, t);</span>
+            //Don't care how or why we failed to get the value in this JVM. Return -1 to indicate failure
+<span class="nc" id="L329">            return -1;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

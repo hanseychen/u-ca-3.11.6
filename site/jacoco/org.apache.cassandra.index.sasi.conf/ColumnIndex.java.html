@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sasi.conf</a> &gt; <span class="el_source">ColumnIndex.java</span></div><h1>ColumnIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sasi.conf;
+
+import java.nio.ByteBuffer;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Memtable;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sasi.conf.view.View;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
+import org.apache.cassandra.index.sasi.disk.Token;
+import org.apache.cassandra.index.sasi.memory.IndexMemtable;
+import org.apache.cassandra.index.sasi.plan.Expression;
+import org.apache.cassandra.index.sasi.plan.Expression.Op;
+import org.apache.cassandra.index.sasi.utils.RangeIterator;
+import org.apache.cassandra.index.sasi.utils.RangeUnionIterator;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class ColumnIndex
+{
+    private static final String FILE_NAME_FORMAT = &quot;SI_%s.db&quot;;
+
+    private final AbstractType&lt;?&gt; keyValidator;
+
+    private final ColumnDefinition column;
+    private final Optional&lt;IndexMetadata&gt; config;
+
+    private final AtomicReference&lt;IndexMemtable&gt; memtable;
+<span class="nc" id="L64">    private final ConcurrentMap&lt;Memtable, IndexMemtable&gt; pendingFlush = new ConcurrentHashMap&lt;&gt;();</span>
+
+    private final IndexMode mode;
+
+    private final Component component;
+    private final DataTracker tracker;
+
+    private final boolean isTokenized;
+
+    public ColumnIndex(AbstractType&lt;?&gt; keyValidator, ColumnDefinition column, IndexMetadata metadata)
+<span class="nc" id="L74">    {</span>
+<span class="nc" id="L75">        this.keyValidator = keyValidator;</span>
+<span class="nc" id="L76">        this.column = column;</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">        this.config = metadata == null ? Optional.empty() : Optional.of(metadata);</span>
+<span class="nc" id="L78">        this.mode = IndexMode.getMode(column, config);</span>
+<span class="nc" id="L79">        this.memtable = new AtomicReference&lt;&gt;(new IndexMemtable(this));</span>
+<span class="nc" id="L80">        this.tracker = new DataTracker(keyValidator, this);</span>
+<span class="nc" id="L81">        this.component = new Component(Component.Type.SECONDARY_INDEX, String.format(FILE_NAME_FORMAT, getIndexName()));</span>
+<span class="nc" id="L82">        this.isTokenized = getAnalyzer().isTokenizing();</span>
+<span class="nc" id="L83">    }</span>
+
+    /**
+     * Initialize this column index with specific set of SSTables.
+     *
+     * @param sstables The sstables to be used by index initially.
+     *
+     * @return A collection of sstables which don't have this specific index attached to them.
+     */
+    public Iterable&lt;SSTableReader&gt; init(Set&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L94">        return tracker.update(Collections.emptySet(), sstables);</span>
+    }
+
+    public AbstractType&lt;?&gt; keyValidator()
+    {
+<span class="nc" id="L99">        return keyValidator;</span>
+    }
+
+    public long index(DecoratedKey key, Row row)
+    {
+<span class="nc" id="L104">        return getCurrentMemtable().index(key, getValueOf(column, row, FBUtilities.nowInSeconds()));</span>
+    }
+
+    public void switchMemtable()
+    {
+        // discard current memtable with all of it's data, useful on truncate
+<span class="nc" id="L110">        memtable.set(new IndexMemtable(this));</span>
+<span class="nc" id="L111">    }</span>
+
+    public void switchMemtable(Memtable parent)
+    {
+<span class="nc" id="L115">        pendingFlush.putIfAbsent(parent, memtable.getAndSet(new IndexMemtable(this)));</span>
+<span class="nc" id="L116">    }</span>
+
+    public void discardMemtable(Memtable parent)
+    {
+<span class="nc" id="L120">        pendingFlush.remove(parent);</span>
+<span class="nc" id="L121">    }</span>
+
+    @VisibleForTesting
+    public IndexMemtable getCurrentMemtable()
+    {
+<span class="nc" id="L126">        return memtable.get();</span>
+    }
+
+    @VisibleForTesting
+    public Collection&lt;IndexMemtable&gt; getPendingMemtables()
+    {
+<span class="nc" id="L132">        return pendingFlush.values();</span>
+    }
+
+    public RangeIterator&lt;Long, Token&gt; searchMemtable(Expression e)
+    {
+<span class="nc" id="L137">        RangeIterator.Builder&lt;Long, Token&gt; builder = new RangeUnionIterator.Builder&lt;&gt;();</span>
+<span class="nc" id="L138">        builder.add(getCurrentMemtable().search(e));</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        for (IndexMemtable memtable : getPendingMemtables())</span>
+<span class="nc" id="L140">            builder.add(memtable.search(e));</span>
+
+<span class="nc" id="L142">        return builder.build();</span>
+    }
+
+    public void update(Collection&lt;SSTableReader&gt; oldSSTables, Collection&lt;SSTableReader&gt; newSSTables)
+    {
+<span class="nc" id="L147">        tracker.update(oldSSTables, newSSTables);</span>
+<span class="nc" id="L148">    }</span>
+
+    public ColumnDefinition getDefinition()
+    {
+<span class="nc" id="L152">        return column;</span>
+    }
+
+    public AbstractType&lt;?&gt; getValidator()
+    {
+<span class="nc" id="L157">        return column.cellValueType();</span>
+    }
+
+    public Component getComponent()
+    {
+<span class="nc" id="L162">        return component;</span>
+    }
+
+    public IndexMode getMode()
+    {
+<span class="nc" id="L167">        return mode;</span>
+    }
+
+    public String getColumnName()
+    {
+<span class="nc" id="L172">        return column.name.toString();</span>
+    }
+
+    public String getIndexName()
+    {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        return config.isPresent() ? config.get().name : &quot;undefined&quot;;</span>
+    }
+
+    public AbstractAnalyzer getAnalyzer()
+    {
+<span class="nc" id="L182">        AbstractAnalyzer analyzer = mode.getAnalyzer(getValidator());</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        analyzer.init(config.isPresent() ? config.get().options : Collections.emptyMap(), column.cellValueType());</span>
+<span class="nc" id="L184">        return analyzer;</span>
+    }
+
+    public View getView()
+    {
+<span class="nc" id="L189">        return tracker.getView();</span>
+    }
+
+    public boolean hasSSTable(SSTableReader sstable)
+    {
+<span class="nc" id="L194">        return tracker.hasSSTable(sstable);</span>
+    }
+
+    public void dropData(Collection&lt;SSTableReader&gt; sstablesToRebuild)
+    {
+<span class="nc" id="L199">        tracker.dropData(sstablesToRebuild);</span>
+<span class="nc" id="L200">    }</span>
+
+    public void dropData(long truncateUntil)
+    {
+<span class="nc" id="L204">        switchMemtable();</span>
+<span class="nc" id="L205">        tracker.dropData(truncateUntil);</span>
+<span class="nc" id="L206">    }</span>
+
+    public boolean isIndexed()
+    {
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        return mode != IndexMode.NOT_INDEXED;</span>
+    }
+
+    public boolean isLiteral()
+    {
+<span class="nc" id="L215">        AbstractType&lt;?&gt; validator = getValidator();</span>
+<span class="nc bnc" id="L216" title="All 6 branches missed.">        return isIndexed() ? mode.isLiteral : (validator instanceof UTF8Type || validator instanceof AsciiType);</span>
+    }
+
+    public boolean supports(Operator op)
+    {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (op == Operator.LIKE)</span>
+<span class="nc" id="L222">            return isLiteral();</span>
+
+<span class="nc" id="L224">        Op operator = Op.valueOf(op);</span>
+<span class="nc bnc" id="L225" title="All 10 branches missed.">        return !(isTokenized &amp;&amp; operator == Op.EQ) // EQ is only applicable to non-tokenized indexes</span>
+               &amp;&amp; !(isTokenized &amp;&amp; mode.mode == OnDiskIndexBuilder.Mode.CONTAINS &amp;&amp; operator == Op.PREFIX) // PREFIX not supported on tokenized CONTAINS mode indexes
+<span class="nc bnc" id="L227" title="All 4 branches missed.">               &amp;&amp; !(isLiteral() &amp;&amp; operator == Op.RANGE) // RANGE only applicable to indexes non-literal indexes</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">               &amp;&amp; mode.supports(operator); // for all other cases let's refer to index itself</span>
+
+    }
+
+    public static ByteBuffer getValueOf(ColumnDefinition column, Row row, int nowInSecs)
+    {
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (row == null)</span>
+<span class="nc" id="L235">            return null;</span>
+
+<span class="nc bnc" id="L237" title="All 4 branches missed.">        switch (column.kind)</span>
+        {
+            case CLUSTERING:
+                // skip indexing of static clustering when regular column is indexed
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                if (row.isStatic())</span>
+<span class="nc" id="L242">                    return null;</span>
+
+<span class="nc" id="L244">                return row.clustering().get(column.position());</span>
+
+            // treat static cell retrieval the same was as regular
+            // only if row kind is STATIC otherwise return null
+            case STATIC:
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (!row.isStatic())</span>
+<span class="nc" id="L250">                    return null;</span>
+            case REGULAR:
+<span class="nc" id="L252">                Cell cell = row.getCell(column);</span>
+<span class="nc bnc" id="L253" title="All 4 branches missed.">                return cell == null || !cell.isLive(nowInSecs) ? null : cell.value();</span>
+
+            default:
+<span class="nc" id="L256">                return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

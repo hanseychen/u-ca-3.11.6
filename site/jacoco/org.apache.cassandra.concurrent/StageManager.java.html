@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StageManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.concurrent</a> &gt; <span class="el_source">StageManager.java</span></div><h1>StageManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.concurrent;
+
+import java.util.EnumMap;
+import java.util.concurrent.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.config.DatabaseDescriptor.*;
+
+
+/**
+ * This class manages executor services for Messages recieved: each Message requests
+ * running on a specific &quot;stage&quot; for concurrency control; hence the Map approach,
+ * even though stages (executors) are not created dynamically.
+ */
+<span class="nc" id="L39">public class StageManager</span>
+{
+<span class="fc" id="L41">    private static final Logger logger = LoggerFactory.getLogger(StageManager.class);</span>
+
+<span class="fc" id="L43">    private static final EnumMap&lt;Stage, LocalAwareExecutorService&gt; stages = new EnumMap&lt;Stage, LocalAwareExecutorService&gt;(Stage.class);</span>
+
+    public static final long KEEPALIVE = 60; // seconds to keep &quot;extra&quot; threads alive for when idle
+
+    static
+    {
+<span class="fc" id="L49">        stages.put(Stage.MUTATION, multiThreadedLowSignalStage(Stage.MUTATION, getConcurrentWriters()));</span>
+<span class="fc" id="L50">        stages.put(Stage.COUNTER_MUTATION, multiThreadedLowSignalStage(Stage.COUNTER_MUTATION, getConcurrentCounterWriters()));</span>
+<span class="fc" id="L51">        stages.put(Stage.VIEW_MUTATION, multiThreadedLowSignalStage(Stage.VIEW_MUTATION, getConcurrentViewWriters()));</span>
+<span class="fc" id="L52">        stages.put(Stage.READ, multiThreadedLowSignalStage(Stage.READ, getConcurrentReaders()));</span>
+<span class="fc" id="L53">        stages.put(Stage.REQUEST_RESPONSE, multiThreadedLowSignalStage(Stage.REQUEST_RESPONSE, FBUtilities.getAvailableProcessors()));</span>
+<span class="fc" id="L54">        stages.put(Stage.INTERNAL_RESPONSE, multiThreadedStage(Stage.INTERNAL_RESPONSE, FBUtilities.getAvailableProcessors()));</span>
+        // the rest are all single-threaded
+<span class="fc" id="L56">        stages.put(Stage.GOSSIP, new JMXEnabledThreadPoolExecutor(Stage.GOSSIP));</span>
+<span class="fc" id="L57">        stages.put(Stage.ANTI_ENTROPY, new JMXEnabledThreadPoolExecutor(Stage.ANTI_ENTROPY));</span>
+<span class="fc" id="L58">        stages.put(Stage.MIGRATION, new JMXEnabledThreadPoolExecutor(Stage.MIGRATION));</span>
+<span class="fc" id="L59">        stages.put(Stage.MISC, new JMXEnabledThreadPoolExecutor(Stage.MISC));</span>
+<span class="fc" id="L60">        stages.put(Stage.READ_REPAIR, multiThreadedStage(Stage.READ_REPAIR, FBUtilities.getAvailableProcessors()));</span>
+<span class="fc" id="L61">        stages.put(Stage.TRACING, tracingExecutor());</span>
+<span class="fc" id="L62">    }</span>
+
+    private static LocalAwareExecutorService tracingExecutor()
+    {
+<span class="fc" id="L66">        RejectedExecutionHandler reh = new RejectedExecutionHandler()</span>
+<span class="fc" id="L67">        {</span>
+            public void rejectedExecution(Runnable r, ThreadPoolExecutor executor)
+            {
+<span class="nc" id="L70">                MessagingService.instance().incrementDroppedMessages(MessagingService.Verb._TRACE);</span>
+<span class="nc" id="L71">            }</span>
+        };
+<span class="fc" id="L73">        return new TracingExecutor(1,</span>
+                                   1,
+                                   KEEPALIVE,
+                                   TimeUnit.SECONDS,
+                                   new ArrayBlockingQueue&lt;Runnable&gt;(1000),
+<span class="fc" id="L78">                                   new NamedThreadFactory(Stage.TRACING.getJmxName()),</span>
+                                   reh);
+    }
+
+    private static JMXEnabledThreadPoolExecutor multiThreadedStage(Stage stage, int numThreads)
+    {
+<span class="fc" id="L84">        return new JMXEnabledThreadPoolExecutor(numThreads,</span>
+                                                KEEPALIVE,
+                                                TimeUnit.SECONDS,
+                                                new LinkedBlockingQueue&lt;Runnable&gt;(),
+<span class="fc" id="L88">                                                new NamedThreadFactory(stage.getJmxName()),</span>
+<span class="fc" id="L89">                                                stage.getJmxType());</span>
+    }
+
+    private static LocalAwareExecutorService multiThreadedLowSignalStage(Stage stage, int numThreads)
+    {
+<span class="fc" id="L94">        return SharedExecutorPool.SHARED.newExecutor(numThreads, Integer.MAX_VALUE, stage.getJmxType(), stage.getJmxName());</span>
+    }
+
+    /**
+     * Retrieve a stage from the StageManager
+     * @param stage name of the stage to be retrieved.
+     */
+    public static LocalAwareExecutorService getStage(Stage stage)
+    {
+<span class="fc" id="L103">        return stages.get(stage);</span>
+    }
+
+    /**
+     * This method shuts down all registered stages.
+     */
+    public static void shutdownNow()
+    {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        for (Stage stage : Stage.values())</span>
+        {
+<span class="nc" id="L113">            StageManager.stages.get(stage).shutdownNow();</span>
+        }
+<span class="nc" id="L115">    }</span>
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L120">        ExecutorUtils.shutdownNowAndWait(timeout, unit, StageManager.stages.values());</span>
+<span class="nc" id="L121">    }</span>
+
+    /**
+     * The executor used for tracing.
+     */
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">    private static class TracingExecutor extends ThreadPoolExecutor implements LocalAwareExecutorService</span>
+    {
+        public TracingExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue&lt;Runnable&gt; workQueue, ThreadFactory threadFactory, RejectedExecutionHandler handler)
+        {
+<span class="fc" id="L130">            super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler);</span>
+<span class="fc" id="L131">        }</span>
+
+        public void execute(Runnable command, ExecutorLocals locals)
+        {
+<span class="nc bnc" id="L135" title="All 4 branches missed.">            assert locals == null;</span>
+<span class="nc" id="L136">            super.execute(command);</span>
+<span class="nc" id="L137">        }</span>
+
+        public void maybeExecuteImmediately(Runnable command)
+        {
+<span class="nc" id="L141">            execute(command);</span>
+<span class="nc" id="L142">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,405 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsDescriptor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsDescriptor.java</span></div><h1>HintsDescriptor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.DataInput;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.regex.Pattern;
+import java.util.zip.CRC32;
+import javax.crypto.Cipher;
+
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.ICompressor;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.utils.Hex;
+import org.json.simple.JSONValue;
+
+import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
+
+/**
+ * Describes the host id, the version, the timestamp of creation, and an arbitrary map of JSON-encoded parameters of a
+ * hints file.
+ *
+ * Written in the beginning of each hints file.
+ */
+final class HintsDescriptor
+{
+<span class="nc" id="L61">    private static final Logger logger = LoggerFactory.getLogger(HintsDescriptor.class);</span>
+
+    static final int VERSION_30 = 1;
+    static final int CURRENT_VERSION = VERSION_30;
+
+    static final String COMPRESSION = &quot;compression&quot;;
+    static final String ENCRYPTION = &quot;encryption&quot;;
+
+<span class="nc" id="L69">    static final Pattern pattern =</span>
+<span class="nc" id="L70">        Pattern.compile(&quot;^[a-fA-F0-9]{8}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{4}\\-[a-fA-F0-9]{12}\\-(\\d+)\\-(\\d+)\\.hints$&quot;);</span>
+
+    final UUID hostId;
+    final int version;
+    final long timestamp;
+
+    final ImmutableMap&lt;String, Object&gt; parameters;
+    final ParameterizedClass compressionConfig;
+
+    private final Cipher cipher;
+    private final ICompressor compressor;
+
+    HintsDescriptor(UUID hostId, int version, long timestamp, ImmutableMap&lt;String, Object&gt; parameters)
+<span class="nc" id="L83">    {</span>
+<span class="nc" id="L84">        this.hostId = hostId;</span>
+<span class="nc" id="L85">        this.version = version;</span>
+<span class="nc" id="L86">        this.timestamp = timestamp;</span>
+<span class="nc" id="L87">        compressionConfig = createCompressionConfig(parameters);</span>
+
+<span class="nc" id="L89">        EncryptionData encryption = createEncryption(parameters);</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        if (encryption == null)</span>
+        {
+<span class="nc" id="L92">            cipher = null;</span>
+<span class="nc" id="L93">            compressor = null;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (compressionConfig != null)</span>
+<span class="nc" id="L98">                throw new IllegalStateException(&quot;a hints file cannot be configured for both compression and encryption&quot;);</span>
+<span class="nc" id="L99">            cipher = encryption.cipher;</span>
+<span class="nc" id="L100">            compressor = encryption.compressor;</span>
+<span class="nc" id="L101">            parameters = encryption.params;</span>
+        }
+
+<span class="nc" id="L104">        this.parameters = parameters;</span>
+<span class="nc" id="L105">    }</span>
+
+    HintsDescriptor(UUID hostId, long timestamp, ImmutableMap&lt;String, Object&gt; parameters)
+    {
+<span class="nc" id="L109">        this(hostId, CURRENT_VERSION, timestamp, parameters);</span>
+<span class="nc" id="L110">    }</span>
+
+    HintsDescriptor(UUID hostId, long timestamp)
+    {
+<span class="nc" id="L114">        this(hostId, CURRENT_VERSION, timestamp, ImmutableMap.&lt;String, Object&gt;of());</span>
+<span class="nc" id="L115">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    static ParameterizedClass createCompressionConfig(Map&lt;String, Object&gt; params)
+    {
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (params.containsKey(COMPRESSION))</span>
+        {
+<span class="nc" id="L122">            Map&lt;String, Object&gt; compressorConfig = (Map&lt;String, Object&gt;) params.get(COMPRESSION);</span>
+<span class="nc" id="L123">            return new ParameterizedClass((String) compressorConfig.get(ParameterizedClass.CLASS_NAME),</span>
+<span class="nc" id="L124">                                          (Map&lt;String, String&gt;) compressorConfig.get(ParameterizedClass.PARAMETERS));</span>
+        }
+        else
+        {
+<span class="nc" id="L128">            return null;</span>
+        }
+    }
+
+    /**
+     * Create, if necessary, the required encryption components (for either decrpyt or encrypt operations).
+     * Note that in the case of encyption (this is, when writing out a new hints file), we need to write
+     * the cipher's IV out to the header so it can be used when decrypting. Thus, we need to add an additional
+     * entry to the {@code params} map.
+     *
+     * @param params the base parameters into the descriptor.
+     * @return null if not using encryption; else, the initialized {@link Cipher} and a possibly updated version
+     * of the {@code params} map.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    static EncryptionData createEncryption(ImmutableMap&lt;String, Object&gt; params)
+    {
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (params.containsKey(ENCRYPTION))</span>
+        {
+<span class="nc" id="L147">            Map&lt;?, ?&gt; encryptionConfig = (Map&lt;?, ?&gt;) params.get(ENCRYPTION);</span>
+<span class="nc" id="L148">            EncryptionContext encryptionContext = EncryptionContext.createFromMap(encryptionConfig, DatabaseDescriptor.getEncryptionContext());</span>
+
+            try
+            {
+                Cipher cipher;
+<span class="nc bnc" id="L153" title="All 2 branches missed.">                if (encryptionConfig.containsKey(EncryptionContext.ENCRYPTION_IV))</span>
+                {
+<span class="nc" id="L155">                    cipher = encryptionContext.getDecryptor();</span>
+                }
+                else
+                {
+<span class="nc" id="L159">                    cipher = encryptionContext.getEncryptor();</span>
+<span class="nc" id="L160">                    ImmutableMap&lt;String, Object&gt; encParams = ImmutableMap.&lt;String, Object&gt;builder()</span>
+<span class="nc" id="L161">                                                                 .putAll(encryptionContext.toHeaderParameters())</span>
+<span class="nc" id="L162">                                                                 .put(EncryptionContext.ENCRYPTION_IV, Hex.bytesToHex(cipher.getIV()))</span>
+<span class="nc" id="L163">                                                                 .build();</span>
+
+<span class="nc" id="L165">                    Map&lt;String, Object&gt; map = new HashMap&lt;&gt;(params);</span>
+<span class="nc" id="L166">                    map.put(ENCRYPTION, encParams);</span>
+<span class="nc" id="L167">                    params = ImmutableMap.&lt;String, Object&gt;builder().putAll(map).build();</span>
+                }
+<span class="nc" id="L169">                return new EncryptionData(cipher, encryptionContext.getCompressor(), params);</span>
+            }
+<span class="nc" id="L171">            catch (IOException ioe)</span>
+            {
+<span class="nc" id="L173">                logger.warn(&quot;failed to create encyption context for hints file. ignoring encryption for hints.&quot;, ioe);</span>
+<span class="nc" id="L174">                return null;</span>
+            }
+        }
+        else
+        {
+<span class="nc" id="L179">            return null;</span>
+        }
+    }
+
+    private static final class EncryptionData
+    {
+        final Cipher cipher;
+        final ICompressor compressor;
+        final ImmutableMap&lt;String, Object&gt; params;
+
+        private EncryptionData(Cipher cipher, ICompressor compressor, ImmutableMap&lt;String, Object&gt; params)
+<span class="nc" id="L190">        {</span>
+<span class="nc" id="L191">            this.cipher = cipher;</span>
+<span class="nc" id="L192">            this.compressor = compressor;</span>
+<span class="nc" id="L193">            this.params = params;</span>
+<span class="nc" id="L194">        }</span>
+    }
+
+    String fileName()
+    {
+<span class="nc" id="L199">        return String.format(&quot;%s-%s-%s.hints&quot;, hostId, timestamp, version);</span>
+    }
+
+    String checksumFileName()
+    {
+<span class="nc" id="L204">        return String.format(&quot;%s-%s-%s.crc32&quot;, hostId, timestamp, version);</span>
+    }
+
+    int messagingVersion()
+    {
+<span class="nc" id="L209">        return messagingVersion(version);</span>
+    }
+
+    static int messagingVersion(int hintsVersion)
+    {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        switch (hintsVersion)</span>
+        {
+            case VERSION_30:
+<span class="nc bnc" id="L217" title="All 2 branches missed.">                return MessagingService.FORCE_3_0_PROTOCOL_VERSION ? MessagingService.VERSION_30 : MessagingService.VERSION_3014;</span>
+            default:
+<span class="nc" id="L219">                throw new AssertionError();</span>
+        }
+    }
+
+    static boolean isHintFileName(Path path)
+    {
+<span class="nc" id="L225">        return pattern.matcher(path.getFileName().toString()).matches();</span>
+    }
+
+    static Optional&lt;HintsDescriptor&gt; readFromFileQuietly(Path path)
+    {
+<span class="nc" id="L230">        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), &quot;r&quot;))</span>
+        {
+<span class="nc" id="L232">            return Optional.of(deserialize(raf));</span>
+        }
+<span class="nc" id="L234">        catch (ChecksumMismatchException e)</span>
+        {
+<span class="nc" id="L236">            throw new FSReadError(e, path.toFile());</span>
+        }
+<span class="nc" id="L238">        catch (IOException e)</span>
+        {
+<span class="nc" id="L240">            logger.error(&quot;Failed to deserialize hints descriptor {}&quot;, path.toString(), e);</span>
+<span class="nc" id="L241">            return Optional.empty();</span>
+        }
+    }
+
+    static HintsDescriptor readFromFile(Path path)
+    {
+<span class="nc" id="L247">        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), &quot;r&quot;))</span>
+        {
+<span class="nc" id="L249">            return deserialize(raf);</span>
+        }
+<span class="nc" id="L251">        catch (IOException e)</span>
+        {
+<span class="nc" id="L253">            throw new FSReadError(e, path.toFile());</span>
+        }
+    }
+
+    public boolean isCompressed()
+    {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        return compressionConfig != null;</span>
+    }
+
+    public boolean isEncrypted()
+    {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        return cipher != null;</span>
+    }
+
+    public ICompressor createCompressor()
+    {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (isCompressed())</span>
+<span class="nc" id="L270">            return CompressionParams.createCompressor(compressionConfig);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (isEncrypted())</span>
+<span class="nc" id="L272">            return compressor;</span>
+<span class="nc" id="L273">        return null;</span>
+    }
+
+    public Cipher getCipher()
+    {
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        return isEncrypted() ? cipher : null;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L284">        return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L285">                          .add(&quot;hostId&quot;, hostId)</span>
+<span class="nc" id="L286">                          .add(&quot;version&quot;, version)</span>
+<span class="nc" id="L287">                          .add(&quot;timestamp&quot;, timestamp)</span>
+<span class="nc" id="L288">                          .add(&quot;parameters&quot;, parameters)</span>
+<span class="nc" id="L289">                          .toString();</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (this == o)</span>
+<span class="nc" id="L296">            return true;</span>
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (!(o instanceof HintsDescriptor))</span>
+<span class="nc" id="L299">            return false;</span>
+
+<span class="nc" id="L301">        HintsDescriptor hd = (HintsDescriptor) o;</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        return Objects.equal(hostId, hd.hostId)</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            &amp;&amp; Objects.equal(version, hd.version)</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">            &amp;&amp; Objects.equal(timestamp, hd.timestamp)</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            &amp;&amp; Objects.equal(parameters, hd.parameters);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L312">        return Objects.hashCode(hostId, version, timestamp, parameters);</span>
+    }
+
+    void serialize(DataOutputPlus out) throws IOException
+    {
+<span class="nc" id="L317">        CRC32 crc = new CRC32();</span>
+
+<span class="nc" id="L319">        out.writeInt(version);</span>
+<span class="nc" id="L320">        updateChecksumInt(crc, version);</span>
+
+<span class="nc" id="L322">        out.writeLong(timestamp);</span>
+<span class="nc" id="L323">        updateChecksumLong(crc, timestamp);</span>
+
+<span class="nc" id="L325">        out.writeLong(hostId.getMostSignificantBits());</span>
+<span class="nc" id="L326">        updateChecksumLong(crc, hostId.getMostSignificantBits());</span>
+<span class="nc" id="L327">        out.writeLong(hostId.getLeastSignificantBits());</span>
+<span class="nc" id="L328">        updateChecksumLong(crc, hostId.getLeastSignificantBits());</span>
+
+<span class="nc" id="L330">        byte[] paramsBytes = JSONValue.toJSONString(parameters).getBytes(StandardCharsets.UTF_8);</span>
+<span class="nc" id="L331">        out.writeInt(paramsBytes.length);</span>
+<span class="nc" id="L332">        updateChecksumInt(crc, paramsBytes.length);</span>
+<span class="nc" id="L333">        out.writeInt((int) crc.getValue());</span>
+
+<span class="nc" id="L335">        out.write(paramsBytes);</span>
+<span class="nc" id="L336">        crc.update(paramsBytes, 0, paramsBytes.length);</span>
+
+<span class="nc" id="L338">        out.writeInt((int) crc.getValue());</span>
+<span class="nc" id="L339">    }</span>
+
+    int serializedSize()
+    {
+<span class="nc" id="L343">        int size = TypeSizes.sizeof(version);</span>
+<span class="nc" id="L344">        size += TypeSizes.sizeof(timestamp);</span>
+
+<span class="nc" id="L346">        size += TypeSizes.sizeof(hostId.getMostSignificantBits());</span>
+<span class="nc" id="L347">        size += TypeSizes.sizeof(hostId.getLeastSignificantBits());</span>
+
+<span class="nc" id="L349">        byte[] paramsBytes = JSONValue.toJSONString(parameters).getBytes(StandardCharsets.UTF_8);</span>
+<span class="nc" id="L350">        size += TypeSizes.sizeof(paramsBytes.length);</span>
+<span class="nc" id="L351">        size += 4; // size checksum</span>
+<span class="nc" id="L352">        size += paramsBytes.length;</span>
+<span class="nc" id="L353">        size += 4; // total checksum</span>
+
+<span class="nc" id="L355">        return size;</span>
+    }
+
+    static HintsDescriptor deserialize(DataInput in) throws IOException
+    {
+<span class="nc" id="L360">        CRC32 crc = new CRC32();</span>
+
+<span class="nc" id="L362">        int version = in.readInt();</span>
+<span class="nc" id="L363">        updateChecksumInt(crc, version);</span>
+
+<span class="nc" id="L365">        long timestamp = in.readLong();</span>
+<span class="nc" id="L366">        updateChecksumLong(crc, timestamp);</span>
+
+<span class="nc" id="L368">        long msb = in.readLong();</span>
+<span class="nc" id="L369">        updateChecksumLong(crc, msb);</span>
+<span class="nc" id="L370">        long lsb = in.readLong();</span>
+<span class="nc" id="L371">        updateChecksumLong(crc, lsb);</span>
+
+<span class="nc" id="L373">        UUID hostId = new UUID(msb, lsb);</span>
+
+<span class="nc" id="L375">        int paramsLength = in.readInt();</span>
+<span class="nc" id="L376">        updateChecksumInt(crc, paramsLength);</span>
+<span class="nc" id="L377">        validateCRC(in.readInt(), (int) crc.getValue());</span>
+
+<span class="nc" id="L379">        byte[] paramsBytes = new byte[paramsLength];</span>
+<span class="nc" id="L380">        in.readFully(paramsBytes, 0, paramsLength);</span>
+<span class="nc" id="L381">        crc.update(paramsBytes, 0, paramsLength);</span>
+<span class="nc" id="L382">        validateCRC(in.readInt(), (int) crc.getValue());</span>
+
+<span class="nc" id="L384">        return new HintsDescriptor(hostId, version, timestamp, decodeJSONBytes(paramsBytes));</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static ImmutableMap&lt;String, Object&gt; decodeJSONBytes(byte[] bytes)
+    {
+<span class="nc" id="L390">        return ImmutableMap.copyOf((Map&lt;String, Object&gt;) JSONValue.parse(new String(bytes, StandardCharsets.UTF_8)));</span>
+    }
+
+    private static void updateChecksumLong(CRC32 crc, long value)
+    {
+<span class="nc" id="L395">        updateChecksumInt(crc, (int) (value &amp; 0xFFFFFFFFL));</span>
+<span class="nc" id="L396">        updateChecksumInt(crc, (int) (value &gt;&gt;&gt; 32));</span>
+<span class="nc" id="L397">    }</span>
+
+    private static void validateCRC(int expected, int actual) throws IOException
+    {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (expected != actual)</span>
+<span class="nc" id="L402">            throw new ChecksumMismatchException(&quot;Hints Descriptor CRC Mismatch&quot;);</span>
+<span class="nc" id="L403">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

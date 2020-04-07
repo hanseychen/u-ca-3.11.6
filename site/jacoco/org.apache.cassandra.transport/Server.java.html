@@ -1,0 +1,723 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Server.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">Server.java</span></div><h1>Server.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.transport;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.*;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.Version;
+import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.concurrent.GlobalEventExecutor;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.net.ResourceLimits;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.service.*;
+import org.apache.cassandra.transport.messages.EventMessage;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class Server implements CassandraDaemon.Server
+{
+    static
+    {
+<span class="fc" id="L64">        InternalLoggerFactory.setDefaultFactory(new Slf4JLoggerFactory());</span>
+    }
+
+<span class="fc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(Server.class);</span>
+<span class="fc" id="L68">    private static final boolean useEpoll = NativeTransportService.useEpoll();</span>
+
+<span class="fc" id="L70">    private final ConnectionTracker connectionTracker = new ConnectionTracker();</span>
+
+<span class="fc" id="L72">    private final Connection.Factory connectionFactory = new Connection.Factory()</span>
+<span class="fc" id="L73">    {</span>
+        public Connection newConnection(Channel channel, ProtocolVersion version)
+        {
+<span class="nc" id="L76">            return new ServerConnection(channel, version, connectionTracker);</span>
+        }
+    };
+
+    public final InetSocketAddress socket;
+<span class="fc" id="L81">    public boolean useSSL = false;</span>
+<span class="fc" id="L82">    private final AtomicBoolean isRunning = new AtomicBoolean(false);</span>
+
+    private EventLoopGroup workerGroup;
+    private final ProtocolVersionLimit protocolVersionLimit;
+
+    private Server (Builder builder)
+<span class="fc" id="L88">    {</span>
+<span class="fc" id="L89">        this.socket = builder.getSocket();</span>
+<span class="fc" id="L90">        this.useSSL = builder.useSSL;</span>
+<span class="fc" id="L91">        this.protocolVersionLimit = builder.getProtocolVersionLimit();</span>
+
+<span class="pc bpc" id="L93" title="1 of 2 branches missed.">        if (builder.workerGroup != null)</span>
+        {
+<span class="fc" id="L95">            workerGroup = builder.workerGroup;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">            if (useEpoll)</span>
+<span class="nc" id="L100">                workerGroup = new EpollEventLoopGroup();</span>
+            else
+<span class="nc" id="L102">                workerGroup = new NioEventLoopGroup();</span>
+        }
+<span class="fc" id="L104">        EventNotifier notifier = new EventNotifier(this);</span>
+<span class="fc" id="L105">        StorageService.instance.register(notifier);</span>
+<span class="fc" id="L106">        MigrationManager.instance.register(notifier);</span>
+<span class="fc" id="L107">    }</span>
+
+    public void stop()
+    {
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">        if (isRunning.compareAndSet(true, false))</span>
+<span class="fc" id="L112">            close();</span>
+<span class="fc" id="L113">    }</span>
+
+    public boolean isRunning()
+    {
+<span class="fc" id="L117">        return isRunning.get();</span>
+    }
+
+    public synchronized void start()
+    {
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">        if(isRunning())</span>
+<span class="nc" id="L123">            return;</span>
+
+        // Configure the server.
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        ServerBootstrap bootstrap = new ServerBootstrap()</span>
+<span class="fc" id="L127">                                    .channel(useEpoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class)</span>
+<span class="fc" id="L128">                                    .childOption(ChannelOption.TCP_NODELAY, true)</span>
+<span class="fc" id="L129">                                    .childOption(ChannelOption.SO_LINGER, 0)</span>
+<span class="fc" id="L130">                                    .childOption(ChannelOption.SO_KEEPALIVE, DatabaseDescriptor.getRpcKeepAlive())</span>
+<span class="fc" id="L131">                                    .childOption(ChannelOption.ALLOCATOR, CBUtil.allocator)</span>
+<span class="fc" id="L132">                                    .childOption(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 32 * 1024)</span>
+<span class="fc" id="L133">                                    .childOption(ChannelOption.WRITE_BUFFER_LOW_WATER_MARK, 8 * 1024);</span>
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">        if (workerGroup != null)</span>
+<span class="fc" id="L135">            bootstrap = bootstrap.group(workerGroup);</span>
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        if (this.useSSL)</span>
+        {
+<span class="nc" id="L139">            final EncryptionOptions.ClientEncryptionOptions clientEnc = DatabaseDescriptor.getClientEncryptionOptions();</span>
+
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if (clientEnc.optional)</span>
+            {
+<span class="nc" id="L143">                logger.info(&quot;Enabling optionally encrypted CQL connections between client and server&quot;);</span>
+<span class="nc" id="L144">                bootstrap.childHandler(new OptionalSecureInitializer(this, clientEnc));</span>
+            }
+            else
+            {
+<span class="nc" id="L148">                logger.info(&quot;Enabling encrypted CQL connections between client and server&quot;);</span>
+<span class="nc" id="L149">                bootstrap.childHandler(new SecureInitializer(this, clientEnc));</span>
+            }
+<span class="nc" id="L151">        }</span>
+        else
+        {
+<span class="fc" id="L154">            bootstrap.childHandler(new Initializer(this));</span>
+        }
+
+        // Bind and start to accept incoming connections.
+<span class="fc" id="L158">        logger.info(&quot;Using Netty Version: {}&quot;, Version.identify().entrySet());</span>
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">        logger.info(&quot;Starting listening for CQL clients on {} ({})...&quot;, socket, this.useSSL ? &quot;encrypted&quot; : &quot;unencrypted&quot;);</span>
+
+<span class="fc" id="L161">        ChannelFuture bindFuture = bootstrap.bind(socket);</span>
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (!bindFuture.awaitUninterruptibly().isSuccess())</span>
+<span class="nc" id="L163">            throw new IllegalStateException(String.format(&quot;Failed to bind port %d on %s.&quot;, socket.getPort(), socket.getAddress().getHostAddress()));</span>
+
+<span class="fc" id="L165">        connectionTracker.allChannels.add(bindFuture.channel());</span>
+<span class="fc" id="L166">        isRunning.set(true);</span>
+<span class="fc" id="L167">    }</span>
+
+    public int getConnectedClients()
+    {
+<span class="nc" id="L171">        return connectionTracker.getConnectedClients();</span>
+    }
+
+    private void close()
+    {
+        // Close opened connections
+<span class="fc" id="L177">        connectionTracker.closeAll();</span>
+
+<span class="fc" id="L179">        logger.info(&quot;Stop listening for CQL clients&quot;);</span>
+<span class="fc" id="L180">    }</span>
+
+<span class="fc" id="L182">    public static class Builder</span>
+    {
+        private EventLoopGroup workerGroup;
+        private EventExecutor eventExecutorGroup;
+<span class="fc" id="L186">        private boolean useSSL = false;</span>
+        private InetAddress hostAddr;
+<span class="fc" id="L188">        private int port = -1;</span>
+        private InetSocketAddress socket;
+        private ProtocolVersionLimit versionLimit;
+
+        public Builder withSSL(boolean useSSL)
+        {
+<span class="fc" id="L194">            this.useSSL = useSSL;</span>
+<span class="fc" id="L195">            return this;</span>
+        }
+
+        public Builder withEventLoopGroup(EventLoopGroup eventLoopGroup)
+        {
+<span class="fc" id="L200">            this.workerGroup = eventLoopGroup;</span>
+<span class="fc" id="L201">            return this;</span>
+        }
+
+        public Builder withHost(InetAddress host)
+        {
+<span class="fc" id="L206">            this.hostAddr = host;</span>
+<span class="fc" id="L207">            this.socket = null;</span>
+<span class="fc" id="L208">            return this;</span>
+        }
+
+        public Builder withPort(int port)
+        {
+<span class="fc" id="L213">            this.port = port;</span>
+<span class="fc" id="L214">            this.socket = null;</span>
+<span class="fc" id="L215">            return this;</span>
+        }
+
+        public Builder withProtocolVersionLimit(ProtocolVersionLimit limit)
+        {
+<span class="fc" id="L220">            this.versionLimit = limit;</span>
+<span class="fc" id="L221">            return this;</span>
+        }
+
+        ProtocolVersionLimit getProtocolVersionLimit()
+        {
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">            if (versionLimit == null)</span>
+<span class="nc" id="L227">                throw new IllegalArgumentException(&quot;Missing protocol version limiter&quot;);</span>
+<span class="fc" id="L228">            return versionLimit;</span>
+        }
+
+        public Server build()
+        {
+<span class="fc" id="L233">            return new Server(this);</span>
+        }
+
+        private InetSocketAddress getSocket()
+        {
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">            if (this.socket != null)</span>
+<span class="nc" id="L239">                return this.socket;</span>
+            else
+            {
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">                if (this.port == -1)</span>
+<span class="nc" id="L243">                    throw new IllegalStateException(&quot;Missing port number&quot;);</span>
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">                if (this.hostAddr != null)</span>
+<span class="fc" id="L245">                    this.socket = new InetSocketAddress(this.hostAddr, this.port);</span>
+                else
+<span class="nc" id="L247">                    throw new IllegalStateException(&quot;Missing host&quot;);</span>
+<span class="fc" id="L248">                return this.socket;</span>
+            }
+        }
+    }
+
+    public static class ConnectionTracker implements Connection.Tracker
+    {
+        // TODO: should we be using the GlobalEventExecutor or defining our own?
+<span class="fc" id="L256">        public final ChannelGroup allChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);</span>
+<span class="fc" id="L257">        private final EnumMap&lt;Event.Type, ChannelGroup&gt; groups = new EnumMap&lt;&gt;(Event.Type.class);</span>
+
+        public ConnectionTracker()
+<span class="fc" id="L260">        {</span>
+<span class="fc bfc" id="L261" title="All 2 branches covered.">            for (Event.Type type : Event.Type.values())</span>
+<span class="fc" id="L262">                groups.put(type, new DefaultChannelGroup(type.toString(), GlobalEventExecutor.INSTANCE));</span>
+<span class="fc" id="L263">        }</span>
+
+        public void addConnection(Channel ch, Connection connection)
+        {
+<span class="nc" id="L267">            allChannels.add(ch);</span>
+<span class="nc" id="L268">        }</span>
+
+        public void register(Event.Type type, Channel ch)
+        {
+<span class="nc" id="L272">            groups.get(type).add(ch);</span>
+<span class="nc" id="L273">        }</span>
+
+        public void send(Event event)
+        {
+<span class="fc" id="L277">            groups.get(event.type).writeAndFlush(new EventMessage(event));</span>
+<span class="fc" id="L278">        }</span>
+
+        public void closeAll()
+        {
+<span class="fc" id="L282">            allChannels.close().awaitUninterruptibly();</span>
+<span class="fc" id="L283">        }</span>
+
+        public int getConnectedClients()
+        {
+            /*
+              - When server is running: allChannels contains all clients' connections (channels)
+                plus one additional channel used for the server's own bootstrap.
+               - When server is stopped: the size is 0
+            */
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            return allChannels.size() != 0 ? allChannels.size() - 1 : 0;</span>
+        }
+    }
+
+    // global inflight payload across all channels across all endpoints
+<span class="fc" id="L297">    private static final ResourceLimits.Concurrent globalRequestPayloadInFlight = new ResourceLimits.Concurrent(DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytes());</span>
+
+    public static class EndpointPayloadTracker
+    {
+        // inflight payload per endpoint across corresponding channels
+<span class="fc" id="L302">        private static final ConcurrentMap&lt;InetAddress, EndpointPayloadTracker&gt; requestPayloadInFlightPerEndpoint = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="fc" id="L304">        private final AtomicInteger refCount = new AtomicInteger(0);</span>
+        private final InetAddress endpoint;
+
+<span class="fc" id="L307">        final ResourceLimits.EndpointAndGlobal endpointAndGlobalPayloadsInFlight = new ResourceLimits.EndpointAndGlobal(new ResourceLimits.Concurrent(DatabaseDescriptor.getNativeTransportMaxConcurrentRequestsInBytesPerIp()),</span>
+<span class="fc" id="L308">                                                                                                                         globalRequestPayloadInFlight);</span>
+
+        private EndpointPayloadTracker(InetAddress endpoint)
+<span class="fc" id="L311">        {</span>
+<span class="fc" id="L312">            this.endpoint = endpoint;</span>
+<span class="fc" id="L313">        }</span>
+
+        public static EndpointPayloadTracker get(InetAddress endpoint)
+        {
+            while (true)
+            {
+<span class="fc" id="L319">                EndpointPayloadTracker result = requestPayloadInFlightPerEndpoint.computeIfAbsent(endpoint, EndpointPayloadTracker::new);</span>
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">                if (result.acquire())</span>
+<span class="fc" id="L321">                    return result;</span>
+
+<span class="nc" id="L323">                requestPayloadInFlightPerEndpoint.remove(endpoint, result);</span>
+<span class="nc" id="L324">            }</span>
+        }
+
+        private boolean acquire()
+        {
+<span class="pc bpc" id="L329" title="2 of 4 branches missed.">            return 0 &lt; refCount.updateAndGet(i -&gt; i &lt; 0 ? i : i + 1);</span>
+        }
+
+        public void release()
+        {
+<span class="pc bpc" id="L334" title="2 of 4 branches missed.">            if (-1 == refCount.updateAndGet(i -&gt; i == 1 ? -1 : i - 1))</span>
+<span class="fc" id="L335">                requestPayloadInFlightPerEndpoint.remove(endpoint, this);</span>
+<span class="fc" id="L336">        }</span>
+    }
+
+    private static class Initializer extends ChannelInitializer&lt;Channel&gt;
+    {
+        // Stateless handlers
+<span class="fc" id="L342">        private static final Message.ProtocolDecoder messageDecoder = new Message.ProtocolDecoder();</span>
+<span class="fc" id="L343">        private static final Frame.Decompressor frameDecompressor = new Frame.Decompressor();</span>
+<span class="fc" id="L344">        private static final Frame.Compressor frameCompressor = new Frame.Compressor();</span>
+<span class="fc" id="L345">        private static final Frame.Encoder frameEncoder = new Frame.Encoder();</span>
+<span class="fc" id="L346">        private static final Message.ExceptionHandler exceptionHandler = new Message.ExceptionHandler();</span>
+<span class="fc" id="L347">        private static final ConnectionLimitHandler connectionLimitHandler = new ConnectionLimitHandler();</span>
+
+        private final Server server;
+
+        public Initializer(Server server)
+<span class="fc" id="L352">        {</span>
+<span class="fc" id="L353">            this.server = server;</span>
+<span class="fc" id="L354">        }</span>
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+<span class="fc" id="L358">            ChannelPipeline pipeline = channel.pipeline();</span>
+
+            // Add the ConnectionLimitHandler to the pipeline if configured to do so.
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            if (DatabaseDescriptor.getNativeTransportMaxConcurrentConnections() &gt; 0</span>
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">                    || DatabaseDescriptor.getNativeTransportMaxConcurrentConnectionsPerIp() &gt; 0)</span>
+            {
+                // Add as first to the pipeline so the limit is enforced as first action.
+<span class="nc" id="L365">                pipeline.addFirst(&quot;connectionLimitHandler&quot;, connectionLimitHandler);</span>
+            }
+
+            //pipeline.addLast(&quot;debug&quot;, new LoggingHandler());
+
+<span class="fc" id="L370">            pipeline.addLast(&quot;frameDecoder&quot;, new Frame.Decoder(server.connectionFactory, server.protocolVersionLimit));</span>
+<span class="fc" id="L371">            pipeline.addLast(&quot;frameEncoder&quot;, frameEncoder);</span>
+
+<span class="fc" id="L373">            pipeline.addLast(&quot;frameDecompressor&quot;, frameDecompressor);</span>
+<span class="fc" id="L374">            pipeline.addLast(&quot;frameCompressor&quot;, frameCompressor);</span>
+
+<span class="fc" id="L376">            pipeline.addLast(&quot;messageDecoder&quot;, messageDecoder);</span>
+<span class="fc" id="L377">            pipeline.addLast(&quot;messageEncoder&quot;, new Message.ProtocolEncoder(server.protocolVersionLimit));</span>
+
+<span class="fc" id="L379">            pipeline.addLast(&quot;executor&quot;, new Message.Dispatcher(DatabaseDescriptor.useNativeTransportLegacyFlusher(),</span>
+<span class="fc" id="L380">                                                                EndpointPayloadTracker.get(((InetSocketAddress) channel.remoteAddress()).getAddress())));</span>
+
+            // The exceptionHandler will take care of handling exceptionCaught(...) events while still running
+            // on the same EventLoop as all previous added handlers in the pipeline. This is important as the used
+            // eventExecutorGroup may not enforce strict ordering for channel events.
+            // As the exceptionHandler runs in the EventLoop as the previous handlers we are sure all exceptions are
+            // correctly handled before the handler itself is removed.
+            // See https://issues.apache.org/jira/browse/CASSANDRA-13649
+<span class="fc" id="L388">            pipeline.addLast(&quot;exceptionHandler&quot;, exceptionHandler);</span>
+<span class="fc" id="L389">        }</span>
+    }
+
+    protected abstract static class AbstractSecureIntializer extends Initializer
+    {
+        private final SSLContext sslContext;
+        private final EncryptionOptions encryptionOptions;
+
+        protected AbstractSecureIntializer(Server server, EncryptionOptions encryptionOptions)
+        {
+<span class="nc" id="L399">            super(server);</span>
+<span class="nc" id="L400">            this.encryptionOptions = encryptionOptions;</span>
+            try
+            {
+<span class="nc" id="L403">                this.sslContext = SSLFactory.createSSLContext(encryptionOptions, encryptionOptions.require_client_auth);</span>
+            }
+<span class="nc" id="L405">            catch (IOException e)</span>
+            {
+<span class="nc" id="L407">                throw new RuntimeException(&quot;Failed to setup secure pipeline&quot;, e);</span>
+<span class="nc" id="L408">            }</span>
+<span class="nc" id="L409">        }</span>
+
+        protected final SslHandler createSslHandler()
+        {
+<span class="nc" id="L413">            SSLEngine sslEngine = sslContext.createSSLEngine();</span>
+<span class="nc" id="L414">            sslEngine.setUseClientMode(false);</span>
+<span class="nc" id="L415">            String[] suites = SSLFactory.filterCipherSuites(sslEngine.getSupportedCipherSuites(), encryptionOptions.cipher_suites);</span>
+<span class="nc" id="L416">            sslEngine.setEnabledCipherSuites(suites);</span>
+<span class="nc" id="L417">            sslEngine.setNeedClientAuth(encryptionOptions.require_client_auth);</span>
+<span class="nc" id="L418">            return new SslHandler(sslEngine);</span>
+        }
+    }
+
+    private static class OptionalSecureInitializer extends AbstractSecureIntializer
+    {
+        public OptionalSecureInitializer(Server server, EncryptionOptions encryptionOptions)
+        {
+<span class="nc" id="L426">            super(server, encryptionOptions);</span>
+<span class="nc" id="L427">        }</span>
+
+        protected void initChannel(final Channel channel) throws Exception
+        {
+<span class="nc" id="L431">            super.initChannel(channel);</span>
+<span class="nc" id="L432">            channel.pipeline().addFirst(&quot;sslDetectionHandler&quot;, new ByteToMessageDecoder()</span>
+<span class="nc" id="L433">            {</span>
+                @Override
+                protected void decode(ChannelHandlerContext channelHandlerContext, ByteBuf byteBuf, List&lt;Object&gt; list) throws Exception
+                {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                    if (byteBuf.readableBytes() &lt; 5)</span>
+                    {
+                        // To detect if SSL must be used we need to have at least 5 bytes, so return here and try again
+                        // once more bytes a ready.
+<span class="nc" id="L441">                        return;</span>
+                    }
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                    if (SslHandler.isEncrypted(byteBuf))</span>
+                    {
+                        // Connection uses SSL/TLS, replace the detection handler with a SslHandler and so use
+                        // encryption.
+<span class="nc" id="L447">                        SslHandler sslHandler = createSslHandler();</span>
+<span class="nc" id="L448">                        channelHandlerContext.pipeline().replace(this, &quot;ssl&quot;, sslHandler);</span>
+<span class="nc" id="L449">                    }</span>
+                    else
+                    {
+                        // Connection use no TLS/SSL encryption, just remove the detection handler and continue without
+                        // SslHandler in the pipeline.
+<span class="nc" id="L454">                        channelHandlerContext.pipeline().remove(this);</span>
+                    }
+<span class="nc" id="L456">                }</span>
+            });
+<span class="nc" id="L458">        }</span>
+    }
+
+    private static class SecureInitializer extends AbstractSecureIntializer
+    {
+        public SecureInitializer(Server server, EncryptionOptions encryptionOptions)
+        {
+<span class="nc" id="L465">            super(server, encryptionOptions);</span>
+<span class="nc" id="L466">        }</span>
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+<span class="nc" id="L470">            SslHandler sslHandler = createSslHandler();</span>
+<span class="nc" id="L471">            super.initChannel(channel);</span>
+<span class="nc" id="L472">            channel.pipeline().addFirst(&quot;ssl&quot;, sslHandler);</span>
+<span class="nc" id="L473">        }</span>
+    }
+
+    private static class LatestEvent
+    {
+        public final Event.StatusChange.Status status;
+        public final Event.TopologyChange.Change topology;
+
+        private LatestEvent(Event.StatusChange.Status status, Event.TopologyChange.Change topology)
+<span class="fc" id="L482">        {</span>
+<span class="fc" id="L483">            this.status = status;</span>
+<span class="fc" id="L484">            this.topology = topology;</span>
+<span class="fc" id="L485">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L490">            return String.format(&quot;Status %s, Topology %s&quot;, status, topology);</span>
+        }
+
+        public static LatestEvent forStatusChange(Event.StatusChange.Status status, LatestEvent prev)
+        {
+<span class="pc bpc" id="L495" title="1 of 2 branches missed.">            return new LatestEvent(status,</span>
+                                   prev == null ?
+                                           null :
+                                           prev.topology);
+        }
+
+        public static LatestEvent forTopologyChange(Event.TopologyChange.Change change, LatestEvent prev)
+        {
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">            return new LatestEvent(prev == null ?</span>
+                                           null :
+                                           prev.status,
+                                           change);
+        }
+    }
+
+    private static class EventNotifier extends MigrationListener implements IEndpointLifecycleSubscriber
+    {
+        private final Server server;
+
+        // We keep track of the latest status change events we have sent to avoid sending duplicates
+        // since StorageService may send duplicate notifications (CASSANDRA-7816, CASSANDRA-8236, CASSANDRA-9156)
+<span class="fc" id="L516">        private final Map&lt;InetAddress, LatestEvent&gt; latestEvents = new ConcurrentHashMap&lt;&gt;();</span>
+        // We also want to delay delivering a NEW_NODE notification until the new node has set its RPC ready
+        // state. This tracks the endpoints which have joined, but not yet signalled they're ready for clients
+<span class="fc" id="L519">        private final Set&lt;InetAddress&gt; endpointsPendingJoinedNotification = ConcurrentHashMap.newKeySet();</span>
+
+
+        private static final InetAddress bindAll;
+        static
+        {
+            try
+            {
+<span class="fc" id="L527">                bindAll = InetAddress.getByAddress(new byte[4]);</span>
+            }
+<span class="nc" id="L529">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L531">                throw new AssertionError(e);</span>
+<span class="fc" id="L532">            }</span>
+<span class="fc" id="L533">        }</span>
+
+        private EventNotifier(Server server)
+<span class="fc" id="L536">        {</span>
+<span class="fc" id="L537">            this.server = server;</span>
+<span class="fc" id="L538">        }</span>
+
+        private InetAddress getRpcAddress(InetAddress endpoint)
+        {
+            try
+            {
+<span class="fc" id="L544">                InetAddress rpcAddress = InetAddress.getByName(StorageService.instance.getRpcaddress(endpoint));</span>
+                // If rpcAddress == 0.0.0.0 (i.e. bound on all addresses), returning that is not very helpful,
+                // so return the internal address (which is ok since &quot;we're bound on all addresses&quot;).
+                // Note that after all nodes are running a version that includes CASSANDRA-5899, rpcAddress should
+                // never be 0.0.0.0, so this can eventually be removed.
+<span class="pc bpc" id="L549" title="1 of 2 branches missed.">                return rpcAddress.equals(bindAll) ? endpoint : rpcAddress;</span>
+            }
+<span class="nc" id="L551">            catch (UnknownHostException e)</span>
+            {
+                // That should not happen, so log an error, but return the
+                // endpoint address since there's a good change this is right
+<span class="nc" id="L555">                logger.error(&quot;Problem retrieving RPC address for {}&quot;, endpoint, e);</span>
+<span class="nc" id="L556">                return endpoint;</span>
+            }
+        }
+
+        private void send(InetAddress endpoint, Event.NodeEvent event)
+        {
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L563">                logger.trace(&quot;Sending event for endpoint {}, rpc address {}&quot;, endpoint, event.nodeAddress());</span>
+
+            // If the endpoint is not the local node, extract the node address
+            // and if it is the same as our own RPC broadcast address (which defaults to the rcp address)
+            // then don't send the notification. This covers the case of rpc_address set to &quot;localhost&quot;,
+            // which is not useful to any driver and in fact may cauase serious problems to some drivers,
+            // see CASSANDRA-10052
+<span class="fc bfc" id="L570" title="All 2 branches covered.">            if (!endpoint.equals(FBUtilities.getBroadcastAddress()) &amp;&amp;</span>
+<span class="pc bpc" id="L571" title="1 of 2 branches missed.">                event.nodeAddress().equals(FBUtilities.getBroadcastRpcAddress()))</span>
+<span class="nc" id="L572">                return;</span>
+
+<span class="fc" id="L574">            send(event);</span>
+<span class="fc" id="L575">        }</span>
+
+        private void send(Event event)
+        {
+<span class="fc" id="L579">            server.connectionTracker.send(event);</span>
+<span class="fc" id="L580">        }</span>
+
+        public void onJoinCluster(InetAddress endpoint)
+        {
+<span class="fc bfc" id="L584" title="All 2 branches covered.">            if (!StorageService.instance.isRpcReady(endpoint))</span>
+<span class="fc" id="L585">                endpointsPendingJoinedNotification.add(endpoint);</span>
+            else
+<span class="fc" id="L587">                onTopologyChange(endpoint, Event.TopologyChange.newNode(getRpcAddress(endpoint), server.socket.getPort()));</span>
+<span class="fc" id="L588">        }</span>
+
+        public void onLeaveCluster(InetAddress endpoint)
+        {
+<span class="nc" id="L592">            onTopologyChange(endpoint, Event.TopologyChange.removedNode(getRpcAddress(endpoint), server.socket.getPort()));</span>
+<span class="nc" id="L593">        }</span>
+
+        public void onMove(InetAddress endpoint)
+        {
+<span class="nc" id="L597">            onTopologyChange(endpoint, Event.TopologyChange.movedNode(getRpcAddress(endpoint), server.socket.getPort()));</span>
+<span class="nc" id="L598">        }</span>
+
+        public void onUp(InetAddress endpoint)
+        {
+<span class="fc bfc" id="L602" title="All 2 branches covered.">            if (endpointsPendingJoinedNotification.remove(endpoint))</span>
+<span class="fc" id="L603">                onJoinCluster(endpoint);</span>
+
+<span class="fc" id="L605">            onStatusChange(endpoint, Event.StatusChange.nodeUp(getRpcAddress(endpoint), server.socket.getPort()));</span>
+<span class="fc" id="L606">        }</span>
+
+        public void onDown(InetAddress endpoint)
+        {
+<span class="fc" id="L610">            onStatusChange(endpoint, Event.StatusChange.nodeDown(getRpcAddress(endpoint), server.socket.getPort()));</span>
+<span class="fc" id="L611">        }</span>
+
+        private void onTopologyChange(InetAddress endpoint, Event.TopologyChange event)
+        {
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L616">                logger.trace(&quot;Topology changed event : {}, {}&quot;, endpoint, event.change);</span>
+
+<span class="fc" id="L618">            LatestEvent prev = latestEvents.get(endpoint);</span>
+<span class="pc bpc" id="L619" title="3 of 4 branches missed.">            if (prev == null || prev.topology != event.change)</span>
+            {
+<span class="fc" id="L621">                LatestEvent ret = latestEvents.put(endpoint, LatestEvent.forTopologyChange(event.change, prev));</span>
+<span class="pc bpc" id="L622" title="1 of 2 branches missed.">                if (ret == prev)</span>
+<span class="fc" id="L623">                    send(endpoint, event);</span>
+            }
+<span class="fc" id="L625">        }</span>
+
+        private void onStatusChange(InetAddress endpoint, Event.StatusChange event)
+        {
+<span class="pc bpc" id="L629" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L630">                logger.trace(&quot;Status changed event : {}, {}&quot;, endpoint, event.status);</span>
+
+<span class="fc" id="L632">            LatestEvent prev = latestEvents.get(endpoint);</span>
+<span class="pc bpc" id="L633" title="1 of 4 branches missed.">            if (prev == null || prev.status != event.status)</span>
+            {
+<span class="fc" id="L635">                LatestEvent ret = latestEvents.put(endpoint, LatestEvent.forStatusChange(event.status, null));</span>
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">                if (ret == prev)</span>
+<span class="fc" id="L637">                    send(endpoint, event);</span>
+            }
+<span class="fc" id="L639">        }</span>
+
+        public void onCreateKeyspace(String ksName)
+        {
+<span class="nc" id="L643">            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, ksName));</span>
+<span class="nc" id="L644">        }</span>
+
+        public void onCreateColumnFamily(String ksName, String cfName)
+        {
+<span class="nc" id="L648">            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TABLE, ksName, cfName));</span>
+<span class="nc" id="L649">        }</span>
+
+        public void onCreateUserType(String ksName, String typeName)
+        {
+<span class="nc" id="L653">            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TYPE, ksName, typeName));</span>
+<span class="nc" id="L654">        }</span>
+
+        public void onCreateFunction(String ksName, String functionName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L658">            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.FUNCTION,</span>
+<span class="nc" id="L659">                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L660">        }</span>
+
+        public void onCreateAggregate(String ksName, String aggregateName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L664">            send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.AGGREGATE,</span>
+<span class="nc" id="L665">                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L666">        }</span>
+
+        public void onUpdateKeyspace(String ksName)
+        {
+<span class="nc" id="L670">            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, ksName));</span>
+<span class="nc" id="L671">        }</span>
+
+        public void onUpdateColumnFamily(String ksName, String cfName, boolean affectsStatements)
+        {
+<span class="nc" id="L675">            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, ksName, cfName));</span>
+<span class="nc" id="L676">        }</span>
+
+        public void onUpdateUserType(String ksName, String typeName)
+        {
+<span class="nc" id="L680">            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TYPE, ksName, typeName));</span>
+<span class="nc" id="L681">        }</span>
+
+        public void onUpdateFunction(String ksName, String functionName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L685">            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.FUNCTION,</span>
+<span class="nc" id="L686">                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L687">        }</span>
+
+        public void onUpdateAggregate(String ksName, String aggregateName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L691">            send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.AGGREGATE,</span>
+<span class="nc" id="L692">                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L693">        }</span>
+
+        public void onDropKeyspace(String ksName)
+        {
+<span class="nc" id="L697">            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, ksName));</span>
+<span class="nc" id="L698">        }</span>
+
+        public void onDropColumnFamily(String ksName, String cfName)
+        {
+<span class="nc" id="L702">            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TABLE, ksName, cfName));</span>
+<span class="nc" id="L703">        }</span>
+
+        public void onDropUserType(String ksName, String typeName)
+        {
+<span class="nc" id="L707">            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, ksName, typeName));</span>
+<span class="nc" id="L708">        }</span>
+
+        public void onDropFunction(String ksName, String functionName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L712">            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.FUNCTION,</span>
+<span class="nc" id="L713">                                        ksName, functionName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L714">        }</span>
+
+        public void onDropAggregate(String ksName, String aggregateName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+<span class="nc" id="L718">            send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.AGGREGATE,</span>
+<span class="nc" id="L719">                                        ksName, aggregateName, AbstractType.asCQLTypeStringList(argTypes)));</span>
+<span class="nc" id="L720">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

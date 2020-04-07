@@ -1,0 +1,785 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CqlRecordReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hadoop.cql3</a> &gt; <span class="el_source">CqlRecordReader.java</span></div><h1>CqlRecordReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hadoop.cql3;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.base.Function;
+import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
+
+import com.datastax.driver.core.TypeCodec;
+import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ColumnDefinitions;
+import com.datastax.driver.core.ColumnMetadata;
+import com.datastax.driver.core.LocalDate;
+import com.datastax.driver.core.Metadata;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.TableMetadata;
+import com.datastax.driver.core.Token;
+import com.datastax.driver.core.TupleValue;
+import com.datastax.driver.core.UDTValue;
+import com.google.common.reflect.TypeToken;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.hadoop.ColumnFamilySplit;
+import org.apache.cassandra.hadoop.ConfigHelper;
+import org.apache.cassandra.hadoop.HadoopCompat;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.mapreduce.InputSplit;
+import org.apache.hadoop.mapreduce.RecordReader;
+import org.apache.hadoop.mapreduce.TaskAttemptContext;
+
+/**
+ * &lt;p&gt;
+ * CqlRecordReader reads the rows return from the CQL query
+ * It uses CQL auto-paging.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Return a Long as a local CQL row key starts from 0;
+ * &lt;/p&gt;
+ * {@code
+ * Row as C* java driver CQL result set row
+ * 1) select clause must include partition key columns (to calculate the progress based on the actual CF row processed)
+ * 2) where clause must include token(partition_key1, ...  , partition_keyn) &gt; ? and 
+ *       token(partition_key1, ... , partition_keyn) &lt;= ?  (in the right order) 
+ * }
+ */
+public class CqlRecordReader extends RecordReader&lt;Long, Row&gt;
+        implements org.apache.hadoop.mapred.RecordReader&lt;Long, Row&gt;, AutoCloseable
+{
+<span class="nc" id="L82">    private static final Logger logger = LoggerFactory.getLogger(CqlRecordReader.class);</span>
+
+    private ColumnFamilySplit split;
+    private RowIterator rowIterator;
+
+    private Pair&lt;Long, Row&gt; currentRow;
+    private int totalRowCount; // total number of rows to fetch
+    private String keyspace;
+    private String cfName;
+    private String cqlQuery;
+    private Cluster cluster;
+    private Session session;
+    private IPartitioner partitioner;
+    private String inputColumns;
+    private String userDefinedWhereClauses;
+
+<span class="nc" id="L98">    private List&lt;String&gt; partitionKeys = new ArrayList&lt;&gt;();</span>
+
+    // partition keys -- key aliases
+<span class="nc" id="L101">    private LinkedHashMap&lt;String, Boolean&gt; partitionBoundColumns = Maps.newLinkedHashMap();</span>
+<span class="nc" id="L102">    protected int nativeProtocolVersion = 1;</span>
+
+    public CqlRecordReader()
+    {
+<span class="nc" id="L106">        super();</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public void initialize(InputSplit split, TaskAttemptContext context) throws IOException
+    {
+<span class="nc" id="L112">        this.split = (ColumnFamilySplit) split;</span>
+<span class="nc" id="L113">        Configuration conf = HadoopCompat.getConfiguration(context);</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        totalRowCount = (this.split.getLength() &lt; Long.MAX_VALUE)</span>
+<span class="nc" id="L115">                      ? (int) this.split.getLength()</span>
+<span class="nc" id="L116">                      : ConfigHelper.getInputSplitSize(conf);</span>
+<span class="nc" id="L117">        cfName = ConfigHelper.getInputColumnFamily(conf);</span>
+<span class="nc" id="L118">        keyspace = ConfigHelper.getInputKeyspace(conf);</span>
+<span class="nc" id="L119">        partitioner = ConfigHelper.getInputPartitioner(conf);</span>
+<span class="nc" id="L120">        inputColumns = CqlConfigHelper.getInputcolumns(conf);</span>
+<span class="nc" id="L121">        userDefinedWhereClauses = CqlConfigHelper.getInputWhereClauses(conf);</span>
+
+        try
+        {
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            if (cluster != null)</span>
+<span class="nc" id="L126">                return;</span>
+
+            // create a Cluster instance
+<span class="nc" id="L129">            String[] locations = split.getLocations();</span>
+<span class="nc" id="L130">            cluster = CqlConfigHelper.getInputCluster(locations, conf);</span>
+        }
+<span class="nc" id="L132">        catch (Exception e)</span>
+        {
+<span class="nc" id="L134">            throw new RuntimeException(e);</span>
+<span class="nc" id="L135">        }</span>
+
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (cluster != null)</span>
+<span class="nc" id="L138">            session = cluster.connect(quote(keyspace));</span>
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (session == null)</span>
+<span class="nc" id="L141">          throw new RuntimeException(&quot;Can't create connection session&quot;);</span>
+
+        //get negotiated serialization protocol
+<span class="nc" id="L144">        nativeProtocolVersion = cluster.getConfiguration().getProtocolOptions().getProtocolVersion().toInt();</span>
+
+        // If the user provides a CQL query then we will use it without validation
+        // otherwise we will fall back to building a query using the:
+        //   inputColumns
+        //   whereClauses
+<span class="nc" id="L150">        cqlQuery = CqlConfigHelper.getInputCql(conf);</span>
+        // validate that the user hasn't tried to give us a custom query along with input columns
+        // and where clauses
+<span class="nc bnc" id="L153" title="All 4 branches missed.">        if (StringUtils.isNotEmpty(cqlQuery) &amp;&amp; (StringUtils.isNotEmpty(inputColumns) ||</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">                                                 StringUtils.isNotEmpty(userDefinedWhereClauses)))</span>
+        {
+<span class="nc" id="L156">            throw new AssertionError(&quot;Cannot define a custom query with input columns and / or where clauses&quot;);</span>
+        }
+
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (StringUtils.isEmpty(cqlQuery))</span>
+<span class="nc" id="L160">            cqlQuery = buildQuery();</span>
+<span class="nc" id="L161">        logger.trace(&quot;cqlQuery {}&quot;, cqlQuery);</span>
+
+<span class="nc" id="L163">        rowIterator = new RowIterator();</span>
+<span class="nc" id="L164">        logger.trace(&quot;created {}&quot;, rowIterator);</span>
+<span class="nc" id="L165">    }</span>
+
+    public void close()
+    {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (session != null)</span>
+<span class="nc" id="L170">            session.close();</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (cluster != null)</span>
+<span class="nc" id="L172">            cluster.close();</span>
+<span class="nc" id="L173">    }</span>
+
+    public Long getCurrentKey()
+    {
+<span class="nc" id="L177">        return currentRow.left;</span>
+    }
+
+    public Row getCurrentValue()
+    {
+<span class="nc" id="L182">        return currentRow.right;</span>
+    }
+
+    public float getProgress()
+    {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (!rowIterator.hasNext())</span>
+<span class="nc" id="L188">            return 1.0F;</span>
+
+        // the progress is likely to be reported slightly off the actual but close enough
+<span class="nc" id="L191">        float progress = ((float) rowIterator.totalRead / totalRowCount);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        return progress &gt; 1.0F ? 1.0F : progress;</span>
+    }
+
+    public boolean nextKeyValue() throws IOException
+    {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (!rowIterator.hasNext())</span>
+        {
+<span class="nc" id="L199">            logger.trace(&quot;Finished scanning {} rows (estimate was: {})&quot;, rowIterator.totalRead, totalRowCount);</span>
+<span class="nc" id="L200">            return false;</span>
+        }
+
+        try
+        {
+<span class="nc" id="L205">            currentRow = rowIterator.next();</span>
+        }
+<span class="nc" id="L207">        catch (Exception e)</span>
+        {
+            // throw it as IOException, so client can catch it and handle it at client side
+<span class="nc" id="L210">            IOException ioe = new IOException(e.getMessage());</span>
+<span class="nc" id="L211">            ioe.initCause(ioe.getCause());</span>
+<span class="nc" id="L212">            throw ioe;</span>
+<span class="nc" id="L213">        }</span>
+<span class="nc" id="L214">        return true;</span>
+    }
+
+    // Because the old Hadoop API wants us to write to the key and value
+    // and the new asks for them, we need to copy the output of the new API
+    // to the old. Thus, expect a small performance hit.
+    // And obviously this wouldn't work for wide rows. But since ColumnFamilyInputFormat
+    // and ColumnFamilyRecordReader don't support them, it should be fine for now.
+    public boolean next(Long key, Row value) throws IOException
+    {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (nextKeyValue())</span>
+        {
+<span class="nc" id="L226">            ((WrappedRow)value).setRow(getCurrentValue());</span>
+<span class="nc" id="L227">            return true;</span>
+        }
+<span class="nc" id="L229">        return false;</span>
+    }
+
+    public long getPos() throws IOException
+    {
+<span class="nc" id="L234">        return rowIterator.totalRead;</span>
+    }
+
+    public Long createKey()
+    {
+<span class="nc" id="L239">        return Long.valueOf(0L);</span>
+    }
+
+    public Row createValue()
+    {
+<span class="nc" id="L244">        return new WrappedRow();</span>
+    }
+
+    /**
+     * Return native version protocol of the cluster connection
+     * @return serialization protocol version.
+     */
+    public int getNativeProtocolVersion() 
+    {
+<span class="nc" id="L253">        return nativeProtocolVersion;</span>
+    }
+
+    /** CQL row iterator 
+     *  Input cql query  
+     *  1) select clause must include key columns (if we use partition key based row count)
+     *  2) where clause must include token(partition_key1 ... partition_keyn) &gt; ? and 
+     *     token(partition_key1 ... partition_keyn) &lt;= ? 
+     */
+    private class RowIterator extends AbstractIterator&lt;Pair&lt;Long, Row&gt;&gt;
+    {
+<span class="nc" id="L264">        private long keyId = 0L;</span>
+<span class="nc" id="L265">        protected int totalRead = 0; // total number of cf rows read</span>
+        protected Iterator&lt;Row&gt; rows;
+<span class="nc" id="L267">        private Map&lt;String, ByteBuffer&gt; previousRowKey = new HashMap&lt;String, ByteBuffer&gt;(); // previous CF row key</span>
+
+        public RowIterator()
+<span class="nc" id="L270">        {</span>
+<span class="nc" id="L271">            AbstractType type = partitioner.getTokenValidator();</span>
+<span class="nc" id="L272">            ResultSet rs = session.execute(cqlQuery, type.compose(type.fromString(split.getStartToken())), type.compose(type.fromString(split.getEndToken())) );</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            for (ColumnMetadata meta : cluster.getMetadata().getKeyspace(quote(keyspace)).getTable(quote(cfName)).getPartitionKey())</span>
+<span class="nc" id="L274">                partitionBoundColumns.put(meta.getName(), Boolean.TRUE);</span>
+<span class="nc" id="L275">            rows = rs.iterator();</span>
+<span class="nc" id="L276">        }</span>
+
+        protected Pair&lt;Long, Row&gt; computeNext()
+        {
+<span class="nc bnc" id="L280" title="All 4 branches missed.">            if (rows == null || !rows.hasNext())</span>
+<span class="nc" id="L281">                return endOfData();</span>
+
+<span class="nc" id="L283">            Row row = rows.next();</span>
+<span class="nc" id="L284">            Map&lt;String, ByteBuffer&gt; keyColumns = new HashMap&lt;String, ByteBuffer&gt;(partitionBoundColumns.size()); </span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            for (String column : partitionBoundColumns.keySet())</span>
+<span class="nc" id="L286">                keyColumns.put(column, row.getBytesUnsafe(column));</span>
+
+            // increase total CF row read
+<span class="nc bnc" id="L289" title="All 4 branches missed.">            if (previousRowKey.isEmpty() &amp;&amp; !keyColumns.isEmpty())</span>
+            {
+<span class="nc" id="L291">                previousRowKey = keyColumns;</span>
+<span class="nc" id="L292">                totalRead++;</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L296" title="All 2 branches missed.">                for (String column : partitionBoundColumns.keySet())</span>
+                {
+                    // this is not correct - but we don't seem to have easy access to better type information here
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                    if (ByteBufferUtil.compareUnsigned(keyColumns.get(column), previousRowKey.get(column)) != 0)</span>
+                    {
+<span class="nc" id="L301">                        previousRowKey = keyColumns;</span>
+<span class="nc" id="L302">                        totalRead++;</span>
+<span class="nc" id="L303">                        break;</span>
+                    }
+<span class="nc" id="L305">                }</span>
+            }
+<span class="nc" id="L307">            keyId ++;</span>
+<span class="nc" id="L308">            return Pair.create(keyId, row);</span>
+        }
+    }
+
+    private static class WrappedRow implements Row
+    {
+        private Row row;
+
+        public void setRow(Row row)
+        {
+<span class="nc" id="L318">            this.row = row;</span>
+<span class="nc" id="L319">        }</span>
+
+        @Override
+        public ColumnDefinitions getColumnDefinitions()
+        {
+<span class="nc" id="L324">            return row.getColumnDefinitions();</span>
+        }
+
+        @Override
+        public boolean isNull(int i)
+        {
+<span class="nc" id="L330">            return row.isNull(i);</span>
+        }
+
+        @Override
+        public boolean isNull(String name)
+        {
+<span class="nc" id="L336">            return row.isNull(name);</span>
+        }
+
+        @Override
+        public Object getObject(int i)
+        {
+<span class="nc" id="L342">            return row.getObject(i);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(int i, Class&lt;T&gt; aClass)
+        {
+<span class="nc" id="L348">            return row.get(i, aClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(int i, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L354">            return row.get(i, typeToken);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(int i, TypeCodec&lt;T&gt; typeCodec)
+        {
+<span class="nc" id="L360">            return row.get(i, typeCodec);</span>
+        }
+
+        @Override
+        public Object getObject(String s)
+        {
+<span class="nc" id="L366">            return row.getObject(s);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(String s, Class&lt;T&gt; aClass)
+        {
+<span class="nc" id="L372">            return row.get(s, aClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(String s, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L378">            return row.get(s, typeToken);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T get(String s, TypeCodec&lt;T&gt; typeCodec)
+        {
+<span class="nc" id="L384">            return row.get(s, typeCodec);</span>
+        }
+
+        @Override
+        public boolean getBool(int i)
+        {
+<span class="nc" id="L390">            return row.getBool(i);</span>
+        }
+
+        @Override
+        public boolean getBool(String name)
+        {
+<span class="nc" id="L396">            return row.getBool(name);</span>
+        }
+
+        @Override
+        public short getShort(int i)
+        {
+<span class="nc" id="L402">            return row.getShort(i);</span>
+        }
+
+        @Override
+        public short getShort(String s)
+        {
+<span class="nc" id="L408">            return row.getShort(s);</span>
+        }
+
+        @Override
+        public byte getByte(int i)
+        {
+<span class="nc" id="L414">            return row.getByte(i);</span>
+        }
+
+        @Override
+        public byte getByte(String s)
+        {
+<span class="nc" id="L420">            return row.getByte(s);</span>
+        }
+
+        @Override
+        public int getInt(int i)
+        {
+<span class="nc" id="L426">            return row.getInt(i);</span>
+        }
+
+        @Override
+        public int getInt(String name)
+        {
+<span class="nc" id="L432">            return row.getInt(name);</span>
+        }
+
+        @Override
+        public long getLong(int i)
+        {
+<span class="nc" id="L438">            return row.getLong(i);</span>
+        }
+
+        @Override
+        public long getLong(String name)
+        {
+<span class="nc" id="L444">            return row.getLong(name);</span>
+        }
+
+        @Override
+        public Date getTimestamp(int i)
+        {
+<span class="nc" id="L450">            return row.getTimestamp(i);</span>
+        }
+
+        @Override
+        public Date getTimestamp(String s)
+        {
+<span class="nc" id="L456">            return row.getTimestamp(s);</span>
+        }
+
+        @Override
+        public LocalDate getDate(int i)
+        {
+<span class="nc" id="L462">            return row.getDate(i);</span>
+        }
+
+        @Override
+        public LocalDate getDate(String s)
+        {
+<span class="nc" id="L468">            return row.getDate(s);</span>
+        }
+
+        @Override
+        public long getTime(int i)
+        {
+<span class="nc" id="L474">            return row.getTime(i);</span>
+        }
+
+        @Override
+        public long getTime(String s)
+        {
+<span class="nc" id="L480">            return row.getTime(s);</span>
+        }
+
+        @Override
+        public float getFloat(int i)
+        {
+<span class="nc" id="L486">            return row.getFloat(i);</span>
+        }
+
+        @Override
+        public float getFloat(String name)
+        {
+<span class="nc" id="L492">            return row.getFloat(name);</span>
+        }
+
+        @Override
+        public double getDouble(int i)
+        {
+<span class="nc" id="L498">            return row.getDouble(i);</span>
+        }
+
+        @Override
+        public double getDouble(String name)
+        {
+<span class="nc" id="L504">            return row.getDouble(name);</span>
+        }
+
+        @Override
+        public ByteBuffer getBytesUnsafe(int i)
+        {
+<span class="nc" id="L510">            return row.getBytesUnsafe(i);</span>
+        }
+
+        @Override
+        public ByteBuffer getBytesUnsafe(String name)
+        {
+<span class="nc" id="L516">            return row.getBytesUnsafe(name);</span>
+        }
+
+        @Override
+        public ByteBuffer getBytes(int i)
+        {
+<span class="nc" id="L522">            return row.getBytes(i);</span>
+        }
+
+        @Override
+        public ByteBuffer getBytes(String name)
+        {
+<span class="nc" id="L528">            return row.getBytes(name);</span>
+        }
+
+        @Override
+        public String getString(int i)
+        {
+<span class="nc" id="L534">            return row.getString(i);</span>
+        }
+
+        @Override
+        public String getString(String name)
+        {
+<span class="nc" id="L540">            return row.getString(name);</span>
+        }
+
+        @Override
+        public BigInteger getVarint(int i)
+        {
+<span class="nc" id="L546">            return row.getVarint(i);</span>
+        }
+
+        @Override
+        public BigInteger getVarint(String name)
+        {
+<span class="nc" id="L552">            return row.getVarint(name);</span>
+        }
+
+        @Override
+        public BigDecimal getDecimal(int i)
+        {
+<span class="nc" id="L558">            return row.getDecimal(i);</span>
+        }
+
+        @Override
+        public BigDecimal getDecimal(String name)
+        {
+<span class="nc" id="L564">            return row.getDecimal(name);</span>
+        }
+
+        @Override
+        public UUID getUUID(int i)
+        {
+<span class="nc" id="L570">            return row.getUUID(i);</span>
+        }
+
+        @Override
+        public UUID getUUID(String name)
+        {
+<span class="nc" id="L576">            return row.getUUID(name);</span>
+        }
+
+        @Override
+        public InetAddress getInet(int i)
+        {
+<span class="nc" id="L582">            return row.getInet(i);</span>
+        }
+
+        @Override
+        public InetAddress getInet(String name)
+        {
+<span class="nc" id="L588">            return row.getInet(name);</span>
+        }
+
+        @Override
+        public &lt;T&gt; List&lt;T&gt; getList(int i, Class&lt;T&gt; elementsClass)
+        {
+<span class="nc" id="L594">            return row.getList(i, elementsClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; List&lt;T&gt; getList(int i, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L600">            return row.getList(i, typeToken);</span>
+        }
+
+        @Override
+        public &lt;T&gt; List&lt;T&gt; getList(String name, Class&lt;T&gt; elementsClass)
+        {
+<span class="nc" id="L606">            return row.getList(name, elementsClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; List&lt;T&gt; getList(String s, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L612">            return row.getList(s, typeToken);</span>
+        }
+
+        @Override
+        public &lt;T&gt; Set&lt;T&gt; getSet(int i, Class&lt;T&gt; elementsClass)
+        {
+<span class="nc" id="L618">            return row.getSet(i, elementsClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; Set&lt;T&gt; getSet(int i, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L624">            return row.getSet(i, typeToken);</span>
+        }
+
+        @Override
+        public &lt;T&gt; Set&lt;T&gt; getSet(String name, Class&lt;T&gt; elementsClass)
+        {
+<span class="nc" id="L630">            return row.getSet(name, elementsClass);</span>
+        }
+
+        @Override
+        public &lt;T&gt; Set&lt;T&gt; getSet(String s, TypeToken&lt;T&gt; typeToken)
+        {
+<span class="nc" id="L636">            return row.getSet(s, typeToken);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; Map&lt;K, V&gt; getMap(int i, Class&lt;K&gt; keysClass, Class&lt;V&gt; valuesClass)
+        {
+<span class="nc" id="L642">            return row.getMap(i, keysClass, valuesClass);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; Map&lt;K, V&gt; getMap(int i, TypeToken&lt;K&gt; typeToken, TypeToken&lt;V&gt; typeToken1)
+        {
+<span class="nc" id="L648">            return row.getMap(i, typeToken, typeToken1);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; Map&lt;K, V&gt; getMap(String name, Class&lt;K&gt; keysClass, Class&lt;V&gt; valuesClass)
+        {
+<span class="nc" id="L654">            return row.getMap(name, keysClass, valuesClass);</span>
+        }
+
+        @Override
+        public &lt;K, V&gt; Map&lt;K, V&gt; getMap(String s, TypeToken&lt;K&gt; typeToken, TypeToken&lt;V&gt; typeToken1)
+        {
+<span class="nc" id="L660">            return row.getMap(s, typeToken, typeToken1);</span>
+        }
+
+        @Override
+        public UDTValue getUDTValue(int i)
+        {
+<span class="nc" id="L666">            return row.getUDTValue(i);</span>
+        }
+
+        @Override
+        public UDTValue getUDTValue(String name)
+        {
+<span class="nc" id="L672">            return row.getUDTValue(name);</span>
+        }
+
+        @Override
+        public TupleValue getTupleValue(int i)
+        {
+<span class="nc" id="L678">            return row.getTupleValue(i);</span>
+        }
+
+        @Override
+        public TupleValue getTupleValue(String name)
+        {
+<span class="nc" id="L684">            return row.getTupleValue(name);</span>
+        }
+
+        @Override
+        public Token getToken(int i)
+        {
+<span class="nc" id="L690">            return row.getToken(i);</span>
+        }
+
+        @Override
+        public Token getToken(String name)
+        {
+<span class="nc" id="L696">            return row.getToken(name);</span>
+        }
+
+        @Override
+        public Token getPartitionKeyToken()
+        {
+<span class="nc" id="L702">            return row.getPartitionKeyToken();</span>
+        }
+    }
+
+    /**
+     * Build a query for the reader of the form:
+     *
+     * SELECT * FROM ks&gt;cf token(pk1,...pkn)&gt;? AND token(pk1,...pkn)&lt;=? [AND user where clauses] [ALLOW FILTERING]
+     */
+    private String buildQuery()
+    {
+<span class="nc" id="L713">        fetchKeys();</span>
+
+<span class="nc" id="L715">        List&lt;String&gt; columns = getSelectColumns();</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">        String selectColumnList = columns.size() == 0 ? &quot;*&quot; : makeColumnList(columns);</span>
+<span class="nc" id="L717">        String partitionKeyList = makeColumnList(partitionKeys);</span>
+
+<span class="nc" id="L719">        return String.format(&quot;SELECT %s FROM %s.%s WHERE token(%s)&gt;? AND token(%s)&lt;=?&quot; + getAdditionalWhereClauses(),</span>
+<span class="nc" id="L720">                             selectColumnList, quote(keyspace), quote(cfName), partitionKeyList, partitionKeyList);</span>
+    }
+
+    private String getAdditionalWhereClauses()
+    {
+<span class="nc" id="L725">        String whereClause = &quot;&quot;;</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        if (StringUtils.isNotEmpty(userDefinedWhereClauses))</span>
+<span class="nc" id="L727">            whereClause += &quot; AND &quot; + userDefinedWhereClauses;</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">        if (StringUtils.isNotEmpty(userDefinedWhereClauses))</span>
+<span class="nc" id="L729">            whereClause += &quot; ALLOW FILTERING&quot;;</span>
+<span class="nc" id="L730">        return whereClause;</span>
+    }
+
+    private List&lt;String&gt; getSelectColumns()
+    {
+<span class="nc" id="L735">        List&lt;String&gt; selectColumns = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        if (StringUtils.isNotEmpty(inputColumns))</span>
+        {
+            // We must select all the partition keys plus any other columns the user wants
+<span class="nc" id="L740">            selectColumns.addAll(partitionKeys);</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">            for (String column : Splitter.on(',').split(inputColumns))</span>
+            {
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (!partitionKeys.contains(column))</span>
+<span class="nc" id="L744">                    selectColumns.add(column);</span>
+<span class="nc" id="L745">            }</span>
+        }
+<span class="nc" id="L747">        return selectColumns;</span>
+    }
+
+    private String makeColumnList(Collection&lt;String&gt; columns)
+    {
+<span class="nc" id="L752">        return Joiner.on(',').join(Iterables.transform(columns, new Function&lt;String, String&gt;()</span>
+<span class="nc" id="L753">        {</span>
+            public String apply(String column)
+            {
+<span class="nc" id="L756">                return quote(column);</span>
+            }
+        }));
+    }
+
+    private void fetchKeys()
+    {
+        // get CF meta data
+<span class="nc" id="L764">        TableMetadata tableMetadata = session.getCluster()</span>
+<span class="nc" id="L765">                                             .getMetadata()</span>
+<span class="nc" id="L766">                                             .getKeyspace(Metadata.quote(keyspace))</span>
+<span class="nc" id="L767">                                             .getTable(Metadata.quote(cfName));</span>
+<span class="nc bnc" id="L768" title="All 2 branches missed.">        if (tableMetadata == null)</span>
+        {
+<span class="nc" id="L770">            throw new RuntimeException(&quot;No table metadata found for &quot; + keyspace + &quot;.&quot; + cfName);</span>
+        }
+        //Here we assume that tableMetadata.getPartitionKey() always
+        //returns the list of columns in order of component_index
+<span class="nc bnc" id="L774" title="All 2 branches missed.">        for (ColumnMetadata partitionKey : tableMetadata.getPartitionKey())</span>
+        {
+<span class="nc" id="L776">            partitionKeys.add(partitionKey.getName());</span>
+<span class="nc" id="L777">        }</span>
+<span class="nc" id="L778">    }</span>
+
+    private String quote(String identifier)
+    {
+<span class="nc" id="L782">        return &quot;\&quot;&quot; + identifier.replaceAll(&quot;\&quot;&quot;, &quot;\&quot;\&quot;&quot;) + &quot;\&quot;&quot;;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

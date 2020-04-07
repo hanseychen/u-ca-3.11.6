@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FrameCompressor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">FrameCompressor.java</span></div><h1>FrameCompressor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.transport;
+
+import java.io.IOException;
+
+import io.netty.buffer.ByteBuf;
+import org.xerial.snappy.Snappy;
+import org.xerial.snappy.SnappyError;
+
+import net.jpountz.lz4.LZ4Factory;
+
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+public interface FrameCompressor
+{
+    public Frame compress(Frame frame) throws IOException;
+    public Frame decompress(Frame frame) throws IOException;
+
+    /*
+     * TODO: We can probably do more efficient, like by avoiding copy.
+     * Also, we don't reuse ICompressor because the API doesn't expose enough.
+     */
+    public static class SnappyCompressor implements FrameCompressor
+    {
+        public static final SnappyCompressor instance;
+        static
+        {
+            SnappyCompressor i;
+            try
+            {
+<span class="nc" id="L47">                i = new SnappyCompressor();</span>
+            }
+<span class="nc" id="L49">            catch (Exception e)</span>
+            {
+<span class="nc" id="L51">                JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L52">                i = null;</span>
+            }
+<span class="nc" id="L54">            catch (NoClassDefFoundError | SnappyError | UnsatisfiedLinkError e)</span>
+            {
+<span class="nc" id="L56">                i = null;</span>
+<span class="nc" id="L57">            }</span>
+<span class="nc" id="L58">            instance = i;</span>
+<span class="nc" id="L59">        }</span>
+
+        private SnappyCompressor()
+<span class="nc" id="L62">        {</span>
+            // this would throw java.lang.NoClassDefFoundError if Snappy class
+            // wasn't found at runtime which should be processed by the calling method
+<span class="nc" id="L65">            Snappy.getNativeLibraryVersion();</span>
+<span class="nc" id="L66">        }</span>
+
+        public Frame compress(Frame frame) throws IOException
+        {
+<span class="nc" id="L70">            byte[] input = CBUtil.readRawBytes(frame.body);</span>
+<span class="nc" id="L71">            ByteBuf output = CBUtil.allocator.heapBuffer(Snappy.maxCompressedLength(input.length));</span>
+
+            try
+            {
+<span class="nc" id="L75">                int written = Snappy.compress(input, 0, input.length, output.array(), output.arrayOffset());</span>
+<span class="nc" id="L76">                output.writerIndex(written);</span>
+            }
+<span class="nc" id="L78">            catch (final Throwable e)</span>
+            {
+<span class="nc" id="L80">                output.release();</span>
+<span class="nc" id="L81">                throw e;</span>
+            }
+            finally
+            {
+                //release the old frame
+<span class="nc" id="L86">                frame.release();</span>
+            }
+
+<span class="nc" id="L89">            return frame.with(output);</span>
+        }
+
+        public Frame decompress(Frame frame) throws IOException
+        {
+<span class="nc" id="L94">            byte[] input = CBUtil.readRawBytes(frame.body);</span>
+
+<span class="nc bnc" id="L96" title="All 2 branches missed.">            if (!Snappy.isValidCompressedBuffer(input, 0, input.length))</span>
+<span class="nc" id="L97">                throw new ProtocolException(&quot;Provided frame does not appear to be Snappy compressed&quot;);</span>
+
+<span class="nc" id="L99">            ByteBuf output = CBUtil.allocator.heapBuffer(Snappy.uncompressedLength(input));</span>
+
+            try
+            {
+<span class="nc" id="L103">                int size = Snappy.uncompress(input, 0, input.length, output.array(), output.arrayOffset());</span>
+<span class="nc" id="L104">                output.writerIndex(size);</span>
+            }
+<span class="nc" id="L106">            catch (final Throwable e)</span>
+            {
+<span class="nc" id="L108">                output.release();</span>
+<span class="nc" id="L109">                throw e;</span>
+            }
+            finally
+            {
+                //release the old frame
+<span class="nc" id="L114">                frame.release();</span>
+            }
+
+<span class="nc" id="L117">            return frame.with(output);</span>
+        }
+    }
+
+    /*
+     * This is very close to the ICompressor implementation, and in particular
+     * it also layout the uncompressed size at the beginning of the message to
+     * make uncompression faster, but contrarly to the ICompressor, that length
+     * is written in big-endian. The native protocol is entirely big-endian, so
+     * it feels like putting little-endian here would be a annoying trap for
+     * client writer.
+     */
+    public static class LZ4Compressor implements FrameCompressor
+    {
+<span class="nc" id="L131">        public static final LZ4Compressor instance = new LZ4Compressor();</span>
+
+        private static final int INTEGER_BYTES = 4;
+        private final net.jpountz.lz4.LZ4Compressor compressor;
+        private final net.jpountz.lz4.LZ4Decompressor decompressor;
+
+        private LZ4Compressor()
+<span class="nc" id="L138">        {</span>
+<span class="nc" id="L139">            final LZ4Factory lz4Factory = LZ4Factory.fastestInstance();</span>
+<span class="nc" id="L140">            compressor = lz4Factory.fastCompressor();</span>
+<span class="nc" id="L141">            decompressor = lz4Factory.decompressor();</span>
+<span class="nc" id="L142">        }</span>
+
+        public Frame compress(Frame frame) throws IOException
+        {
+<span class="nc" id="L146">            byte[] input = CBUtil.readRawBytes(frame.body);</span>
+
+<span class="nc" id="L148">            int maxCompressedLength = compressor.maxCompressedLength(input.length);</span>
+<span class="nc" id="L149">            ByteBuf outputBuf = CBUtil.allocator.heapBuffer(INTEGER_BYTES + maxCompressedLength);</span>
+
+<span class="nc" id="L151">            byte[] output = outputBuf.array();</span>
+<span class="nc" id="L152">            int outputOffset = outputBuf.arrayOffset();</span>
+
+<span class="nc" id="L154">            output[outputOffset + 0] = (byte) (input.length &gt;&gt;&gt; 24);</span>
+<span class="nc" id="L155">            output[outputOffset + 1] = (byte) (input.length &gt;&gt;&gt; 16);</span>
+<span class="nc" id="L156">            output[outputOffset + 2] = (byte) (input.length &gt;&gt;&gt;  8);</span>
+<span class="nc" id="L157">            output[outputOffset + 3] = (byte) (input.length);</span>
+
+            try
+            {
+<span class="nc" id="L161">                int written = compressor.compress(input, 0, input.length, output, outputOffset + INTEGER_BYTES, maxCompressedLength);</span>
+<span class="nc" id="L162">                outputBuf.writerIndex(INTEGER_BYTES + written);</span>
+
+<span class="nc" id="L164">                return frame.with(outputBuf);</span>
+            }
+<span class="nc" id="L166">            catch (final Throwable e)</span>
+            {
+<span class="nc" id="L168">                outputBuf.release();</span>
+<span class="nc" id="L169">                throw e;</span>
+            }
+            finally
+            {
+                //release the old frame
+<span class="nc" id="L174">                frame.release();</span>
+            }
+        }
+
+        public Frame decompress(Frame frame) throws IOException
+        {
+<span class="nc" id="L180">            byte[] input = CBUtil.readRawBytes(frame.body);</span>
+
+<span class="nc" id="L182">            int uncompressedLength = ((input[0] &amp; 0xFF) &lt;&lt; 24)</span>
+                                   | ((input[1] &amp; 0xFF) &lt;&lt; 16)
+                                   | ((input[2] &amp; 0xFF) &lt;&lt;  8)
+                                   | ((input[3] &amp; 0xFF));
+
+<span class="nc" id="L187">            ByteBuf output = CBUtil.allocator.heapBuffer(uncompressedLength);</span>
+
+            try
+            {
+<span class="nc" id="L191">                int read = decompressor.decompress(input, INTEGER_BYTES, output.array(), output.arrayOffset(), uncompressedLength);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if (read != input.length - INTEGER_BYTES)</span>
+<span class="nc" id="L193">                    throw new IOException(&quot;Compressed lengths mismatch&quot;);</span>
+
+<span class="nc" id="L195">                output.writerIndex(uncompressedLength);</span>
+
+<span class="nc" id="L197">                return frame.with(output);</span>
+            }
+<span class="nc" id="L199">            catch (final Throwable e)</span>
+            {
+<span class="nc" id="L201">                output.release();</span>
+<span class="nc" id="L202">                throw e;</span>
+            }
+            finally
+            {
+                //release the old frame
+<span class="nc" id="L207">                frame.release();</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

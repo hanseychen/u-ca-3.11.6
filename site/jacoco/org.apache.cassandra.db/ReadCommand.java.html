@@ -1,0 +1,1808 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReadCommand.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">ReadCommand.java</span></div><h1>ReadCommand.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.function.Predicate;
+
+import javax.annotation.Nullable;
+
+import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.monitoring.ApproximateTime;
+import org.apache.cassandra.db.monitoring.MonitorableImpl;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.transform.RTBoundCloser;
+import org.apache.cassandra.db.transform.RTBoundValidator;
+import org.apache.cassandra.db.transform.RTBoundValidator.Stage;
+import org.apache.cassandra.db.transform.StoppingTransformation;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexNotAvailableException;
+import org.apache.cassandra.io.ForwardingVersionedSerializer;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.UnknownIndexException;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * General interface for storage-engine read commands (common to both range and
+ * single partition commands).
+ * &lt;p&gt;
+ * This contains all the informations needed to do a local read.
+ */
+public abstract class ReadCommand extends MonitorableImpl implements ReadQuery
+{
+<span class="fc" id="L69">    private static final int TEST_ITERATION_DELAY_MILLIS = Integer.parseInt(System.getProperty(&quot;cassandra.test.read_iteration_delay_ms&quot;, &quot;0&quot;));</span>
+<span class="fc" id="L70">    protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);</span>
+<span class="fc" id="L71">    public static final IVersionedSerializer&lt;ReadCommand&gt; serializer = new Serializer();</span>
+
+    // For READ verb: will either dispatch on 'serializer' for 3.0 or 'legacyReadCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+<span class="fc" id="L75">    public static final IVersionedSerializer&lt;ReadCommand&gt; readSerializer = new ForwardingVersionedSerializer&lt;ReadCommand&gt;()</span>
+<span class="fc" id="L76">    {</span>
+        protected IVersionedSerializer&lt;ReadCommand&gt; delegate(int version)
+        {
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">            return version &lt; MessagingService.VERSION_30</span>
+                    ? legacyReadCommandSerializer : serializer;
+        }
+    };
+
+    // For RANGE_SLICE verb: will either dispatch on 'serializer' for 3.0 or 'legacyRangeSliceCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+<span class="fc" id="L86">    public static final IVersionedSerializer&lt;ReadCommand&gt; rangeSliceSerializer = new ForwardingVersionedSerializer&lt;ReadCommand&gt;()</span>
+<span class="fc" id="L87">    {</span>
+        protected IVersionedSerializer&lt;ReadCommand&gt; delegate(int version)
+        {
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">            return version &lt; MessagingService.VERSION_30</span>
+                    ? legacyRangeSliceCommandSerializer : serializer;
+        }
+    };
+
+    // For PAGED_RANGE verb: will either dispatch on 'serializer' for 3.0 or 'legacyPagedRangeCommandSerializer' for earlier version.
+    // Can be removed (and replaced by 'serializer') once we drop pre-3.0 backward compatibility.
+<span class="fc" id="L97">    public static final IVersionedSerializer&lt;ReadCommand&gt; pagedRangeSerializer = new ForwardingVersionedSerializer&lt;ReadCommand&gt;()</span>
+<span class="fc" id="L98">    {</span>
+        protected IVersionedSerializer&lt;ReadCommand&gt; delegate(int version)
+        {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">            return version &lt; MessagingService.VERSION_30</span>
+                    ? legacyPagedRangeCommandSerializer : serializer;
+        }
+    };
+
+<span class="fc" id="L106">    public static final IVersionedSerializer&lt;ReadCommand&gt; legacyRangeSliceCommandSerializer = new LegacyRangeSliceCommandSerializer();</span>
+<span class="fc" id="L107">    public static final IVersionedSerializer&lt;ReadCommand&gt; legacyPagedRangeCommandSerializer = new LegacyPagedRangeCommandSerializer();</span>
+<span class="fc" id="L108">    public static final IVersionedSerializer&lt;ReadCommand&gt; legacyReadCommandSerializer = new LegacyReadCommandSerializer();</span>
+
+    private final Kind kind;
+    private final CFMetaData metadata;
+    private final int nowInSec;
+
+    private final ColumnFilter columnFilter;
+    private final RowFilter rowFilter;
+    private final DataLimits limits;
+
+    private final boolean isDigestQuery;
+    // if a digest query, the version for which the digest is expected. Ignored if not a digest.
+    private int digestVersion;
+    private final boolean isForThrift;
+
+    @Nullable
+    private final IndexMetadata index;
+
+<span class="fc" id="L126">    protected static abstract class SelectionDeserializer</span>
+    {
+        public abstract ReadCommand deserialize(DataInputPlus in,
+                                                int version,
+                                                boolean isDigest,
+                                                int digestVersion,
+                                                boolean isForThrift,
+                                                CFMetaData metadata,
+                                                int nowInSec,
+                                                ColumnFilter columnFilter,
+                                                RowFilter rowFilter,
+                                                DataLimits limits,
+                                                IndexMetadata index) throws IOException;
+    }
+
+<span class="fc" id="L141">    protected enum Kind</span>
+    {
+<span class="fc" id="L143">        SINGLE_PARTITION (SinglePartitionReadCommand.selectionDeserializer),</span>
+<span class="fc" id="L144">        PARTITION_RANGE  (PartitionRangeReadCommand.selectionDeserializer);</span>
+
+        private final SelectionDeserializer selectionDeserializer;
+
+        Kind(SelectionDeserializer selectionDeserializer)
+<span class="fc" id="L149">        {</span>
+<span class="fc" id="L150">            this.selectionDeserializer = selectionDeserializer;</span>
+<span class="fc" id="L151">        }</span>
+    }
+
+    protected ReadCommand(Kind kind,
+                          boolean isDigestQuery,
+                          int digestVersion,
+                          boolean isForThrift,
+                          CFMetaData metadata,
+                          int nowInSec,
+                          ColumnFilter columnFilter,
+                          RowFilter rowFilter,
+                          DataLimits limits,
+                          IndexMetadata index)
+<span class="fc" id="L164">    {</span>
+<span class="fc" id="L165">        this.kind = kind;</span>
+<span class="fc" id="L166">        this.isDigestQuery = isDigestQuery;</span>
+<span class="fc" id="L167">        this.digestVersion = digestVersion;</span>
+<span class="fc" id="L168">        this.isForThrift = isForThrift;</span>
+<span class="fc" id="L169">        this.metadata = metadata;</span>
+<span class="fc" id="L170">        this.nowInSec = nowInSec;</span>
+<span class="fc" id="L171">        this.columnFilter = columnFilter;</span>
+<span class="fc" id="L172">        this.rowFilter = rowFilter;</span>
+<span class="fc" id="L173">        this.limits = limits;</span>
+<span class="fc" id="L174">        this.index = index;</span>
+<span class="fc" id="L175">    }</span>
+
+    protected abstract void serializeSelection(DataOutputPlus out, int version) throws IOException;
+    protected abstract long selectionSerializedSize(int version);
+
+    public abstract boolean isLimitedToOnePartition();
+
+    /**
+     * Creates a new &lt;code&gt;ReadCommand&lt;/code&gt; instance with new limits.
+     *
+     * @param newLimits the new limits
+     * @return a new &lt;code&gt;ReadCommand&lt;/code&gt; with the updated limits
+     */
+    public abstract ReadCommand withUpdatedLimit(DataLimits newLimits);
+
+    /**
+     * The metadata for the table queried.
+     *
+     * @return the metadata for the table queried.
+     */
+    public CFMetaData metadata()
+    {
+<span class="fc" id="L197">        return metadata;</span>
+    }
+
+    /**
+     * The time in seconds to use as &quot;now&quot; for this query.
+     * &lt;p&gt;
+     * We use the same time as &quot;now&quot; for the whole query to avoid considering different
+     * values as expired during the query, which would be buggy (would throw of counting amongst other
+     * things).
+     *
+     * @return the time (in seconds) to use as &quot;now&quot;.
+     */
+    public int nowInSec()
+    {
+<span class="fc" id="L211">        return nowInSec;</span>
+    }
+
+    /**
+     * The configured timeout for this command.
+     *
+     * @return the configured timeout for this command.
+     */
+    public abstract long getTimeout();
+
+    /**
+     * A filter on which (non-PK) columns must be returned by the query.
+     *
+     * @return which columns must be fetched by this query.
+     */
+    public ColumnFilter columnFilter()
+    {
+<span class="fc" id="L228">        return columnFilter;</span>
+    }
+
+    /**
+     * Filters/Resrictions on CQL rows.
+     * &lt;p&gt;
+     * This contains the restrictions that are not directly handled by the
+     * {@code ClusteringIndexFilter}. More specifically, this includes any non-PK column
+     * restrictions and can include some PK columns restrictions when those can't be
+     * satisfied entirely by the clustering index filter (because not all clustering columns
+     * have been restricted for instance). If there is 2ndary indexes on the table,
+     * one of this restriction might be handled by a 2ndary index.
+     *
+     * @return the filter holding the expression that rows must satisfy.
+     */
+    public RowFilter rowFilter()
+    {
+<span class="fc" id="L245">        return rowFilter;</span>
+    }
+
+    /**
+     * The limits set on this query.
+     *
+     * @return the limits set on this query.
+     */
+    public DataLimits limits()
+    {
+<span class="fc" id="L255">        return limits;</span>
+    }
+
+    /**
+     * Whether this query is a digest one or not.
+     *
+     * @return Whether this query is a digest query.
+     */
+    public boolean isDigestQuery()
+    {
+<span class="fc" id="L265">        return isDigestQuery;</span>
+    }
+
+    /**
+     * If the query is a digest one, the requested digest version.
+     *
+     * @return the requested digest version if the query is a digest. Otherwise, this can return
+     * anything.
+     */
+    public int digestVersion()
+    {
+<span class="fc" id="L276">        return digestVersion;</span>
+    }
+
+    /**
+     * Sets the digest version, for when digest for that command is requested.
+     * &lt;p&gt;
+     * Note that we allow setting this independently of setting the command as a digest query as
+     * this allows us to use the command as a carrier of the digest version even if we only call
+     * setIsDigestQuery on some copy of it.
+     *
+     * @param digestVersion the version for the digest is this command is used for digest query..
+     * @return this read command.
+     */
+    public ReadCommand setDigestVersion(int digestVersion)
+    {
+<span class="fc" id="L291">        this.digestVersion = digestVersion;</span>
+<span class="fc" id="L292">        return this;</span>
+    }
+
+    /**
+     * Whether this query is for thrift or not.
+     *
+     * @return whether this query is for thrift.
+     */
+    public boolean isForThrift()
+    {
+<span class="fc" id="L302">        return isForThrift;</span>
+    }
+
+    /**
+     * Index (metadata) chosen for this query. Can be null.
+     *
+     * @return index (metadata) chosen for this query
+     */
+    @Nullable
+    public IndexMetadata indexMetadata()
+    {
+<span class="fc" id="L313">        return index;</span>
+    }
+
+    /**
+     * The clustering index filter this command to use for the provided key.
+     * &lt;p&gt;
+     * Note that that method should only be called on a key actually queried by this command
+     * and in practice, this will almost always return the same filter, but for the sake of
+     * paging, the filter on the first key of a range command might be slightly different.
+     *
+     * @param key a partition key queried by this command.
+     *
+     * @return the {@code ClusteringIndexFilter} to use for the partition of key {@code key}.
+     */
+    public abstract ClusteringIndexFilter clusteringIndexFilter(DecoratedKey key);
+
+    /**
+     * Returns a copy of this command.
+     *
+     * @return a copy of this command.
+     */
+    public abstract ReadCommand copy();
+
+    /**
+     * Returns a copy of this command with isDigestQuery set to true.
+     */
+    public abstract ReadCommand copyAsDigestQuery();
+
+    protected abstract UnfilteredPartitionIterator queryStorage(ColumnFamilyStore cfs, ReadExecutionController executionController);
+
+    protected abstract int oldestUnrepairedTombstone();
+
+    public ReadResponse createResponse(UnfilteredPartitionIterator iterator)
+    {
+        // validate that the sequence of RT markers is correct: open is followed by close, deletion times for both
+        // ends equal, and there are no dangling RT bound in any partition.
+<span class="fc" id="L349">        iterator = RTBoundValidator.validate(iterator, Stage.PROCESSED, true);</span>
+
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        return isDigestQuery()</span>
+<span class="pc" id="L352">             ? ReadResponse.createDigestResponse(iterator, this)</span>
+<span class="fc" id="L353">             : ReadResponse.createDataResponse(iterator, this);</span>
+    }
+
+    long indexSerializedSize(int version)
+    {
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        return null != index</span>
+<span class="pc" id="L359">             ? IndexMetadata.serializer.serializedSize(index, version)</span>
+             : 0;
+    }
+
+    public Index getIndex(ColumnFamilyStore cfs)
+    {
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        return null != index</span>
+<span class="pc" id="L366">             ? cfs.indexManager.getIndex(index)</span>
+             : null;
+    }
+
+    static IndexMetadata findIndex(CFMetaData table, RowFilter rowFilter)
+    {
+<span class="pc bpc" id="L372" title="3 of 4 branches missed.">        if (table.getIndexes().isEmpty() || rowFilter.isEmpty())</span>
+<span class="fc" id="L373">            return null;</span>
+
+<span class="nc" id="L375">        ColumnFamilyStore cfs = Keyspace.openAndGetStore(table);</span>
+
+<span class="nc" id="L377">        Index index = cfs.indexManager.getBestIndexFor(rowFilter);</span>
+
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        return null != index</span>
+<span class="nc" id="L380">             ? index.getIndexMetadata()</span>
+             : null;
+    }
+
+    /**
+     * If the index manager for the CFS determines that there's an applicable
+     * 2i that can be used to execute this command, call its (optional)
+     * validation method to check that nothing in this command's parameters
+     * violates the implementation specific validation rules.
+     */
+    public void maybeValidateIndex()
+    {
+<span class="fc" id="L392">        Index index = getIndex(Keyspace.openAndGetStore(metadata));</span>
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">        if (null != index)</span>
+<span class="nc" id="L394">            index.validate(this);</span>
+<span class="fc" id="L395">    }</span>
+
+    /**
+     * Executes this command on the local host.
+     *
+     * @param executionController the execution controller spanning this command
+     *
+     * @return an iterator over the result of executing this command locally.
+     */
+    @SuppressWarnings(&quot;resource&quot;) // The result iterator is closed upon exceptions (we know it's fine to potentially not close the intermediary
+                                  // iterators created inside the try as long as we do close the original resultIterator), or by closing the result.
+    public UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController)
+    {
+<span class="fc" id="L408">        long startTimeNanos = System.nanoTime();</span>
+
+<span class="fc" id="L410">        ColumnFamilyStore cfs = Keyspace.openAndGetStore(metadata());</span>
+<span class="fc" id="L411">        Index index = getIndex(cfs);</span>
+
+<span class="fc" id="L413">        Index.Searcher searcher = null;</span>
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">        if (index != null)</span>
+        {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (!cfs.indexManager.isIndexQueryable(index))</span>
+<span class="nc" id="L417">                throw new IndexNotAvailableException(index);</span>
+
+<span class="nc" id="L419">            searcher = index.searcherFor(this);</span>
+<span class="nc" id="L420">            Tracing.trace(&quot;Executing read on {}.{} using index {}&quot;, cfs.metadata.ksName, cfs.metadata.cfName, index.getIndexMetadata().name);</span>
+        }
+
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">        UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);</span>
+<span class="fc" id="L424">        iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);</span>
+
+        try
+        {
+<span class="fc" id="L428">            iterator = withStateTracking(iterator);</span>
+<span class="fc" id="L429">            iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs), Stage.PURGED, false);</span>
+<span class="fc" id="L430">            iterator = withMetricsRecording(iterator, cfs.metric, startTimeNanos);</span>
+
+            // If we've used a 2ndary index, we know the result already satisfy the primary expression used, so
+            // no point in checking it again.
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">            RowFilter filter = (null == searcher) ? rowFilter() : index.getPostIndexQueryFilter(rowFilter());</span>
+
+            /*
+             * TODO: We'll currently do filtering by the rowFilter here because it's convenient. However,
+             * we'll probably want to optimize by pushing it down the layer (like for dropped columns) as it
+             * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
+             * processing we do on it).
+             */
+<span class="fc" id="L442">            iterator = filter.filter(iterator, nowInSec());</span>
+
+            // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
+            // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
+<span class="fc" id="L446">            iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());</span>
+
+            // because of the above, we need to append an aritifical end bound if the source iterator was stopped short by a counter.
+<span class="fc" id="L449">            return RTBoundCloser.close(iterator);</span>
+        }
+<span class="nc" id="L451">        catch (RuntimeException | Error e)</span>
+        {
+<span class="nc" id="L453">            iterator.close();</span>
+<span class="nc" id="L454">            throw e;</span>
+        }
+    }
+
+    protected abstract void recordLatency(TableMetrics metric, long latencyNanos);
+
+    public PartitionIterator executeInternal(ReadExecutionController controller)
+    {
+<span class="fc" id="L462">        return UnfilteredPartitionIterators.filter(executeLocally(controller), nowInSec());</span>
+    }
+
+    public ReadExecutionController executionController()
+    {
+<span class="fc" id="L467">        return ReadExecutionController.forCommand(this);</span>
+    }
+
+    /**
+     * Wraps the provided iterator so that metrics on what is scanned by the command are recorded.
+     * This also log warning/trow TombstoneOverwhelmingException if appropriate.
+     */
+    private UnfilteredPartitionIterator withMetricsRecording(UnfilteredPartitionIterator iter, final TableMetrics metric, final long startTimeNanos)
+    {
+<span class="fc" id="L476">        class MetricRecording extends Transformation&lt;UnfilteredRowIterator&gt;</span>
+        {
+<span class="fc" id="L478">            private final int failureThreshold = DatabaseDescriptor.getTombstoneFailureThreshold();</span>
+<span class="fc" id="L479">            private final int warningThreshold = DatabaseDescriptor.getTombstoneWarnThreshold();</span>
+
+<span class="fc bfc" id="L481" title="All 2 branches covered.">            private final boolean respectTombstoneThresholds = !SchemaConstants.isLocalSystemKeyspace(ReadCommand.this.metadata().ksName);</span>
+<span class="fc" id="L482">            private final boolean enforceStrictLiveness = metadata.enforceStrictLiveness();</span>
+
+<span class="fc" id="L484">            private int liveRows = 0;</span>
+<span class="fc" id="L485">            private int tombstones = 0;</span>
+
+            private DecoratedKey currentKey;
+
+            @Override
+            public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
+            {
+<span class="fc" id="L492">                currentKey = iter.partitionKey();</span>
+<span class="fc" id="L493">                return Transformation.apply(iter, this);</span>
+            }
+
+            @Override
+            public Row applyToStatic(Row row)
+            {
+<span class="fc" id="L499">                return applyToRow(row);</span>
+            }
+
+            /**
+             * Count the number of live rows returned by the read command and the number of tombstones.
+             *
+             * Tombstones come in two forms on rows :
+             * - cells that aren't live anymore (either expired through TTL or deleted) : 1 tombstone per cell
+             * - Rows that aren't live and have no cell (DELETEs performed on the primary key) : 1 tombstone per row 
+             * We avoid counting rows as tombstones if they contain nothing but expired cells.
+             */
+            @Override
+            public Row applyToRow(Row row)
+            {
+<span class="fc" id="L513">                boolean hasTombstones = false;</span>
+<span class="fc bfc" id="L514" title="All 2 branches covered.">                for (Cell cell : row.cells())</span>
+                {
+<span class="fc bfc" id="L516" title="All 2 branches covered.">                    if (!cell.isLive(ReadCommand.this.nowInSec()))</span>
+                    {
+<span class="fc" id="L518">                        countTombstone(row.clustering());</span>
+<span class="fc" id="L519">                        hasTombstones = true; // allows to avoid counting an extra tombstone if the whole row expired</span>
+                    }
+<span class="fc" id="L521">                }</span>
+
+<span class="fc bfc" id="L523" title="All 2 branches covered.">                if (row.hasLiveData(ReadCommand.this.nowInSec(), enforceStrictLiveness))</span>
+<span class="fc" id="L524">                    ++liveRows;</span>
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">                else if (!row.primaryKeyLivenessInfo().isLive(ReadCommand.this.nowInSec())</span>
+<span class="pc bpc" id="L526" title="3 of 4 branches missed.">                        &amp;&amp; row.hasDeletion(ReadCommand.this.nowInSec())</span>
+                        &amp;&amp; !hasTombstones)
+                {
+                    // We're counting primary key deletions only here.
+<span class="nc" id="L530">                    countTombstone(row.clustering());</span>
+                }
+
+<span class="fc" id="L533">                return row;</span>
+            }
+
+            @Override
+            public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+            {
+<span class="nc" id="L539">                countTombstone(marker.clustering());</span>
+<span class="nc" id="L540">                return marker;</span>
+            }
+
+            private void countTombstone(ClusteringPrefix clustering)
+            {
+<span class="fc" id="L545">                ++tombstones;</span>
+<span class="pc bpc" id="L546" title="3 of 4 branches missed.">                if (tombstones &gt; failureThreshold &amp;&amp; respectTombstoneThresholds)</span>
+                {
+<span class="nc" id="L548">                    String query = ReadCommand.this.toCQLString();</span>
+<span class="nc" id="L549">                    Tracing.trace(&quot;Scanned over {} tombstones for query {}; query aborted (see tombstone_failure_threshold)&quot;, failureThreshold, query);</span>
+<span class="nc" id="L550">                    throw new TombstoneOverwhelmingException(tombstones, query, ReadCommand.this.metadata(), currentKey, clustering);</span>
+                }
+<span class="fc" id="L552">            }</span>
+
+            @Override
+            public void onClose()
+            {
+<span class="fc" id="L557">                recordLatency(metric, System.nanoTime() - startTimeNanos);</span>
+
+<span class="fc" id="L559">                metric.tombstoneScannedHistogram.update(tombstones);</span>
+<span class="fc" id="L560">                metric.liveScannedHistogram.update(liveRows);</span>
+
+<span class="pc bpc" id="L562" title="3 of 4 branches missed.">                boolean warnTombstones = tombstones &gt; warningThreshold &amp;&amp; respectTombstoneThresholds;</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">                if (warnTombstones)</span>
+                {
+<span class="nc" id="L565">                    String msg = String.format(</span>
+                            &quot;Read %d live rows and %d tombstone cells for query %1.512s (see tombstone_warn_threshold)&quot;,
+<span class="nc" id="L567">                            liveRows, tombstones, ReadCommand.this.toCQLString());</span>
+<span class="nc" id="L568">                    ClientWarn.instance.warn(msg);</span>
+<span class="nc" id="L569">                    logger.warn(msg);</span>
+                }
+
+<span class="fc" id="L572">                Tracing.trace(&quot;Read {} live rows and {} tombstone cells{}&quot;,</span>
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">                        liveRows, tombstones,</span>
+                        (warnTombstones ? &quot; (see tombstone_warn_threshold)&quot; : &quot;&quot;));
+<span class="fc" id="L575">            }</span>
+        };
+
+<span class="fc" id="L578">        return Transformation.apply(iter, new MetricRecording());</span>
+    }
+
+<span class="fc" id="L581">    protected class CheckForAbort extends StoppingTransformation&lt;UnfilteredRowIterator&gt;</span>
+    {
+<span class="fc" id="L583">        long lastChecked = 0;</span>
+
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">            if (maybeAbort())</span>
+            {
+<span class="nc" id="L589">                partition.close();</span>
+<span class="nc" id="L590">                return null;</span>
+            }
+
+<span class="fc" id="L593">            return Transformation.apply(partition, this);</span>
+        }
+
+        protected Row applyToRow(Row row)
+        {
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">            if (TEST_ITERATION_DELAY_MILLIS &gt; 0)</span>
+<span class="nc" id="L599">                maybeDelayForTesting();</span>
+
+<span class="pc bpc" id="L601" title="1 of 2 branches missed.">            return maybeAbort() ? null : row;</span>
+        }
+
+        private boolean maybeAbort()
+        {
+            /**
+             * The value returned by ApproximateTime.currentTimeMillis() is updated only every
+             * {@link ApproximateTime.CHECK_INTERVAL_MS}, by default 10 millis. Since MonitorableImpl
+             * relies on ApproximateTime, we don't need to check unless the approximate time has elapsed.
+             */
+<span class="fc bfc" id="L611" title="All 2 branches covered.">            if (lastChecked == ApproximateTime.currentTimeMillis())</span>
+<span class="fc" id="L612">                return false;</span>
+
+<span class="fc" id="L614">            lastChecked = ApproximateTime.currentTimeMillis();</span>
+
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">            if (isAborted())</span>
+            {
+<span class="nc" id="L618">                stop();</span>
+<span class="nc" id="L619">                return true;</span>
+            }
+
+<span class="fc" id="L622">            return false;</span>
+        }
+
+        private void maybeDelayForTesting()
+        {
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (!metadata.ksName.startsWith(&quot;system&quot;))</span>
+<span class="nc" id="L628">                FBUtilities.sleepQuietly(TEST_ITERATION_DELAY_MILLIS);</span>
+<span class="nc" id="L629">        }</span>
+    }
+
+    protected UnfilteredPartitionIterator withStateTracking(UnfilteredPartitionIterator iter)
+    {
+<span class="fc" id="L634">        return Transformation.apply(iter, new CheckForAbort());</span>
+    }
+
+    /**
+     * Creates a message for this command.
+     */
+    public abstract MessageOut&lt;ReadCommand&gt; createMessage(int version);
+
+    protected abstract void appendCQLWhereClause(StringBuilder sb);
+
+    // Skip purgeable tombstones. We do this because it's safe to do (post-merge of the memtable and sstable at least), it
+    // can save us some bandwith, and avoid making us throw a TombstoneOverwhelmingException for purgeable tombstones (which
+    // are to some extend an artefact of compaction lagging behind and hence counting them is somewhat unintuitive).
+    protected UnfilteredPartitionIterator withoutPurgeableTombstones(UnfilteredPartitionIterator iterator, ColumnFamilyStore cfs)
+    {
+<span class="fc" id="L649">        final boolean isForThrift = iterator.isForThrift();</span>
+        class WithoutPurgeableTombstones extends PurgeFunction
+        {
+            public WithoutPurgeableTombstones()
+<span class="fc" id="L653">            {</span>
+<span class="fc" id="L654">                super(isForThrift,</span>
+<span class="fc" id="L655">                      nowInSec(),</span>
+<span class="fc" id="L656">                      cfs.gcBefore(nowInSec()),</span>
+<span class="fc" id="L657">                      oldestUnrepairedTombstone(),</span>
+<span class="fc" id="L658">                      cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones(),</span>
+<span class="fc" id="L659">                      cfs.metadata.enforceStrictLiveness());</span>
+<span class="fc" id="L660">            }</span>
+
+            protected Predicate&lt;Long&gt; getPurgeEvaluator()
+            {
+<span class="fc" id="L664">                return time -&gt; true;</span>
+            }
+        }
+<span class="fc" id="L667">        return Transformation.apply(iterator, new WithoutPurgeableTombstones());</span>
+    }
+
+    /**
+     * Recreate the CQL string corresponding to this query.
+     * &lt;p&gt;
+     * Note that in general the returned string will not be exactly the original user string, first
+     * because there isn't always a single syntax for a given query,  but also because we don't have
+     * all the information needed (we know the non-PK columns queried but not the PK ones as internally
+     * we query them all). So this shouldn't be relied too strongly, but this should be good enough for
+     * debugging purpose which is what this is for.
+     */
+    public String toCQLString()
+    {
+<span class="nc" id="L681">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L682">        sb.append(&quot;SELECT &quot;).append(columnFilter());</span>
+<span class="nc" id="L683">        sb.append(&quot; FROM &quot;).append(metadata().ksName).append('.').append(metadata.cfName);</span>
+<span class="nc" id="L684">        appendCQLWhereClause(sb);</span>
+
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (limits() != DataLimits.NONE)</span>
+<span class="nc" id="L687">            sb.append(' ').append(limits());</span>
+<span class="nc" id="L688">        return sb.toString();</span>
+    }
+
+    // Monitorable interface
+    public String name()
+    {
+<span class="nc" id="L694">        return toCQLString();</span>
+    }
+
+<span class="pc bpc" id="L697" title="1 of 2 branches missed.">    private static class Serializer implements IVersionedSerializer&lt;ReadCommand&gt;</span>
+    {
+        private static int digestFlag(boolean isDigest)
+        {
+<span class="pc bpc" id="L701" title="1 of 2 branches missed.">            return isDigest ? 0x01 : 0;</span>
+        }
+
+        private static boolean isDigest(int flags)
+        {
+<span class="pc bpc" id="L706" title="1 of 2 branches missed.">            return (flags &amp; 0x01) != 0;</span>
+        }
+
+        private static int thriftFlag(boolean isForThrift)
+        {
+<span class="pc bpc" id="L711" title="1 of 2 branches missed.">            return isForThrift ? 0x02 : 0;</span>
+        }
+
+        private static boolean isForThrift(int flags)
+        {
+<span class="pc bpc" id="L716" title="1 of 2 branches missed.">            return (flags &amp; 0x02) != 0;</span>
+        }
+
+        private static int indexFlag(boolean hasIndex)
+        {
+<span class="pc bpc" id="L721" title="1 of 2 branches missed.">            return hasIndex ? 0x04 : 0;</span>
+        }
+
+        private static boolean hasIndex(int flags)
+        {
+<span class="pc bpc" id="L726" title="1 of 2 branches missed.">            return (flags &amp; 0x04) != 0;</span>
+        }
+
+        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
+        {
+<span class="pc bpc" id="L731" title="2 of 4 branches missed.">            assert version &gt;= MessagingService.VERSION_30;</span>
+
+<span class="fc" id="L733">            out.writeByte(command.kind.ordinal());</span>
+<span class="pc bpc" id="L734" title="1 of 2 branches missed.">            out.writeByte(digestFlag(command.isDigestQuery()) | thriftFlag(command.isForThrift()) | indexFlag(null != command.index));</span>
+<span class="pc bpc" id="L735" title="1 of 2 branches missed.">            if (command.isDigestQuery())</span>
+<span class="nc" id="L736">                out.writeUnsignedVInt(command.digestVersion());</span>
+<span class="fc" id="L737">            CFMetaData.serializer.serialize(command.metadata(), out, version);</span>
+<span class="fc" id="L738">            out.writeInt(command.nowInSec());</span>
+<span class="fc" id="L739">            ColumnFilter.serializer.serialize(command.columnFilter(), out, version);</span>
+<span class="fc" id="L740">            RowFilter.serializer.serialize(command.rowFilter(), out, version);</span>
+<span class="fc" id="L741">            DataLimits.serializer.serialize(command.limits(), out, version, command.metadata.comparator);</span>
+<span class="pc bpc" id="L742" title="1 of 2 branches missed.">            if (null != command.index)</span>
+<span class="nc" id="L743">                IndexMetadata.serializer.serialize(command.index, out, version);</span>
+
+<span class="fc" id="L745">            command.serializeSelection(out, version);</span>
+<span class="fc" id="L746">        }</span>
+
+        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="pc bpc" id="L750" title="2 of 4 branches missed.">            assert version &gt;= MessagingService.VERSION_30;</span>
+
+<span class="fc" id="L752">            Kind kind = Kind.values()[in.readByte()];</span>
+<span class="fc" id="L753">            int flags = in.readByte();</span>
+<span class="fc" id="L754">            boolean isDigest = isDigest(flags);</span>
+<span class="fc" id="L755">            boolean isForThrift = isForThrift(flags);</span>
+<span class="fc" id="L756">            boolean hasIndex = hasIndex(flags);</span>
+<span class="pc bpc" id="L757" title="1 of 2 branches missed.">            int digestVersion = isDigest ? (int)in.readUnsignedVInt() : 0;</span>
+<span class="fc" id="L758">            CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);</span>
+<span class="fc" id="L759">            int nowInSec = in.readInt();</span>
+<span class="fc" id="L760">            ColumnFilter columnFilter = ColumnFilter.serializer.deserialize(in, version, metadata);</span>
+<span class="fc" id="L761">            RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, metadata);</span>
+<span class="fc" id="L762">            DataLimits limits = DataLimits.serializer.deserialize(in, version,  metadata.comparator);</span>
+<span class="pc bpc" id="L763" title="1 of 2 branches missed.">            IndexMetadata index = hasIndex ? deserializeIndexMetadata(in, version, metadata) : null;</span>
+
+<span class="fc" id="L765">            return kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, index);</span>
+        }
+
+        private IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, CFMetaData cfm) throws IOException
+        {
+            try
+            {
+<span class="nc" id="L772">                return IndexMetadata.serializer.deserialize(in, version, cfm);</span>
+            }
+<span class="nc" id="L774">            catch (UnknownIndexException e)</span>
+            {
+<span class="nc" id="L776">                logger.info(&quot;Couldn't find a defined index on {}.{} with the id {}. &quot; +</span>
+                            &quot;If an index was just created, this is likely due to the schema not &quot; +
+                            &quot;being fully propagated. Local read will proceed without using the &quot; +
+                            &quot;index. Please wait for schema agreement after index creation.&quot;,
+                            cfm.ksName, cfm.cfName, e.indexId);
+<span class="nc" id="L781">                return null;</span>
+            }
+        }
+
+        public long serializedSize(ReadCommand command, int version)
+        {
+<span class="pc bpc" id="L787" title="2 of 4 branches missed.">            assert version &gt;= MessagingService.VERSION_30;</span>
+
+<span class="fc" id="L789">            return 2 // kind + flags</span>
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">                 + (command.isDigestQuery() ? TypeSizes.sizeofUnsignedVInt(command.digestVersion()) : 0)</span>
+<span class="fc" id="L791">                 + CFMetaData.serializer.serializedSize(command.metadata(), version)</span>
+<span class="fc" id="L792">                 + TypeSizes.sizeof(command.nowInSec())</span>
+<span class="fc" id="L793">                 + ColumnFilter.serializer.serializedSize(command.columnFilter(), version)</span>
+<span class="fc" id="L794">                 + RowFilter.serializer.serializedSize(command.rowFilter(), version)</span>
+<span class="fc" id="L795">                 + DataLimits.serializer.serializedSize(command.limits(), version, command.metadata.comparator)</span>
+<span class="fc" id="L796">                 + command.selectionSerializedSize(version)</span>
+<span class="fc" id="L797">                 + command.indexSerializedSize(version);</span>
+        }
+    }
+
+<span class="nc" id="L801">    private enum LegacyType</span>
+    {
+<span class="nc" id="L803">        GET_BY_NAMES((byte)1),</span>
+<span class="nc" id="L804">        GET_SLICES((byte)2);</span>
+
+        public final byte serializedValue;
+
+        LegacyType(byte b)
+<span class="nc" id="L809">        {</span>
+<span class="nc" id="L810">            this.serializedValue = b;</span>
+<span class="nc" id="L811">        }</span>
+
+        public static LegacyType fromPartitionFilterKind(ClusteringIndexFilter.Kind kind)
+        {
+<span class="nc bnc" id="L815" title="All 2 branches missed.">            return kind == ClusteringIndexFilter.Kind.SLICE</span>
+                   ? GET_SLICES
+                   : GET_BY_NAMES;
+        }
+
+        public static LegacyType fromSerializedValue(byte b)
+        {
+<span class="nc bnc" id="L822" title="All 2 branches missed.">            return b == 1 ? GET_BY_NAMES : GET_SLICES;</span>
+        }
+    }
+
+    /**
+     * Serializer for pre-3.0 RangeSliceCommands.
+     */
+<span class="pc bpc" id="L829" title="1 of 2 branches missed.">    private static class LegacyRangeSliceCommandSerializer implements IVersionedSerializer&lt;ReadCommand&gt;</span>
+    {
+        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc bnc" id="L833" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc" id="L835">            PartitionRangeReadCommand rangeCommand = (PartitionRangeReadCommand) command;</span>
+<span class="nc bnc" id="L836" title="All 4 branches missed.">            assert !rangeCommand.dataRange().isPaging();</span>
+
+            // convert pre-3.0 incompatible names filters to slice filters
+<span class="nc" id="L839">            rangeCommand = maybeConvertNamesToSlice(rangeCommand);</span>
+
+<span class="nc" id="L841">            CFMetaData metadata = rangeCommand.metadata();</span>
+
+<span class="nc" id="L843">            out.writeUTF(metadata.ksName);</span>
+<span class="nc" id="L844">            out.writeUTF(metadata.cfName);</span>
+<span class="nc" id="L845">            out.writeLong(rangeCommand.nowInSec() * 1000L);  // convert from seconds to millis</span>
+
+            // begin DiskAtomFilterSerializer.serialize()
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            if (rangeCommand.isNamesQuery())</span>
+            {
+<span class="nc" id="L850">                out.writeByte(1);  // 0 for slices, 1 for names</span>
+<span class="nc" id="L851">                ClusteringIndexNamesFilter filter = (ClusteringIndexNamesFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+<span class="nc" id="L852">                LegacyReadCommandSerializer.serializeNamesFilter(rangeCommand, filter, out);</span>
+<span class="nc" id="L853">            }</span>
+            else
+            {
+<span class="nc" id="L856">                out.writeByte(0);  // 0 for slices, 1 for names</span>
+
+                // slice filter serialization
+<span class="nc" id="L859">                ClusteringIndexSliceFilter filter = (ClusteringIndexSliceFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+
+<span class="nc bnc" id="L861" title="All 4 branches missed.">                boolean makeStaticSlice = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L862">                LegacyReadCommandSerializer.serializeSlices(out, filter.requestedSlices(), filter.isReversed(), makeStaticSlice, metadata);</span>
+
+<span class="nc" id="L864">                out.writeBoolean(filter.isReversed());</span>
+
+                // limit
+<span class="nc" id="L867">                DataLimits limits = rangeCommand.limits();</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">                if (limits.isDistinct())</span>
+<span class="nc" id="L869">                    out.writeInt(1);</span>
+                else
+<span class="nc" id="L871">                    out.writeInt(LegacyReadCommandSerializer.updateLimitForQuery(rangeCommand.limits().count(), filter.requestedSlices()));</span>
+
+                int compositesToGroup;
+<span class="nc bnc" id="L874" title="All 4 branches missed.">                boolean selectsStatics = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">                if (limits.kind() == DataLimits.Kind.THRIFT_LIMIT)</span>
+<span class="nc" id="L876">                    compositesToGroup = -1;</span>
+<span class="nc bnc" id="L877" title="All 4 branches missed.">                else if (limits.isDistinct() &amp;&amp; !selectsStatics)</span>
+<span class="nc" id="L878">                    compositesToGroup = -2;  // for DISTINCT queries (CASSANDRA-8490)</span>
+                else
+<span class="nc bnc" id="L880" title="All 2 branches missed.">                    compositesToGroup = metadata.isDense() ? -1 : metadata.clusteringColumns().size();</span>
+
+<span class="nc" id="L882">                out.writeInt(compositesToGroup);</span>
+            }
+
+<span class="nc" id="L885">            serializeRowFilter(out, rangeCommand.rowFilter());</span>
+<span class="nc" id="L886">            AbstractBounds.rowPositionSerializer.serialize(rangeCommand.dataRange().keyRange(), out, version);</span>
+
+            // maxResults
+<span class="nc" id="L889">            out.writeInt(rangeCommand.limits().count());</span>
+
+            // countCQL3Rows
+<span class="nc bnc" id="L892" title="All 4 branches missed.">            if (rangeCommand.isForThrift() || rangeCommand.limits().perPartitionCount() == 1)  // if for Thrift or DISTINCT</span>
+<span class="nc" id="L893">                out.writeBoolean(false);</span>
+            else
+<span class="nc" id="L895">                out.writeBoolean(true);</span>
+
+            // isPaging
+<span class="nc" id="L898">            out.writeBoolean(false);</span>
+<span class="nc" id="L899">        }</span>
+
+        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc bnc" id="L903" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc" id="L905">            String keyspace = in.readUTF();</span>
+<span class="nc" id="L906">            String columnFamily = in.readUTF();</span>
+
+<span class="nc" id="L908">            CFMetaData metadata = Schema.instance.getCFMetaData(keyspace, columnFamily);</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if (metadata == null)</span>
+            {
+<span class="nc" id="L911">                String message = String.format(&quot;Got legacy range command for nonexistent table %s.%s.&quot;, keyspace, columnFamily);</span>
+<span class="nc" id="L912">                throw new UnknownColumnFamilyException(message, null);</span>
+            }
+
+<span class="nc" id="L915">            int nowInSec = (int) (in.readLong() / 1000);  // convert from millis to seconds</span>
+
+            ClusteringIndexFilter filter;
+            ColumnFilter selection;
+<span class="nc" id="L919">            int compositesToGroup = 0;</span>
+<span class="nc" id="L920">            int perPartitionLimit = -1;</span>
+<span class="nc" id="L921">            byte readType = in.readByte();  // 0 for slices, 1 for names</span>
+<span class="nc bnc" id="L922" title="All 2 branches missed.">            if (readType == 1)</span>
+            {
+<span class="nc" id="L924">                Pair&lt;ColumnFilter, ClusteringIndexNamesFilter&gt; selectionAndFilter = LegacyReadCommandSerializer.deserializeNamesSelectionAndFilter(in, metadata);</span>
+<span class="nc" id="L925">                selection = selectionAndFilter.left;</span>
+<span class="nc" id="L926">                filter = selectionAndFilter.right;</span>
+<span class="nc" id="L927">            }</span>
+            else
+            {
+<span class="nc" id="L930">                Pair&lt;ClusteringIndexSliceFilter, Boolean&gt; p = LegacyReadCommandSerializer.deserializeSlicePartitionFilter(in, metadata);</span>
+<span class="nc" id="L931">                filter = p.left;</span>
+<span class="nc" id="L932">                perPartitionLimit = in.readInt();</span>
+<span class="nc" id="L933">                compositesToGroup = in.readInt();</span>
+<span class="nc" id="L934">                selection = getColumnSelectionForSlice(p.right, compositesToGroup, metadata);</span>
+            }
+
+<span class="nc" id="L937">            RowFilter rowFilter = deserializeRowFilter(in, metadata);</span>
+
+<span class="nc" id="L939">            AbstractBounds&lt;PartitionPosition&gt; keyRange = AbstractBounds.rowPositionSerializer.deserialize(in, metadata.partitioner, version);</span>
+<span class="nc" id="L940">            int maxResults = in.readInt();</span>
+
+<span class="nc" id="L942">            boolean countCQL3Rows = in.readBoolean();  // countCQL3Rows (not needed)</span>
+<span class="nc" id="L943">            in.readBoolean();  // isPaging (not needed)</span>
+
+<span class="nc bnc" id="L945" title="All 4 branches missed.">            boolean selectsStatics = (!selection.fetchedColumns().statics.isEmpty() || filter.selects(Clustering.STATIC_CLUSTERING));</span>
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter one is slightly less
+            // direct, but we know that on 2.1/2.2 queries, DISTINCT queries are the only CQL queries that have countCQL3Rows to false so we use
+            // that fact.
+<span class="nc bnc" id="L950" title="All 6 branches missed.">            boolean isDistinct = compositesToGroup == -2 || (compositesToGroup != -1 &amp;&amp; !countCQL3Rows);</span>
+            DataLimits limits;
+<span class="nc bnc" id="L952" title="All 2 branches missed.">            if (isDistinct)</span>
+<span class="nc" id="L953">                limits = DataLimits.distinctLimits(maxResults);</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">            else if (compositesToGroup == -1)</span>
+<span class="nc" id="L955">                limits = DataLimits.thriftLimits(maxResults, perPartitionLimit);</span>
+<span class="nc bnc" id="L956" title="All 2 branches missed.">            else if (metadata.isStaticCompactTable())</span>
+<span class="nc" id="L957">                limits = DataLimits.legacyCompactStaticCqlLimits(maxResults);</span>
+            else
+<span class="nc" id="L959">                limits = DataLimits.cqlLimits(maxResults);</span>
+
+<span class="nc" id="L961">            return PartitionRangeReadCommand.create(true, metadata, nowInSec, selection, rowFilter, limits, new DataRange(keyRange, filter));</span>
+        }
+
+        static void serializeRowFilter(DataOutputPlus out, RowFilter rowFilter) throws IOException
+        {
+<span class="nc" id="L966">            ArrayList&lt;RowFilter.Expression&gt; indexExpressions = Lists.newArrayList(rowFilter.iterator());</span>
+<span class="nc" id="L967">            out.writeInt(indexExpressions.size());</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">            for (RowFilter.Expression expression : indexExpressions)</span>
+            {
+<span class="nc" id="L970">                ByteBufferUtil.writeWithShortLength(expression.column().name.bytes, out);</span>
+<span class="nc" id="L971">                expression.operator().writeTo(out);</span>
+<span class="nc" id="L972">                ByteBufferUtil.writeWithShortLength(expression.getIndexValue(), out);</span>
+<span class="nc" id="L973">            }</span>
+<span class="nc" id="L974">        }</span>
+
+        static RowFilter deserializeRowFilter(DataInputPlus in, CFMetaData metadata) throws IOException
+        {
+<span class="nc" id="L978">            int numRowFilters = in.readInt();</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">            if (numRowFilters == 0)</span>
+<span class="nc" id="L980">                return RowFilter.NONE;</span>
+
+<span class="nc" id="L982">            RowFilter rowFilter = RowFilter.create(numRowFilters);</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            for (int i = 0; i &lt; numRowFilters; i++)</span>
+            {
+<span class="nc" id="L985">                ByteBuffer columnName = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L986">                ColumnDefinition column = metadata.getColumnDefinition(columnName);</span>
+<span class="nc" id="L987">                Operator op = Operator.readFrom(in);</span>
+<span class="nc" id="L988">                ByteBuffer indexValue = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L989">                rowFilter.add(column, op, indexValue);</span>
+            }
+<span class="nc" id="L991">            return rowFilter;</span>
+        }
+
+        static long serializedRowFilterSize(RowFilter rowFilter)
+        {
+<span class="nc" id="L996">            long size = TypeSizes.sizeof(0);  // rowFilterCount</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">            for (RowFilter.Expression expression : rowFilter)</span>
+            {
+<span class="nc" id="L999">                size += ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes);</span>
+<span class="nc" id="L1000">                size += TypeSizes.sizeof(0);  // operator int value</span>
+<span class="nc" id="L1001">                size += ByteBufferUtil.serializedSizeWithShortLength(expression.getIndexValue());</span>
+<span class="nc" id="L1002">            }</span>
+<span class="nc" id="L1003">            return size;</span>
+        }
+
+        public long serializedSize(ReadCommand command, int version)
+        {
+<span class="nc bnc" id="L1008" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+<span class="nc bnc" id="L1009" title="All 4 branches missed.">            assert command.kind == Kind.PARTITION_RANGE;</span>
+
+<span class="nc" id="L1011">            PartitionRangeReadCommand rangeCommand = (PartitionRangeReadCommand) command;</span>
+<span class="nc" id="L1012">            rangeCommand = maybeConvertNamesToSlice(rangeCommand);</span>
+<span class="nc" id="L1013">            CFMetaData metadata = rangeCommand.metadata();</span>
+
+<span class="nc" id="L1015">            long size = TypeSizes.sizeof(metadata.ksName);</span>
+<span class="nc" id="L1016">            size += TypeSizes.sizeof(metadata.cfName);</span>
+<span class="nc" id="L1017">            size += TypeSizes.sizeof((long) rangeCommand.nowInSec());</span>
+
+<span class="nc" id="L1019">            size += 1;  // single byte flag: 0 for slices, 1 for names</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">            if (rangeCommand.isNamesQuery())</span>
+            {
+<span class="nc" id="L1022">                PartitionColumns columns = rangeCommand.columnFilter().fetchedColumns();</span>
+<span class="nc" id="L1023">                ClusteringIndexNamesFilter filter = (ClusteringIndexNamesFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+<span class="nc" id="L1024">                size += LegacyReadCommandSerializer.serializedNamesFilterSize(filter, metadata, columns);</span>
+<span class="nc" id="L1025">            }</span>
+            else
+            {
+<span class="nc" id="L1028">                ClusteringIndexSliceFilter filter = (ClusteringIndexSliceFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+<span class="nc bnc" id="L1029" title="All 4 branches missed.">                boolean makeStaticSlice = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L1030">                size += LegacyReadCommandSerializer.serializedSlicesSize(filter.requestedSlices(), makeStaticSlice, metadata);</span>
+<span class="nc" id="L1031">                size += TypeSizes.sizeof(filter.isReversed());</span>
+<span class="nc" id="L1032">                size += TypeSizes.sizeof(rangeCommand.limits().perPartitionCount());</span>
+<span class="nc" id="L1033">                size += TypeSizes.sizeof(0); // compositesToGroup</span>
+            }
+
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">            if (rangeCommand.rowFilter().equals(RowFilter.NONE))</span>
+            {
+<span class="nc" id="L1038">                size += TypeSizes.sizeof(0);</span>
+            }
+            else
+            {
+<span class="nc" id="L1042">                ArrayList&lt;RowFilter.Expression&gt; indexExpressions = Lists.newArrayList(rangeCommand.rowFilter().iterator());</span>
+<span class="nc" id="L1043">                size += TypeSizes.sizeof(indexExpressions.size());</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">                for (RowFilter.Expression expression : indexExpressions)</span>
+                {
+<span class="nc" id="L1046">                    size += ByteBufferUtil.serializedSizeWithShortLength(expression.column().name.bytes);</span>
+<span class="nc" id="L1047">                    size += TypeSizes.sizeof(expression.operator().ordinal());</span>
+<span class="nc" id="L1048">                    size += ByteBufferUtil.serializedSizeWithShortLength(expression.getIndexValue());</span>
+<span class="nc" id="L1049">                }</span>
+            }
+
+<span class="nc" id="L1052">            size += AbstractBounds.rowPositionSerializer.serializedSize(rangeCommand.dataRange().keyRange(), version);</span>
+<span class="nc" id="L1053">            size += TypeSizes.sizeof(rangeCommand.limits().count());</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">            size += TypeSizes.sizeof(!rangeCommand.isForThrift());</span>
+<span class="nc" id="L1055">            return size + TypeSizes.sizeof(rangeCommand.dataRange().isPaging());</span>
+        }
+
+        static PartitionRangeReadCommand maybeConvertNamesToSlice(PartitionRangeReadCommand command)
+        {
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">            if (!command.dataRange().isNamesQuery())</span>
+<span class="nc" id="L1061">                return command;</span>
+
+<span class="nc" id="L1063">            CFMetaData metadata = command.metadata();</span>
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">            if (!LegacyReadCommandSerializer.shouldConvertNamesToSlice(metadata, command.columnFilter().fetchedColumns()))</span>
+<span class="nc" id="L1065">                return command;</span>
+
+<span class="nc" id="L1067">            ClusteringIndexNamesFilter filter = (ClusteringIndexNamesFilter) command.dataRange().clusteringIndexFilter;</span>
+<span class="nc" id="L1068">            ClusteringIndexSliceFilter sliceFilter = LegacyReadCommandSerializer.convertNamesFilterToSliceFilter(filter, metadata);</span>
+<span class="nc" id="L1069">            DataRange newRange = new DataRange(command.dataRange().keyRange(), sliceFilter);</span>
+
+<span class="nc" id="L1071">            return command.withUpdatedDataRange(newRange);</span>
+        }
+
+        static ColumnFilter getColumnSelectionForSlice(boolean selectsStatics, int compositesToGroup, CFMetaData metadata)
+        {
+            // A value of -2 indicates this is a DISTINCT query that doesn't select static columns, only partition keys.
+            // In that case, we'll basically be querying the first row of the partition, but we must make sure we include
+            // all columns so we get at least one cell if there is a live row as it would confuse pre-3.0 nodes otherwise.
+<span class="nc bnc" id="L1079" title="All 2 branches missed.">            if (compositesToGroup == -2)</span>
+<span class="nc" id="L1080">                return ColumnFilter.all(metadata);</span>
+
+            // if a slice query from a pre-3.0 node doesn't cover statics, we shouldn't select them at all
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">            PartitionColumns columns = selectsStatics</span>
+<span class="nc" id="L1084">                                     ? metadata.partitionColumns()</span>
+<span class="nc" id="L1085">                                     : metadata.partitionColumns().withoutStatics();</span>
+<span class="nc" id="L1086">            return ColumnFilter.selectionBuilder().addAll(columns).build();</span>
+        }
+    }
+
+    /**
+     * Serializer for pre-3.0 PagedRangeCommands.
+     */
+<span class="pc bpc" id="L1093" title="1 of 2 branches missed.">    private static class LegacyPagedRangeCommandSerializer implements IVersionedSerializer&lt;ReadCommand&gt;</span>
+    {
+        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc bnc" id="L1097" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc" id="L1099">            PartitionRangeReadCommand rangeCommand = (PartitionRangeReadCommand) command;</span>
+<span class="nc bnc" id="L1100" title="All 4 branches missed.">            assert rangeCommand.dataRange().isPaging();</span>
+
+<span class="nc" id="L1102">            CFMetaData metadata = rangeCommand.metadata();</span>
+
+<span class="nc" id="L1104">            out.writeUTF(metadata.ksName);</span>
+<span class="nc" id="L1105">            out.writeUTF(metadata.cfName);</span>
+<span class="nc" id="L1106">            out.writeLong(rangeCommand.nowInSec() * 1000L);  // convert from seconds to millis</span>
+
+<span class="nc" id="L1108">            AbstractBounds.rowPositionSerializer.serialize(rangeCommand.dataRange().keyRange(), out, version);</span>
+
+            // pre-3.0 nodes don't accept names filters for paged range commands
+            ClusteringIndexSliceFilter filter;
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">            if (rangeCommand.dataRange().clusteringIndexFilter.kind() == ClusteringIndexFilter.Kind.NAMES)</span>
+<span class="nc" id="L1113">                filter = LegacyReadCommandSerializer.convertNamesFilterToSliceFilter((ClusteringIndexNamesFilter) rangeCommand.dataRange().clusteringIndexFilter, metadata);</span>
+            else
+<span class="nc" id="L1115">                filter = (ClusteringIndexSliceFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+
+            // slice filter
+<span class="nc bnc" id="L1118" title="All 4 branches missed.">            boolean makeStaticSlice = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L1119">            LegacyReadCommandSerializer.serializeSlices(out, filter.requestedSlices(), filter.isReversed(), makeStaticSlice, metadata);</span>
+<span class="nc" id="L1120">            out.writeBoolean(filter.isReversed());</span>
+
+            // slice filter's count
+<span class="nc" id="L1123">            DataLimits.Kind kind = rangeCommand.limits().kind();</span>
+<span class="nc bnc" id="L1124" title="All 6 branches missed.">            boolean isDistinct = (kind == DataLimits.Kind.CQL_LIMIT || kind == DataLimits.Kind.CQL_PAGING_LIMIT) &amp;&amp; rangeCommand.limits().perPartitionCount() == 1;</span>
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">            if (isDistinct)</span>
+<span class="nc" id="L1126">                out.writeInt(1);</span>
+            else
+<span class="nc" id="L1128">                out.writeInt(LegacyReadCommandSerializer.updateLimitForQuery(rangeCommand.limits().perPartitionCount(), filter.requestedSlices()));</span>
+
+            // compositesToGroup
+<span class="nc bnc" id="L1131" title="All 4 branches missed.">            boolean selectsStatics = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() || filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+            int compositesToGroup;
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">            if (kind == DataLimits.Kind.THRIFT_LIMIT)</span>
+<span class="nc" id="L1134">                compositesToGroup = -1;</span>
+<span class="nc bnc" id="L1135" title="All 4 branches missed.">            else if (isDistinct &amp;&amp; !selectsStatics)</span>
+<span class="nc" id="L1136">                compositesToGroup = -2;  // for DISTINCT queries (CASSANDRA-8490)</span>
+            else
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">                compositesToGroup = metadata.isDense() ? -1 : metadata.clusteringColumns().size();</span>
+
+<span class="nc" id="L1140">            out.writeInt(compositesToGroup);</span>
+
+            // command-level &quot;start&quot; and &quot;stop&quot; composites.  The start is the last-returned cell name if there is one,
+            // otherwise it's the same as the slice filter's start.  The stop appears to always be the same as the
+            // slice filter's stop.
+<span class="nc" id="L1145">            DataRange.Paging pagingRange = (DataRange.Paging) rangeCommand.dataRange();</span>
+<span class="nc" id="L1146">            Clustering lastReturned = pagingRange.getLastReturned();</span>
+<span class="nc" id="L1147">            ClusteringBound newStart = ClusteringBound.inclusiveStartOf(lastReturned);</span>
+<span class="nc" id="L1148">            Slice lastSlice = filter.requestedSlices().get(filter.requestedSlices().size() - 1);</span>
+<span class="nc" id="L1149">            ByteBufferUtil.writeWithShortLength(LegacyLayout.encodeBound(metadata, newStart, true), out);</span>
+<span class="nc" id="L1150">            ByteBufferUtil.writeWithShortLength(LegacyLayout.encodeClustering(metadata, lastSlice.end().clustering()), out);</span>
+
+<span class="nc" id="L1152">            LegacyRangeSliceCommandSerializer.serializeRowFilter(out, rangeCommand.rowFilter());</span>
+
+            // command-level limit
+            // Pre-3.0 we would always request one more row than we actually needed and the command-level &quot;start&quot; would
+            // be the last-returned cell name, so the response would always include it.
+<span class="nc" id="L1157">            int maxResults = rangeCommand.limits().count() + 1;</span>
+<span class="nc" id="L1158">            out.writeInt(maxResults);</span>
+
+            // countCQL3Rows
+<span class="nc bnc" id="L1161" title="All 4 branches missed.">            if (rangeCommand.isForThrift() || rangeCommand.limits().perPartitionCount() == 1)  // for Thrift or DISTINCT</span>
+<span class="nc" id="L1162">                out.writeBoolean(false);</span>
+            else
+<span class="nc" id="L1164">                out.writeBoolean(true);</span>
+<span class="nc" id="L1165">        }</span>
+
+        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc bnc" id="L1169" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc" id="L1171">            String keyspace = in.readUTF();</span>
+<span class="nc" id="L1172">            String columnFamily = in.readUTF();</span>
+
+<span class="nc" id="L1174">            CFMetaData metadata = Schema.instance.getCFMetaData(keyspace, columnFamily);</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">            if (metadata == null)</span>
+            {
+<span class="nc" id="L1177">                String message = String.format(&quot;Got legacy paged range command for nonexistent table %s.%s.&quot;, keyspace, columnFamily);</span>
+<span class="nc" id="L1178">                throw new UnknownColumnFamilyException(message, null);</span>
+            }
+
+<span class="nc" id="L1181">            int nowInSec = (int) (in.readLong() / 1000);  // convert from millis to seconds</span>
+<span class="nc" id="L1182">            AbstractBounds&lt;PartitionPosition&gt; keyRange = AbstractBounds.rowPositionSerializer.deserialize(in, metadata.partitioner, version);</span>
+
+<span class="nc" id="L1184">            Pair&lt;ClusteringIndexSliceFilter, Boolean&gt; p = LegacyReadCommandSerializer.deserializeSlicePartitionFilter(in, metadata);</span>
+<span class="nc" id="L1185">            ClusteringIndexSliceFilter filter = p.left;</span>
+<span class="nc" id="L1186">            boolean selectsStatics = p.right;</span>
+
+<span class="nc" id="L1188">            int perPartitionLimit = in.readInt();</span>
+<span class="nc" id="L1189">            int compositesToGroup = in.readInt();</span>
+
+            // command-level Composite &quot;start&quot; and &quot;stop&quot;
+<span class="nc" id="L1192">            LegacyLayout.LegacyBound startBound = LegacyLayout.decodeSliceBound(metadata, ByteBufferUtil.readWithShortLength(in), true);</span>
+
+<span class="nc" id="L1194">            ByteBufferUtil.readWithShortLength(in);  // the composite &quot;stop&quot;, which isn't actually needed</span>
+
+<span class="nc" id="L1196">            ColumnFilter selection = LegacyRangeSliceCommandSerializer.getColumnSelectionForSlice(selectsStatics, compositesToGroup, metadata);</span>
+
+<span class="nc" id="L1198">            RowFilter rowFilter = LegacyRangeSliceCommandSerializer.deserializeRowFilter(in, metadata);</span>
+<span class="nc" id="L1199">            int maxResults = in.readInt();</span>
+<span class="nc" id="L1200">            boolean countCQL3Rows = in.readBoolean();</span>
+
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter one is slightly less
+            // direct, but we know that on 2.1/2.2 queries, DISTINCT queries are the only CQL queries that have countCQL3Rows to false so we use
+            // that fact.
+<span class="nc bnc" id="L1206" title="All 6 branches missed.">            boolean isDistinct = compositesToGroup == -2 || (compositesToGroup != -1 &amp;&amp; !countCQL3Rows);</span>
+            DataLimits limits;
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">            if (isDistinct)</span>
+<span class="nc" id="L1209">                limits = DataLimits.distinctLimits(maxResults);</span>
+            else
+<span class="nc" id="L1211">                limits = DataLimits.cqlLimits(maxResults);</span>
+
+<span class="nc" id="L1213">            limits = limits.forPaging(maxResults);</span>
+
+            // The pagedRangeCommand is used in pre-3.0 for both the first page and the following ones. On the first page, the startBound will be
+            // the start of the overall slice and will not be a proper Clustering. So detect that case and just return a non-paging DataRange, which
+            // is what 3.0 does.
+<span class="nc" id="L1218">            DataRange dataRange = new DataRange(keyRange, filter);</span>
+<span class="nc" id="L1219">            Slices slices = filter.requestedSlices();</span>
+<span class="nc bnc" id="L1220" title="All 6 branches missed.">            if (!isDistinct &amp;&amp; startBound != LegacyLayout.LegacyBound.BOTTOM &amp;&amp; !startBound.bound.equals(slices.get(0).start()))</span>
+            {
+                // pre-3.0 nodes normally expect pages to include the last cell from the previous page, but they handle it
+                // missing without any problems, so we can safely always set &quot;inclusive&quot; to false in the data range
+<span class="nc" id="L1224">                dataRange = dataRange.forPaging(keyRange, metadata.comparator, startBound.getAsClustering(metadata), false);</span>
+            }
+<span class="nc" id="L1226">            return PartitionRangeReadCommand.create(true, metadata, nowInSec, selection, rowFilter, limits, dataRange);</span>
+        }
+
+        public long serializedSize(ReadCommand command, int version)
+        {
+<span class="nc bnc" id="L1231" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+<span class="nc bnc" id="L1232" title="All 4 branches missed.">            assert command.kind == Kind.PARTITION_RANGE;</span>
+
+<span class="nc" id="L1234">            PartitionRangeReadCommand rangeCommand = (PartitionRangeReadCommand) command;</span>
+<span class="nc" id="L1235">            CFMetaData metadata = rangeCommand.metadata();</span>
+<span class="nc bnc" id="L1236" title="All 4 branches missed.">            assert rangeCommand.dataRange().isPaging();</span>
+
+<span class="nc" id="L1238">            long size = TypeSizes.sizeof(metadata.ksName);</span>
+<span class="nc" id="L1239">            size += TypeSizes.sizeof(metadata.cfName);</span>
+<span class="nc" id="L1240">            size += TypeSizes.sizeof((long) rangeCommand.nowInSec());</span>
+
+<span class="nc" id="L1242">            size += AbstractBounds.rowPositionSerializer.serializedSize(rangeCommand.dataRange().keyRange(), version);</span>
+
+            // pre-3.0 nodes only accept slice filters for paged range commands
+            ClusteringIndexSliceFilter filter;
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">            if (rangeCommand.dataRange().clusteringIndexFilter.kind() == ClusteringIndexFilter.Kind.NAMES)</span>
+<span class="nc" id="L1247">                filter = LegacyReadCommandSerializer.convertNamesFilterToSliceFilter((ClusteringIndexNamesFilter) rangeCommand.dataRange().clusteringIndexFilter, metadata);</span>
+            else
+<span class="nc" id="L1249">                filter = (ClusteringIndexSliceFilter) rangeCommand.dataRange().clusteringIndexFilter;</span>
+
+            // slice filter
+<span class="nc bnc" id="L1252" title="All 4 branches missed.">            boolean makeStaticSlice = !rangeCommand.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !filter.requestedSlices().selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L1253">            size += LegacyReadCommandSerializer.serializedSlicesSize(filter.requestedSlices(), makeStaticSlice, metadata);</span>
+<span class="nc" id="L1254">            size += TypeSizes.sizeof(filter.isReversed());</span>
+
+            // slice filter's count
+<span class="nc" id="L1257">            size += TypeSizes.sizeof(rangeCommand.limits().perPartitionCount());</span>
+
+            // compositesToGroup
+<span class="nc" id="L1260">            size += TypeSizes.sizeof(0);</span>
+
+            // command-level Composite &quot;start&quot; and &quot;stop&quot;
+<span class="nc" id="L1263">            DataRange.Paging pagingRange = (DataRange.Paging) rangeCommand.dataRange();</span>
+<span class="nc" id="L1264">            Clustering lastReturned = pagingRange.getLastReturned();</span>
+<span class="nc" id="L1265">            Slice lastSlice = filter.requestedSlices().get(filter.requestedSlices().size() - 1);</span>
+<span class="nc" id="L1266">            size += ByteBufferUtil.serializedSizeWithShortLength(LegacyLayout.encodeClustering(metadata, lastReturned));</span>
+<span class="nc" id="L1267">            size += ByteBufferUtil.serializedSizeWithShortLength(LegacyLayout.encodeClustering(metadata, lastSlice.end().clustering()));</span>
+
+<span class="nc" id="L1269">            size += LegacyRangeSliceCommandSerializer.serializedRowFilterSize(rangeCommand.rowFilter());</span>
+
+            // command-level limit
+<span class="nc" id="L1272">            size += TypeSizes.sizeof(rangeCommand.limits().count());</span>
+
+            // countCQL3Rows
+<span class="nc" id="L1275">            return size + TypeSizes.sizeof(true);</span>
+        }
+    }
+
+    /**
+     * Serializer for pre-3.0 ReadCommands.
+     */
+<span class="pc bpc" id="L1282" title="1 of 2 branches missed.">    static class LegacyReadCommandSerializer implements IVersionedSerializer&lt;ReadCommand&gt;</span>
+    {
+        public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc bnc" id="L1286" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+<span class="nc bnc" id="L1287" title="All 4 branches missed.">            assert command.kind == Kind.SINGLE_PARTITION;</span>
+
+<span class="nc" id="L1289">            SinglePartitionReadCommand singleReadCommand = (SinglePartitionReadCommand) command;</span>
+<span class="nc" id="L1290">            singleReadCommand = maybeConvertNamesToSlice(singleReadCommand);</span>
+
+<span class="nc" id="L1292">            CFMetaData metadata = singleReadCommand.metadata();</span>
+
+<span class="nc" id="L1294">            out.writeByte(LegacyType.fromPartitionFilterKind(singleReadCommand.clusteringIndexFilter().kind()).serializedValue);</span>
+
+<span class="nc" id="L1296">            out.writeBoolean(singleReadCommand.isDigestQuery());</span>
+<span class="nc" id="L1297">            out.writeUTF(metadata.ksName);</span>
+<span class="nc" id="L1298">            ByteBufferUtil.writeWithShortLength(singleReadCommand.partitionKey().getKey(), out);</span>
+<span class="nc" id="L1299">            out.writeUTF(metadata.cfName);</span>
+<span class="nc" id="L1300">            out.writeLong(singleReadCommand.nowInSec() * 1000L);  // convert from seconds to millis</span>
+
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">            if (singleReadCommand.clusteringIndexFilter().kind() == ClusteringIndexFilter.Kind.SLICE)</span>
+<span class="nc" id="L1303">                serializeSliceCommand(singleReadCommand, out);</span>
+            else
+<span class="nc" id="L1305">                serializeNamesCommand(singleReadCommand, out);</span>
+<span class="nc" id="L1306">        }</span>
+
+        public ReadCommand deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc bnc" id="L1310" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+<span class="nc" id="L1311">            LegacyType msgType = LegacyType.fromSerializedValue(in.readByte());</span>
+
+<span class="nc" id="L1313">            boolean isDigest = in.readBoolean();</span>
+<span class="nc" id="L1314">            String keyspaceName = in.readUTF();</span>
+<span class="nc" id="L1315">            ByteBuffer key = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L1316">            String cfName = in.readUTF();</span>
+<span class="nc" id="L1317">            long nowInMillis = in.readLong();</span>
+<span class="nc" id="L1318">            int nowInSeconds = (int) (nowInMillis / 1000);  // convert from millis to seconds</span>
+<span class="nc" id="L1319">            CFMetaData metadata = Schema.instance.getCFMetaData(keyspaceName, cfName);</span>
+<span class="nc" id="L1320">            DecoratedKey dk = metadata.partitioner.decorateKey(key);</span>
+
+<span class="nc bnc" id="L1322" title="All 3 branches missed.">            switch (msgType)</span>
+            {
+                case GET_BY_NAMES:
+<span class="nc" id="L1325">                    return deserializeNamesCommand(in, isDigest, metadata, dk, nowInSeconds, version);</span>
+                case GET_SLICES:
+<span class="nc" id="L1327">                    return deserializeSliceCommand(in, isDigest, metadata, dk, nowInSeconds, version);</span>
+                default:
+<span class="nc" id="L1329">                    throw new AssertionError();</span>
+            }
+        }
+
+        public long serializedSize(ReadCommand command, int version)
+        {
+<span class="nc bnc" id="L1335" title="All 4 branches missed.">            assert version &lt; MessagingService.VERSION_30;</span>
+<span class="nc bnc" id="L1336" title="All 4 branches missed.">            assert command.kind == Kind.SINGLE_PARTITION;</span>
+<span class="nc" id="L1337">            SinglePartitionReadCommand singleReadCommand = (SinglePartitionReadCommand) command;</span>
+<span class="nc" id="L1338">            singleReadCommand = maybeConvertNamesToSlice(singleReadCommand);</span>
+
+<span class="nc" id="L1340">            int keySize = singleReadCommand.partitionKey().getKey().remaining();</span>
+
+<span class="nc" id="L1342">            CFMetaData metadata = singleReadCommand.metadata();</span>
+
+<span class="nc" id="L1344">            long size = 1;  // message type (single byte)</span>
+<span class="nc" id="L1345">            size += TypeSizes.sizeof(command.isDigestQuery());</span>
+<span class="nc" id="L1346">            size += TypeSizes.sizeof(metadata.ksName);</span>
+<span class="nc" id="L1347">            size += TypeSizes.sizeof((short) keySize) + keySize;</span>
+<span class="nc" id="L1348">            size += TypeSizes.sizeof((long) command.nowInSec());</span>
+
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">            if (singleReadCommand.clusteringIndexFilter().kind() == ClusteringIndexFilter.Kind.SLICE)</span>
+<span class="nc" id="L1351">                return size + serializedSliceCommandSize(singleReadCommand);</span>
+            else
+<span class="nc" id="L1353">                return size + serializedNamesCommandSize(singleReadCommand);</span>
+        }
+
+        private void serializeNamesCommand(SinglePartitionReadCommand command, DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L1358">            serializeNamesFilter(command, (ClusteringIndexNamesFilter)command.clusteringIndexFilter(), out);</span>
+<span class="nc" id="L1359">        }</span>
+
+        private static void serializeNamesFilter(ReadCommand command, ClusteringIndexNamesFilter filter, DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L1363">            PartitionColumns columns = command.columnFilter().fetchedColumns();</span>
+<span class="nc" id="L1364">            CFMetaData metadata = command.metadata();</span>
+<span class="nc" id="L1365">            SortedSet&lt;Clustering&gt; requestedRows = filter.requestedRows();</span>
+
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">            if (requestedRows.isEmpty())</span>
+            {
+                // only static columns are requested
+<span class="nc" id="L1370">                out.writeInt(columns.size());</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">                for (ColumnDefinition column : columns)</span>
+<span class="nc" id="L1372">                    ByteBufferUtil.writeWithShortLength(column.name.bytes, out);</span>
+            }
+            else
+            {
+<span class="nc" id="L1376">                out.writeInt(requestedRows.size() * columns.size());</span>
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">                for (Clustering clustering : requestedRows)</span>
+                {
+<span class="nc bnc" id="L1379" title="All 2 branches missed.">                    for (ColumnDefinition column : columns)</span>
+<span class="nc" id="L1380">                        ByteBufferUtil.writeWithShortLength(LegacyLayout.encodeCellName(metadata, clustering, column.name.bytes, null), out);</span>
+<span class="nc" id="L1381">                }</span>
+            }
+
+            // countCql3Rows should be true if it's not for Thrift or a DISTINCT query
+<span class="nc bnc" id="L1385" title="All 6 branches missed.">            if (command.isForThrift() || (command.limits().kind() == DataLimits.Kind.CQL_LIMIT &amp;&amp; command.limits().perPartitionCount() == 1))</span>
+<span class="nc" id="L1386">                out.writeBoolean(false);  // it's compact and not a DISTINCT query</span>
+            else
+<span class="nc" id="L1388">                out.writeBoolean(true);</span>
+<span class="nc" id="L1389">        }</span>
+
+        static long serializedNamesFilterSize(ClusteringIndexNamesFilter filter, CFMetaData metadata, PartitionColumns fetchedColumns)
+        {
+<span class="nc" id="L1393">            SortedSet&lt;Clustering&gt; requestedRows = filter.requestedRows();</span>
+
+<span class="nc" id="L1395">            long size = 0;</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">            if (requestedRows.isEmpty())</span>
+            {
+                // only static columns are requested
+<span class="nc" id="L1399">                size += TypeSizes.sizeof(fetchedColumns.size());</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">                for (ColumnDefinition column : fetchedColumns)</span>
+<span class="nc" id="L1401">                    size += ByteBufferUtil.serializedSizeWithShortLength(column.name.bytes);</span>
+            }
+            else
+            {
+<span class="nc" id="L1405">                size += TypeSizes.sizeof(requestedRows.size() * fetchedColumns.size());</span>
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">                for (Clustering clustering : requestedRows)</span>
+                {
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">                    for (ColumnDefinition column : fetchedColumns)</span>
+<span class="nc" id="L1409">                        size += ByteBufferUtil.serializedSizeWithShortLength(LegacyLayout.encodeCellName(metadata, clustering, column.name.bytes, null));</span>
+<span class="nc" id="L1410">                }</span>
+            }
+
+<span class="nc" id="L1413">            return size + TypeSizes.sizeof(true);  // countCql3Rows</span>
+        }
+
+        private SinglePartitionReadCommand deserializeNamesCommand(DataInputPlus in, boolean isDigest, CFMetaData metadata, DecoratedKey key, int nowInSeconds, int version) throws IOException
+        {
+<span class="nc" id="L1418">            Pair&lt;ColumnFilter, ClusteringIndexNamesFilter&gt; selectionAndFilter = deserializeNamesSelectionAndFilter(in, metadata);</span>
+
+<span class="nc" id="L1420">            return SinglePartitionReadCommand.legacyNamesCommand(isDigest, version, metadata, nowInSeconds, selectionAndFilter.left, key, selectionAndFilter.right);</span>
+        }
+
+        static Pair&lt;ColumnFilter, ClusteringIndexNamesFilter&gt; deserializeNamesSelectionAndFilter(DataInputPlus in, CFMetaData metadata) throws IOException
+        {
+<span class="nc" id="L1425">            int numCellNames = in.readInt();</span>
+
+            // The names filter could include either a) static columns or b) normal columns with the clustering columns
+            // fully specified.  We need to handle those cases differently in 3.0.
+<span class="nc" id="L1429">            NavigableSet&lt;Clustering&gt; clusterings = new TreeSet&lt;&gt;(metadata.comparator);</span>
+
+<span class="nc" id="L1431">            ColumnFilter.Builder selectionBuilder = ColumnFilter.selectionBuilder();</span>
+<span class="nc bnc" id="L1432" title="All 2 branches missed.">            for (int i = 0; i &lt; numCellNames; i++)</span>
+            {
+<span class="nc" id="L1434">                ByteBuffer buffer = ByteBufferUtil.readWithShortLength(in);</span>
+                LegacyLayout.LegacyCellName cellName;
+                try
+                {
+<span class="nc" id="L1438">                    cellName = LegacyLayout.decodeCellName(metadata, buffer);</span>
+                }
+<span class="nc" id="L1440">                catch (UnknownColumnException exc)</span>
+                {
+                    // TODO this probably needs a new exception class that shares a parent with UnknownColumnFamilyException
+<span class="nc" id="L1443">                    throw new UnknownColumnFamilyException(</span>
+                            &quot;Received legacy range read command with names filter for unrecognized column name. &quot; +
+<span class="nc" id="L1445">                                    &quot;Fill name in filter (hex): &quot; + ByteBufferUtil.bytesToHex(buffer), metadata.cfId);</span>
+<span class="nc" id="L1446">                }</span>
+
+                // If we're querying for a static column, we may also need to read it
+                // as if it were a thrift dynamic column (because the column metadata,
+                // which makes it a static column in 3.0+, may have been added *after*
+                // some values were written). Note that all cql queries on non-compact
+                // tables used slice &amp; not name filters prior to 3.0 so this path is
+                // not taken for non-compact tables. It is theoretically possible to
+                // get here via thrift, hence the check on metadata.isStaticCompactTable.
+                // See CASSANDRA-11087.
+<span class="nc bnc" id="L1456" title="All 4 branches missed.">                if (metadata.isStaticCompactTable() &amp;&amp; cellName.clustering.equals(Clustering.STATIC_CLUSTERING))</span>
+                {
+<span class="nc" id="L1458">                    clusterings.add(Clustering.make(cellName.column.name.bytes));</span>
+<span class="nc" id="L1459">                    selectionBuilder.add(metadata.compactValueColumn());</span>
+                }
+                else
+                {
+<span class="nc" id="L1463">                    clusterings.add(cellName.clustering);</span>
+                }
+
+<span class="nc" id="L1466">                selectionBuilder.add(cellName.column);</span>
+            }
+
+            // for compact storage tables without clustering keys, the column holding the selected value is named
+            // 'value' internally we add it to the selection here to prevent errors due to unexpected column names
+            // when serializing the initial local data response
+<span class="nc bnc" id="L1472" title="All 4 branches missed.">            if (metadata.isStaticCompactTable() &amp;&amp; clusterings.isEmpty())</span>
+<span class="nc" id="L1473">                selectionBuilder.addAll(metadata.partitionColumns());</span>
+
+<span class="nc" id="L1475">            in.readBoolean();  // countCql3Rows</span>
+
+            // clusterings cannot include STATIC_CLUSTERING, so if the names filter is for static columns, clusterings
+            // will be empty.  However, by requesting the static columns in our ColumnFilter, this will still work.
+<span class="nc" id="L1479">            ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(clusterings, false);</span>
+<span class="nc" id="L1480">            return Pair.create(selectionBuilder.build(), filter);</span>
+        }
+
+        private long serializedNamesCommandSize(SinglePartitionReadCommand command)
+        {
+<span class="nc" id="L1485">            ClusteringIndexNamesFilter filter = (ClusteringIndexNamesFilter)command.clusteringIndexFilter();</span>
+<span class="nc" id="L1486">            PartitionColumns columns = command.columnFilter().fetchedColumns();</span>
+<span class="nc" id="L1487">            return serializedNamesFilterSize(filter, command.metadata(), columns);</span>
+        }
+
+        private void serializeSliceCommand(SinglePartitionReadCommand command, DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L1492">            CFMetaData metadata = command.metadata();</span>
+<span class="nc" id="L1493">            ClusteringIndexSliceFilter filter = (ClusteringIndexSliceFilter)command.clusteringIndexFilter();</span>
+
+<span class="nc" id="L1495">            Slices slices = filter.requestedSlices();</span>
+<span class="nc bnc" id="L1496" title="All 4 branches missed.">            boolean makeStaticSlice = !command.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !slices.selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L1497">            serializeSlices(out, slices, filter.isReversed(), makeStaticSlice, metadata);</span>
+
+<span class="nc" id="L1499">            out.writeBoolean(filter.isReversed());</span>
+
+<span class="nc bnc" id="L1501" title="All 4 branches missed.">            boolean selectsStatics = !command.columnFilter().fetchedColumns().statics.isEmpty() || slices.selects(Clustering.STATIC_CLUSTERING);</span>
+<span class="nc" id="L1502">            DataLimits limits = command.limits();</span>
+<span class="nc bnc" id="L1503" title="All 2 branches missed.">            if (limits.isDistinct())</span>
+<span class="nc" id="L1504">                out.writeInt(1);  // the limit is always 1 for DISTINCT queries</span>
+            else
+<span class="nc" id="L1506">                out.writeInt(updateLimitForQuery(command.limits().count(), filter.requestedSlices()));</span>
+
+            int compositesToGroup;
+<span class="nc bnc" id="L1509" title="All 4 branches missed.">            if (limits.kind() == DataLimits.Kind.THRIFT_LIMIT || metadata.isDense())</span>
+<span class="nc" id="L1510">                compositesToGroup = -1;</span>
+<span class="nc bnc" id="L1511" title="All 4 branches missed.">            else if (limits.isDistinct() &amp;&amp; !selectsStatics)</span>
+<span class="nc" id="L1512">                compositesToGroup = -2;  // for DISTINCT queries (CASSANDRA-8490)</span>
+            else
+<span class="nc" id="L1514">                compositesToGroup = metadata.clusteringColumns().size();</span>
+
+<span class="nc" id="L1516">            out.writeInt(compositesToGroup);</span>
+<span class="nc" id="L1517">        }</span>
+
+        private SinglePartitionReadCommand deserializeSliceCommand(DataInputPlus in, boolean isDigest, CFMetaData metadata, DecoratedKey key, int nowInSeconds, int version) throws IOException
+        {
+<span class="nc" id="L1521">            Pair&lt;ClusteringIndexSliceFilter, Boolean&gt; p = deserializeSlicePartitionFilter(in, metadata);</span>
+<span class="nc" id="L1522">            ClusteringIndexSliceFilter filter = p.left;</span>
+<span class="nc" id="L1523">            boolean selectsStatics = p.right;</span>
+<span class="nc" id="L1524">            int count = in.readInt();</span>
+<span class="nc" id="L1525">            int compositesToGroup = in.readInt();</span>
+
+            // if a slice query from a pre-3.0 node doesn't cover statics, we shouldn't select them at all
+<span class="nc" id="L1528">            ColumnFilter columnFilter = LegacyRangeSliceCommandSerializer.getColumnSelectionForSlice(selectsStatics, compositesToGroup, metadata);</span>
+
+            // We have 2 types of DISTINCT queries: ones on only the partition key, and ones on the partition key and static columns. For the former,
+            // we can easily detect the case because compositeToGroup is -2 and that's the only case it can be that. The latter is probablematic
+            // however as we have no way to distinguish it from a normal select with a limit of 1 (and this, contrarily to the range query case
+            // were the countCQL3Rows boolean allows us to decide).
+            // So we consider this case not distinct here. This is ok because even if it is a distinct (with static), the count will be 1 and
+            // we'll still just query one row (a distinct DataLimits currently behave exactly like a CQL limit with a count of 1). The only
+            // drawback is that we'll send back the first row entirely while a 2.1/2.2 node would return only the first cell in that same
+            // situation. This isn't a problem for 2.1/2.2 code however (it would be for a range query, as it would throw off the count for
+            // reasons similar to CASSANDRA-10762, but it's ok for single partition queries).
+            // We do _not_ want to do the reverse however and consider a 'SELECT * FROM foo LIMIT 1' as a DISTINCT query as that would make
+            // us only return the 1st cell rather then 1st row.
+            DataLimits limits;
+<span class="nc bnc" id="L1542" title="All 2 branches missed.">            if (compositesToGroup == -2)</span>
+<span class="nc" id="L1543">                limits = DataLimits.distinctLimits(count);  // See CASSANDRA-8490 for the explanation of this value</span>
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">            else if (compositesToGroup == -1)</span>
+<span class="nc" id="L1545">                limits = DataLimits.thriftLimits(1, count);</span>
+            else
+<span class="nc" id="L1547">                limits = DataLimits.cqlLimits(count);</span>
+
+<span class="nc" id="L1549">            return SinglePartitionReadCommand.legacySliceCommand(isDigest, version, metadata, nowInSeconds, columnFilter, limits, key, filter);</span>
+        }
+
+        private long serializedSliceCommandSize(SinglePartitionReadCommand command)
+        {
+<span class="nc" id="L1554">            CFMetaData metadata = command.metadata();</span>
+<span class="nc" id="L1555">            ClusteringIndexSliceFilter filter = (ClusteringIndexSliceFilter)command.clusteringIndexFilter();</span>
+
+<span class="nc" id="L1557">            Slices slices = filter.requestedSlices();</span>
+<span class="nc bnc" id="L1558" title="All 4 branches missed.">            boolean makeStaticSlice = !command.columnFilter().fetchedColumns().statics.isEmpty() &amp;&amp; !slices.selects(Clustering.STATIC_CLUSTERING);</span>
+
+<span class="nc" id="L1560">            long size = serializedSlicesSize(slices, makeStaticSlice, metadata);</span>
+<span class="nc" id="L1561">            size += TypeSizes.sizeof(command.clusteringIndexFilter().isReversed());</span>
+<span class="nc" id="L1562">            size += TypeSizes.sizeof(command.limits().count());</span>
+<span class="nc" id="L1563">            return size + TypeSizes.sizeof(0);  // compositesToGroup</span>
+        }
+
+        static void serializeSlices(DataOutputPlus out, Slices slices, boolean isReversed, boolean makeStaticSlice, CFMetaData metadata) throws IOException
+        {
+<span class="nc bnc" id="L1568" title="All 2 branches missed.">            out.writeInt(slices.size() + (makeStaticSlice ? 1 : 0));</span>
+
+            // In 3.0 we always store the slices in normal comparator order.  Pre-3.0 nodes expect the slices to
+            // be in reversed order if the query is reversed, so we handle that here.
+<span class="nc bnc" id="L1572" title="All 2 branches missed.">            if (isReversed)</span>
+            {
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">                for (int i = slices.size() - 1; i &gt;= 0; i--)</span>
+<span class="nc" id="L1575">                    serializeSlice(out, slices.get(i), true, metadata);</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">                if (makeStaticSlice)</span>
+<span class="nc" id="L1577">                    serializeStaticSlice(out, true, metadata);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L1581" title="All 2 branches missed.">                if (makeStaticSlice)</span>
+<span class="nc" id="L1582">                    serializeStaticSlice(out, false, metadata);</span>
+<span class="nc bnc" id="L1583" title="All 2 branches missed.">                for (Slice slice : slices)</span>
+<span class="nc" id="L1584">                    serializeSlice(out, slice, false, metadata);</span>
+            }
+<span class="nc" id="L1586">        }</span>
+
+        static long serializedSlicesSize(Slices slices, boolean makeStaticSlice, CFMetaData metadata)
+        {
+<span class="nc" id="L1590">            long size = TypeSizes.sizeof(slices.size());</span>
+
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">            for (Slice slice : slices)</span>
+            {
+<span class="nc" id="L1594">                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, slice.start(), true);</span>
+<span class="nc" id="L1595">                size += ByteBufferUtil.serializedSizeWithShortLength(sliceStart);</span>
+<span class="nc" id="L1596">                ByteBuffer sliceEnd = LegacyLayout.encodeBound(metadata, slice.end(), false);</span>
+<span class="nc" id="L1597">                size += ByteBufferUtil.serializedSizeWithShortLength(sliceEnd);</span>
+<span class="nc" id="L1598">            }</span>
+
+<span class="nc bnc" id="L1600" title="All 2 branches missed.">            if (makeStaticSlice)</span>
+<span class="nc" id="L1601">                size += serializedStaticSliceSize(metadata);</span>
+
+<span class="nc" id="L1603">            return size;</span>
+        }
+
+        static long serializedStaticSliceSize(CFMetaData metadata)
+        {
+            // unlike serializeStaticSlice(), but we don't care about reversal for size calculations
+<span class="nc" id="L1609">            ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);</span>
+<span class="nc" id="L1610">            long size = ByteBufferUtil.serializedSizeWithShortLength(sliceStart);</span>
+
+<span class="nc" id="L1612">            size += TypeSizes.sizeof((short) (metadata.comparator.size() * 3 + 2));</span>
+<span class="nc" id="L1613">            size += TypeSizes.sizeof((short) LegacyLayout.STATIC_PREFIX);</span>
+<span class="nc bnc" id="L1614" title="All 2 branches missed.">            for (int i = 0; i &lt; metadata.comparator.size(); i++)</span>
+            {
+<span class="nc" id="L1616">                size += ByteBufferUtil.serializedSizeWithShortLength(ByteBufferUtil.EMPTY_BYTE_BUFFER);</span>
+<span class="nc" id="L1617">                size += 1;  // EOC</span>
+            }
+<span class="nc" id="L1619">            return size;</span>
+        }
+
+        private static void serializeSlice(DataOutputPlus out, Slice slice, boolean isReversed, CFMetaData metadata) throws IOException
+        {
+<span class="nc bnc" id="L1624" title="All 4 branches missed.">            ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, isReversed ? slice.end() : slice.start(), !isReversed);</span>
+<span class="nc" id="L1625">            ByteBufferUtil.writeWithShortLength(sliceStart, out);</span>
+
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">            ByteBuffer sliceEnd = LegacyLayout.encodeBound(metadata, isReversed ? slice.start() : slice.end(), isReversed);</span>
+<span class="nc" id="L1628">            ByteBufferUtil.writeWithShortLength(sliceEnd, out);</span>
+<span class="nc" id="L1629">        }</span>
+
+        private static void serializeStaticSlice(DataOutputPlus out, boolean isReversed, CFMetaData metadata) throws IOException
+        {
+            // if reversed, write an empty bound for the slice start; if reversed, write out an empty bound for the
+            // slice finish after we've written the static slice start
+<span class="nc bnc" id="L1635" title="All 2 branches missed.">            if (!isReversed)</span>
+            {
+<span class="nc" id="L1637">                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);</span>
+<span class="nc" id="L1638">                ByteBufferUtil.writeWithShortLength(sliceStart, out);</span>
+            }
+
+            // write out the length of the composite
+<span class="nc" id="L1642">            out.writeShort(2 + metadata.comparator.size() * 3);  // two bytes + EOC for each component, plus static prefix</span>
+<span class="nc" id="L1643">            out.writeShort(LegacyLayout.STATIC_PREFIX);</span>
+<span class="nc bnc" id="L1644" title="All 2 branches missed.">            for (int i = 0; i &lt; metadata.comparator.size(); i++)</span>
+            {
+<span class="nc" id="L1646">                ByteBufferUtil.writeWithShortLength(ByteBufferUtil.EMPTY_BYTE_BUFFER, out);</span>
+                // write the EOC, using an inclusive end if we're on the final component
+<span class="nc bnc" id="L1648" title="All 2 branches missed.">                out.writeByte(i == metadata.comparator.size() - 1 ? 1 : 0);</span>
+            }
+
+<span class="nc bnc" id="L1651" title="All 2 branches missed.">            if (isReversed)</span>
+            {
+<span class="nc" id="L1653">                ByteBuffer sliceStart = LegacyLayout.encodeBound(metadata, ClusteringBound.BOTTOM, false);</span>
+<span class="nc" id="L1654">                ByteBufferUtil.writeWithShortLength(sliceStart, out);</span>
+            }
+<span class="nc" id="L1656">        }</span>
+
+        // Returns the deserialized filter, and whether static columns are queried (in pre-3.0, both info are determined by the slices,
+        // but in 3.0 they are separated: whether static columns are queried or not depends on the ColumnFilter).
+        static Pair&lt;ClusteringIndexSliceFilter, Boolean&gt; deserializeSlicePartitionFilter(DataInputPlus in, CFMetaData metadata) throws IOException
+        {
+<span class="nc" id="L1662">            int numSlices = in.readInt();</span>
+<span class="nc" id="L1663">            ByteBuffer[] startBuffers = new ByteBuffer[numSlices];</span>
+<span class="nc" id="L1664">            ByteBuffer[] finishBuffers = new ByteBuffer[numSlices];</span>
+<span class="nc bnc" id="L1665" title="All 2 branches missed.">            for (int i = 0; i &lt; numSlices; i++)</span>
+            {
+<span class="nc" id="L1667">                startBuffers[i] = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L1668">                finishBuffers[i] = ByteBufferUtil.readWithShortLength(in);</span>
+            }
+
+<span class="nc" id="L1671">            boolean reversed = in.readBoolean();</span>
+
+<span class="nc bnc" id="L1673" title="All 2 branches missed.">            if (reversed)</span>
+            {
+                // pre-3.0, reversed query slices put the greater element at the start of the slice
+<span class="nc" id="L1676">                ByteBuffer[] tmp = finishBuffers;</span>
+<span class="nc" id="L1677">                finishBuffers = startBuffers;</span>
+<span class="nc" id="L1678">                startBuffers = tmp;</span>
+            }
+
+<span class="nc" id="L1681">            boolean selectsStatics = false;</span>
+<span class="nc" id="L1682">            Slices.Builder slicesBuilder = new Slices.Builder(metadata.comparator);</span>
+<span class="nc bnc" id="L1683" title="All 2 branches missed.">            for (int i = 0; i &lt; numSlices; i++)</span>
+            {
+<span class="nc" id="L1685">                LegacyLayout.LegacyBound start = LegacyLayout.decodeSliceBound(metadata, startBuffers[i], true);</span>
+<span class="nc" id="L1686">                LegacyLayout.LegacyBound finish = LegacyLayout.decodeSliceBound(metadata, finishBuffers[i], false);</span>
+
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">                if (start.isStatic)</span>
+                {
+                    // If we start at the static block, this means we start at the beginning of the partition in 3.0
+                    // terms (since 3.0 handles static outside of the slice).
+<span class="nc" id="L1692">                    start = LegacyLayout.LegacyBound.BOTTOM;</span>
+
+                    // Then if we include the static, records it
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">                    if (start.bound.isInclusive())</span>
+<span class="nc" id="L1696">                        selectsStatics = true;</span>
+                }
+<span class="nc bnc" id="L1698" title="All 2 branches missed.">                else if (start == LegacyLayout.LegacyBound.BOTTOM)</span>
+                {
+<span class="nc" id="L1700">                    selectsStatics = true;</span>
+                }
+
+                // If the end of the slice is the end of the statics, then that mean this slice was just selecting static
+                // columns. We have already recorded that in selectsStatics, so we can ignore the slice (which doesn't make
+                // sense for 3.0).
+<span class="nc bnc" id="L1706" title="All 2 branches missed.">                if (finish.isStatic)</span>
+                {
+<span class="nc bnc" id="L1708" title="All 4 branches missed.">                    assert finish.bound.isInclusive(); // it would make no sense for a pre-3.0 node to have a slice that stops</span>
+                                                     // before the static columns (since there is nothing before that)
+                    continue;
+                }
+
+<span class="nc" id="L1713">                slicesBuilder.add(Slice.make(start.bound, finish.bound));</span>
+            }
+
+<span class="nc" id="L1716">            return Pair.create(new ClusteringIndexSliceFilter(slicesBuilder.build(), reversed), selectsStatics);</span>
+        }
+
+        private static SinglePartitionReadCommand maybeConvertNamesToSlice(SinglePartitionReadCommand command)
+        {
+<span class="nc bnc" id="L1721" title="All 2 branches missed.">            if (command.clusteringIndexFilter().kind() != ClusteringIndexFilter.Kind.NAMES)</span>
+<span class="nc" id="L1722">                return command;</span>
+
+<span class="nc" id="L1724">            CFMetaData metadata = command.metadata();</span>
+
+<span class="nc bnc" id="L1726" title="All 2 branches missed.">            if (!shouldConvertNamesToSlice(metadata, command.columnFilter().fetchedColumns()))</span>
+<span class="nc" id="L1727">                return command;</span>
+
+<span class="nc" id="L1729">            ClusteringIndexNamesFilter filter = (ClusteringIndexNamesFilter)command.clusteringIndexFilter();</span>
+<span class="nc" id="L1730">            ClusteringIndexSliceFilter sliceFilter = convertNamesFilterToSliceFilter(filter, metadata);</span>
+
+<span class="nc" id="L1732">            return command.withUpdatedClusteringIndexFilter(sliceFilter);</span>
+        }
+
+        /**
+         * Returns true if a names filter on the given table and column selection should be converted to a slice
+         * filter for compatibility with pre-3.0 nodes, false otherwise.
+         */
+        static boolean shouldConvertNamesToSlice(CFMetaData metadata, PartitionColumns columns)
+        {
+            // On pre-3.0 nodes, due to CASSANDRA-5762, we always do a slice for CQL3 tables (not dense, composite).
+<span class="nc bnc" id="L1742" title="All 4 branches missed.">            if (!metadata.isDense() &amp;&amp; metadata.isCompound())</span>
+<span class="nc" id="L1743">                return true;</span>
+
+            // pre-3.0 nodes don't support names filters for reading collections, so if we're requesting any of those,
+            // we need to convert this to a slice filter
+<span class="nc bnc" id="L1747" title="All 2 branches missed.">            for (ColumnDefinition column : columns)</span>
+            {
+<span class="nc bnc" id="L1749" title="All 2 branches missed.">                if (column.type.isMultiCell())</span>
+<span class="nc" id="L1750">                    return true;</span>
+<span class="nc" id="L1751">            }</span>
+<span class="nc" id="L1752">            return false;</span>
+        }
+
+        /**
+         * Converts a names filter that is incompatible with pre-3.0 nodes to a slice filter that is compatible.
+         */
+        private static ClusteringIndexSliceFilter convertNamesFilterToSliceFilter(ClusteringIndexNamesFilter filter, CFMetaData metadata)
+        {
+<span class="nc" id="L1760">            SortedSet&lt;Clustering&gt; requestedRows = filter.requestedRows();</span>
+            Slices slices;
+<span class="nc bnc" id="L1762" title="All 2 branches missed.">            if (requestedRows.isEmpty())</span>
+            {
+<span class="nc" id="L1764">                slices = Slices.NONE;</span>
+            }
+<span class="nc bnc" id="L1766" title="All 4 branches missed.">            else if (requestedRows.size() == 1 &amp;&amp; requestedRows.first().size() == 0)</span>
+            {
+<span class="nc" id="L1768">                slices = Slices.ALL;</span>
+            }
+            else
+            {
+<span class="nc" id="L1772">                Slices.Builder slicesBuilder = new Slices.Builder(metadata.comparator);</span>
+<span class="nc bnc" id="L1773" title="All 2 branches missed.">                for (Clustering clustering : requestedRows)</span>
+<span class="nc" id="L1774">                    slicesBuilder.add(ClusteringBound.inclusiveStartOf(clustering), ClusteringBound.inclusiveEndOf(clustering));</span>
+<span class="nc" id="L1775">                slices = slicesBuilder.build();</span>
+            }
+
+<span class="nc" id="L1778">            return new ClusteringIndexSliceFilter(slices, filter.isReversed());</span>
+        }
+
+        /**
+         * Potentially increases the existing query limit to account for the lack of exclusive bounds in pre-3.0 nodes.
+         * @param limit the existing query limit
+         * @param slices the requested slices
+         * @return the updated limit
+         */
+        static int updateLimitForQuery(int limit, Slices slices)
+        {
+            // Pre-3.0 nodes don't support exclusive bounds for slices. Instead, we query one more element if necessary
+            // and filter it later (in LegacyRemoteDataResponse)
+<span class="nc bnc" id="L1791" title="All 4 branches missed.">            if (!slices.hasLowerBound() &amp;&amp; ! slices.hasUpperBound())</span>
+<span class="nc" id="L1792">                return limit;</span>
+
+<span class="nc bnc" id="L1794" title="All 2 branches missed.">            for (Slice slice : slices)</span>
+            {
+<span class="nc bnc" id="L1796" title="All 2 branches missed.">                if (limit == Integer.MAX_VALUE)</span>
+<span class="nc" id="L1797">                    return limit;</span>
+
+<span class="nc bnc" id="L1799" title="All 2 branches missed.">                if (!slice.start().isInclusive())</span>
+<span class="nc" id="L1800">                    limit++;</span>
+<span class="nc bnc" id="L1801" title="All 2 branches missed.">                if (!slice.end().isInclusive())</span>
+<span class="nc" id="L1802">                    limit++;</span>
+<span class="nc" id="L1803">            }</span>
+<span class="nc" id="L1804">            return limit;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

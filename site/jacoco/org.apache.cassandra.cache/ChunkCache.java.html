@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ChunkCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cache</a> &gt; <span class="el_source">ChunkCache.java</span></div><h1>ChunkCache.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.cache;
+
+import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import com.github.benmanes.caffeine.cache.*;
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.metrics.CacheMissMetrics;
+import org.apache.cassandra.utils.memory.BufferPool;
+
+<span class="pc bpc" id="L39" title="1 of 2 branches missed.">public class ChunkCache</span>
+        implements CacheLoader&lt;ChunkCache.Key, ChunkCache.Buffer&gt;, RemovalListener&lt;ChunkCache.Key, ChunkCache.Buffer&gt;, CacheSize
+{
+    public static final int RESERVED_POOL_SPACE_IN_MB = 32;
+<span class="fc" id="L43">    public static final long cacheSize = 1024L * 1024L * Math.max(0, DatabaseDescriptor.getFileCacheSizeInMB() - RESERVED_POOL_SPACE_IN_MB);</span>
+<span class="fc" id="L44">    public static final boolean roundUp = DatabaseDescriptor.getFileCacheRoundUp();</span>
+
+<span class="pc bpc" id="L46" title="1 of 2 branches missed.">    private static boolean enabled = cacheSize &gt; 0;</span>
+<span class="pc bpc" id="L47" title="1 of 2 branches missed.">    public static final ChunkCache instance = enabled ? new ChunkCache() : null;</span>
+
+    private final LoadingCache&lt;Key, Buffer&gt; cache;
+    public final CacheMissMetrics metrics;
+
+    static class Key
+    {
+        final ChunkReader file;
+        final String path;
+        final long position;
+
+        public Key(ChunkReader file, long position)
+        {
+<span class="fc" id="L60">            super();</span>
+<span class="fc" id="L61">            this.file = file;</span>
+<span class="fc" id="L62">            this.position = position;</span>
+<span class="fc" id="L63">            this.path = file.channel().filePath();</span>
+<span class="fc" id="L64">        }</span>
+
+        public int hashCode()
+        {
+<span class="fc" id="L68">            final int prime = 31;</span>
+<span class="fc" id="L69">            int result = 1;</span>
+<span class="fc" id="L70">            result = prime * result + path.hashCode();</span>
+<span class="fc" id="L71">            result = prime * result + file.getClass().hashCode();</span>
+<span class="fc" id="L72">            result = prime * result + Long.hashCode(position);</span>
+<span class="fc" id="L73">            return result;</span>
+        }
+
+        public boolean equals(Object obj)
+        {
+<span class="pc bpc" id="L78" title="1 of 2 branches missed.">            if (this == obj)</span>
+<span class="nc" id="L79">                return true;</span>
+<span class="pc bpc" id="L80" title="1 of 2 branches missed.">            if (obj == null)</span>
+<span class="nc" id="L81">                return false;</span>
+
+<span class="fc" id="L83">            Key other = (Key) obj;</span>
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">            return (position == other.position)</span>
+<span class="pc bpc" id="L85" title="1 of 2 branches missed.">                    &amp;&amp; file.getClass() == other.file.getClass()</span>
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">                    &amp;&amp; path.equals(other.path);</span>
+        }
+    }
+
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">    static class Buffer implements Rebufferer.BufferHolder</span>
+    {
+        private final ByteBuffer buffer;
+        private final long offset;
+        private final AtomicInteger references;
+
+        public Buffer(ByteBuffer buffer, long offset)
+<span class="fc" id="L97">        {</span>
+<span class="fc" id="L98">            this.buffer = buffer;</span>
+<span class="fc" id="L99">            this.offset = offset;</span>
+<span class="fc" id="L100">            references = new AtomicInteger(1);  // start referenced.</span>
+<span class="fc" id="L101">        }</span>
+
+        Buffer reference()
+        {
+            int refCount;
+            do
+            {
+<span class="fc" id="L108">                refCount = references.get();</span>
+<span class="pc bpc" id="L109" title="1 of 2 branches missed.">                if (refCount == 0)</span>
+                    // Buffer was released before we managed to reference it.
+<span class="nc" id="L111">                    return null;</span>
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">            } while (!references.compareAndSet(refCount, refCount + 1));</span>
+
+<span class="fc" id="L114">            return this;</span>
+        }
+
+        @Override
+        public ByteBuffer buffer()
+        {
+<span class="pc bpc" id="L120" title="2 of 4 branches missed.">            assert references.get() &gt; 0;</span>
+<span class="fc" id="L121">            return buffer.duplicate();</span>
+        }
+
+        @Override
+        public long offset()
+        {
+<span class="fc" id="L127">            return offset;</span>
+        }
+
+        @Override
+        public void release()
+        {
+<span class="fc bfc" id="L133" title="All 2 branches covered.">            if (references.decrementAndGet() == 0)</span>
+<span class="fc" id="L134">                BufferPool.put(buffer);</span>
+<span class="fc" id="L135">        }</span>
+    }
+
+    public ChunkCache()
+<span class="fc" id="L139">    {</span>
+<span class="fc" id="L140">        cache = Caffeine.newBuilder()</span>
+<span class="fc" id="L141">                .maximumWeight(cacheSize)</span>
+<span class="fc" id="L142">                .executor(MoreExecutors.directExecutor())</span>
+<span class="fc" id="L143">                .weigher((key, buffer) -&gt; ((Buffer) buffer).buffer.capacity())</span>
+<span class="fc" id="L144">                .removalListener(this)</span>
+<span class="fc" id="L145">                .build(this);</span>
+<span class="fc" id="L146">        metrics = new CacheMissMetrics(&quot;ChunkCache&quot;, this);</span>
+<span class="fc" id="L147">    }</span>
+
+    @Override
+    public Buffer load(Key key) throws Exception
+    {
+<span class="fc" id="L152">        ChunkReader rebufferer = key.file;</span>
+<span class="fc" id="L153">        metrics.misses.mark();</span>
+<span class="fc" id="L154">        try (Timer.Context ctx = metrics.missLatency.time())</span>
+        {
+<span class="fc" id="L156">            ByteBuffer buffer = BufferPool.get(key.file.chunkSize(), key.file.preferredBufferType());</span>
+<span class="pc bpc" id="L157" title="2 of 4 branches missed.">            assert buffer != null;</span>
+<span class="fc" id="L158">            rebufferer.readChunk(key.position, buffer);</span>
+<span class="fc" id="L159">            return new Buffer(buffer, key.position);</span>
+        }
+    }
+
+    @Override
+    public void onRemoval(Key key, Buffer buffer, RemovalCause cause)
+    {
+<span class="fc" id="L166">        buffer.release();</span>
+<span class="fc" id="L167">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L171">        cache.invalidateAll();</span>
+<span class="nc" id="L172">    }</span>
+
+    public RebuffererFactory wrap(ChunkReader file)
+    {
+<span class="fc" id="L176">        return new CachingRebufferer(file);</span>
+    }
+
+    public static RebuffererFactory maybeWrap(ChunkReader file)
+    {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (!enabled)</span>
+<span class="nc" id="L182">            return file;</span>
+
+<span class="nc" id="L184">        return instance.wrap(file);</span>
+    }
+
+    public void invalidatePosition(FileHandle dfile, long position)
+    {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        if (!(dfile.rebuffererFactory() instanceof CachingRebufferer))</span>
+<span class="nc" id="L190">            return;</span>
+
+<span class="nc" id="L192">        ((CachingRebufferer) dfile.rebuffererFactory()).invalidate(position);</span>
+<span class="nc" id="L193">    }</span>
+
+    public void invalidateFile(String fileName)
+    {
+<span class="fc" id="L197">        cache.invalidateAll(Iterables.filter(cache.asMap().keySet(), x -&gt; x.path.equals(fileName)));</span>
+<span class="fc" id="L198">    }</span>
+
+    @VisibleForTesting
+    public void enable(boolean enabled)
+    {
+<span class="nc" id="L203">        ChunkCache.enabled = enabled;</span>
+<span class="nc" id="L204">        cache.invalidateAll();</span>
+<span class="nc" id="L205">        metrics.reset();</span>
+<span class="nc" id="L206">    }</span>
+
+    // TODO: Invalidate caches for obsoleted/MOVED_START tables?
+
+    /**
+     * Rebufferer providing cached chunks where data is obtained from the specified ChunkReader.
+     * Thread-safe. One instance per SegmentedFile, created by ChunkCache.maybeWrap if the cache is enabled.
+     */
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">    class CachingRebufferer implements Rebufferer, RebuffererFactory</span>
+    {
+        private final ChunkReader source;
+        final long alignmentMask;
+
+        public CachingRebufferer(ChunkReader file)
+<span class="fc" id="L220">        {</span>
+<span class="fc" id="L221">            source = file;</span>
+<span class="fc" id="L222">            int chunkSize = file.chunkSize();</span>
+<span class="pc bpc" id="L223" title="2 of 4 branches missed.">            assert Integer.bitCount(chunkSize) == 1 : String.format(&quot;%d must be a power of two&quot;, chunkSize);</span>
+<span class="fc" id="L224">            alignmentMask = -chunkSize;</span>
+<span class="fc" id="L225">        }</span>
+
+        @Override
+        public Buffer rebuffer(long position)
+        {
+            try
+            {
+<span class="fc" id="L232">                metrics.requests.mark();</span>
+<span class="fc" id="L233">                long pageAlignedPos = position &amp; alignmentMask;</span>
+                Buffer buf;
+                do
+<span class="fc" id="L236">                    buf = cache.get(new Key(source, pageAlignedPos)).reference();</span>
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">                while (buf == null);</span>
+
+<span class="fc" id="L239">                return buf;</span>
+            }
+<span class="nc" id="L241">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L243">                Throwables.propagateIfInstanceOf(t.getCause(), CorruptSSTableException.class);</span>
+<span class="nc" id="L244">                throw Throwables.propagate(t);</span>
+            }
+        }
+
+        public void invalidate(long position)
+        {
+<span class="nc" id="L250">            long pageAlignedPos = position &amp; alignmentMask;</span>
+<span class="nc" id="L251">            cache.invalidate(new Key(source, pageAlignedPos));</span>
+<span class="nc" id="L252">        }</span>
+
+        @Override
+        public Rebufferer instantiateRebufferer()
+        {
+<span class="fc" id="L257">            return this;</span>
+        }
+
+        @Override
+        public void close()
+        {
+<span class="fc" id="L263">            source.close();</span>
+<span class="fc" id="L264">        }</span>
+
+        @Override
+        public void closeReader()
+        {
+            // Instance is shared among readers. Nothing to release.
+<span class="fc" id="L270">        }</span>
+
+        @Override
+        public ChannelProxy channel()
+        {
+<span class="fc" id="L275">            return source.channel();</span>
+        }
+
+        @Override
+        public long fileLength()
+        {
+<span class="fc" id="L281">            return source.fileLength();</span>
+        }
+
+        @Override
+        public double getCrcCheckChance()
+        {
+<span class="nc" id="L287">            return source.getCrcCheckChance();</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L293">            return &quot;CachingRebufferer:&quot; + source.toString();</span>
+        }
+    }
+
+    @Override
+    public long capacity()
+    {
+<span class="fc" id="L300">        return cacheSize;</span>
+    }
+
+    @Override
+    public void setCapacity(long capacity)
+    {
+<span class="nc" id="L306">        throw new UnsupportedOperationException(&quot;Chunk cache size cannot be changed.&quot;);</span>
+    }
+
+    @Override
+    public int size()
+    {
+<span class="nc" id="L312">        return cache.asMap().size();</span>
+    }
+
+    @Override
+    public long weightedSize()
+    {
+<span class="nc" id="L318">        return cache.policy().eviction()</span>
+<span class="nc" id="L319">                .map(policy -&gt; policy.weightedSize().orElseGet(cache::estimatedSize))</span>
+<span class="nc" id="L320">                .orElseGet(cache::estimatedSize);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

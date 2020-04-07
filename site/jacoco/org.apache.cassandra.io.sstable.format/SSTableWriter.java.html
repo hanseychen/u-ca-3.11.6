@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format</a> &gt; <span class="el_source">SSTableWriter.java</span></div><h1>SSTableWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.io.sstable.format;
+
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
+import org.apache.cassandra.io.sstable.metadata.MetadataType;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+/**
+ * This is the API all table writers must implement.
+ *
+ * TableWriter.create() is the primary way to create a writer for a particular format.
+ * The format information is part of the Descriptor.
+ */
+public abstract class SSTableWriter extends SSTable implements Transactional
+{
+    protected long repairedAt;
+<span class="fc" id="L57">    protected long maxDataAge = -1;</span>
+    protected final long keyCount;
+    protected final MetadataCollector metadataCollector;
+    protected final RowIndexEntry.IndexSerializer rowIndexEntrySerializer;
+    protected final SerializationHeader header;
+<span class="fc" id="L62">    protected final TransactionalProxy txnProxy = txnProxy();</span>
+    protected final Collection&lt;SSTableFlushObserver&gt; observers;
+
+    protected abstract TransactionalProxy txnProxy();
+
+    // due to lack of multiple inheritance, we use an inner class to proxy our Transactional implementation details
+<span class="fc" id="L68">    protected abstract class TransactionalProxy extends AbstractTransactional</span>
+    {
+        // should be set during doPrepare()
+        protected SSTableReader finalReader;
+        protected boolean openResult;
+    }
+
+    protected SSTableWriter(Descriptor descriptor,
+                            long keyCount,
+                            long repairedAt,
+                            CFMetaData metadata,
+                            MetadataCollector metadataCollector,
+                            SerializationHeader header,
+                            Collection&lt;SSTableFlushObserver&gt; observers)
+    {
+<span class="fc" id="L83">        super(descriptor, components(metadata), metadata, DatabaseDescriptor.getDiskOptimizationStrategy());</span>
+<span class="fc" id="L84">        this.keyCount = keyCount;</span>
+<span class="fc" id="L85">        this.repairedAt = repairedAt;</span>
+<span class="fc" id="L86">        this.metadataCollector = metadataCollector;</span>
+<span class="pc bpc" id="L87" title="1 of 2 branches missed.">        this.header = header != null ? header : SerializationHeader.makeWithoutStats(metadata); //null header indicates streaming from pre-3.0 sstable</span>
+<span class="fc" id="L88">        this.rowIndexEntrySerializer = descriptor.version.getSSTableFormat().getIndexSerializer(metadata, descriptor.version, header);</span>
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">        this.observers = observers == null ? Collections.emptySet() : observers;</span>
+<span class="fc" id="L90">    }</span>
+
+    public static SSTableWriter create(Descriptor descriptor,
+                                       Long keyCount,
+                                       Long repairedAt,
+                                       CFMetaData metadata,
+                                       MetadataCollector metadataCollector,
+                                       SerializationHeader header,
+                                       Collection&lt;Index&gt; indexes,
+                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="fc" id="L101">        Factory writerFactory = descriptor.getFormat().getWriterFactory();</span>
+<span class="fc" id="L102">        return writerFactory.open(descriptor, keyCount, repairedAt, metadata, metadataCollector, header, observers(descriptor, indexes, lifecycleNewTracker.opType()), lifecycleNewTracker);</span>
+    }
+
+    public static SSTableWriter create(Descriptor descriptor,
+                                       long keyCount,
+                                       long repairedAt,
+                                       int sstableLevel,
+                                       SerializationHeader header,
+                                       Collection&lt;Index&gt; indexes,
+                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="nc" id="L113">        CFMetaData metadata = Schema.instance.getCFMetaData(descriptor);</span>
+<span class="nc" id="L114">        return create(metadata, descriptor, keyCount, repairedAt, sstableLevel, header, indexes, lifecycleNewTracker);</span>
+    }
+
+    public static SSTableWriter create(CFMetaData metadata,
+                                       Descriptor descriptor,
+                                       long keyCount,
+                                       long repairedAt,
+                                       int sstableLevel,
+                                       SerializationHeader header,
+                                       Collection&lt;Index&gt; indexes,
+                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="nc" id="L126">        MetadataCollector collector = new MetadataCollector(metadata.comparator).sstableLevel(sstableLevel);</span>
+<span class="nc" id="L127">        return create(descriptor, keyCount, repairedAt, metadata, collector, header, indexes, lifecycleNewTracker);</span>
+    }
+
+    public static SSTableWriter create(String filename,
+                                       long keyCount,
+                                       long repairedAt,
+                                       int sstableLevel,
+                                       SerializationHeader header,
+                                       Collection&lt;Index&gt; indexes,
+                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="nc" id="L138">        return create(Descriptor.fromFilename(filename), keyCount, repairedAt, sstableLevel, header, indexes, lifecycleNewTracker);</span>
+    }
+
+    @VisibleForTesting
+    public static SSTableWriter create(String filename,
+                                       long keyCount,
+                                       long repairedAt,
+                                       SerializationHeader header,
+                                       Collection&lt;Index&gt; indexes,
+                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="nc" id="L149">        Descriptor descriptor = Descriptor.fromFilename(filename);</span>
+<span class="nc" id="L150">        return create(descriptor, keyCount, repairedAt, 0, header, indexes, lifecycleNewTracker);</span>
+    }
+
+    private static Set&lt;Component&gt; components(CFMetaData metadata)
+    {
+<span class="fc" id="L155">        Set&lt;Component&gt; components = new HashSet&lt;Component&gt;(Arrays.asList(Component.DATA,</span>
+                Component.PRIMARY_INDEX,
+                Component.STATS,
+                Component.SUMMARY,
+                Component.TOC,
+<span class="fc" id="L160">                Component.digestFor(BigFormat.latestVersion.uncompressedChecksumType())));</span>
+
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (metadata.params.bloomFilterFpChance &lt; 1.0)</span>
+<span class="fc" id="L163">            components.add(Component.FILTER);</span>
+
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">        if (metadata.params.compression.isEnabled())</span>
+        {
+<span class="fc" id="L167">            components.add(Component.COMPRESSION_INFO);</span>
+        }
+        else
+        {
+            // it would feel safer to actually add this component later in maybeWriteDigest(),
+            // but the components are unmodifiable after construction
+<span class="nc" id="L173">            components.add(Component.CRC);</span>
+        }
+<span class="fc" id="L175">        return components;</span>
+    }
+
+    private static Collection&lt;SSTableFlushObserver&gt; observers(Descriptor descriptor,
+                                                              Collection&lt;Index&gt; indexes,
+                                                              OperationType operationType)
+    {
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        if (indexes == null)</span>
+<span class="nc" id="L183">            return Collections.emptyList();</span>
+
+<span class="fc" id="L185">        List&lt;SSTableFlushObserver&gt; observers = new ArrayList&lt;&gt;(indexes.size());</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">        for (Index index : indexes)</span>
+        {
+<span class="nc" id="L188">            SSTableFlushObserver observer = index.getFlushObserver(descriptor, operationType);</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            if (observer != null)</span>
+            {
+<span class="nc" id="L191">                observer.begin();</span>
+<span class="nc" id="L192">                observers.add(observer);</span>
+            }
+<span class="nc" id="L194">        }</span>
+
+<span class="fc" id="L196">        return ImmutableList.copyOf(observers);</span>
+    }
+
+    public abstract void mark();
+
+    /**
+     * Appends partition data to this writer.
+     *
+     * @param iterator the partition to write
+     * @return the created index entry if something was written, that is if {@code iterator}
+     * wasn't empty, {@code null} otherwise.
+     *
+     * @throws FSWriteError if a write to the dataFile fails
+     */
+    public abstract RowIndexEntry append(UnfilteredRowIterator iterator);
+
+    public abstract long getFilePointer();
+
+    public abstract long getOnDiskFilePointer();
+
+    public long getEstimatedOnDiskBytesWritten()
+    {
+<span class="nc" id="L218">        return getOnDiskFilePointer();</span>
+    }
+
+    public abstract void resetAndTruncate();
+
+    public SSTableWriter setRepairedAt(long repairedAt)
+    {
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">        if (repairedAt &gt; 0)</span>
+<span class="nc" id="L226">            this.repairedAt = repairedAt;</span>
+<span class="fc" id="L227">        return this;</span>
+    }
+
+    public SSTableWriter setMaxDataAge(long maxDataAge)
+    {
+<span class="fc" id="L232">        this.maxDataAge = maxDataAge;</span>
+<span class="fc" id="L233">        return this;</span>
+    }
+
+    public SSTableWriter setOpenResult(boolean openResult)
+    {
+<span class="fc" id="L238">        txnProxy.openResult = openResult;</span>
+<span class="fc" id="L239">        return this;</span>
+    }
+
+    /**
+     * Open the resultant SSTableReader before it has been fully written
+     */
+    public abstract SSTableReader openEarly();
+
+    /**
+     * Open the resultant SSTableReader once it has been fully written, but before the
+     * _set_ of tables that are being written together as one atomic operation are all ready
+     */
+    public abstract SSTableReader openFinalEarly();
+
+    public SSTableReader finish(long repairedAt, long maxDataAge, boolean openResult)
+    {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (repairedAt &gt; 0)</span>
+<span class="nc" id="L256">            this.repairedAt = repairedAt;</span>
+<span class="nc" id="L257">        this.maxDataAge = maxDataAge;</span>
+<span class="nc" id="L258">        return finish(openResult);</span>
+    }
+
+    public SSTableReader finish(boolean openResult)
+    {
+<span class="nc" id="L263">        setOpenResult(openResult);</span>
+<span class="nc" id="L264">        txnProxy.finish();</span>
+<span class="nc" id="L265">        observers.forEach(SSTableFlushObserver::complete);</span>
+<span class="nc" id="L266">        return finished();</span>
+    }
+
+    /**
+     * Open the resultant SSTableReader once it has been fully written, and all related state
+     * is ready to be finalised including other sstables being written involved in the same operation
+     */
+    public SSTableReader finished()
+    {
+<span class="fc" id="L275">        return txnProxy.finalReader;</span>
+    }
+
+    // finalise our state on disk, including renaming
+    public final void prepareToCommit()
+    {
+<span class="fc" id="L281">        txnProxy.prepareToCommit();</span>
+<span class="fc" id="L282">    }</span>
+
+    public final Throwable commit(Throwable accumulate)
+    {
+        try
+        {
+<span class="fc" id="L288">            return txnProxy.commit(accumulate);</span>
+        }
+        finally
+        {
+<span class="fc" id="L292">            observers.forEach(SSTableFlushObserver::complete);</span>
+        }
+    }
+
+    public final Throwable abort(Throwable accumulate)
+    {
+<span class="nc" id="L298">        return txnProxy.abort(accumulate);</span>
+    }
+
+    public final void close()
+    {
+<span class="nc" id="L303">        txnProxy.close();</span>
+<span class="nc" id="L304">    }</span>
+
+    public final void abort()
+    {
+<span class="nc" id="L308">        txnProxy.abort();</span>
+<span class="nc" id="L309">    }</span>
+
+    protected Map&lt;MetadataType, MetadataComponent&gt; finalizeMetadata()
+    {
+<span class="fc" id="L313">        return metadataCollector.finalizeMetadata(getPartitioner().getClass().getCanonicalName(),</span>
+                                                  metadata.params.bloomFilterFpChance,
+                                                  repairedAt,
+                                                  header);
+    }
+
+    protected StatsMetadata statsMetadata()
+    {
+<span class="fc" id="L321">        return (StatsMetadata) finalizeMetadata().get(MetadataType.STATS);</span>
+    }
+
+    public static void rename(Descriptor tmpdesc, Descriptor newdesc, Set&lt;Component&gt; components)
+    {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        for (Component component : Sets.difference(components, Sets.newHashSet(Component.DATA, Component.SUMMARY)))</span>
+        {
+<span class="nc" id="L328">            FileUtils.renameWithConfirm(tmpdesc.filenameFor(component), newdesc.filenameFor(component));</span>
+<span class="nc" id="L329">        }</span>
+
+        // do -Data last because -Data present should mean the sstable was completely renamed before crash
+<span class="nc" id="L332">        FileUtils.renameWithConfirm(tmpdesc.filenameFor(Component.DATA), newdesc.filenameFor(Component.DATA));</span>
+
+        // rename it without confirmation because summary can be available for loadNewSSTables but not for closeAndOpenReader
+<span class="nc" id="L335">        FileUtils.renameWithOutConfirm(tmpdesc.filenameFor(Component.SUMMARY), newdesc.filenameFor(Component.SUMMARY));</span>
+<span class="nc" id="L336">    }</span>
+
+
+<span class="fc" id="L339">    public static abstract class Factory</span>
+    {
+        public abstract SSTableWriter open(Descriptor descriptor,
+                                           long keyCount,
+                                           long repairedAt,
+                                           CFMetaData metadata,
+                                           MetadataCollector metadataCollector,
+                                           SerializationHeader header,
+                                           Collection&lt;SSTableFlushObserver&gt; observers,
+                                           LifecycleNewTracker lifecycleNewTracker);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

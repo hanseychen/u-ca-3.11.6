@@ -1,0 +1,2593 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DatabaseDescriptor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.config</a> &gt; <span class="el_source">DatabaseDescriptor.java</span></div><h1>DatabaseDescriptor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.config;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.net.*;
+import java.nio.file.FileStore;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.primitives.Ints;
+import com.google.common.primitives.Longs;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.AuthConfig;
+import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.IAuthorizer;
+import org.apache.cassandra.auth.IInternodeAuthenticator;
+import org.apache.cassandra.auth.IRoleManager;
+import org.apache.cassandra.config.Config.CommitLogSync;
+import org.apache.cassandra.config.Config.RequestSchedulerId;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.DiskOptimizationStrategy;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SpinningDiskOptimizationStrategy;
+import org.apache.cassandra.io.util.SsdDiskOptimizationStrategy;
+import org.apache.cassandra.locator.DynamicEndpointSnitch;
+import org.apache.cassandra.locator.EndpointSnitchInfo;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.SeedProvider;
+import org.apache.cassandra.net.BackPressureStrategy;
+import org.apache.cassandra.net.RateBasedBackPressure;
+import org.apache.cassandra.scheduler.IRequestScheduler;
+import org.apache.cassandra.scheduler.NoScheduler;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.service.CacheService.CacheType;
+import org.apache.cassandra.thrift.ThriftServer.ThriftServerType;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.ProtocolVersionLimit;
+import org.apache.cassandra.utils.FBUtilities;
+
+import org.apache.commons.lang3.StringUtils;
+
+import static org.apache.cassandra.io.util.FileUtils.ONE_GB;
+
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">public class DatabaseDescriptor</span>
+{
+<span class="fc" id="L74">    private static final Logger logger = LoggerFactory.getLogger(DatabaseDescriptor.class);</span>
+
+    /**
+     * Tokens are serialized in a Gossip VersionedValue String.  VV are restricted to 64KB
+     * when we send them over the wire, which works out to about 1700 tokens.
+     */
+    private static final int MAX_NUM_TOKENS = 1536;
+
+    private static Config conf;
+
+    private static IEndpointSnitch snitch;
+    private static InetAddress listenAddress; // leave null so we can fall through to getLocalHost
+    private static InetAddress broadcastAddress;
+    private static InetAddress rpcAddress;
+    private static InetAddress broadcastRpcAddress;
+    private static SeedProvider seedProvider;
+    private static IInternodeAuthenticator internodeAuthenticator;
+
+    /* Hashing strategy Random or OPHF */
+    private static IPartitioner partitioner;
+    private static String paritionerName;
+
+    private static Config.DiskAccessMode indexAccessMode;
+
+    private static IAuthenticator authenticator;
+    private static IAuthorizer authorizer;
+    // Don't initialize the role manager until applying config. The options supported by CassandraRoleManager
+    // depend on the configured IAuthenticator, so defer creating it until that's been set.
+    private static IRoleManager roleManager;
+
+    private static IRequestScheduler requestScheduler;
+    private static RequestSchedulerId requestSchedulerId;
+    private static RequestSchedulerOptions requestSchedulerOptions;
+
+    private static long preparedStatementsCacheSizeInMB;
+    private static long thriftPreparedStatementsCacheSizeInMB;
+
+    private static long keyCacheSizeInMB;
+    private static long counterCacheSizeInMB;
+    private static long indexSummaryCapacityInMB;
+
+    private static String localDC;
+    private static Comparator&lt;InetAddress&gt; localComparator;
+    private static EncryptionContext encryptionContext;
+    private static boolean hasLoggedConfig;
+
+    private static BackPressureStrategy backPressureStrategy;
+    private static DiskOptimizationStrategy diskOptimizationStrategy;
+
+    private static boolean clientInitialized;
+    private static boolean toolInitialized;
+    private static boolean daemonInitialized;
+
+<span class="fc" id="L127">    private static final int searchConcurrencyFactor = Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;search_concurrency_factor&quot;, &quot;1&quot;));</span>
+
+<span class="fc" id="L129">    private static final boolean disableSTCSInL0 = Boolean.getBoolean(Config.PROPERTY_PREFIX + &quot;disable_stcs_in_l0&quot;);</span>
+<span class="fc" id="L130">    private static final boolean unsafeSystem = Boolean.getBoolean(Config.PROPERTY_PREFIX + &quot;unsafesystem&quot;);</span>
+
+    // turns some warnings into exceptions for testing
+<span class="fc" id="L133">    private static final boolean strictRuntimeChecks = Boolean.getBoolean(&quot;cassandra.strict.runtime.checks&quot;);</span>
+
+    public static void daemonInitialization() throws ConfigurationException
+    {
+<span class="fc" id="L137">        daemonInitialization(DatabaseDescriptor::loadConfig);</span>
+<span class="fc" id="L138">    }</span>
+
+    public static void daemonInitialization(Supplier&lt;Config&gt; config) throws ConfigurationException
+    {
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">        if (toolInitialized)</span>
+<span class="nc" id="L143">            throw new AssertionError(&quot;toolInitialization() already called&quot;);</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">        if (clientInitialized)</span>
+<span class="nc" id="L145">            throw new AssertionError(&quot;clientInitialization() already called&quot;);</span>
+
+        // Some unit tests require this :(
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">        if (daemonInitialized)</span>
+<span class="nc" id="L149">            return;</span>
+<span class="fc" id="L150">        daemonInitialized = true;</span>
+
+<span class="fc" id="L152">        setConfig(config.get());</span>
+<span class="fc" id="L153">        applyAll();</span>
+<span class="fc" id="L154">        AuthConfig.applyAuth();</span>
+<span class="fc" id="L155">    }</span>
+
+    /**
+     * Equivalent to {@link #toolInitialization(boolean) toolInitialization(true)}.
+     */
+    public static void toolInitialization()
+    {
+<span class="nc" id="L162">        toolInitialization(true);</span>
+<span class="nc" id="L163">    }</span>
+
+    /**
+     * Initializes this class as a tool, which means that the configuration is loaded
+     * using {@link #loadConfig()} and all non-daemon configuration parts will be setup.
+     *
+     * @param failIfDaemonOrClient if {@code true} and a call to {@link #daemonInitialization()} or
+     *                             {@link #clientInitialization()} has been performed before, an
+     *                             {@link AssertionError} will be thrown.
+     */
+    public static void toolInitialization(boolean failIfDaemonOrClient)
+    {
+<span class="nc bnc" id="L175" title="All 6 branches missed.">        if (!failIfDaemonOrClient &amp;&amp; (daemonInitialized || clientInitialized))</span>
+        {
+<span class="nc" id="L177">            return;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">            if (daemonInitialized)</span>
+<span class="nc" id="L182">                throw new AssertionError(&quot;daemonInitialization() already called&quot;);</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (clientInitialized)</span>
+<span class="nc" id="L184">                throw new AssertionError(&quot;clientInitialization() already called&quot;);</span>
+        }
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (toolInitialized)</span>
+<span class="nc" id="L188">            return;</span>
+<span class="nc" id="L189">        toolInitialized = true;</span>
+
+<span class="nc" id="L191">        setConfig(loadConfig());</span>
+
+<span class="nc" id="L193">        applySimpleConfig();</span>
+
+<span class="nc" id="L195">        applyPartitioner();</span>
+
+<span class="nc" id="L197">        applySnitch();</span>
+
+<span class="nc" id="L199">        applyEncryptionContext();</span>
+<span class="nc" id="L200">    }</span>
+
+    /**
+     * Equivalent to {@link #clientInitialization(boolean) clientInitialization(true)}.
+     */
+    public static void clientInitialization()
+    {
+<span class="nc" id="L207">        clientInitialization(true);</span>
+<span class="nc" id="L208">    }</span>
+
+    /**
+     * Initializes this class as a client, which means that just an empty configuration will
+     * be used.
+     *
+     * @param failIfDaemonOrTool if {@code true} and a call to {@link #daemonInitialization()} or
+     *                           {@link #toolInitialization()} has been performed before, an
+     *                           {@link AssertionError} will be thrown.
+     */
+    public static void clientInitialization(boolean failIfDaemonOrTool)
+    {
+<span class="nc bnc" id="L220" title="All 6 branches missed.">        if (!failIfDaemonOrTool &amp;&amp; (daemonInitialized || toolInitialized))</span>
+        {
+<span class="nc" id="L222">            return;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (daemonInitialized)</span>
+<span class="nc" id="L227">                throw new AssertionError(&quot;daemonInitialization() already called&quot;);</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            if (toolInitialized)</span>
+<span class="nc" id="L229">                throw new AssertionError(&quot;toolInitialization() already called&quot;);</span>
+        }
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (clientInitialized)</span>
+<span class="nc" id="L233">            return;</span>
+<span class="nc" id="L234">        clientInitialized = true;</span>
+
+<span class="nc" id="L236">        Config.setClientMode(true);</span>
+<span class="nc" id="L237">        conf = new Config();</span>
+<span class="nc" id="L238">        diskOptimizationStrategy = new SpinningDiskOptimizationStrategy();</span>
+<span class="nc" id="L239">    }</span>
+
+    public static boolean isClientInitialized()
+    {
+<span class="nc" id="L243">        return clientInitialized;</span>
+    }
+
+    public static boolean isToolInitialized()
+    {
+<span class="nc" id="L248">        return toolInitialized;</span>
+    }
+
+    public static boolean isClientOrToolInitialized()
+    {
+<span class="pc bpc" id="L253" title="2 of 4 branches missed.">        return clientInitialized || toolInitialized;</span>
+    }
+
+    public static boolean isDaemonInitialized()
+    {
+<span class="fc" id="L258">        return daemonInitialized;</span>
+    }
+
+    public static Config getRawConfig()
+    {
+<span class="fc" id="L263">        return conf;</span>
+    }
+
+    @VisibleForTesting
+    public static Config loadConfig() throws ConfigurationException
+    {
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">        if (Config.getOverrideLoadConfig() != null)</span>
+<span class="nc" id="L270">            return Config.getOverrideLoadConfig().get();</span>
+
+<span class="fc" id="L272">        String loaderClass = System.getProperty(Config.PROPERTY_PREFIX + &quot;config.loader&quot;);</span>
+<span class="pc bpc" id="L273" title="1 of 2 branches missed.">        ConfigurationLoader loader = loaderClass == null</span>
+                                   ? new YamlConfigurationLoader()
+<span class="pc" id="L275">                                   : FBUtilities.&lt;ConfigurationLoader&gt;construct(loaderClass, &quot;configuration loading&quot;);</span>
+<span class="fc" id="L276">        Config config = loader.loadConfig();</span>
+
+<span class="fc bfc" id="L278" title="All 2 branches covered.">        if (!hasLoggedConfig)</span>
+        {
+<span class="fc" id="L280">            hasLoggedConfig = true;</span>
+<span class="fc" id="L281">            Config.log(config);</span>
+        }
+
+<span class="fc" id="L284">        return config;</span>
+    }
+
+    private static InetAddress getNetworkInterfaceAddress(String intf, String configName, boolean preferIPv6) throws ConfigurationException
+    {
+        try
+        {
+<span class="nc" id="L291">            NetworkInterface ni = NetworkInterface.getByName(intf);</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (ni == null)</span>
+<span class="nc" id="L293">                throw new ConfigurationException(&quot;Configured &quot; + configName + &quot; \&quot;&quot; + intf + &quot;\&quot; could not be found&quot;, false);</span>
+<span class="nc" id="L294">            Enumeration&lt;InetAddress&gt; addrs = ni.getInetAddresses();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (!addrs.hasMoreElements())</span>
+<span class="nc" id="L296">                throw new ConfigurationException(&quot;Configured &quot; + configName + &quot; \&quot;&quot; + intf + &quot;\&quot; was found, but had no addresses&quot;, false);</span>
+
+            /*
+             * Try to return the first address of the preferred type, otherwise return the first address
+             */
+<span class="nc" id="L301">            InetAddress retval = null;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            while (addrs.hasMoreElements())</span>
+            {
+<span class="nc" id="L304">                InetAddress temp = addrs.nextElement();</span>
+<span class="nc bnc" id="L305" title="All 4 branches missed.">                if (preferIPv6 &amp;&amp; temp instanceof Inet6Address) return temp;</span>
+<span class="nc bnc" id="L306" title="All 4 branches missed.">                if (!preferIPv6 &amp;&amp; temp instanceof Inet4Address) return temp;</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (retval == null) retval = temp;</span>
+<span class="nc" id="L308">            }</span>
+<span class="nc" id="L309">            return retval;</span>
+        }
+<span class="nc" id="L311">        catch (SocketException e)</span>
+        {
+<span class="nc" id="L313">            throw new ConfigurationException(&quot;Configured &quot; + configName + &quot; \&quot;&quot; + intf + &quot;\&quot; caused an exception&quot;, e);</span>
+        }
+    }
+
+    private static void setConfig(Config config)
+    {
+<span class="fc" id="L319">        conf = config;</span>
+<span class="fc" id="L320">    }</span>
+
+    private static void applyAll() throws ConfigurationException
+    {
+<span class="fc" id="L324">        applySimpleConfig();</span>
+
+<span class="fc" id="L326">        applyPartitioner();</span>
+
+<span class="fc" id="L328">        applyAddressConfig();</span>
+
+<span class="fc" id="L330">        applyThriftHSHA();</span>
+
+<span class="fc" id="L332">        applySnitch();</span>
+
+<span class="fc" id="L334">        applyRequestScheduler();</span>
+
+<span class="fc" id="L336">        applyInitialTokens();</span>
+
+<span class="fc" id="L338">        applySeedProvider();</span>
+
+<span class="fc" id="L340">        applyEncryptionContext();</span>
+<span class="fc" id="L341">    }</span>
+
+    private static void applySimpleConfig()
+    {
+
+<span class="pc bpc" id="L346" title="1 of 2 branches missed.">        if (conf.commitlog_sync == null)</span>
+        {
+<span class="nc" id="L348">            throw new ConfigurationException(&quot;Missing required directive CommitLogSync&quot;, false);</span>
+        }
+
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        if (conf.commitlog_sync == Config.CommitLogSync.batch)</span>
+        {
+<span class="nc bnc" id="L353" title="All 4 branches missed.">            if (Double.isNaN(conf.commitlog_sync_batch_window_in_ms) || conf.commitlog_sync_batch_window_in_ms &lt;= 0d)</span>
+            {
+<span class="nc" id="L355">                throw new ConfigurationException(&quot;Missing value for commitlog_sync_batch_window_in_ms: positive double value expected.&quot;, false);</span>
+            }
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            else if (conf.commitlog_sync_period_in_ms != 0)</span>
+            {
+<span class="nc" id="L359">                throw new ConfigurationException(&quot;Batch sync specified, but commitlog_sync_period_in_ms found. Only specify commitlog_sync_batch_window_in_ms when using batch sync&quot;, false);</span>
+            }
+<span class="nc" id="L361">            logger.debug(&quot;Syncing log with a batch window of {}&quot;, conf.commitlog_sync_batch_window_in_ms);</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">            if (conf.commitlog_sync_period_in_ms &lt;= 0)</span>
+            {
+<span class="nc" id="L367">                throw new ConfigurationException(&quot;Missing value for commitlog_sync_period_in_ms: positive integer expected&quot;, false);</span>
+            }
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">            else if (!Double.isNaN(conf.commitlog_sync_batch_window_in_ms))</span>
+            {
+<span class="nc" id="L371">                throw new ConfigurationException(&quot;commitlog_sync_period_in_ms specified, but commitlog_sync_batch_window_in_ms found.  Only specify commitlog_sync_period_in_ms when using periodic sync.&quot;, false);</span>
+            }
+<span class="fc" id="L373">            logger.debug(&quot;Syncing log with a period of {}&quot;, conf.commitlog_sync_period_in_ms);</span>
+        }
+
+        /* evaluate the DiskAccessMode Config directive, which also affects indexAccessMode selection */
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (conf.disk_access_mode == Config.DiskAccessMode.auto)</span>
+        {
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">            conf.disk_access_mode = hasLargeAddressSpace() ? Config.DiskAccessMode.mmap : Config.DiskAccessMode.standard;</span>
+<span class="fc" id="L380">            indexAccessMode = conf.disk_access_mode;</span>
+<span class="fc" id="L381">            logger.info(&quot;DiskAccessMode 'auto' determined to be {}, indexAccessMode is {}&quot;, conf.disk_access_mode, indexAccessMode);</span>
+        }
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        else if (conf.disk_access_mode == Config.DiskAccessMode.mmap_index_only)</span>
+        {
+<span class="nc" id="L385">            conf.disk_access_mode = Config.DiskAccessMode.standard;</span>
+<span class="nc" id="L386">            indexAccessMode = Config.DiskAccessMode.mmap;</span>
+<span class="nc" id="L387">            logger.info(&quot;DiskAccessMode is {}, indexAccessMode is {}&quot;, conf.disk_access_mode, indexAccessMode);</span>
+        }
+        else
+        {
+<span class="nc" id="L391">            indexAccessMode = conf.disk_access_mode;</span>
+<span class="nc" id="L392">            logger.info(&quot;DiskAccessMode is {}, indexAccessMode is {}&quot;, conf.disk_access_mode, indexAccessMode);</span>
+        }
+
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">        if (conf.gc_warn_threshold_in_ms &lt; 0)</span>
+        {
+<span class="nc" id="L397">            throw new ConfigurationException(&quot;gc_warn_threshold_in_ms must be a positive integer&quot;);</span>
+        }
+
+        /* phi convict threshold for FailureDetector */
+<span class="pc bpc" id="L401" title="2 of 4 branches missed.">        if (conf.phi_convict_threshold &lt; 5 || conf.phi_convict_threshold &gt; 16)</span>
+        {
+<span class="nc" id="L403">            throw new ConfigurationException(&quot;phi_convict_threshold must be between 5 and 16, but was &quot; + conf.phi_convict_threshold, false);</span>
+        }
+
+        /* Thread per pool */
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">        if (conf.concurrent_reads &lt; 2)</span>
+        {
+<span class="nc" id="L409">            throw new ConfigurationException(&quot;concurrent_reads must be at least 2, but was &quot; + conf.concurrent_reads, false);</span>
+        }
+
+<span class="pc bpc" id="L412" title="3 of 4 branches missed.">        if (conf.concurrent_writes &lt; 2 &amp;&amp; System.getProperty(&quot;cassandra.test.fail_mv_locks_count&quot;, &quot;&quot;).isEmpty())</span>
+        {
+<span class="nc" id="L414">            throw new ConfigurationException(&quot;concurrent_writes must be at least 2, but was &quot; + conf.concurrent_writes, false);</span>
+        }
+
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">        if (conf.concurrent_counter_writes &lt; 2)</span>
+<span class="nc" id="L418">            throw new ConfigurationException(&quot;concurrent_counter_writes must be at least 2, but was &quot; + conf.concurrent_counter_writes, false);</span>
+
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">        if (conf.concurrent_replicates != null)</span>
+<span class="nc" id="L421">            logger.warn(&quot;concurrent_replicates has been deprecated and should be removed from cassandra.yaml&quot;);</span>
+
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">        if (conf.file_cache_size_in_mb == null)</span>
+<span class="fc" id="L424">            conf.file_cache_size_in_mb = Math.min(512, (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576)));</span>
+
+        // round down for SSDs and round up for spinning disks
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">        if (conf.file_cache_round_up == null)</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">            conf.file_cache_round_up = conf.disk_optimization_strategy == Config.DiskOptimizationStrategy.spinning;</span>
+
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">        if (conf.memtable_offheap_space_in_mb == null)</span>
+<span class="fc" id="L431">            conf.memtable_offheap_space_in_mb = (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576));</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">        if (conf.memtable_offheap_space_in_mb &lt; 0)</span>
+<span class="nc" id="L433">            throw new ConfigurationException(&quot;memtable_offheap_space_in_mb must be positive, but was &quot; + conf.memtable_offheap_space_in_mb, false);</span>
+        // for the moment, we default to twice as much on-heap space as off-heap, as heap overhead is very large
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">        if (conf.memtable_heap_space_in_mb == null)</span>
+<span class="fc" id="L436">            conf.memtable_heap_space_in_mb = (int) (Runtime.getRuntime().maxMemory() / (4 * 1048576));</span>
+<span class="pc bpc" id="L437" title="1 of 2 branches missed.">        if (conf.memtable_heap_space_in_mb &lt;= 0)</span>
+<span class="nc" id="L438">            throw new ConfigurationException(&quot;memtable_heap_space_in_mb must be positive, but was &quot; + conf.memtable_heap_space_in_mb, false);</span>
+<span class="fc" id="L439">        logger.info(&quot;Global memtable on-heap threshold is enabled at {}MB&quot;, conf.memtable_heap_space_in_mb);</span>
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">        if (conf.memtable_offheap_space_in_mb == 0)</span>
+<span class="nc" id="L441">            logger.info(&quot;Global memtable off-heap threshold is disabled, HeapAllocator will be used instead&quot;);</span>
+        else
+<span class="fc" id="L443">            logger.info(&quot;Global memtable off-heap threshold is enabled at {}MB&quot;, conf.memtable_offheap_space_in_mb);</span>
+
+<span class="pc bpc" id="L445" title="1 of 2 branches missed.">        if (conf.repair_session_max_tree_depth &lt; 10)</span>
+<span class="nc" id="L446">            throw new ConfigurationException(&quot;repair_session_max_tree_depth should not be &lt; 10, but was &quot; + conf.repair_session_max_tree_depth);</span>
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">        if (conf.repair_session_max_tree_depth &gt; 20)</span>
+<span class="nc" id="L448">            logger.warn(&quot;repair_session_max_tree_depth of &quot; + conf.repair_session_max_tree_depth + &quot; &gt; 20 could lead to excessive memory usage&quot;);</span>
+
+<span class="pc bpc" id="L450" title="1 of 2 branches missed.">        if (conf.thrift_framed_transport_size_in_mb &lt;= 0)</span>
+<span class="nc" id="L451">            throw new ConfigurationException(&quot;thrift_framed_transport_size_in_mb must be positive, but was &quot; + conf.thrift_framed_transport_size_in_mb, false);</span>
+
+<span class="pc bpc" id="L453" title="1 of 2 branches missed.">        if (conf.native_transport_max_frame_size_in_mb &lt;= 0)</span>
+<span class="nc" id="L454">            throw new ConfigurationException(&quot;native_transport_max_frame_size_in_mb must be positive, but was &quot; + conf.native_transport_max_frame_size_in_mb, false);</span>
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">        else if (conf.native_transport_max_frame_size_in_mb &gt;= 2048)</span>
+<span class="nc" id="L456">            throw new ConfigurationException(&quot;native_transport_max_frame_size_in_mb must be smaller than 2048, but was &quot;</span>
+                    + conf.native_transport_max_frame_size_in_mb, false);
+
+        // if data dirs, commitlog dir, or saved caches dir are set in cassandra.yaml, use that.  Otherwise,
+        // use -Dcassandra.storagedir (set in cassandra-env.sh) as the parent dir for data/, commitlog/, and saved_caches/
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">        if (conf.commitlog_directory == null)</span>
+        {
+<span class="nc" id="L463">            conf.commitlog_directory = storagedirFor(&quot;commitlog&quot;);</span>
+        }
+
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">        if (conf.hints_directory == null)</span>
+        {
+<span class="nc" id="L468">            conf.hints_directory = storagedirFor(&quot;hints&quot;);</span>
+        }
+
+<span class="pc bpc" id="L471" title="1 of 2 branches missed.">        if (conf.native_transport_max_concurrent_requests_in_bytes &lt;= 0)</span>
+        {
+<span class="fc" id="L473">            conf.native_transport_max_concurrent_requests_in_bytes = Runtime.getRuntime().maxMemory() / 10;</span>
+        }
+
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">        if (conf.native_transport_max_concurrent_requests_in_bytes_per_ip &lt;= 0)</span>
+        {
+<span class="fc" id="L478">            conf.native_transport_max_concurrent_requests_in_bytes_per_ip = Runtime.getRuntime().maxMemory() / 40;</span>
+        }
+
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">        if (conf.cdc_raw_directory == null)</span>
+        {
+<span class="nc" id="L483">            conf.cdc_raw_directory = storagedirFor(&quot;cdc_raw&quot;);</span>
+        }
+
+<span class="pc bpc" id="L486" title="1 of 2 branches missed.">        if (conf.commitlog_total_space_in_mb == null)</span>
+        {
+<span class="fc" id="L488">            int preferredSize = 8192;</span>
+<span class="fc" id="L489">            int minSize = 0;</span>
+            try
+            {
+                // use 1/4 of available space.  See discussion on #10013 and #10199
+<span class="fc" id="L493">                minSize = Ints.saturatedCast((guessFileStore(conf.commitlog_directory).getTotalSpace() / 1048576) / 4);</span>
+            }
+<span class="nc" id="L495">            catch (IOException e)</span>
+            {
+<span class="nc" id="L497">                logger.debug(&quot;Error checking disk space&quot;, e);</span>
+<span class="nc" id="L498">                throw new ConfigurationException(String.format(&quot;Unable to check disk space available to %s. Perhaps the Cassandra user does not have the necessary permissions&quot;,</span>
+                                                               conf.commitlog_directory), e);
+<span class="fc" id="L500">            }</span>
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">            if (minSize &lt; preferredSize)</span>
+            {
+<span class="nc" id="L503">                logger.warn(&quot;Small commitlog volume detected at {}; setting commitlog_total_space_in_mb to {}.  You can override this in cassandra.yaml&quot;,</span>
+<span class="nc" id="L504">                            conf.commitlog_directory, minSize);</span>
+<span class="nc" id="L505">                conf.commitlog_total_space_in_mb = minSize;</span>
+            }
+            else
+            {
+<span class="fc" id="L509">                conf.commitlog_total_space_in_mb = preferredSize;</span>
+            }
+        }
+
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">        if (conf.cdc_total_space_in_mb == 0)</span>
+        {
+<span class="fc" id="L515">            int preferredSize = 4096;</span>
+<span class="fc" id="L516">            int minSize = 0;</span>
+            try
+            {
+                // use 1/8th of available space.  See discussion on #10013 and #10199 on the CL, taking half that for CDC
+<span class="fc" id="L520">                minSize = Ints.saturatedCast((guessFileStore(conf.cdc_raw_directory).getTotalSpace() / 1048576) / 8);</span>
+            }
+<span class="nc" id="L522">            catch (IOException e)</span>
+            {
+<span class="nc" id="L524">                logger.debug(&quot;Error checking disk space&quot;, e);</span>
+<span class="nc" id="L525">                throw new ConfigurationException(String.format(&quot;Unable to check disk space available to %s. Perhaps the Cassandra user does not have the necessary permissions&quot;,</span>
+                                                               conf.cdc_raw_directory), e);
+<span class="fc" id="L527">            }</span>
+<span class="pc bpc" id="L528" title="1 of 2 branches missed.">            if (minSize &lt; preferredSize)</span>
+            {
+<span class="nc" id="L530">                logger.warn(&quot;Small cdc volume detected at {}; setting cdc_total_space_in_mb to {}.  You can override this in cassandra.yaml&quot;,</span>
+<span class="nc" id="L531">                            conf.cdc_raw_directory, minSize);</span>
+<span class="nc" id="L532">                conf.cdc_total_space_in_mb = minSize;</span>
+            }
+            else
+            {
+<span class="fc" id="L536">                conf.cdc_total_space_in_mb = preferredSize;</span>
+            }
+        }
+
+<span class="pc bpc" id="L540" title="1 of 2 branches missed.">        if (conf.cdc_enabled)</span>
+        {
+<span class="nc" id="L542">            logger.info(&quot;cdc_enabled is true. Starting casssandra node with Change-Data-Capture enabled.&quot;);</span>
+        }
+
+<span class="pc bpc" id="L545" title="1 of 2 branches missed.">        if (conf.saved_caches_directory == null)</span>
+        {
+<span class="nc" id="L547">            conf.saved_caches_directory = storagedirFor(&quot;saved_caches&quot;);</span>
+        }
+<span class="pc bpc" id="L549" title="2 of 4 branches missed.">        if (conf.data_file_directories == null || conf.data_file_directories.length == 0)</span>
+        {
+<span class="nc" id="L551">            conf.data_file_directories = new String[]{ storagedir(&quot;data_file_directories&quot;) + File.separator + &quot;data&quot; };</span>
+        }
+
+<span class="fc" id="L554">        long dataFreeBytes = 0;</span>
+        /* data file and commit log directories. they get created later, when they're needed. */
+<span class="fc bfc" id="L556" title="All 2 branches covered.">        for (String datadir : conf.data_file_directories)</span>
+        {
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">            if (datadir == null)</span>
+<span class="nc" id="L559">                throw new ConfigurationException(&quot;data_file_directories must not contain empty entry&quot;, false);</span>
+<span class="pc bpc" id="L560" title="1 of 2 branches missed.">            if (datadir.equals(conf.commitlog_directory))</span>
+<span class="nc" id="L561">                throw new ConfigurationException(&quot;commitlog_directory must not be the same as any data_file_directories&quot;, false);</span>
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">            if (datadir.equals(conf.hints_directory))</span>
+<span class="nc" id="L563">                throw new ConfigurationException(&quot;hints_directory must not be the same as any data_file_directories&quot;, false);</span>
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">            if (datadir.equals(conf.saved_caches_directory))</span>
+<span class="nc" id="L565">                throw new ConfigurationException(&quot;saved_caches_directory must not be the same as any data_file_directories&quot;, false);</span>
+
+            try
+            {
+<span class="fc" id="L569">                dataFreeBytes = saturatedSum(dataFreeBytes, guessFileStore(datadir).getUnallocatedSpace());</span>
+            }
+<span class="nc" id="L571">            catch (IOException e)</span>
+            {
+<span class="nc" id="L573">                logger.debug(&quot;Error checking disk space&quot;, e);</span>
+<span class="nc" id="L574">                throw new ConfigurationException(String.format(&quot;Unable to check disk space available to %s. Perhaps the Cassandra user does not have the necessary permissions&quot;,</span>
+                                                               datadir), e);
+<span class="fc" id="L576">            }</span>
+        }
+<span class="pc bpc" id="L578" title="1 of 2 branches missed.">        if (dataFreeBytes &lt; 64 * ONE_GB) // 64 GB</span>
+<span class="fc" id="L579">            logger.warn(&quot;Only {} free across all data volumes. Consider adding more capacity to your cluster or removing obsolete snapshots&quot;,</span>
+<span class="fc" id="L580">                        FBUtilities.prettyPrintMemory(dataFreeBytes));</span>
+
+<span class="pc bpc" id="L582" title="1 of 2 branches missed.">        if (conf.commitlog_directory.equals(conf.saved_caches_directory))</span>
+<span class="nc" id="L583">            throw new ConfigurationException(&quot;saved_caches_directory must not be the same as the commitlog_directory&quot;, false);</span>
+<span class="pc bpc" id="L584" title="1 of 2 branches missed.">        if (conf.commitlog_directory.equals(conf.hints_directory))</span>
+<span class="nc" id="L585">            throw new ConfigurationException(&quot;hints_directory must not be the same as the commitlog_directory&quot;, false);</span>
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">        if (conf.hints_directory.equals(conf.saved_caches_directory))</span>
+<span class="nc" id="L587">            throw new ConfigurationException(&quot;saved_caches_directory must not be the same as the hints_directory&quot;, false);</span>
+
+<span class="pc bpc" id="L589" title="1 of 2 branches missed.">        if (conf.memtable_flush_writers == 0)</span>
+        {
+<span class="pc bpc" id="L591" title="1 of 2 branches missed.">            conf.memtable_flush_writers = conf.data_file_directories.length == 1 ? 2 : 1;</span>
+        }
+
+<span class="pc bpc" id="L594" title="1 of 2 branches missed.">        if (conf.memtable_flush_writers &lt; 1)</span>
+<span class="nc" id="L595">            throw new ConfigurationException(&quot;memtable_flush_writers must be at least 1, but was &quot; + conf.memtable_flush_writers, false);</span>
+
+<span class="pc bpc" id="L597" title="1 of 2 branches missed.">        if (conf.memtable_cleanup_threshold == null)</span>
+        {
+<span class="fc" id="L599">            conf.memtable_cleanup_threshold = (float) (1.0 / (1 + conf.memtable_flush_writers));</span>
+        }
+        else
+        {
+<span class="nc" id="L603">            logger.warn(&quot;memtable_cleanup_threshold has been deprecated and should be removed from cassandra.yaml&quot;);</span>
+        }
+
+<span class="pc bpc" id="L606" title="1 of 2 branches missed.">        if (conf.memtable_cleanup_threshold &lt; 0.01f)</span>
+<span class="nc" id="L607">            throw new ConfigurationException(&quot;memtable_cleanup_threshold must be &gt;= 0.01, but was &quot; + conf.memtable_cleanup_threshold, false);</span>
+<span class="pc bpc" id="L608" title="1 of 2 branches missed.">        if (conf.memtable_cleanup_threshold &gt; 0.99f)</span>
+<span class="nc" id="L609">            throw new ConfigurationException(&quot;memtable_cleanup_threshold must be &lt;= 0.99, but was &quot; + conf.memtable_cleanup_threshold, false);</span>
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">        if (conf.memtable_cleanup_threshold &lt; 0.1f)</span>
+<span class="nc" id="L611">            logger.warn(&quot;memtable_cleanup_threshold is set very low [{}], which may cause performance degradation&quot;, conf.memtable_cleanup_threshold);</span>
+
+<span class="pc bpc" id="L613" title="1 of 2 branches missed.">        if (conf.concurrent_compactors == null)</span>
+<span class="fc" id="L614">            conf.concurrent_compactors = Math.min(8, Math.max(2, Math.min(FBUtilities.getAvailableProcessors(), conf.data_file_directories.length)));</span>
+
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        if (conf.concurrent_compactors &lt;= 0)</span>
+<span class="nc" id="L617">            throw new ConfigurationException(&quot;concurrent_compactors should be strictly greater than 0, but was &quot; + conf.concurrent_compactors, false);</span>
+
+<span class="pc bpc" id="L619" title="1 of 2 branches missed.">        if (conf.num_tokens &gt; MAX_NUM_TOKENS)</span>
+<span class="nc" id="L620">            throw new ConfigurationException(String.format(&quot;A maximum number of %d tokens per node is supported&quot;, MAX_NUM_TOKENS), false);</span>
+
+        try
+        {
+            // if prepared_statements_cache_size_mb option was set to &quot;auto&quot; then size of the cache should be &quot;max(1/256 of Heap (in MB), 10MB)&quot;
+<span class="pc bpc" id="L625" title="1 of 2 branches missed.">            preparedStatementsCacheSizeInMB = (conf.prepared_statements_cache_size_mb == null)</span>
+<span class="pc" id="L626">                                              ? Math.max(10, (int) (Runtime.getRuntime().maxMemory() / 1024 / 1024 / 256))</span>
+<span class="pc" id="L627">                                              : conf.prepared_statements_cache_size_mb;</span>
+
+<span class="pc bpc" id="L629" title="1 of 2 branches missed.">            if (preparedStatementsCacheSizeInMB &lt;= 0)</span>
+<span class="nc" id="L630">                throw new NumberFormatException(); // to escape duplicating error message</span>
+        }
+<span class="nc" id="L632">        catch (NumberFormatException e)</span>
+        {
+<span class="nc" id="L634">            throw new ConfigurationException(&quot;prepared_statements_cache_size_mb option was set incorrectly to '&quot;</span>
+                                             + conf.prepared_statements_cache_size_mb + &quot;', supported values are &lt;integer&gt; &gt;= 0.&quot;, false);
+<span class="fc" id="L636">        }</span>
+
+        try
+        {
+            // if thrift_prepared_statements_cache_size_mb option was set to &quot;auto&quot; then size of the cache should be &quot;max(1/256 of Heap (in MB), 10MB)&quot;
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">            thriftPreparedStatementsCacheSizeInMB = (conf.thrift_prepared_statements_cache_size_mb == null)</span>
+<span class="pc" id="L642">                                                    ? Math.max(10, (int) (Runtime.getRuntime().maxMemory() / 1024 / 1024 / 256))</span>
+<span class="pc" id="L643">                                                    : conf.thrift_prepared_statements_cache_size_mb;</span>
+
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">            if (thriftPreparedStatementsCacheSizeInMB &lt;= 0)</span>
+<span class="nc" id="L646">                throw new NumberFormatException(); // to escape duplicating error message</span>
+        }
+<span class="nc" id="L648">        catch (NumberFormatException e)</span>
+        {
+<span class="nc" id="L650">            throw new ConfigurationException(&quot;thrift_prepared_statements_cache_size_mb option was set incorrectly to '&quot;</span>
+                                             + conf.thrift_prepared_statements_cache_size_mb + &quot;', supported values are &lt;integer&gt; &gt;= 0.&quot;, false);
+<span class="fc" id="L652">        }</span>
+
+        try
+        {
+            // if key_cache_size_in_mb option was set to &quot;auto&quot; then size of the cache should be &quot;min(5% of Heap (in MB), 100MB)
+<span class="pc bpc" id="L657" title="1 of 2 branches missed.">            keyCacheSizeInMB = (conf.key_cache_size_in_mb == null)</span>
+<span class="pc" id="L658">                               ? Math.min(Math.max(1, (int) (Runtime.getRuntime().totalMemory() * 0.05 / 1024 / 1024)), 100)</span>
+<span class="pc" id="L659">                               : conf.key_cache_size_in_mb;</span>
+
+<span class="pc bpc" id="L661" title="1 of 2 branches missed.">            if (keyCacheSizeInMB &lt; 0)</span>
+<span class="nc" id="L662">                throw new NumberFormatException(); // to escape duplicating error message</span>
+        }
+<span class="nc" id="L664">        catch (NumberFormatException e)</span>
+        {
+<span class="nc" id="L666">            throw new ConfigurationException(&quot;key_cache_size_in_mb option was set incorrectly to '&quot;</span>
+                                             + conf.key_cache_size_in_mb + &quot;', supported values are &lt;integer&gt; &gt;= 0.&quot;, false);
+<span class="fc" id="L668">        }</span>
+
+        try
+        {
+            // if counter_cache_size_in_mb option was set to &quot;auto&quot; then size of the cache should be &quot;min(2.5% of Heap (in MB), 50MB)
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">            counterCacheSizeInMB = (conf.counter_cache_size_in_mb == null)</span>
+<span class="pc" id="L674">                                   ? Math.min(Math.max(1, (int) (Runtime.getRuntime().totalMemory() * 0.025 / 1024 / 1024)), 50)</span>
+<span class="pc" id="L675">                                   : conf.counter_cache_size_in_mb;</span>
+
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">            if (counterCacheSizeInMB &lt; 0)</span>
+<span class="nc" id="L678">                throw new NumberFormatException(); // to escape duplicating error message</span>
+        }
+<span class="nc" id="L680">        catch (NumberFormatException e)</span>
+        {
+<span class="nc" id="L682">            throw new ConfigurationException(&quot;counter_cache_size_in_mb option was set incorrectly to '&quot;</span>
+                                             + conf.counter_cache_size_in_mb + &quot;', supported values are &lt;integer&gt; &gt;= 0.&quot;, false);
+<span class="fc" id="L684">        }</span>
+
+        // if set to empty/&quot;auto&quot; then use 5% of Heap size
+<span class="pc bpc" id="L687" title="1 of 2 branches missed.">        indexSummaryCapacityInMB = (conf.index_summary_capacity_in_mb == null)</span>
+<span class="pc" id="L688">                                   ? Math.max(1, (int) (Runtime.getRuntime().totalMemory() * 0.05 / 1024 / 1024))</span>
+<span class="pc" id="L689">                                   : conf.index_summary_capacity_in_mb;</span>
+
+<span class="pc bpc" id="L691" title="1 of 2 branches missed.">        if (indexSummaryCapacityInMB &lt; 0)</span>
+<span class="nc" id="L692">            throw new ConfigurationException(&quot;index_summary_capacity_in_mb option was set incorrectly to '&quot;</span>
+                                             + conf.index_summary_capacity_in_mb + &quot;', it should be a non-negative integer.&quot;, false);
+
+<span class="pc bpc" id="L695" title="1 of 2 branches missed.">        if (conf.index_interval != null)</span>
+<span class="nc" id="L696">            logger.warn(&quot;index_interval has been deprecated and should be removed from cassandra.yaml&quot;);</span>
+
+<span class="pc bpc" id="L698" title="1 of 2 branches missed.">        if(conf.encryption_options != null)</span>
+        {
+<span class="nc" id="L700">            logger.warn(&quot;Please rename encryption_options as server_encryption_options in the yaml&quot;);</span>
+            //operate under the assumption that server_encryption_options is not set in yaml rather than both
+<span class="nc" id="L702">            conf.server_encryption_options = conf.encryption_options;</span>
+        }
+
+<span class="pc bpc" id="L705" title="1 of 2 branches missed.">        if (conf.user_defined_function_fail_timeout &lt; 0)</span>
+<span class="nc" id="L706">            throw new ConfigurationException(&quot;user_defined_function_fail_timeout must not be negative&quot;, false);</span>
+<span class="pc bpc" id="L707" title="1 of 2 branches missed.">        if (conf.user_defined_function_warn_timeout &lt; 0)</span>
+<span class="nc" id="L708">            throw new ConfigurationException(&quot;user_defined_function_warn_timeout must not be negative&quot;, false);</span>
+
+<span class="pc bpc" id="L710" title="1 of 2 branches missed.">        if (conf.user_defined_function_fail_timeout &lt; conf.user_defined_function_warn_timeout)</span>
+<span class="nc" id="L711">            throw new ConfigurationException(&quot;user_defined_function_warn_timeout must less than user_defined_function_fail_timeout&quot;, false);</span>
+
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">        if (conf.commitlog_segment_size_in_mb &lt;= 0)</span>
+<span class="nc" id="L714">            throw new ConfigurationException(&quot;commitlog_segment_size_in_mb must be positive, but was &quot;</span>
+                    + conf.commitlog_segment_size_in_mb, false);
+<span class="pc bpc" id="L716" title="1 of 2 branches missed.">        else if (conf.commitlog_segment_size_in_mb &gt;= 2048)</span>
+<span class="nc" id="L717">            throw new ConfigurationException(&quot;commitlog_segment_size_in_mb must be smaller than 2048, but was &quot;</span>
+                    + conf.commitlog_segment_size_in_mb, false);
+
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">        if (conf.max_mutation_size_in_kb == null)</span>
+<span class="fc" id="L721">            conf.max_mutation_size_in_kb = conf.commitlog_segment_size_in_mb * 1024 / 2;</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">        else if (conf.commitlog_segment_size_in_mb * 1024 &lt; 2 * conf.max_mutation_size_in_kb)</span>
+<span class="nc" id="L723">            throw new ConfigurationException(&quot;commitlog_segment_size_in_mb must be at least twice the size of max_mutation_size_in_kb / 1024&quot;, false);</span>
+
+        // native transport encryption options
+<span class="pc bpc" id="L726" title="1 of 2 branches missed.">        if (conf.native_transport_port_ssl != null</span>
+<span class="nc bnc" id="L727" title="All 4 branches missed.">            &amp;&amp; conf.native_transport_port_ssl != conf.native_transport_port</span>
+            &amp;&amp; !conf.client_encryption_options.enabled)
+        {
+<span class="nc" id="L730">            throw new ConfigurationException(&quot;Encryption must be enabled in client_encryption_options for native_transport_port_ssl&quot;, false);</span>
+        }
+
+        // If max protocol version has been set, just validate it's within an acceptable range
+<span class="pc bpc" id="L734" title="1 of 2 branches missed.">        if (conf.native_transport_max_negotiable_protocol_version != Integer.MIN_VALUE)</span>
+        {
+            try
+            {
+<span class="nc" id="L738">                ProtocolVersion.decode(conf.native_transport_max_negotiable_protocol_version, ProtocolVersionLimit.SERVER_DEFAULT);</span>
+<span class="nc" id="L739">                logger.info(&quot;Native transport max negotiable version statically limited to {}&quot;, conf.native_transport_max_negotiable_protocol_version);</span>
+            }
+<span class="nc" id="L741">            catch (Exception e)</span>
+            {
+<span class="nc" id="L743">                throw new ConfigurationException(&quot;Invalid setting for native_transport_max_negotiable_protocol_version; &quot; +</span>
+<span class="nc" id="L744">                                                 ProtocolVersion.invalidVersionMessage(conf.native_transport_max_negotiable_protocol_version));</span>
+<span class="nc" id="L745">            }</span>
+        }
+
+<span class="pc bpc" id="L748" title="1 of 2 branches missed.">        if (conf.max_value_size_in_mb &lt;= 0)</span>
+<span class="nc" id="L749">            throw new ConfigurationException(&quot;max_value_size_in_mb must be positive&quot;, false);</span>
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">        else if (conf.max_value_size_in_mb &gt;= 2048)</span>
+<span class="nc" id="L751">            throw new ConfigurationException(&quot;max_value_size_in_mb must be smaller than 2048, but was &quot;</span>
+                    + conf.max_value_size_in_mb, false);
+
+<span class="pc bpc" id="L754" title="2 of 3 branches missed.">        switch (conf.disk_optimization_strategy)</span>
+        {
+            case ssd:
+<span class="fc" id="L757">                diskOptimizationStrategy = new SsdDiskOptimizationStrategy(conf.disk_optimization_page_cross_chance);</span>
+<span class="fc" id="L758">                break;</span>
+            case spinning:
+<span class="nc" id="L760">                diskOptimizationStrategy = new SpinningDiskOptimizationStrategy();</span>
+                break;
+        }
+
+        try
+        {
+<span class="pc bpc" id="L766" title="1 of 2 branches missed.">            ParameterizedClass strategy = conf.back_pressure_strategy != null ? conf.back_pressure_strategy : RateBasedBackPressure.withDefaultParams();</span>
+<span class="fc" id="L767">            Class&lt;?&gt; clazz = Class.forName(strategy.class_name);</span>
+<span class="pc bpc" id="L768" title="1 of 2 branches missed.">            if (!BackPressureStrategy.class.isAssignableFrom(clazz))</span>
+<span class="nc" id="L769">                throw new ConfigurationException(strategy + &quot; is not an instance of &quot; + BackPressureStrategy.class.getCanonicalName(), false);</span>
+
+<span class="fc" id="L771">            Constructor&lt;?&gt; ctor = clazz.getConstructor(Map.class);</span>
+<span class="fc" id="L772">            BackPressureStrategy instance = (BackPressureStrategy) ctor.newInstance(strategy.parameters);</span>
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">            logger.info(&quot;Back-pressure is {} with strategy {}.&quot;, backPressureEnabled() ? &quot;enabled&quot; : &quot;disabled&quot;, conf.back_pressure_strategy);</span>
+<span class="fc" id="L774">            backPressureStrategy = instance;</span>
+        }
+<span class="nc" id="L776">        catch (ConfigurationException ex)</span>
+        {
+<span class="nc" id="L778">            throw ex;</span>
+        }
+<span class="nc" id="L780">        catch (Exception ex)</span>
+        {
+<span class="nc" id="L782">            throw new ConfigurationException(&quot;Error configuring back-pressure strategy: &quot; + conf.back_pressure_strategy, ex);</span>
+<span class="fc" id="L783">        }</span>
+
+<span class="pc bpc" id="L785" title="1 of 2 branches missed.">        if (conf.otc_coalescing_enough_coalesced_messages &gt; 128)</span>
+<span class="nc" id="L786">            throw new ConfigurationException(&quot;otc_coalescing_enough_coalesced_messages must be smaller than 128&quot;, false);</span>
+
+<span class="pc bpc" id="L788" title="1 of 2 branches missed.">        if (conf.otc_coalescing_enough_coalesced_messages &lt;= 0)</span>
+<span class="nc" id="L789">            throw new ConfigurationException(&quot;otc_coalescing_enough_coalesced_messages must be positive&quot;, false);</span>
+<span class="fc" id="L790">    }</span>
+
+    private static String storagedirFor(String type)
+    {
+<span class="nc" id="L794">        return storagedir(type + &quot;_directory&quot;) + File.separator + type;</span>
+    }
+
+    private static String storagedir(String errMsgType)
+    {
+<span class="nc" id="L799">        String storagedir = System.getProperty(Config.PROPERTY_PREFIX + &quot;storagedir&quot;, null);</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">        if (storagedir == null)</span>
+<span class="nc" id="L801">            throw new ConfigurationException(errMsgType + &quot; is missing and -Dcassandra.storagedir is not set&quot;, false);</span>
+<span class="nc" id="L802">        return storagedir;</span>
+    }
+
+    public static void applyAddressConfig() throws ConfigurationException
+    {
+<span class="fc" id="L807">        applyAddressConfig(conf);</span>
+<span class="fc" id="L808">    }</span>
+
+    public static void applyAddressConfig(Config config) throws ConfigurationException
+    {
+<span class="fc" id="L812">        listenAddress = null;</span>
+<span class="fc" id="L813">        rpcAddress = null;</span>
+<span class="fc" id="L814">        broadcastAddress = null;</span>
+<span class="fc" id="L815">        broadcastRpcAddress = null;</span>
+
+        /* Local IP, hostname or interface to bind services to */
+<span class="pc bpc" id="L818" title="2 of 4 branches missed.">        if (config.listen_address != null &amp;&amp; config.listen_interface != null)</span>
+        {
+<span class="nc" id="L820">            throw new ConfigurationException(&quot;Set listen_address OR listen_interface, not both&quot;, false);</span>
+        }
+<span class="pc bpc" id="L822" title="1 of 2 branches missed.">        else if (config.listen_address != null)</span>
+        {
+            try
+            {
+<span class="fc" id="L826">                listenAddress = InetAddress.getByName(config.listen_address);</span>
+            }
+<span class="nc" id="L828">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L830">                throw new ConfigurationException(&quot;Unknown listen_address '&quot; + config.listen_address + &quot;'&quot;, false);</span>
+<span class="fc" id="L831">            }</span>
+
+<span class="pc bpc" id="L833" title="1 of 2 branches missed.">            if (listenAddress.isAnyLocalAddress())</span>
+<span class="nc" id="L834">                throw new ConfigurationException(&quot;listen_address cannot be a wildcard address (&quot; + config.listen_address + &quot;)!&quot;, false);</span>
+        }
+<span class="nc bnc" id="L836" title="All 2 branches missed.">        else if (config.listen_interface != null)</span>
+        {
+<span class="nc" id="L838">            listenAddress = getNetworkInterfaceAddress(config.listen_interface, &quot;listen_interface&quot;, config.listen_interface_prefer_ipv6);</span>
+        }
+
+        /* Gossip Address to broadcast */
+<span class="pc bpc" id="L842" title="1 of 2 branches missed.">        if (config.broadcast_address != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L846">                broadcastAddress = InetAddress.getByName(config.broadcast_address);</span>
+            }
+<span class="nc" id="L848">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L850">                throw new ConfigurationException(&quot;Unknown broadcast_address '&quot; + config.broadcast_address + &quot;'&quot;, false);</span>
+<span class="nc" id="L851">            }</span>
+
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (broadcastAddress.isAnyLocalAddress())</span>
+<span class="nc" id="L854">                throw new ConfigurationException(&quot;broadcast_address cannot be a wildcard address (&quot; + config.broadcast_address + &quot;)!&quot;, false);</span>
+        }
+
+        /* Local IP, hostname or interface to bind RPC server to */
+<span class="pc bpc" id="L858" title="2 of 4 branches missed.">        if (config.rpc_address != null &amp;&amp; config.rpc_interface != null)</span>
+        {
+<span class="nc" id="L860">            throw new ConfigurationException(&quot;Set rpc_address OR rpc_interface, not both&quot;, false);</span>
+        }
+<span class="pc bpc" id="L862" title="1 of 2 branches missed.">        else if (config.rpc_address != null)</span>
+        {
+            try
+            {
+<span class="fc" id="L866">                rpcAddress = InetAddress.getByName(config.rpc_address);</span>
+            }
+<span class="nc" id="L868">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L870">                throw new ConfigurationException(&quot;Unknown host in rpc_address &quot; + config.rpc_address, false);</span>
+<span class="fc" id="L871">            }</span>
+        }
+<span class="nc bnc" id="L873" title="All 2 branches missed.">        else if (config.rpc_interface != null)</span>
+        {
+<span class="nc" id="L875">            rpcAddress = getNetworkInterfaceAddress(config.rpc_interface, &quot;rpc_interface&quot;, config.rpc_interface_prefer_ipv6);</span>
+        }
+        else
+        {
+<span class="nc" id="L879">            rpcAddress = FBUtilities.getLocalAddress();</span>
+        }
+
+        /* RPC address to broadcast */
+<span class="pc bpc" id="L883" title="1 of 2 branches missed.">        if (config.broadcast_rpc_address != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L887">                broadcastRpcAddress = InetAddress.getByName(config.broadcast_rpc_address);</span>
+            }
+<span class="nc" id="L889">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L891">                throw new ConfigurationException(&quot;Unknown broadcast_rpc_address '&quot; + config.broadcast_rpc_address + &quot;'&quot;, false);</span>
+<span class="nc" id="L892">            }</span>
+
+<span class="nc bnc" id="L894" title="All 2 branches missed.">            if (broadcastRpcAddress.isAnyLocalAddress())</span>
+<span class="nc" id="L895">                throw new ConfigurationException(&quot;broadcast_rpc_address cannot be a wildcard address (&quot; + config.broadcast_rpc_address + &quot;)!&quot;, false);</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">            if (rpcAddress.isAnyLocalAddress())</span>
+<span class="nc" id="L900">                throw new ConfigurationException(&quot;If rpc_address is set to a wildcard address (&quot; + config.rpc_address + &quot;), then &quot; +</span>
+                                                 &quot;you must set broadcast_rpc_address to a value other than &quot; + config.rpc_address, false);
+        }
+<span class="fc" id="L903">    }</span>
+
+    public static void applyThriftHSHA()
+    {
+        // fail early instead of OOMing (see CASSANDRA-8116)
+<span class="pc bpc" id="L908" title="3 of 4 branches missed.">        if (ThriftServerType.HSHA.equals(conf.rpc_server_type) &amp;&amp; conf.rpc_max_threads == Integer.MAX_VALUE)</span>
+<span class="nc" id="L909">            throw new ConfigurationException(&quot;The hsha rpc_server_type is not compatible with an rpc_max_threads &quot; +</span>
+                                             &quot;setting of 'unlimited'.  Please see the comments in cassandra.yaml &quot; +
+                                             &quot;for rpc_server_type and rpc_max_threads.&quot;,
+                                             false);
+<span class="pc bpc" id="L913" title="3 of 4 branches missed.">        if (ThriftServerType.HSHA.equals(conf.rpc_server_type) &amp;&amp; conf.rpc_max_threads &gt; (FBUtilities.getAvailableProcessors() * 2 + 1024))</span>
+<span class="nc" id="L914">            logger.warn(&quot;rpc_max_threads setting of {} may be too high for the hsha server and cause unnecessary thread contention, reducing performance&quot;, conf.rpc_max_threads);</span>
+<span class="fc" id="L915">    }</span>
+
+    public static void applyEncryptionContext()
+    {
+        // always attempt to load the cipher factory, as we could be in the situation where the user has disabled encryption,
+        // but has existing commitlogs and sstables on disk that are still encrypted (and still need to be read)
+<span class="fc" id="L921">        encryptionContext = new EncryptionContext(conf.transparent_data_encryption_options);</span>
+<span class="fc" id="L922">    }</span>
+
+    public static void applySeedProvider()
+    {
+        // load the seeds for node contact points
+<span class="pc bpc" id="L927" title="1 of 2 branches missed.">        if (conf.seed_provider == null)</span>
+        {
+<span class="nc" id="L929">            throw new ConfigurationException(&quot;seeds configuration is missing; a minimum of one seed is required.&quot;, false);</span>
+        }
+        try
+        {
+<span class="fc" id="L933">            Class&lt;?&gt; seedProviderClass = Class.forName(conf.seed_provider.class_name);</span>
+<span class="fc" id="L934">            seedProvider = (SeedProvider)seedProviderClass.getConstructor(Map.class).newInstance(conf.seed_provider.parameters);</span>
+        }
+        // there are about 5 checked exceptions that could be thrown here.
+<span class="nc" id="L937">        catch (Exception e)</span>
+        {
+<span class="nc" id="L939">            throw new ConfigurationException(e.getMessage() + &quot;\nFatal configuration error; unable to start server.  See log for stacktrace.&quot;, true);</span>
+<span class="fc" id="L940">        }</span>
+<span class="pc bpc" id="L941" title="1 of 2 branches missed.">        if (seedProvider.getSeeds().size() == 0)</span>
+<span class="nc" id="L942">            throw new ConfigurationException(&quot;The seed provider lists no seeds.&quot;, false);</span>
+<span class="fc" id="L943">    }</span>
+
+    public static void applyInitialTokens()
+    {
+<span class="pc bpc" id="L947" title="1 of 2 branches missed.">        if (conf.initial_token != null)</span>
+        {
+<span class="fc" id="L949">            Collection&lt;String&gt; tokens = tokensFromString(conf.initial_token);</span>
+<span class="pc bpc" id="L950" title="1 of 2 branches missed.">            if (tokens.size() != conf.num_tokens)</span>
+<span class="nc" id="L951">                throw new ConfigurationException(&quot;The number of initial tokens (by initial_token) specified is different from num_tokens value&quot;, false);</span>
+
+<span class="fc bfc" id="L953" title="All 2 branches covered.">            for (String token : tokens)</span>
+<span class="fc" id="L954">                partitioner.getTokenFactory().validate(token);</span>
+        }
+<span class="fc" id="L956">    }</span>
+
+    // Maybe safe for clients + tools
+    public static void applyRequestScheduler()
+    {
+        /* Request Scheduler setup */
+<span class="fc" id="L962">        requestSchedulerOptions = conf.request_scheduler_options;</span>
+<span class="pc bpc" id="L963" title="1 of 2 branches missed.">        if (conf.request_scheduler != null)</span>
+        {
+            try
+            {
+<span class="pc bpc" id="L967" title="1 of 2 branches missed.">                if (requestSchedulerOptions == null)</span>
+                {
+<span class="fc" id="L969">                    requestSchedulerOptions = new RequestSchedulerOptions();</span>
+                }
+<span class="fc" id="L971">                Class&lt;?&gt; cls = Class.forName(conf.request_scheduler);</span>
+<span class="fc" id="L972">                requestScheduler = (IRequestScheduler) cls.getConstructor(RequestSchedulerOptions.class).newInstance(requestSchedulerOptions);</span>
+            }
+<span class="nc" id="L974">            catch (ClassNotFoundException e)</span>
+            {
+<span class="nc" id="L976">                throw new ConfigurationException(&quot;Invalid Request Scheduler class &quot; + conf.request_scheduler, false);</span>
+            }
+<span class="nc" id="L978">            catch (Exception e)</span>
+            {
+<span class="nc" id="L980">                throw new ConfigurationException(&quot;Unable to instantiate request scheduler&quot;, e);</span>
+<span class="fc" id="L981">            }</span>
+        }
+        else
+        {
+<span class="nc" id="L985">            requestScheduler = new NoScheduler();</span>
+        }
+
+<span class="pc bpc" id="L988" title="1 of 2 branches missed.">        if (conf.request_scheduler_id == RequestSchedulerId.keyspace)</span>
+        {
+<span class="nc" id="L990">            requestSchedulerId = conf.request_scheduler_id;</span>
+        }
+        else
+        {
+            // Default to Keyspace
+<span class="fc" id="L995">            requestSchedulerId = RequestSchedulerId.keyspace;</span>
+        }
+<span class="fc" id="L997">    }</span>
+
+    // definitely not safe for tools + clients - implicitly instantiates StorageService
+    public static void applySnitch()
+    {
+        /* end point snitch */
+<span class="pc bpc" id="L1003" title="1 of 2 branches missed.">        if (conf.endpoint_snitch == null)</span>
+        {
+<span class="nc" id="L1005">            throw new ConfigurationException(&quot;Missing endpoint_snitch directive&quot;, false);</span>
+        }
+<span class="fc" id="L1007">        snitch = createEndpointSnitch(conf.dynamic_snitch, conf.endpoint_snitch);</span>
+<span class="fc" id="L1008">        EndpointSnitchInfo.create();</span>
+
+<span class="fc" id="L1010">        localDC = snitch.getDatacenter(FBUtilities.getBroadcastAddress());</span>
+<span class="fc" id="L1011">        localComparator = new Comparator&lt;InetAddress&gt;()</span>
+<span class="fc" id="L1012">        {</span>
+            public int compare(InetAddress endpoint1, InetAddress endpoint2)
+            {
+<span class="nc" id="L1015">                boolean local1 = localDC.equals(snitch.getDatacenter(endpoint1));</span>
+<span class="nc" id="L1016">                boolean local2 = localDC.equals(snitch.getDatacenter(endpoint2));</span>
+<span class="nc bnc" id="L1017" title="All 4 branches missed.">                if (local1 &amp;&amp; !local2)</span>
+<span class="nc" id="L1018">                    return -1;</span>
+<span class="nc bnc" id="L1019" title="All 4 branches missed.">                if (local2 &amp;&amp; !local1)</span>
+<span class="nc" id="L1020">                    return 1;</span>
+<span class="nc" id="L1021">                return 0;</span>
+            }
+        };
+<span class="fc" id="L1024">    }</span>
+
+    // definitely not safe for tools + clients - implicitly instantiates schema
+    public static void applyPartitioner()
+    {
+        /* Hashing strategy */
+<span class="pc bpc" id="L1030" title="1 of 2 branches missed.">        if (conf.partitioner == null)</span>
+        {
+<span class="nc" id="L1032">            throw new ConfigurationException(&quot;Missing directive: partitioner&quot;, false);</span>
+        }
+        try
+        {
+<span class="fc" id="L1036">            partitioner = FBUtilities.newPartitioner(System.getProperty(Config.PROPERTY_PREFIX + &quot;partitioner&quot;, conf.partitioner));</span>
+        }
+<span class="nc" id="L1038">        catch (Exception e)</span>
+        {
+<span class="nc" id="L1040">            throw new ConfigurationException(&quot;Invalid partitioner class &quot; + conf.partitioner, false);</span>
+<span class="fc" id="L1041">        }</span>
+
+<span class="fc" id="L1043">        paritionerName = partitioner.getClass().getCanonicalName();</span>
+<span class="fc" id="L1044">    }</span>
+
+    /**
+     * Computes the sum of the 2 specified positive values returning {@code Long.MAX_VALUE} if the sum overflow.
+     *
+     * @param left the left operand
+     * @param right the right operand
+     * @return the sum of the 2 specified positive values of {@code Long.MAX_VALUE} if the sum overflow.
+     */
+    private static long saturatedSum(long left, long right)
+    {
+<span class="pc bpc" id="L1055" title="3 of 6 branches missed.">        assert left &gt;= 0 &amp;&amp; right &gt;= 0;</span>
+<span class="fc" id="L1056">        long sum = left + right;</span>
+<span class="pc bpc" id="L1057" title="1 of 2 branches missed.">        return sum &lt; 0 ? Long.MAX_VALUE : sum;</span>
+    }
+
+    private static FileStore guessFileStore(String dir) throws IOException
+    {
+<span class="fc" id="L1062">        Path path = Paths.get(dir);</span>
+        while (true)
+        {
+            try
+            {
+<span class="fc" id="L1067">                return FileUtils.getFileStore(path);</span>
+            }
+<span class="fc" id="L1069">            catch (IOException e)</span>
+            {
+<span class="pc bpc" id="L1071" title="1 of 2 branches missed.">                if (e instanceof NoSuchFileException)</span>
+<span class="fc" id="L1072">                    path = path.getParent();</span>
+                else
+<span class="nc" id="L1074">                    throw e;</span>
+<span class="fc" id="L1075">            }</span>
+        }
+    }
+
+    public static IEndpointSnitch createEndpointSnitch(boolean dynamic, String snitchClassName) throws ConfigurationException
+    {
+<span class="pc bpc" id="L1081" title="1 of 2 branches missed.">        if (!snitchClassName.contains(&quot;.&quot;))</span>
+<span class="fc" id="L1082">            snitchClassName = &quot;org.apache.cassandra.locator.&quot; + snitchClassName;</span>
+<span class="fc" id="L1083">        IEndpointSnitch snitch = FBUtilities.construct(snitchClassName, &quot;snitch&quot;);</span>
+<span class="pc bpc" id="L1084" title="1 of 2 branches missed.">        return dynamic ? new DynamicEndpointSnitch(snitch) : snitch;</span>
+    }
+
+    public static IAuthenticator getAuthenticator()
+    {
+<span class="fc" id="L1089">        return authenticator;</span>
+    }
+
+    public static void setAuthenticator(IAuthenticator authenticator)
+    {
+<span class="fc" id="L1094">        DatabaseDescriptor.authenticator = authenticator;</span>
+<span class="fc" id="L1095">    }</span>
+
+    public static IAuthorizer getAuthorizer()
+    {
+<span class="fc" id="L1099">        return authorizer;</span>
+    }
+
+    public static void setAuthorizer(IAuthorizer authorizer)
+    {
+<span class="fc" id="L1104">        DatabaseDescriptor.authorizer = authorizer;</span>
+<span class="fc" id="L1105">    }</span>
+
+    public static IRoleManager getRoleManager()
+    {
+<span class="fc" id="L1109">        return roleManager;</span>
+    }
+
+    public static void setRoleManager(IRoleManager roleManager)
+    {
+<span class="fc" id="L1114">        DatabaseDescriptor.roleManager = roleManager;</span>
+<span class="fc" id="L1115">    }</span>
+
+    public static int getPermissionsValidity()
+    {
+<span class="nc" id="L1119">        return conf.permissions_validity_in_ms;</span>
+    }
+
+    public static void setPermissionsValidity(int timeout)
+    {
+<span class="nc" id="L1124">        conf.permissions_validity_in_ms = timeout;</span>
+<span class="nc" id="L1125">    }</span>
+
+    public static int getPermissionsUpdateInterval()
+    {
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">        return conf.permissions_update_interval_in_ms == -1</span>
+             ? conf.permissions_validity_in_ms
+             : conf.permissions_update_interval_in_ms;
+    }
+
+    public static void setPermissionsUpdateInterval(int updateInterval)
+    {
+<span class="nc" id="L1136">        conf.permissions_update_interval_in_ms = updateInterval;</span>
+<span class="nc" id="L1137">    }</span>
+
+    public static int getPermissionsCacheMaxEntries()
+    {
+<span class="nc" id="L1141">        return conf.permissions_cache_max_entries;</span>
+    }
+
+    public static int setPermissionsCacheMaxEntries(int maxEntries)
+    {
+<span class="nc" id="L1146">        return conf.permissions_cache_max_entries = maxEntries;</span>
+    }
+
+    public static int getRolesValidity()
+    {
+<span class="nc" id="L1151">        return conf.roles_validity_in_ms;</span>
+    }
+
+    public static void setRolesValidity(int validity)
+    {
+<span class="nc" id="L1156">        conf.roles_validity_in_ms = validity;</span>
+<span class="nc" id="L1157">    }</span>
+
+    public static int getRolesUpdateInterval()
+    {
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">        return conf.roles_update_interval_in_ms == -1</span>
+             ? conf.roles_validity_in_ms
+             : conf.roles_update_interval_in_ms;
+    }
+
+    public static void setRolesUpdateInterval(int interval)
+    {
+<span class="nc" id="L1168">        conf.roles_update_interval_in_ms = interval;</span>
+<span class="nc" id="L1169">    }</span>
+
+    public static int getRolesCacheMaxEntries()
+    {
+<span class="nc" id="L1173">        return conf.roles_cache_max_entries;</span>
+    }
+
+    public static int setRolesCacheMaxEntries(int maxEntries)
+    {
+<span class="nc" id="L1178">        return conf.roles_cache_max_entries = maxEntries;</span>
+    }
+
+    public static int getCredentialsValidity()
+    {
+<span class="nc" id="L1183">        return conf.credentials_validity_in_ms;</span>
+    }
+
+    public static void setCredentialsValidity(int timeout)
+    {
+<span class="nc" id="L1188">        conf.credentials_validity_in_ms = timeout;</span>
+<span class="nc" id="L1189">    }</span>
+
+    public static int getCredentialsUpdateInterval()
+    {
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        return conf.credentials_update_interval_in_ms == -1</span>
+               ? conf.credentials_validity_in_ms
+               : conf.credentials_update_interval_in_ms;
+    }
+
+    public static void setCredentialsUpdateInterval(int updateInterval)
+    {
+<span class="nc" id="L1200">        conf.credentials_update_interval_in_ms = updateInterval;</span>
+<span class="nc" id="L1201">    }</span>
+
+    public static int getCredentialsCacheMaxEntries()
+    {
+<span class="nc" id="L1205">        return conf.credentials_cache_max_entries;</span>
+    }
+
+    public static int setCredentialsCacheMaxEntries(int maxEntries)
+    {
+<span class="nc" id="L1210">        return conf.credentials_cache_max_entries = maxEntries;</span>
+    }
+
+    public static int getThriftFramedTransportSize()
+    {
+<span class="nc" id="L1215">        return conf.thrift_framed_transport_size_in_mb * 1024 * 1024;</span>
+    }
+
+    public static int getMaxValueSize()
+    {
+<span class="fc" id="L1220">        return conf.max_value_size_in_mb * 1024 * 1024;</span>
+    }
+
+    public static void setMaxValueSize(int maxValueSizeInBytes)
+    {
+<span class="nc" id="L1225">        conf.max_value_size_in_mb = maxValueSizeInBytes / 1024 / 1024;</span>
+<span class="nc" id="L1226">    }</span>
+
+    /**
+     * Creates all storage-related directories.
+     */
+    public static void createAllDirectories()
+    {
+        try
+        {
+<span class="pc bpc" id="L1235" title="1 of 2 branches missed.">            if (conf.data_file_directories.length == 0)</span>
+<span class="nc" id="L1236">                throw new ConfigurationException(&quot;At least one DataFileDirectory must be specified&quot;, false);</span>
+
+<span class="fc bfc" id="L1238" title="All 2 branches covered.">            for (String dataFileDirectory : conf.data_file_directories)</span>
+<span class="fc" id="L1239">                FileUtils.createDirectory(dataFileDirectory);</span>
+
+<span class="pc bpc" id="L1241" title="1 of 2 branches missed.">            if (conf.commitlog_directory == null)</span>
+<span class="nc" id="L1242">                throw new ConfigurationException(&quot;commitlog_directory must be specified&quot;, false);</span>
+<span class="fc" id="L1243">            FileUtils.createDirectory(conf.commitlog_directory);</span>
+
+<span class="pc bpc" id="L1245" title="1 of 2 branches missed.">            if (conf.hints_directory == null)</span>
+<span class="nc" id="L1246">                throw new ConfigurationException(&quot;hints_directory must be specified&quot;, false);</span>
+<span class="fc" id="L1247">            FileUtils.createDirectory(conf.hints_directory);</span>
+
+<span class="pc bpc" id="L1249" title="1 of 2 branches missed.">            if (conf.saved_caches_directory == null)</span>
+<span class="nc" id="L1250">                throw new ConfigurationException(&quot;saved_caches_directory must be specified&quot;, false);</span>
+<span class="fc" id="L1251">            FileUtils.createDirectory(conf.saved_caches_directory);</span>
+
+<span class="pc bpc" id="L1253" title="1 of 2 branches missed.">            if (conf.cdc_enabled)</span>
+            {
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">                if (conf.cdc_raw_directory == null)</span>
+<span class="nc" id="L1256">                    throw new ConfigurationException(&quot;cdc_raw_directory must be specified&quot;, false);</span>
+<span class="nc" id="L1257">                FileUtils.createDirectory(conf.cdc_raw_directory);</span>
+            }
+        }
+<span class="nc" id="L1260">        catch (ConfigurationException e)</span>
+        {
+<span class="nc" id="L1262">            throw new IllegalArgumentException(&quot;Bad configuration; unable to start server: &quot;+e.getMessage());</span>
+        }
+<span class="nc" id="L1264">        catch (FSWriteError e)</span>
+        {
+<span class="nc" id="L1266">            throw new IllegalStateException(e.getCause().getMessage() + &quot;; unable to start server&quot;);</span>
+<span class="fc" id="L1267">        }</span>
+<span class="fc" id="L1268">    }</span>
+
+    public static IPartitioner getPartitioner()
+    {
+<span class="fc" id="L1272">        return partitioner;</span>
+    }
+
+    public static String getPartitionerName()
+    {
+<span class="fc" id="L1277">        return paritionerName;</span>
+    }
+
+    /* For tests ONLY, don't use otherwise or all hell will break loose. Tests should restore value at the end. */
+    public static IPartitioner setPartitionerUnsafe(IPartitioner newPartitioner)
+    {
+<span class="nc" id="L1283">        IPartitioner old = partitioner;</span>
+<span class="nc" id="L1284">        partitioner = newPartitioner;</span>
+<span class="nc" id="L1285">        return old;</span>
+    }
+
+    public static IEndpointSnitch getEndpointSnitch()
+    {
+<span class="fc" id="L1290">        return snitch;</span>
+    }
+    public static void setEndpointSnitch(IEndpointSnitch eps)
+    {
+<span class="nc" id="L1294">        snitch = eps;</span>
+<span class="nc" id="L1295">    }</span>
+
+    public static IRequestScheduler getRequestScheduler()
+    {
+<span class="nc" id="L1299">        return requestScheduler;</span>
+    }
+
+    public static RequestSchedulerOptions getRequestSchedulerOptions()
+    {
+<span class="nc" id="L1304">        return requestSchedulerOptions;</span>
+    }
+
+    public static RequestSchedulerId getRequestSchedulerId()
+    {
+<span class="nc" id="L1309">        return requestSchedulerId;</span>
+    }
+
+    public static int getColumnIndexSize()
+    {
+<span class="fc" id="L1314">        return conf.column_index_size_in_kb * 1024;</span>
+    }
+
+    @VisibleForTesting
+    public static void setColumnIndexSize(int val)
+    {
+<span class="nc" id="L1320">        conf.column_index_size_in_kb = val;</span>
+<span class="nc" id="L1321">    }</span>
+
+    public static int getColumnIndexCacheSize()
+    {
+<span class="fc" id="L1325">        return conf.column_index_cache_size_in_kb * 1024;</span>
+    }
+
+    @VisibleForTesting
+    public static void setColumnIndexCacheSize(int val)
+    {
+<span class="nc" id="L1331">        conf.column_index_cache_size_in_kb = val;</span>
+<span class="nc" id="L1332">    }</span>
+
+    public static int getBatchSizeWarnThreshold()
+    {
+<span class="nc" id="L1336">        return conf.batch_size_warn_threshold_in_kb * 1024;</span>
+    }
+
+    public static long getBatchSizeFailThreshold()
+    {
+<span class="nc" id="L1341">        return conf.batch_size_fail_threshold_in_kb * 1024L;</span>
+    }
+
+    public static int getBatchSizeFailThresholdInKB()
+    {
+<span class="nc" id="L1346">        return conf.batch_size_fail_threshold_in_kb;</span>
+    }
+
+    public static int getUnloggedBatchAcrossPartitionsWarnThreshold()
+    {
+<span class="nc" id="L1351">        return conf.unlogged_batch_across_partitions_warn_threshold;</span>
+    }
+
+    public static void setBatchSizeWarnThresholdInKB(int threshold)
+    {
+<span class="nc" id="L1356">        conf.batch_size_warn_threshold_in_kb = threshold;</span>
+<span class="nc" id="L1357">    }</span>
+
+    public static void setBatchSizeFailThresholdInKB(int threshold)
+    {
+<span class="nc" id="L1361">        conf.batch_size_fail_threshold_in_kb = threshold;</span>
+<span class="nc" id="L1362">    }</span>
+
+    public static Collection&lt;String&gt; getInitialTokens()
+    {
+<span class="fc" id="L1366">        return tokensFromString(System.getProperty(Config.PROPERTY_PREFIX + &quot;initial_token&quot;, conf.initial_token));</span>
+    }
+
+    public static String getAllocateTokensForKeyspace()
+    {
+<span class="fc" id="L1371">        return System.getProperty(Config.PROPERTY_PREFIX + &quot;allocate_tokens_for_keyspace&quot;, conf.allocate_tokens_for_keyspace);</span>
+    }
+
+    public static Collection&lt;String&gt; tokensFromString(String tokenString)
+    {
+<span class="fc" id="L1376">        List&lt;String&gt; tokens = new ArrayList&lt;String&gt;();</span>
+<span class="fc bfc" id="L1377" title="All 2 branches covered.">        if (tokenString != null)</span>
+<span class="fc bfc" id="L1378" title="All 2 branches covered.">            for (String token : StringUtils.split(tokenString, ','))</span>
+<span class="fc" id="L1379">                tokens.add(token.trim());</span>
+<span class="fc" id="L1380">        return tokens;</span>
+    }
+
+    public static int getNumTokens()
+    {
+<span class="fc" id="L1385">        return conf.num_tokens;</span>
+    }
+
+    public static InetAddress getReplaceAddress()
+    {
+        try
+        {
+<span class="pc bpc" id="L1392" title="1 of 2 branches missed.">            if (System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_address&quot;, null) != null)</span>
+<span class="nc" id="L1393">                return InetAddress.getByName(System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_address&quot;, null));</span>
+<span class="pc bpc" id="L1394" title="1 of 2 branches missed.">            else if (System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_address_first_boot&quot;, null) != null)</span>
+<span class="nc" id="L1395">                return InetAddress.getByName(System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_address_first_boot&quot;, null));</span>
+<span class="fc" id="L1396">            return null;</span>
+        }
+<span class="nc" id="L1398">        catch (UnknownHostException e)</span>
+        {
+<span class="nc" id="L1400">            throw new RuntimeException(&quot;Replacement host name could not be resolved or scope_id was specified for a global IPv6 address&quot;, e);</span>
+        }
+    }
+
+    public static Collection&lt;String&gt; getReplaceTokens()
+    {
+<span class="fc" id="L1406">        return tokensFromString(System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_token&quot;, null));</span>
+    }
+
+    public static UUID getReplaceNode()
+    {
+        try
+        {
+<span class="nc" id="L1413">            return UUID.fromString(System.getProperty(Config.PROPERTY_PREFIX + &quot;replace_node&quot;, null));</span>
+<span class="fc" id="L1414">        } catch (NullPointerException e)</span>
+        {
+<span class="fc" id="L1416">            return null;</span>
+        }
+    }
+
+    public static String getClusterName()
+    {
+<span class="fc" id="L1422">        return conf.cluster_name;</span>
+    }
+
+    public static int getStoragePort()
+    {
+<span class="fc" id="L1427">        return Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;storage_port&quot;, Integer.toString(conf.storage_port)));</span>
+    }
+
+    public static int getSSLStoragePort()
+    {
+<span class="nc" id="L1432">        return Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;ssl_storage_port&quot;, Integer.toString(conf.ssl_storage_port)));</span>
+    }
+
+    public static int getRpcPort()
+    {
+<span class="fc" id="L1437">        return Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;rpc_port&quot;, Integer.toString(conf.rpc_port)));</span>
+    }
+
+    public static int getRpcListenBacklog()
+    {
+<span class="fc" id="L1442">        return conf.rpc_listen_backlog;</span>
+    }
+
+    public static long getRpcTimeout()
+    {
+<span class="fc" id="L1447">        return conf.request_timeout_in_ms;</span>
+    }
+
+    public static void setRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1452">        conf.request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1453">    }</span>
+
+    public static long getReadRpcTimeout()
+    {
+<span class="fc" id="L1457">        return conf.read_request_timeout_in_ms;</span>
+    }
+
+    public static void setReadRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1462">        conf.read_request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1463">    }</span>
+
+    public static long getRangeRpcTimeout()
+    {
+<span class="fc" id="L1467">        return conf.range_request_timeout_in_ms;</span>
+    }
+
+    public static void setRangeRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1472">        conf.range_request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1473">    }</span>
+
+    public static long getWriteRpcTimeout()
+    {
+<span class="fc" id="L1477">        return conf.write_request_timeout_in_ms;</span>
+    }
+
+    public static void setWriteRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1482">        conf.write_request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1483">    }</span>
+
+    public static long getCounterWriteRpcTimeout()
+    {
+<span class="fc" id="L1487">        return conf.counter_write_request_timeout_in_ms;</span>
+    }
+
+    public static void setCounterWriteRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1492">        conf.counter_write_request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1493">    }</span>
+
+    public static long getCasContentionTimeout()
+    {
+<span class="nc" id="L1497">        return conf.cas_contention_timeout_in_ms;</span>
+    }
+
+    public static void setCasContentionTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1502">        conf.cas_contention_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1503">    }</span>
+
+    public static long getTruncateRpcTimeout()
+    {
+<span class="fc" id="L1507">        return conf.truncate_request_timeout_in_ms;</span>
+    }
+
+    public static void setTruncateRpcTimeout(long timeOutInMillis)
+    {
+<span class="nc" id="L1512">        conf.truncate_request_timeout_in_ms = timeOutInMillis;</span>
+<span class="nc" id="L1513">    }</span>
+
+    public static boolean hasCrossNodeTimeout()
+    {
+<span class="fc" id="L1517">        return conf.cross_node_timeout;</span>
+    }
+
+    public static long getSlowQueryTimeout()
+    {
+<span class="fc" id="L1522">        return conf.slow_query_log_timeout_in_ms;</span>
+    }
+
+    /**
+     * @return the minimum configured {read, write, range, truncate, misc} timeout
+     */
+    public static long getMinRpcTimeout()
+    {
+<span class="fc" id="L1530">        return Longs.min(getRpcTimeout(),</span>
+<span class="fc" id="L1531">                         getReadRpcTimeout(),</span>
+<span class="fc" id="L1532">                         getRangeRpcTimeout(),</span>
+<span class="fc" id="L1533">                         getWriteRpcTimeout(),</span>
+<span class="fc" id="L1534">                         getCounterWriteRpcTimeout(),</span>
+<span class="fc" id="L1535">                         getTruncateRpcTimeout());</span>
+    }
+
+    public static double getPhiConvictThreshold()
+    {
+<span class="fc" id="L1540">        return conf.phi_convict_threshold;</span>
+    }
+
+    public static void setPhiConvictThreshold(double phiConvictThreshold)
+    {
+<span class="nc" id="L1545">        conf.phi_convict_threshold = phiConvictThreshold;</span>
+<span class="nc" id="L1546">    }</span>
+
+    public static int getConcurrentReaders()
+    {
+<span class="fc" id="L1550">        return conf.concurrent_reads;</span>
+    }
+
+    public static int getConcurrentWriters()
+    {
+<span class="fc" id="L1555">        return conf.concurrent_writes;</span>
+    }
+
+    public static int getConcurrentCounterWriters()
+    {
+<span class="fc" id="L1560">        return conf.concurrent_counter_writes;</span>
+    }
+
+    public static int getConcurrentViewWriters()
+    {
+<span class="fc" id="L1565">        return conf.concurrent_materialized_view_writes;</span>
+    }
+
+    public static int getFlushWriters()
+    {
+<span class="fc" id="L1570">            return conf.memtable_flush_writers;</span>
+    }
+
+    public static int getConcurrentCompactors()
+    {
+<span class="fc" id="L1575">        return conf.concurrent_compactors;</span>
+    }
+
+    public static void setConcurrentCompactors(int value)
+    {
+<span class="nc" id="L1580">        conf.concurrent_compactors = value;</span>
+<span class="nc" id="L1581">    }</span>
+
+    public static int getCompactionThroughputMbPerSec()
+    {
+<span class="fc" id="L1585">        return conf.compaction_throughput_mb_per_sec;</span>
+    }
+
+    public static void setCompactionThroughputMbPerSec(int value)
+    {
+<span class="nc" id="L1590">        conf.compaction_throughput_mb_per_sec = value;</span>
+<span class="nc" id="L1591">    }</span>
+
+<span class="fc" id="L1593">    public static long getCompactionLargePartitionWarningThreshold() { return conf.compaction_large_partition_warning_threshold_mb * 1024L * 1024L; }</span>
+
+    public static long getMinFreeSpacePerDriveInBytes()
+    {
+<span class="fc" id="L1597">        return conf.min_free_space_per_drive_in_mb * 1024L * 1024L;</span>
+    }
+
+    public static boolean getDisableSTCSInL0()
+    {
+<span class="nc" id="L1602">        return disableSTCSInL0;</span>
+    }
+
+    public static int getStreamThroughputOutboundMegabitsPerSec()
+    {
+<span class="nc" id="L1607">        return conf.stream_throughput_outbound_megabits_per_sec;</span>
+    }
+
+    public static void setStreamThroughputOutboundMegabitsPerSec(int value)
+    {
+<span class="nc" id="L1612">        conf.stream_throughput_outbound_megabits_per_sec = value;</span>
+<span class="nc" id="L1613">    }</span>
+
+    public static int getInterDCStreamThroughputOutboundMegabitsPerSec()
+    {
+<span class="nc" id="L1617">        return conf.inter_dc_stream_throughput_outbound_megabits_per_sec;</span>
+    }
+
+    public static void setInterDCStreamThroughputOutboundMegabitsPerSec(int value)
+    {
+<span class="nc" id="L1622">        conf.inter_dc_stream_throughput_outbound_megabits_per_sec = value;</span>
+<span class="nc" id="L1623">    }</span>
+
+    public static String[] getAllDataFileLocations()
+    {
+<span class="fc" id="L1627">        return conf.data_file_directories;</span>
+    }
+
+    public static String getCommitLogLocation()
+    {
+<span class="fc" id="L1632">        return conf.commitlog_directory;</span>
+    }
+
+    @VisibleForTesting
+    public static void setCommitLogLocation(String value)
+    {
+<span class="nc" id="L1638">        conf.commitlog_directory = value;</span>
+<span class="nc" id="L1639">    }</span>
+
+    public static ParameterizedClass getCommitLogCompression()
+    {
+<span class="fc" id="L1643">        return conf.commitlog_compression;</span>
+    }
+
+    public static void setCommitLogCompression(ParameterizedClass compressor)
+    {
+<span class="nc" id="L1648">        conf.commitlog_compression = compressor;</span>
+<span class="nc" id="L1649">    }</span>
+
+   /**
+    * Maximum number of buffers in the compression pool. The default value is 3, it should not be set lower than that
+    * (one segment in compression, one written to, one in reserve); delays in compression may cause the log to use
+    * more, depending on how soon the sync policy stops all writing threads.
+    */
+    public static int getCommitLogMaxCompressionBuffersInPool()
+    {
+<span class="fc" id="L1658">        return conf.commitlog_max_compression_buffers_in_pool;</span>
+    }
+
+    public static void setCommitLogMaxCompressionBuffersPerPool(int buffers)
+    {
+<span class="nc" id="L1663">        conf.commitlog_max_compression_buffers_in_pool = buffers;</span>
+<span class="nc" id="L1664">    }</span>
+
+    public static int getMaxMutationSize()
+    {
+<span class="fc" id="L1668">        return conf.max_mutation_size_in_kb * 1024;</span>
+    }
+
+    public static int getTombstoneWarnThreshold()
+    {
+<span class="fc" id="L1673">        return conf.tombstone_warn_threshold;</span>
+    }
+
+    public static void setTombstoneWarnThreshold(int threshold)
+    {
+<span class="nc" id="L1678">        conf.tombstone_warn_threshold = threshold;</span>
+<span class="nc" id="L1679">    }</span>
+
+    public static int getTombstoneFailureThreshold()
+    {
+<span class="fc" id="L1683">        return conf.tombstone_failure_threshold;</span>
+    }
+
+    public static void setTombstoneFailureThreshold(int threshold)
+    {
+<span class="nc" id="L1688">        conf.tombstone_failure_threshold = threshold;</span>
+<span class="nc" id="L1689">    }</span>
+
+    /**
+     * size of commitlog segments to allocate
+     */
+    public static int getCommitLogSegmentSize()
+    {
+<span class="fc" id="L1696">        return conf.commitlog_segment_size_in_mb * 1024 * 1024;</span>
+    }
+
+    public static void setCommitLogSegmentSize(int sizeMegabytes)
+    {
+<span class="nc" id="L1701">        conf.commitlog_segment_size_in_mb = sizeMegabytes;</span>
+<span class="nc" id="L1702">    }</span>
+
+    public static String getSavedCachesLocation()
+    {
+<span class="fc" id="L1706">        return conf.saved_caches_directory;</span>
+    }
+
+    public static Set&lt;InetAddress&gt; getSeeds()
+    {
+<span class="fc" id="L1711">        return ImmutableSet.&lt;InetAddress&gt;builder().addAll(seedProvider.getSeeds()).build();</span>
+    }
+
+    public static InetAddress getListenAddress()
+    {
+<span class="fc" id="L1716">        return listenAddress;</span>
+    }
+
+    public static InetAddress getBroadcastAddress()
+    {
+<span class="fc" id="L1721">        return broadcastAddress;</span>
+    }
+
+    public static boolean shouldListenOnBroadcastAddress()
+    {
+<span class="fc" id="L1726">        return conf.listen_on_broadcast_address;</span>
+    }
+
+    public static IInternodeAuthenticator getInternodeAuthenticator()
+    {
+<span class="fc" id="L1731">        return internodeAuthenticator;</span>
+    }
+
+    public static void setInternodeAuthenticator(IInternodeAuthenticator internodeAuthenticator)
+    {
+<span class="fc" id="L1736">        DatabaseDescriptor.internodeAuthenticator = internodeAuthenticator;</span>
+<span class="fc" id="L1737">    }</span>
+
+    public static void setBroadcastAddress(InetAddress broadcastAdd)
+    {
+<span class="nc" id="L1741">        broadcastAddress = broadcastAdd;</span>
+<span class="nc" id="L1742">    }</span>
+
+    public static boolean startRpc()
+    {
+<span class="fc" id="L1746">        return conf.start_rpc;</span>
+    }
+
+    public static InetAddress getRpcAddress()
+    {
+<span class="fc" id="L1751">        return rpcAddress;</span>
+    }
+
+    public static void setBroadcastRpcAddress(InetAddress broadcastRPCAddr)
+    {
+<span class="nc" id="L1756">        broadcastRpcAddress = broadcastRPCAddr;</span>
+<span class="nc" id="L1757">    }</span>
+
+    /**
+     * May be null, please use {@link FBUtilities#getBroadcastRpcAddress()} instead.
+     */
+    public static InetAddress getBroadcastRpcAddress()
+    {
+<span class="fc" id="L1764">        return broadcastRpcAddress;</span>
+    }
+
+    public static String getRpcServerType()
+    {
+<span class="nc" id="L1769">        return conf.rpc_server_type;</span>
+    }
+
+    public static boolean getRpcKeepAlive()
+    {
+<span class="fc" id="L1774">        return conf.rpc_keepalive;</span>
+    }
+
+    public static Integer getRpcMinThreads()
+    {
+<span class="nc" id="L1779">        return conf.rpc_min_threads;</span>
+    }
+
+    public static Integer getRpcMaxThreads()
+    {
+<span class="nc" id="L1784">        return conf.rpc_max_threads;</span>
+    }
+
+    public static Integer getRpcSendBufferSize()
+    {
+<span class="nc" id="L1789">        return conf.rpc_send_buff_size_in_bytes;</span>
+    }
+
+    public static Integer getRpcRecvBufferSize()
+    {
+<span class="nc" id="L1794">        return conf.rpc_recv_buff_size_in_bytes;</span>
+    }
+
+    public static int getInternodeSendBufferSize()
+    {
+<span class="fc" id="L1799">        return conf.internode_send_buff_size_in_bytes;</span>
+    }
+
+    public static int getInternodeRecvBufferSize()
+    {
+<span class="fc" id="L1804">        return conf.internode_recv_buff_size_in_bytes;</span>
+    }
+
+    public static boolean startNativeTransport()
+    {
+<span class="fc" id="L1809">        return conf.start_native_transport;</span>
+    }
+
+    public static int getNativeTransportPort()
+    {
+<span class="fc" id="L1814">        return Integer.parseInt(System.getProperty(Config.PROPERTY_PREFIX + &quot;native_transport_port&quot;, Integer.toString(conf.native_transport_port)));</span>
+    }
+
+    @VisibleForTesting
+    public static void setNativeTransportPort(int port)
+    {
+<span class="nc" id="L1820">        conf.native_transport_port = port;</span>
+<span class="nc" id="L1821">    }</span>
+
+    public static int getNativeTransportPortSSL()
+    {
+<span class="pc bpc" id="L1825" title="1 of 2 branches missed.">        return conf.native_transport_port_ssl == null ? getNativeTransportPort() : conf.native_transport_port_ssl;</span>
+    }
+
+    @VisibleForTesting
+    public static void setNativeTransportPortSSL(Integer port)
+    {
+<span class="nc" id="L1831">        conf.native_transport_port_ssl = port;</span>
+<span class="nc" id="L1832">    }</span>
+
+    public static int getNativeTransportMaxThreads()
+    {
+<span class="fc" id="L1836">        return conf.native_transport_max_threads;</span>
+    }
+
+    public static int getNativeTransportMaxFrameSize()
+    {
+<span class="fc" id="L1841">        return conf.native_transport_max_frame_size_in_mb * 1024 * 1024;</span>
+    }
+
+    public static long getNativeTransportMaxConcurrentConnections()
+    {
+<span class="fc" id="L1846">        return conf.native_transport_max_concurrent_connections;</span>
+    }
+
+    public static void setNativeTransportMaxConcurrentConnections(long nativeTransportMaxConcurrentConnections)
+    {
+<span class="nc" id="L1851">        conf.native_transport_max_concurrent_connections = nativeTransportMaxConcurrentConnections;</span>
+<span class="nc" id="L1852">    }</span>
+
+    public static long getNativeTransportMaxConcurrentConnectionsPerIp()
+    {
+<span class="fc" id="L1856">        return conf.native_transport_max_concurrent_connections_per_ip;</span>
+    }
+
+    public static void setNativeTransportMaxConcurrentConnectionsPerIp(long native_transport_max_concurrent_connections_per_ip)
+    {
+<span class="nc" id="L1861">        conf.native_transport_max_concurrent_connections_per_ip = native_transport_max_concurrent_connections_per_ip;</span>
+<span class="nc" id="L1862">    }</span>
+
+    public static boolean useNativeTransportLegacyFlusher()
+    {
+<span class="fc" id="L1866">        return conf.native_transport_flush_in_batches_legacy;</span>
+    }
+
+    public static int getNativeProtocolMaxVersionOverride()
+    {
+<span class="fc" id="L1871">        return conf.native_transport_max_negotiable_protocol_version;</span>
+    }
+
+    public static double getCommitLogSyncBatchWindow()
+    {
+<span class="nc" id="L1876">        return conf.commitlog_sync_batch_window_in_ms;</span>
+    }
+
+    public static void setCommitLogSyncBatchWindow(double windowMillis)
+    {
+<span class="nc" id="L1881">        conf.commitlog_sync_batch_window_in_ms = windowMillis;</span>
+<span class="nc" id="L1882">    }</span>
+
+    public static long getNativeTransportMaxConcurrentRequestsInBytesPerIp()
+    {
+<span class="fc" id="L1886">        return conf.native_transport_max_concurrent_requests_in_bytes_per_ip;</span>
+    }
+
+    public static void setNativeTransportMaxConcurrentRequestsInBytesPerIp(long maxConcurrentRequestsInBytes)
+    {
+<span class="nc" id="L1891">        conf.native_transport_max_concurrent_requests_in_bytes_per_ip = maxConcurrentRequestsInBytes;</span>
+<span class="nc" id="L1892">    }</span>
+
+    public static long getNativeTransportMaxConcurrentRequestsInBytes()
+    {
+<span class="fc" id="L1896">        return conf.native_transport_max_concurrent_requests_in_bytes;</span>
+    }
+
+    public static void setNativeTransportMaxConcurrentRequestsInBytes(long maxConcurrentRequestsInBytes)
+    {
+<span class="nc" id="L1901">        conf.native_transport_max_concurrent_requests_in_bytes = maxConcurrentRequestsInBytes;</span>
+<span class="nc" id="L1902">    }</span>
+
+    public static int getCommitLogSyncPeriod()
+    {
+<span class="fc" id="L1906">        return conf.commitlog_sync_period_in_ms;</span>
+    }
+
+    public static void setCommitLogSyncPeriod(int periodMillis)
+    {
+<span class="nc" id="L1911">        conf.commitlog_sync_period_in_ms = periodMillis;</span>
+<span class="nc" id="L1912">    }</span>
+
+    public static Config.CommitLogSync getCommitLogSync()
+    {
+<span class="fc" id="L1916">        return conf.commitlog_sync;</span>
+    }
+
+    public static void setCommitLogSync(CommitLogSync sync)
+    {
+<span class="nc" id="L1921">        conf.commitlog_sync = sync;</span>
+<span class="nc" id="L1922">    }</span>
+
+    public static Config.DiskAccessMode getDiskAccessMode()
+    {
+<span class="fc" id="L1926">        return conf.disk_access_mode;</span>
+    }
+
+    // Do not use outside unit tests.
+    @VisibleForTesting
+    public static void setDiskAccessMode(Config.DiskAccessMode mode)
+    {
+<span class="nc" id="L1933">        conf.disk_access_mode = mode;</span>
+<span class="nc" id="L1934">    }</span>
+
+    public static Config.DiskAccessMode getIndexAccessMode()
+    {
+<span class="fc" id="L1938">        return indexAccessMode;</span>
+    }
+
+    // Do not use outside unit tests.
+    @VisibleForTesting
+    public static void setIndexAccessMode(Config.DiskAccessMode mode)
+    {
+<span class="nc" id="L1945">        indexAccessMode = mode;</span>
+<span class="nc" id="L1946">    }</span>
+
+    public static void setDiskFailurePolicy(Config.DiskFailurePolicy policy)
+    {
+<span class="nc" id="L1950">        conf.disk_failure_policy = policy;</span>
+<span class="nc" id="L1951">    }</span>
+
+    public static Config.DiskFailurePolicy getDiskFailurePolicy()
+    {
+<span class="nc" id="L1955">        return conf.disk_failure_policy;</span>
+    }
+
+    public static void setCommitFailurePolicy(Config.CommitFailurePolicy policy)
+    {
+<span class="nc" id="L1960">        conf.commit_failure_policy = policy;</span>
+<span class="nc" id="L1961">    }</span>
+
+    public static Config.CommitFailurePolicy getCommitFailurePolicy()
+    {
+<span class="nc" id="L1965">        return conf.commit_failure_policy;</span>
+    }
+
+    public static boolean isSnapshotBeforeCompaction()
+    {
+<span class="fc" id="L1970">        return conf.snapshot_before_compaction;</span>
+    }
+
+    public static boolean isAutoSnapshot()
+    {
+<span class="nc" id="L1975">        return conf.auto_snapshot;</span>
+    }
+
+    @VisibleForTesting
+    public static void setAutoSnapshot(boolean autoSnapshot)
+    {
+<span class="nc" id="L1981">        conf.auto_snapshot = autoSnapshot;</span>
+<span class="nc" id="L1982">    }</span>
+    @VisibleForTesting
+    public static boolean getAutoSnapshot()
+    {
+<span class="nc" id="L1986">        return conf.auto_snapshot;</span>
+    }
+
+    public static boolean isAutoBootstrap()
+    {
+<span class="fc" id="L1991">        return Boolean.parseBoolean(System.getProperty(Config.PROPERTY_PREFIX + &quot;auto_bootstrap&quot;, Boolean.toString(conf.auto_bootstrap)));</span>
+    }
+
+    public static void setHintedHandoffEnabled(boolean hintedHandoffEnabled)
+    {
+<span class="nc" id="L1996">        conf.hinted_handoff_enabled = hintedHandoffEnabled;</span>
+<span class="nc" id="L1997">    }</span>
+
+    public static boolean hintedHandoffEnabled()
+    {
+<span class="nc" id="L2001">        return conf.hinted_handoff_enabled;</span>
+    }
+
+    public static Set&lt;String&gt; hintedHandoffDisabledDCs()
+    {
+<span class="nc" id="L2006">        return conf.hinted_handoff_disabled_datacenters;</span>
+    }
+
+    public static void enableHintsForDC(String dc)
+    {
+<span class="nc" id="L2011">        conf.hinted_handoff_disabled_datacenters.remove(dc);</span>
+<span class="nc" id="L2012">    }</span>
+
+    public static void disableHintsForDC(String dc)
+    {
+<span class="nc" id="L2016">        conf.hinted_handoff_disabled_datacenters.add(dc);</span>
+<span class="nc" id="L2017">    }</span>
+
+    public static void setMaxHintWindow(int ms)
+    {
+<span class="nc" id="L2021">        conf.max_hint_window_in_ms = ms;</span>
+<span class="nc" id="L2022">    }</span>
+
+    public static int getMaxHintWindow()
+    {
+<span class="nc" id="L2026">        return conf.max_hint_window_in_ms;</span>
+    }
+
+    public static File getHintsDirectory()
+    {
+<span class="fc" id="L2031">        return new File(conf.hints_directory);</span>
+    }
+
+    public static File getSerializedCachePath(CacheType cacheType, String version, String extension)
+    {
+<span class="pc bpc" id="L2036" title="1 of 2 branches missed.">        String name = cacheType.toString()</span>
+                + (version == null ? &quot;&quot; : &quot;-&quot; + version + &quot;.&quot; + extension);
+<span class="fc" id="L2038">        return new File(conf.saved_caches_directory, name);</span>
+    }
+
+    public static int getDynamicUpdateInterval()
+    {
+<span class="fc" id="L2043">        return conf.dynamic_snitch_update_interval_in_ms;</span>
+    }
+    public static void setDynamicUpdateInterval(int dynamicUpdateInterval)
+    {
+<span class="nc" id="L2047">        conf.dynamic_snitch_update_interval_in_ms = dynamicUpdateInterval;</span>
+<span class="nc" id="L2048">    }</span>
+
+    public static int getDynamicResetInterval()
+    {
+<span class="fc" id="L2052">        return conf.dynamic_snitch_reset_interval_in_ms;</span>
+    }
+    public static void setDynamicResetInterval(int dynamicResetInterval)
+    {
+<span class="nc" id="L2056">        conf.dynamic_snitch_reset_interval_in_ms = dynamicResetInterval;</span>
+<span class="nc" id="L2057">    }</span>
+
+    public static double getDynamicBadnessThreshold()
+    {
+<span class="fc" id="L2061">        return conf.dynamic_snitch_badness_threshold;</span>
+    }
+
+    public static void setDynamicBadnessThreshold(double dynamicBadnessThreshold)
+    {
+<span class="nc" id="L2066">        conf.dynamic_snitch_badness_threshold = dynamicBadnessThreshold;</span>
+<span class="nc" id="L2067">    }</span>
+
+    public static EncryptionOptions.ServerEncryptionOptions getServerEncryptionOptions()
+    {
+<span class="fc" id="L2071">        return conf.server_encryption_options;</span>
+    }
+
+    public static EncryptionOptions.ClientEncryptionOptions getClientEncryptionOptions()
+    {
+<span class="fc" id="L2076">        return conf.client_encryption_options;</span>
+    }
+
+    public static int getHintedHandoffThrottleInKB()
+    {
+<span class="nc" id="L2081">        return conf.hinted_handoff_throttle_in_kb;</span>
+    }
+
+    public static int getBatchlogReplayThrottleInKB()
+    {
+<span class="fc" id="L2086">        return conf.batchlog_replay_throttle_in_kb;</span>
+    }
+
+    public static void setHintedHandoffThrottleInKB(int throttleInKB)
+    {
+<span class="nc" id="L2091">        conf.hinted_handoff_throttle_in_kb = throttleInKB;</span>
+<span class="nc" id="L2092">    }</span>
+
+    public static int getMaxHintsDeliveryThreads()
+    {
+<span class="fc" id="L2096">        return conf.max_hints_delivery_threads;</span>
+    }
+
+    public static int getHintsFlushPeriodInMS()
+    {
+<span class="fc" id="L2101">        return conf.hints_flush_period_in_ms;</span>
+    }
+
+    public static long getMaxHintsFileSize()
+    {
+<span class="fc" id="L2106">        return conf.max_hints_file_size_in_mb * 1024L * 1024L;</span>
+    }
+
+    public static ParameterizedClass getHintsCompression()
+    {
+<span class="fc" id="L2111">        return conf.hints_compression;</span>
+    }
+
+    public static void setHintsCompression(ParameterizedClass parameterizedClass)
+    {
+<span class="nc" id="L2116">        conf.hints_compression = parameterizedClass;</span>
+<span class="nc" id="L2117">    }</span>
+
+    public static boolean isIncrementalBackupsEnabled()
+    {
+<span class="fc" id="L2121">        return conf.incremental_backups;</span>
+    }
+
+    public static void setIncrementalBackupsEnabled(boolean value)
+    {
+<span class="nc" id="L2126">        conf.incremental_backups = value;</span>
+<span class="nc" id="L2127">    }</span>
+
+    public static int getFileCacheSizeInMB()
+    {
+<span class="pc bpc" id="L2131" title="1 of 2 branches missed.">        if (conf.file_cache_size_in_mb == null)</span>
+        {
+            // In client mode the value is not set.
+<span class="nc bnc" id="L2134" title="All 4 branches missed.">            assert DatabaseDescriptor.isClientInitialized();</span>
+<span class="nc" id="L2135">            return 0;</span>
+        }
+
+<span class="fc" id="L2138">        return conf.file_cache_size_in_mb;</span>
+    }
+
+    public static boolean getFileCacheRoundUp()
+    {
+<span class="pc bpc" id="L2143" title="1 of 2 branches missed.">        if (conf.file_cache_round_up == null)</span>
+        {
+            // In client mode the value is not set.
+<span class="nc bnc" id="L2146" title="All 4 branches missed.">            assert DatabaseDescriptor.isClientInitialized();</span>
+<span class="nc" id="L2147">            return false;</span>
+        }
+
+<span class="fc" id="L2150">        return conf.file_cache_round_up;</span>
+    }
+
+    public static boolean getBufferPoolUseHeapIfExhausted()
+    {
+<span class="fc" id="L2155">        return conf.buffer_pool_use_heap_if_exhausted;</span>
+    }
+
+    public static DiskOptimizationStrategy getDiskOptimizationStrategy()
+    {
+<span class="fc" id="L2160">        return diskOptimizationStrategy;</span>
+    }
+
+    public static double getDiskOptimizationEstimatePercentile()
+    {
+<span class="fc" id="L2165">        return conf.disk_optimization_estimate_percentile;</span>
+    }
+
+    public static long getTotalCommitlogSpaceInMB()
+    {
+<span class="fc" id="L2170">        return conf.commitlog_total_space_in_mb;</span>
+    }
+
+    public static int getSSTablePreempiveOpenIntervalInMB()
+    {
+<span class="pc bpc" id="L2175" title="1 of 2 branches missed.">        return FBUtilities.isWindows ? -1 : conf.sstable_preemptive_open_interval_in_mb;</span>
+    }
+    public static void setSSTablePreempiveOpenIntervalInMB(int mb)
+    {
+<span class="nc" id="L2179">        conf.sstable_preemptive_open_interval_in_mb = mb;</span>
+<span class="nc" id="L2180">    }</span>
+
+    public static boolean getTrickleFsync()
+    {
+<span class="fc" id="L2184">        return conf.trickle_fsync;</span>
+    }
+
+    public static int getTrickleFsyncIntervalInKb()
+    {
+<span class="fc" id="L2189">        return conf.trickle_fsync_interval_in_kb;</span>
+    }
+
+    public static long getKeyCacheSizeInMB()
+    {
+<span class="fc" id="L2194">        return keyCacheSizeInMB;</span>
+    }
+
+    public static long getIndexSummaryCapacityInMB()
+    {
+<span class="fc" id="L2199">        return indexSummaryCapacityInMB;</span>
+    }
+
+    public static int getKeyCacheSavePeriod()
+    {
+<span class="fc" id="L2204">        return conf.key_cache_save_period;</span>
+    }
+
+    public static void setKeyCacheSavePeriod(int keyCacheSavePeriod)
+    {
+<span class="nc" id="L2209">        conf.key_cache_save_period = keyCacheSavePeriod;</span>
+<span class="nc" id="L2210">    }</span>
+
+    public static int getKeyCacheKeysToSave()
+    {
+<span class="fc" id="L2214">        return conf.key_cache_keys_to_save;</span>
+    }
+
+    public static void setKeyCacheKeysToSave(int keyCacheKeysToSave)
+    {
+<span class="nc" id="L2219">        conf.key_cache_keys_to_save = keyCacheKeysToSave;</span>
+<span class="nc" id="L2220">    }</span>
+
+    public static String getRowCacheClassName()
+    {
+<span class="nc" id="L2224">        return conf.row_cache_class_name;</span>
+    }
+
+    public static long getRowCacheSizeInMB()
+    {
+<span class="fc" id="L2229">        return conf.row_cache_size_in_mb;</span>
+    }
+
+    @VisibleForTesting
+    public static void setRowCacheSizeInMB(long val)
+    {
+<span class="nc" id="L2235">        conf.row_cache_size_in_mb = val;</span>
+<span class="nc" id="L2236">    }</span>
+
+    public static int getRowCacheSavePeriod()
+    {
+<span class="fc" id="L2240">        return conf.row_cache_save_period;</span>
+    }
+
+    public static void setRowCacheSavePeriod(int rowCacheSavePeriod)
+    {
+<span class="nc" id="L2245">        conf.row_cache_save_period = rowCacheSavePeriod;</span>
+<span class="nc" id="L2246">    }</span>
+
+    public static int getRowCacheKeysToSave()
+    {
+<span class="fc" id="L2250">        return conf.row_cache_keys_to_save;</span>
+    }
+
+    public static long getCounterCacheSizeInMB()
+    {
+<span class="fc" id="L2255">        return counterCacheSizeInMB;</span>
+    }
+
+    public static void setRowCacheKeysToSave(int rowCacheKeysToSave)
+    {
+<span class="nc" id="L2260">        conf.row_cache_keys_to_save = rowCacheKeysToSave;</span>
+<span class="nc" id="L2261">    }</span>
+
+    public static int getCounterCacheSavePeriod()
+    {
+<span class="fc" id="L2265">        return conf.counter_cache_save_period;</span>
+    }
+
+    public static void setCounterCacheSavePeriod(int counterCacheSavePeriod)
+    {
+<span class="nc" id="L2270">        conf.counter_cache_save_period = counterCacheSavePeriod;</span>
+<span class="nc" id="L2271">    }</span>
+
+    public static int getCounterCacheKeysToSave()
+    {
+<span class="fc" id="L2275">        return conf.counter_cache_keys_to_save;</span>
+    }
+
+    public static void setCounterCacheKeysToSave(int counterCacheKeysToSave)
+    {
+<span class="nc" id="L2280">        conf.counter_cache_keys_to_save = counterCacheKeysToSave;</span>
+<span class="nc" id="L2281">    }</span>
+
+    public static void setStreamingSocketTimeout(int value)
+    {
+<span class="nc" id="L2285">        conf.streaming_socket_timeout_in_ms = value;</span>
+<span class="nc" id="L2286">    }</span>
+
+    /**
+     * @deprecated use {@link this#getStreamingKeepAlivePeriod()} instead
+     * @return streaming_socket_timeout_in_ms property
+     */
+    @Deprecated
+    public static int getStreamingSocketTimeout()
+    {
+<span class="nc" id="L2295">        return conf.streaming_socket_timeout_in_ms;</span>
+    }
+
+    public static int getStreamingKeepAlivePeriod()
+    {
+<span class="nc" id="L2300">        return conf.streaming_keep_alive_period_in_secs;</span>
+    }
+
+    public static String getLocalDataCenter()
+    {
+<span class="nc" id="L2305">        return localDC;</span>
+    }
+
+    public static Comparator&lt;InetAddress&gt; getLocalComparator()
+    {
+<span class="nc" id="L2310">        return localComparator;</span>
+    }
+
+    public static Config.InternodeCompression internodeCompression()
+    {
+<span class="fc" id="L2315">        return conf.internode_compression;</span>
+    }
+
+    public static boolean getInterDCTcpNoDelay()
+    {
+<span class="nc" id="L2320">        return conf.inter_dc_tcp_nodelay;</span>
+    }
+
+    public static long getMemtableHeapSpaceInMb()
+    {
+<span class="fc" id="L2325">        return conf.memtable_heap_space_in_mb;</span>
+    }
+
+    public static long getMemtableOffheapSpaceInMb()
+    {
+<span class="fc" id="L2330">        return conf.memtable_offheap_space_in_mb;</span>
+    }
+
+    public static Config.MemtableAllocationType getMemtableAllocationType()
+    {
+<span class="fc" id="L2335">        return conf.memtable_allocation_type;</span>
+    }
+
+    public static Float getMemtableCleanupThreshold()
+    {
+<span class="fc" id="L2340">        return conf.memtable_cleanup_threshold;</span>
+    }
+
+    public static int getRepairSessionMaxTreeDepth()
+    {
+<span class="nc" id="L2345">        return conf.repair_session_max_tree_depth;</span>
+    }
+
+    public static void setRepairSessionMaxTreeDepth(int depth)
+    {
+<span class="nc bnc" id="L2350" title="All 2 branches missed.">        if (depth &lt; 10)</span>
+<span class="nc" id="L2351">            throw new ConfigurationException(&quot;Cannot set repair_session_max_tree_depth to &quot; + depth +</span>
+                                             &quot; which is &lt; 10, doing nothing&quot;);
+<span class="nc bnc" id="L2353" title="All 2 branches missed.">        else if (depth &gt; 20)</span>
+<span class="nc" id="L2354">            logger.warn(&quot;repair_session_max_tree_depth of &quot; + depth + &quot; &gt; 20 could lead to excessive memory usage&quot;);</span>
+
+<span class="nc" id="L2356">        conf.repair_session_max_tree_depth = depth;</span>
+<span class="nc" id="L2357">    }</span>
+
+    public static int getIndexSummaryResizeIntervalInMinutes()
+    {
+<span class="fc" id="L2361">        return conf.index_summary_resize_interval_in_minutes;</span>
+    }
+
+    public static boolean hasLargeAddressSpace()
+    {
+        // currently we just check if it's a 64bit arch, but any we only really care if the address space is large
+<span class="fc" id="L2367">        String datamodel = System.getProperty(&quot;sun.arch.data.model&quot;);</span>
+<span class="pc bpc" id="L2368" title="1 of 2 branches missed.">        if (datamodel != null)</span>
+        {
+<span class="pc bpc" id="L2370" title="2 of 3 branches missed.">            switch (datamodel)</span>
+            {
+<span class="fc" id="L2372">                case &quot;64&quot;: return true;</span>
+<span class="nc" id="L2373">                case &quot;32&quot;: return false;</span>
+            }
+        }
+<span class="nc" id="L2376">        String arch = System.getProperty(&quot;os.arch&quot;);</span>
+<span class="nc bnc" id="L2377" title="All 4 branches missed.">        return arch.contains(&quot;64&quot;) || arch.contains(&quot;sparcv9&quot;);</span>
+    }
+
+    public static int getTracetypeRepairTTL()
+    {
+<span class="nc" id="L2382">        return conf.tracetype_repair_ttl;</span>
+    }
+
+    public static int getTracetypeQueryTTL()
+    {
+<span class="nc" id="L2387">        return conf.tracetype_query_ttl;</span>
+    }
+
+    public static String getOtcCoalescingStrategy()
+    {
+<span class="fc" id="L2392">        return conf.otc_coalescing_strategy;</span>
+    }
+
+    public static int getOtcCoalescingWindow()
+    {
+<span class="fc" id="L2397">        return conf.otc_coalescing_window_us;</span>
+    }
+
+    public static int getOtcCoalescingEnoughCoalescedMessages()
+    {
+<span class="nc" id="L2402">        return conf.otc_coalescing_enough_coalesced_messages;</span>
+    }
+
+    public static void setOtcCoalescingEnoughCoalescedMessages(int otc_coalescing_enough_coalesced_messages)
+    {
+<span class="nc" id="L2407">        conf.otc_coalescing_enough_coalesced_messages = otc_coalescing_enough_coalesced_messages;</span>
+<span class="nc" id="L2408">    }</span>
+
+    public static int getOtcBacklogExpirationInterval()
+    {
+<span class="fc" id="L2412">        return conf.otc_backlog_expiration_interval_ms;</span>
+    }
+
+    public static void setOtcBacklogExpirationInterval(int intervalInMillis)
+    {
+<span class="nc" id="L2417">        conf.otc_backlog_expiration_interval_ms = intervalInMillis;</span>
+<span class="nc" id="L2418">    }</span>
+ 
+    public static int getWindowsTimerInterval()
+    {
+<span class="nc" id="L2422">        return conf.windows_timer_interval;</span>
+    }
+
+    public static long getPreparedStatementsCacheSizeMB()
+    {
+<span class="fc" id="L2427">        return preparedStatementsCacheSizeInMB;</span>
+    }
+
+    public static long getThriftPreparedStatementsCacheSizeMB()
+    {
+<span class="fc" id="L2432">        return thriftPreparedStatementsCacheSizeInMB;</span>
+    }
+
+    public static boolean enableUserDefinedFunctions()
+    {
+<span class="nc" id="L2437">        return conf.enable_user_defined_functions;</span>
+    }
+
+    public static boolean enableScriptedUserDefinedFunctions()
+    {
+<span class="nc" id="L2442">        return conf.enable_scripted_user_defined_functions;</span>
+    }
+
+    public static void enableScriptedUserDefinedFunctions(boolean enableScriptedUserDefinedFunctions)
+    {
+<span class="nc" id="L2447">        conf.enable_scripted_user_defined_functions = enableScriptedUserDefinedFunctions;</span>
+<span class="nc" id="L2448">    }</span>
+
+    public static boolean enableUserDefinedFunctionsThreads()
+    {
+<span class="nc" id="L2452">        return conf.enable_user_defined_functions_threads;</span>
+    }
+
+    public static long getUserDefinedFunctionWarnTimeout()
+    {
+<span class="nc" id="L2457">        return conf.user_defined_function_warn_timeout;</span>
+    }
+
+    public static void setUserDefinedFunctionWarnTimeout(long userDefinedFunctionWarnTimeout)
+    {
+<span class="nc" id="L2462">        conf.user_defined_function_warn_timeout = userDefinedFunctionWarnTimeout;</span>
+<span class="nc" id="L2463">    }</span>
+
+    public static boolean getEnableMaterializedViews()
+    {
+<span class="nc" id="L2467">        return conf.enable_materialized_views;</span>
+    }
+
+    public static void setEnableMaterializedViews(boolean enableMaterializedViews)
+    {
+<span class="nc" id="L2472">        conf.enable_materialized_views = enableMaterializedViews;</span>
+<span class="nc" id="L2473">    }</span>
+
+    public static boolean getEnableSASIIndexes()
+    {
+<span class="nc" id="L2477">        return conf.enable_sasi_indexes;</span>
+    }
+
+    public static void setEnableSASIIndexes(boolean enableSASIIndexes)
+    {
+<span class="nc" id="L2482">        conf.enable_sasi_indexes = enableSASIIndexes;</span>
+<span class="nc" id="L2483">    }</span>
+
+    public static long getUserDefinedFunctionFailTimeout()
+    {
+<span class="nc" id="L2487">        return conf.user_defined_function_fail_timeout;</span>
+    }
+
+    public static void setUserDefinedFunctionFailTimeout(long userDefinedFunctionFailTimeout)
+    {
+<span class="nc" id="L2492">        conf.user_defined_function_fail_timeout = userDefinedFunctionFailTimeout;</span>
+<span class="nc" id="L2493">    }</span>
+
+    public static Config.UserFunctionTimeoutPolicy getUserFunctionTimeoutPolicy()
+    {
+<span class="nc" id="L2497">        return conf.user_function_timeout_policy;</span>
+    }
+
+    public static void setUserFunctionTimeoutPolicy(Config.UserFunctionTimeoutPolicy userFunctionTimeoutPolicy)
+    {
+<span class="nc" id="L2502">        conf.user_function_timeout_policy = userFunctionTimeoutPolicy;</span>
+<span class="nc" id="L2503">    }</span>
+
+    public static long getGCLogThreshold()
+    {
+<span class="fc" id="L2507">        return conf.gc_log_threshold_in_ms;</span>
+    }
+
+    public static EncryptionContext getEncryptionContext()
+    {
+<span class="fc" id="L2512">        return encryptionContext;</span>
+    }
+
+    public static long getGCWarnThreshold()
+    {
+<span class="fc" id="L2517">        return conf.gc_warn_threshold_in_ms;</span>
+    }
+
+    public static boolean isCDCEnabled()
+    {
+<span class="fc" id="L2522">        return conf.cdc_enabled;</span>
+    }
+
+    public static void setCDCEnabled(boolean cdc_enabled)
+    {
+<span class="nc" id="L2527">        conf.cdc_enabled = cdc_enabled;</span>
+<span class="nc" id="L2528">    }</span>
+
+    public static String getCDCLogLocation()
+    {
+<span class="nc" id="L2532">        return conf.cdc_raw_directory;</span>
+    }
+
+    public static int getCDCSpaceInMB()
+    {
+<span class="nc" id="L2537">        return conf.cdc_total_space_in_mb;</span>
+    }
+
+    @VisibleForTesting
+    public static void setCDCSpaceInMB(int input)
+    {
+<span class="nc" id="L2543">        conf.cdc_total_space_in_mb = input;</span>
+<span class="nc" id="L2544">    }</span>
+
+    public static int getCDCDiskCheckInterval()
+    {
+<span class="nc" id="L2548">        return conf.cdc_free_space_check_interval_ms;</span>
+    }
+
+    @VisibleForTesting
+    public static void setEncryptionContext(EncryptionContext ec)
+    {
+<span class="nc" id="L2554">        encryptionContext = ec;</span>
+<span class="nc" id="L2555">    }</span>
+
+    public static int searchConcurrencyFactor()
+    {
+<span class="nc" id="L2559">        return searchConcurrencyFactor;</span>
+    }
+
+    public static boolean isUnsafeSystem()
+    {
+<span class="fc" id="L2564">        return unsafeSystem;</span>
+    }
+
+    public static void setBackPressureEnabled(boolean backPressureEnabled)
+    {
+<span class="nc" id="L2569">        conf.back_pressure_enabled = backPressureEnabled;</span>
+<span class="nc" id="L2570">    }</span>
+
+    public static boolean backPressureEnabled()
+    {
+<span class="fc" id="L2574">        return conf.back_pressure_enabled;</span>
+    }
+
+    @VisibleForTesting
+    public static void setBackPressureStrategy(BackPressureStrategy strategy)
+    {
+<span class="nc" id="L2580">        backPressureStrategy = strategy;</span>
+<span class="nc" id="L2581">    }</span>
+
+    public static BackPressureStrategy getBackPressureStrategy()
+    {
+<span class="fc" id="L2585">        return backPressureStrategy;</span>
+    }
+
+    public static boolean strictRuntimeChecks()
+    {
+<span class="nc" id="L2590">        return strictRuntimeChecks;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

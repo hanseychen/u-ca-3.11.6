@@ -1,0 +1,315 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CommitLogSegmentManagerCDC.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.commitlog</a> &gt; <span class="el_source">CommitLogSegmentManagerCDC.java</span></div><h1>CommitLogSegmentManagerCDC.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.commitlog;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.commitlog.CommitLogSegment.CDCState;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.DirectorySizeCalculator;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+public class CommitLogSegmentManagerCDC extends AbstractCommitLogSegmentManager
+{
+<span class="nc" id="L44">    static final Logger logger = LoggerFactory.getLogger(CommitLogSegmentManagerCDC.class);</span>
+    private final CDCSizeTracker cdcSizeTracker;
+
+    public CommitLogSegmentManagerCDC(final CommitLog commitLog, String storageDirectory)
+    {
+<span class="nc" id="L49">        super(commitLog, storageDirectory);</span>
+<span class="nc" id="L50">        cdcSizeTracker = new CDCSizeTracker(this, new File(DatabaseDescriptor.getCDCLogLocation()));</span>
+<span class="nc" id="L51">    }</span>
+
+    @Override
+    void start()
+    {
+<span class="nc" id="L56">        cdcSizeTracker.start();</span>
+<span class="nc" id="L57">        super.start();</span>
+<span class="nc" id="L58">    }</span>
+
+    public void discard(CommitLogSegment segment, boolean delete)
+    {
+<span class="nc" id="L62">        segment.close();</span>
+<span class="nc" id="L63">        addSize(-segment.onDiskSize());</span>
+
+<span class="nc" id="L65">        cdcSizeTracker.processDiscardedSegment(segment);</span>
+
+<span class="nc bnc" id="L67" title="All 2 branches missed.">        if (segment.getCDCState() == CDCState.CONTAINS)</span>
+<span class="nc" id="L68">            FileUtils.renameWithConfirm(segment.logFile.getAbsolutePath(), DatabaseDescriptor.getCDCLogLocation() + File.separator + segment.logFile.getName());</span>
+        else
+        {
+<span class="nc bnc" id="L71" title="All 2 branches missed.">            if (delete)</span>
+<span class="nc" id="L72">                FileUtils.deleteWithConfirm(segment.logFile);</span>
+        }
+<span class="nc" id="L74">    }</span>
+
+    /**
+     * Initiates the shutdown process for the management thread. Also stops the cdc on-disk size calculator executor.
+     */
+    public void shutdown()
+    {
+<span class="nc" id="L81">        cdcSizeTracker.shutdown();</span>
+<span class="nc" id="L82">        super.shutdown();</span>
+<span class="nc" id="L83">    }</span>
+
+    /**
+     * Reserve space in the current segment for the provided mutation or, if there isn't space available,
+     * create a new segment. For CDC mutations, allocation is expected to throw WTE if the segment disallows CDC mutations.
+     *
+     * @param mutation Mutation to allocate in segment manager
+     * @param size total size (overhead + serialized) of mutation
+     * @return the created Allocation object
+     * @throws WriteTimeoutException If segment disallows CDC mutations, we throw WTE
+     */
+    @Override
+    public CommitLogSegment.Allocation allocate(Mutation mutation, int size) throws WriteTimeoutException
+    {
+<span class="nc" id="L97">        CommitLogSegment segment = allocatingFrom();</span>
+        CommitLogSegment.Allocation alloc;
+
+<span class="nc" id="L100">        throwIfForbidden(mutation, segment);</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        while ( null == (alloc = segment.allocate(mutation, size)) )</span>
+        {
+            // Failed to allocate, so move to a new segment with enough room if possible.
+<span class="nc" id="L104">            advanceAllocatingFrom(segment);</span>
+<span class="nc" id="L105">            segment = allocatingFrom();</span>
+
+<span class="nc" id="L107">            throwIfForbidden(mutation, segment);</span>
+        }
+
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        if (mutation.trackedByCDC())</span>
+<span class="nc" id="L111">            segment.setCDCState(CDCState.CONTAINS);</span>
+
+<span class="nc" id="L113">        return alloc;</span>
+    }
+
+    private void throwIfForbidden(Mutation mutation, CommitLogSegment segment) throws WriteTimeoutException
+    {
+<span class="nc bnc" id="L118" title="All 4 branches missed.">        if (mutation.trackedByCDC() &amp;&amp; segment.getCDCState() == CDCState.FORBIDDEN)</span>
+        {
+<span class="nc" id="L120">            cdcSizeTracker.submitOverflowSizeRecalculation();</span>
+<span class="nc" id="L121">            NoSpamLogger.log(logger,</span>
+                             NoSpamLogger.Level.WARN,
+                             10,
+                             TimeUnit.SECONDS,
+                             &quot;Rejecting Mutation containing CDC-enabled table. Free up space in {}.&quot;,
+<span class="nc" id="L126">                             DatabaseDescriptor.getCDCLogLocation());</span>
+<span class="nc" id="L127">            throw new WriteTimeoutException(WriteType.CDC, ConsistencyLevel.LOCAL_ONE, 0, 1);</span>
+        }
+<span class="nc" id="L129">    }</span>
+
+    /**
+     * Move files to cdc_raw after replay, since recovery will flush to SSTable and these mutations won't be available
+     * in the CL subsystem otherwise.
+     */
+    void handleReplayedSegment(final File file)
+    {
+<span class="nc" id="L137">        logger.trace(&quot;Moving (Unopened) segment {} to cdc_raw directory after replay&quot;, file);</span>
+<span class="nc" id="L138">        FileUtils.renameWithConfirm(file.getAbsolutePath(), DatabaseDescriptor.getCDCLogLocation() + File.separator + file.getName());</span>
+<span class="nc" id="L139">        cdcSizeTracker.addFlushedSize(file.length());</span>
+<span class="nc" id="L140">    }</span>
+
+    /**
+     * On segment creation, flag whether the segment should accept CDC mutations or not based on the total currently
+     * allocated unflushed CDC segments and the contents of cdc_raw
+     */
+    public CommitLogSegment createSegment()
+    {
+<span class="nc" id="L148">        CommitLogSegment segment = CommitLogSegment.createSegment(commitLog, this);</span>
+<span class="nc" id="L149">        cdcSizeTracker.processNewSegment(segment);</span>
+<span class="nc" id="L150">        return segment;</span>
+    }
+
+    /**
+     * Tracks total disk usage of CDC subsystem, defined by the summation of all unflushed CommitLogSegments with CDC
+     * data in them and all segments archived into cdc_raw.
+     *
+     * Allows atomic increment/decrement of unflushed size, however only allows increment on flushed and requires a full
+     * directory walk to determine any potential deletions by CDC consumer.
+     */
+    private static class CDCSizeTracker extends DirectorySizeCalculator
+    {
+<span class="nc" id="L162">        private final RateLimiter rateLimiter = RateLimiter.create(1000.0 / DatabaseDescriptor.getCDCDiskCheckInterval());</span>
+        private ExecutorService cdcSizeCalculationExecutor;
+        private CommitLogSegmentManagerCDC segmentManager;
+        private volatile long unflushedCDCSize;
+
+        // Used instead of size during walk to remove chance of over-allocation
+<span class="nc" id="L168">        private volatile long sizeInProgress = 0;</span>
+
+        CDCSizeTracker(CommitLogSegmentManagerCDC segmentManager, File path)
+        {
+<span class="nc" id="L172">            super(path);</span>
+<span class="nc" id="L173">            this.segmentManager = segmentManager;</span>
+<span class="nc" id="L174">        }</span>
+
+        /**
+         * Needed for stop/restart during unit tests
+         */
+        public void start()
+        {
+<span class="nc" id="L181">            size = 0;</span>
+<span class="nc" id="L182">            unflushedCDCSize = 0;</span>
+<span class="nc" id="L183">            cdcSizeCalculationExecutor = new ThreadPoolExecutor(1, 1, 1000, TimeUnit.SECONDS, new SynchronousQueue&lt;&gt;(), new ThreadPoolExecutor.DiscardPolicy());</span>
+<span class="nc" id="L184">        }</span>
+
+        /**
+         * Synchronous size recalculation on each segment creation/deletion call could lead to very long delays in new
+         * segment allocation, thus long delays in thread signaling to wake waiting allocation / writer threads.
+         *
+         * This can be reached either from the segment management thread in ABstractCommitLogSegmentManager or from the
+         * size recalculation executor, so we synchronize on this object to reduce the race overlap window available for
+         * size to get off.
+         *
+         * Reference DirectorySizerBench for more information about performance of the directory size recalc.
+         */
+        void processNewSegment(CommitLogSegment segment)
+        {
+            // See synchronization in CommitLogSegment.setCDCState
+<span class="nc" id="L199">            synchronized(segment.cdcStateLock)</span>
+            {
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                segment.setCDCState(defaultSegmentSize() + totalCDCSizeOnDisk() &gt; allowableCDCBytes()</span>
+                                    ? CDCState.FORBIDDEN
+                                    : CDCState.PERMITTED);
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (segment.getCDCState() == CDCState.PERMITTED)</span>
+<span class="nc" id="L205">                    unflushedCDCSize += defaultSegmentSize();</span>
+<span class="nc" id="L206">            }</span>
+
+            // Take this opportunity to kick off a recalc to pick up any consumer file deletion.
+<span class="nc" id="L209">            submitOverflowSizeRecalculation();</span>
+<span class="nc" id="L210">        }</span>
+
+        void processDiscardedSegment(CommitLogSegment segment)
+        {
+            // See synchronization in CommitLogSegment.setCDCState
+<span class="nc" id="L215">            synchronized(segment.cdcStateLock)</span>
+            {
+                // Add to flushed size before decrementing unflushed so we don't have a window of false generosity
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                if (segment.getCDCState() == CDCState.CONTAINS)</span>
+<span class="nc" id="L219">                    size += segment.onDiskSize();</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                if (segment.getCDCState() != CDCState.FORBIDDEN)</span>
+<span class="nc" id="L221">                    unflushedCDCSize -= defaultSegmentSize();</span>
+<span class="nc" id="L222">            }</span>
+
+            // Take this opportunity to kick off a recalc to pick up any consumer file deletion.
+<span class="nc" id="L225">            submitOverflowSizeRecalculation();</span>
+<span class="nc" id="L226">        }</span>
+
+        private long allowableCDCBytes()
+        {
+<span class="nc" id="L230">            return (long)DatabaseDescriptor.getCDCSpaceInMB() * 1024 * 1024;</span>
+        }
+
+        public void submitOverflowSizeRecalculation()
+        {
+            try
+            {
+<span class="nc" id="L237">                cdcSizeCalculationExecutor.submit(() -&gt; recalculateOverflowSize());</span>
+            }
+<span class="nc" id="L239">            catch (RejectedExecutionException e)</span>
+            {
+                // Do nothing. Means we have one in flight so this req. should be satisfied when it completes.
+<span class="nc" id="L242">            }</span>
+<span class="nc" id="L243">        }</span>
+
+        private void recalculateOverflowSize()
+        {
+<span class="nc" id="L247">            rateLimiter.acquire();</span>
+<span class="nc" id="L248">            calculateSize();</span>
+<span class="nc" id="L249">            CommitLogSegment allocatingFrom = segmentManager.allocatingFrom();</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (allocatingFrom.getCDCState() == CDCState.FORBIDDEN)</span>
+<span class="nc" id="L251">                processNewSegment(allocatingFrom);</span>
+<span class="nc" id="L252">        }</span>
+
+        private int defaultSegmentSize()
+        {
+<span class="nc" id="L256">            return DatabaseDescriptor.getCommitLogSegmentSize();</span>
+        }
+
+        private void calculateSize()
+        {
+            try
+            {
+                // The Arrays.stream approach is considerably slower on Windows than linux
+<span class="nc" id="L264">                sizeInProgress = 0;</span>
+<span class="nc" id="L265">                Files.walkFileTree(path.toPath(), this);</span>
+<span class="nc" id="L266">                size = sizeInProgress;</span>
+            }
+<span class="nc" id="L268">            catch (IOException ie)</span>
+            {
+<span class="nc" id="L270">                CommitLog.instance.handleCommitError(&quot;Failed CDC Size Calculation&quot;, ie);</span>
+<span class="nc" id="L271">            }</span>
+<span class="nc" id="L272">        }</span>
+
+        @Override
+        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
+        {
+<span class="nc" id="L277">            sizeInProgress += attrs.size();</span>
+<span class="nc" id="L278">            return FileVisitResult.CONTINUE;</span>
+        }
+
+        private void addFlushedSize(long toAdd)
+        {
+<span class="nc" id="L283">            size += toAdd;</span>
+<span class="nc" id="L284">        }</span>
+
+        private long totalCDCSizeOnDisk()
+        {
+<span class="nc" id="L288">            return unflushedCDCSize + size;</span>
+        }
+
+        public void shutdown()
+        {
+<span class="nc" id="L293">            cdcSizeCalculationExecutor.shutdown();</span>
+<span class="nc" id="L294">        }</span>
+    }
+
+    /**
+     * Only use for testing / validation that size tracker is working. Not for production use.
+     */
+    @VisibleForTesting
+    public long updateCDCTotalSize()
+    {
+<span class="nc" id="L303">        cdcSizeTracker.submitOverflowSizeRecalculation();</span>
+
+        // Give the update time to run
+        try
+        {
+<span class="nc" id="L308">            Thread.sleep(DatabaseDescriptor.getCDCDiskCheckInterval() + 10);</span>
+        }
+<span class="nc" id="L310">        catch (InterruptedException e) {}</span>
+
+<span class="nc" id="L312">        return cdcSizeTracker.totalCDCSizeOnDisk();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

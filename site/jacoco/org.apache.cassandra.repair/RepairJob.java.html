@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RepairJob.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">RepairJob.java</span></div><h1>RepairJob.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.repair;
+
+import java.net.InetAddress;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MerkleTrees;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * RepairJob runs repair on given ColumnFamily.
+ */
+public class RepairJob extends AbstractFuture&lt;RepairResult&gt; implements Runnable
+{
+<span class="nc" id="L42">    private static Logger logger = LoggerFactory.getLogger(RepairJob.class);</span>
+
+    private final RepairSession session;
+    private final RepairJobDesc desc;
+    private final RepairParallelism parallelismDegree;
+    private final long repairedAt;
+    private final ListeningExecutorService taskExecutor;
+
+    /**
+     * Create repair job to run on specific columnfamily
+     *
+     * @param session RepairSession that this RepairJob belongs
+     * @param columnFamily name of the ColumnFamily to repair
+     */
+    public RepairJob(RepairSession session, String columnFamily)
+<span class="nc" id="L57">    {</span>
+<span class="nc" id="L58">        this.session = session;</span>
+<span class="nc" id="L59">        this.desc = new RepairJobDesc(session.parentRepairSession, session.getId(), session.keyspace, columnFamily, session.getRanges());</span>
+<span class="nc" id="L60">        this.repairedAt = session.repairedAt;</span>
+<span class="nc" id="L61">        this.taskExecutor = session.taskExecutor;</span>
+<span class="nc" id="L62">        this.parallelismDegree = session.parallelismDegree;</span>
+<span class="nc" id="L63">    }</span>
+
+    /**
+     * Runs repair job.
+     *
+     * This sets up necessary task and runs them on given {@code taskExecutor}.
+     * After submitting all tasks, waits until validation with replica completes.
+     */
+    public void run()
+    {
+<span class="nc" id="L73">        List&lt;InetAddress&gt; allEndpoints = new ArrayList&lt;&gt;(session.endpoints);</span>
+<span class="nc" id="L74">        allEndpoints.add(FBUtilities.getBroadcastAddress());</span>
+
+        ListenableFuture&lt;List&lt;TreeResponse&gt;&gt; validations;
+        // Create a snapshot at all nodes unless we're using pure parallel repairs
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        if (parallelismDegree != RepairParallelism.PARALLEL)</span>
+        {
+            // Request snapshot to all replica
+<span class="nc" id="L81">            List&lt;ListenableFuture&lt;InetAddress&gt;&gt; snapshotTasks = new ArrayList&lt;&gt;(allEndpoints.size());</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">            for (InetAddress endpoint : allEndpoints)</span>
+            {
+<span class="nc" id="L84">                SnapshotTask snapshotTask = new SnapshotTask(desc, endpoint);</span>
+<span class="nc" id="L85">                snapshotTasks.add(snapshotTask);</span>
+<span class="nc" id="L86">                taskExecutor.execute(snapshotTask);</span>
+<span class="nc" id="L87">            }</span>
+            // When all snapshot complete, send validation requests
+<span class="nc" id="L89">            ListenableFuture&lt;List&lt;InetAddress&gt;&gt; allSnapshotTasks = Futures.allAsList(snapshotTasks);</span>
+<span class="nc" id="L90">            validations = Futures.transform(allSnapshotTasks, new AsyncFunction&lt;List&lt;InetAddress&gt;, List&lt;TreeResponse&gt;&gt;()</span>
+<span class="nc" id="L91">            {</span>
+                public ListenableFuture&lt;List&lt;TreeResponse&gt;&gt; apply(List&lt;InetAddress&gt; endpoints)
+                {
+<span class="nc bnc" id="L94" title="All 2 branches missed.">                    if (parallelismDegree == RepairParallelism.SEQUENTIAL)</span>
+<span class="nc" id="L95">                        return sendSequentialValidationRequest(endpoints);</span>
+                    else
+<span class="nc" id="L97">                        return sendDCAwareValidationRequest(endpoints);</span>
+                }
+            }, taskExecutor);
+<span class="nc" id="L100">        }</span>
+        else
+        {
+            // If not sequential, just send validation request to all replica
+<span class="nc" id="L104">            validations = sendValidationRequest(allEndpoints);</span>
+        }
+
+        // When all validations complete, submit sync tasks
+<span class="nc" id="L108">        ListenableFuture&lt;List&lt;SyncStat&gt;&gt; syncResults = Futures.transform(validations, new AsyncFunction&lt;List&lt;TreeResponse&gt;, List&lt;SyncStat&gt;&gt;()</span>
+<span class="nc" id="L109">        {</span>
+            public ListenableFuture&lt;List&lt;SyncStat&gt;&gt; apply(List&lt;TreeResponse&gt; trees)
+            {
+<span class="nc" id="L112">                return Futures.allAsList(createSyncTasks(trees, FBUtilities.getLocalAddress()));</span>
+            }
+        }, taskExecutor);
+
+        // When all sync complete, set the final result
+<span class="nc" id="L117">        Futures.addCallback(syncResults, new FutureCallback&lt;List&lt;SyncStat&gt;&gt;()</span>
+<span class="nc" id="L118">        {</span>
+            public void onSuccess(List&lt;SyncStat&gt; stats)
+            {
+<span class="nc" id="L121">                logger.info(&quot;[repair #{}] {} is fully synced&quot;, session.getId(), desc.columnFamily);</span>
+<span class="nc" id="L122">                SystemDistributedKeyspace.successfulRepairJob(session.getId(), desc.keyspace, desc.columnFamily);</span>
+<span class="nc" id="L123">                set(new RepairResult(desc, stats));</span>
+<span class="nc" id="L124">            }</span>
+
+            /**
+             * Snapshot, validation and sync failures are all handled here
+             */
+            public void onFailure(Throwable t)
+            {
+<span class="nc" id="L131">                logger.warn(&quot;[repair #{}] {} sync failed&quot;, session.getId(), desc.columnFamily);</span>
+<span class="nc" id="L132">                SystemDistributedKeyspace.failedRepairJob(session.getId(), desc.keyspace, desc.columnFamily, t);</span>
+<span class="nc" id="L133">                setException(t);</span>
+<span class="nc" id="L134">            }</span>
+        }, taskExecutor);
+
+        // Wait for validation to complete
+<span class="nc" id="L138">        Futures.getUnchecked(validations);</span>
+<span class="nc" id="L139">    }</span>
+
+    @VisibleForTesting
+    List&lt;SyncTask&gt; createSyncTasks(List&lt;TreeResponse&gt; trees, InetAddress local)
+    {
+<span class="nc" id="L144">        List&lt;SyncTask&gt; syncTasks = new ArrayList&lt;&gt;();</span>
+        // We need to difference all trees one against another
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        for (int i = 0; i &lt; trees.size() - 1; ++i)</span>
+        {
+<span class="nc" id="L148">            TreeResponse r1 = trees.get(i);</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            for (int j = i + 1; j &lt; trees.size(); ++j)</span>
+            {
+<span class="nc" id="L151">                TreeResponse r2 = trees.get(j);</span>
+                SyncTask task;
+
+<span class="nc" id="L154">                List&lt;Range&lt;Token&gt;&gt; differences = MerkleTrees.difference(r1.trees, r2.trees);</span>
+
+<span class="nc bnc" id="L156" title="All 4 branches missed.">                if (r1.endpoint.equals(local) || r2.endpoint.equals(local))</span>
+                {
+<span class="nc" id="L158">                    task = new LocalSyncTask(desc, r1.endpoint, r2.endpoint, differences, repairedAt, session.pullRepair);</span>
+                }
+                else
+                {
+<span class="nc" id="L162">                    task = new RemoteSyncTask(desc, r1.endpoint, r2.endpoint, differences);</span>
+                    // RemoteSyncTask expects SyncComplete message sent back.
+                    // Register task to RepairSession to receive response.
+<span class="nc" id="L165">                    session.waitForSync(Pair.create(desc, new NodePair(r1.endpoint, r2.endpoint)), (RemoteSyncTask) task);</span>
+                }
+<span class="nc" id="L167">                syncTasks.add(task);</span>
+<span class="nc" id="L168">                taskExecutor.submit(task);</span>
+            }
+        }
+<span class="nc" id="L171">        return syncTasks;</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor in parallel.
+     *
+     * @param endpoints Endpoint addresses to send validation request
+     * @return Future that can get all {@link TreeResponse} from replica, if all validation succeed.
+     */
+    private ListenableFuture&lt;List&lt;TreeResponse&gt;&gt; sendValidationRequest(Collection&lt;InetAddress&gt; endpoints)
+    {
+<span class="nc" id="L182">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="nc" id="L183">        logger.info(&quot;[repair #{}] {}&quot;, desc.sessionId, message);</span>
+<span class="nc" id="L184">        Tracing.traceRepair(message);</span>
+<span class="nc" id="L185">        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L186">        List&lt;ListenableFuture&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        for (InetAddress endpoint : endpoints)</span>
+        {
+<span class="nc" id="L189">            ValidationTask task = new ValidationTask(desc, endpoint, gcBefore);</span>
+<span class="nc" id="L190">            tasks.add(task);</span>
+<span class="nc" id="L191">            session.waitForValidation(Pair.create(desc, endpoint), task);</span>
+<span class="nc" id="L192">            taskExecutor.execute(task);</span>
+<span class="nc" id="L193">        }</span>
+<span class="nc" id="L194">        return Futures.allAsList(tasks);</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor so that tasks run sequentially.
+     */
+    private ListenableFuture&lt;List&lt;TreeResponse&gt;&gt; sendSequentialValidationRequest(Collection&lt;InetAddress&gt; endpoints)
+    {
+<span class="nc" id="L202">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="nc" id="L203">        logger.info(&quot;[repair #{}] {}&quot;, desc.sessionId, message);</span>
+<span class="nc" id="L204">        Tracing.traceRepair(message);</span>
+<span class="nc" id="L205">        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L206">        List&lt;ListenableFuture&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+
+<span class="nc" id="L208">        Queue&lt;InetAddress&gt; requests = new LinkedList&lt;&gt;(endpoints);</span>
+<span class="nc" id="L209">        InetAddress address = requests.poll();</span>
+<span class="nc" id="L210">        ValidationTask firstTask = new ValidationTask(desc, address, gcBefore);</span>
+<span class="nc" id="L211">        logger.info(&quot;Validating {}&quot;, address);</span>
+<span class="nc" id="L212">        session.waitForValidation(Pair.create(desc, address), firstTask);</span>
+<span class="nc" id="L213">        tasks.add(firstTask);</span>
+<span class="nc" id="L214">        ValidationTask currentTask = firstTask;</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        while (requests.size() &gt; 0)</span>
+        {
+<span class="nc" id="L217">            final InetAddress nextAddress = requests.poll();</span>
+<span class="nc" id="L218">            final ValidationTask nextTask = new ValidationTask(desc, nextAddress, gcBefore);</span>
+<span class="nc" id="L219">            tasks.add(nextTask);</span>
+<span class="nc" id="L220">            Futures.addCallback(currentTask, new FutureCallback&lt;TreeResponse&gt;()</span>
+<span class="nc" id="L221">            {</span>
+                public void onSuccess(TreeResponse result)
+                {
+<span class="nc" id="L224">                    logger.info(&quot;Validating {}&quot;, nextAddress);</span>
+<span class="nc" id="L225">                    session.waitForValidation(Pair.create(desc, nextAddress), nextTask);</span>
+<span class="nc" id="L226">                    taskExecutor.execute(nextTask);</span>
+<span class="nc" id="L227">                }</span>
+
+                // failure is handled at root of job chain
+<span class="nc" id="L230">                public void onFailure(Throwable t) {}</span>
+            });
+<span class="nc" id="L232">            currentTask = nextTask;</span>
+<span class="nc" id="L233">        }</span>
+        // start running tasks
+<span class="nc" id="L235">        taskExecutor.execute(firstTask);</span>
+<span class="nc" id="L236">        return Futures.allAsList(tasks);</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor so that tasks run sequentially within each dc.
+     */
+    private ListenableFuture&lt;List&lt;TreeResponse&gt;&gt; sendDCAwareValidationRequest(Collection&lt;InetAddress&gt; endpoints)
+    {
+<span class="nc" id="L244">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="nc" id="L245">        logger.info(&quot;[repair #{}] {}&quot;, desc.sessionId, message);</span>
+<span class="nc" id="L246">        Tracing.traceRepair(message);</span>
+<span class="nc" id="L247">        int gcBefore = Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).gcBefore(FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L248">        List&lt;ListenableFuture&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+
+<span class="nc" id="L250">        Map&lt;String, Queue&lt;InetAddress&gt;&gt; requestsByDatacenter = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        for (InetAddress endpoint : endpoints)</span>
+        {
+<span class="nc" id="L253">            String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(endpoint);</span>
+<span class="nc" id="L254">            Queue&lt;InetAddress&gt; queue = requestsByDatacenter.get(dc);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (queue == null)</span>
+            {
+<span class="nc" id="L257">                queue = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L258">                requestsByDatacenter.put(dc, queue);</span>
+            }
+<span class="nc" id="L260">            queue.add(endpoint);</span>
+<span class="nc" id="L261">        }</span>
+
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        for (Map.Entry&lt;String, Queue&lt;InetAddress&gt;&gt; entry : requestsByDatacenter.entrySet())</span>
+        {
+<span class="nc" id="L265">            Queue&lt;InetAddress&gt; requests = entry.getValue();</span>
+<span class="nc" id="L266">            InetAddress address = requests.poll();</span>
+<span class="nc" id="L267">            ValidationTask firstTask = new ValidationTask(desc, address, gcBefore);</span>
+<span class="nc" id="L268">            logger.info(&quot;Validating {}&quot;, address);</span>
+<span class="nc" id="L269">            session.waitForValidation(Pair.create(desc, address), firstTask);</span>
+<span class="nc" id="L270">            tasks.add(firstTask);</span>
+<span class="nc" id="L271">            ValidationTask currentTask = firstTask;</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            while (requests.size() &gt; 0)</span>
+            {
+<span class="nc" id="L274">                final InetAddress nextAddress = requests.poll();</span>
+<span class="nc" id="L275">                final ValidationTask nextTask = new ValidationTask(desc, nextAddress, gcBefore);</span>
+<span class="nc" id="L276">                tasks.add(nextTask);</span>
+<span class="nc" id="L277">                Futures.addCallback(currentTask, new FutureCallback&lt;TreeResponse&gt;()</span>
+<span class="nc" id="L278">                {</span>
+                    public void onSuccess(TreeResponse result)
+                    {
+<span class="nc" id="L281">                        logger.info(&quot;Validating {}&quot;, nextAddress);</span>
+<span class="nc" id="L282">                        session.waitForValidation(Pair.create(desc, nextAddress), nextTask);</span>
+<span class="nc" id="L283">                        taskExecutor.execute(nextTask);</span>
+<span class="nc" id="L284">                    }</span>
+
+                    // failure is handled at root of job chain
+<span class="nc" id="L287">                    public void onFailure(Throwable t) {}</span>
+                });
+<span class="nc" id="L289">                currentTask = nextTask;</span>
+<span class="nc" id="L290">            }</span>
+            // start running tasks
+<span class="nc" id="L292">            taskExecutor.execute(firstTask);</span>
+<span class="nc" id="L293">        }</span>
+<span class="nc" id="L294">        return Futures.allAsList(tasks);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

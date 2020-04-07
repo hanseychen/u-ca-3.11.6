@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamManager.java</span></div><h1>StreamManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.net.InetAddress;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+import javax.management.ListenerNotFoundException;
+import javax.management.MBeanNotificationInfo;
+import javax.management.NotificationFilter;
+import javax.management.NotificationListener;
+import javax.management.openmbean.CompositeData;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.streaming.management.StreamEventJMXNotifier;
+import org.apache.cassandra.streaming.management.StreamStateCompositeData;
+
+/**
+ * StreamManager manages currently running {@link StreamResultFuture}s and provides status of all operation invoked.
+ *
+ * All stream operation should be created through this class to track streaming status and progress.
+ */
+<span class="fc" id="L47">public class StreamManager implements StreamManagerMBean</span>
+{
+<span class="fc" id="L49">    public static final StreamManager instance = new StreamManager();</span>
+
+    /**
+     * Gets streaming rate limiter.
+     * When stream_throughput_outbound_megabits_per_sec is 0, this returns rate limiter
+     * with the rate of Double.MAX_VALUE bytes per second.
+     * Rate unit is bytes per sec.
+     *
+     * @return StreamRateLimiter with rate limit set based on peer location.
+     */
+    public static StreamRateLimiter getRateLimiter(InetAddress peer)
+    {
+<span class="nc" id="L61">        return new StreamRateLimiter(peer);</span>
+    }
+
+    public static class StreamRateLimiter
+    {
+        private static final double BYTES_PER_MEGABIT = (1024 * 1024) / 8; // from bits
+<span class="nc" id="L67">        private static final RateLimiter limiter = RateLimiter.create(Double.MAX_VALUE);</span>
+<span class="nc" id="L68">        private static final RateLimiter interDCLimiter = RateLimiter.create(Double.MAX_VALUE);</span>
+        private final boolean isLocalDC;
+
+        public StreamRateLimiter(InetAddress peer)
+<span class="nc" id="L72">        {</span>
+<span class="nc" id="L73">            double throughput = DatabaseDescriptor.getStreamThroughputOutboundMegabitsPerSec() * BYTES_PER_MEGABIT;</span>
+<span class="nc" id="L74">            mayUpdateThroughput(throughput, limiter);</span>
+
+<span class="nc" id="L76">            double interDCThroughput = DatabaseDescriptor.getInterDCStreamThroughputOutboundMegabitsPerSec() * BYTES_PER_MEGABIT;</span>
+<span class="nc" id="L77">            mayUpdateThroughput(interDCThroughput, interDCLimiter);</span>
+
+<span class="nc bnc" id="L79" title="All 4 branches missed.">            if (DatabaseDescriptor.getLocalDataCenter() != null &amp;&amp; DatabaseDescriptor.getEndpointSnitch() != null)</span>
+<span class="nc" id="L80">                isLocalDC = DatabaseDescriptor.getLocalDataCenter().equals(</span>
+<span class="nc" id="L81">                            DatabaseDescriptor.getEndpointSnitch().getDatacenter(peer));</span>
+            else
+<span class="nc" id="L83">                isLocalDC = true;</span>
+<span class="nc" id="L84">        }</span>
+
+        private void mayUpdateThroughput(double limit, RateLimiter rateLimiter)
+        {
+            // if throughput is set to 0, throttling is disabled
+<span class="nc bnc" id="L89" title="All 2 branches missed.">            if (limit == 0)</span>
+<span class="nc" id="L90">                limit = Double.MAX_VALUE;</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            if (rateLimiter.getRate() != limit)</span>
+<span class="nc" id="L92">                rateLimiter.setRate(limit);</span>
+<span class="nc" id="L93">        }</span>
+
+        public void acquire(int toTransfer)
+        {
+<span class="nc" id="L97">            limiter.acquire(toTransfer);</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">            if (!isLocalDC)</span>
+<span class="nc" id="L99">                interDCLimiter.acquire(toTransfer);</span>
+<span class="nc" id="L100">        }</span>
+    }
+
+<span class="fc" id="L103">    private final StreamEventJMXNotifier notifier = new StreamEventJMXNotifier();</span>
+
+    /*
+     * Currently running streams. Removed after completion/failure.
+     * We manage them in two different maps to distinguish plan from initiated ones to
+     * receiving ones withing the same JVM.
+     */
+<span class="fc" id="L110">    private final Map&lt;UUID, StreamResultFuture&gt; initiatedStreams = new NonBlockingHashMap&lt;&gt;();</span>
+<span class="fc" id="L111">    private final Map&lt;UUID, StreamResultFuture&gt; receivingStreams = new NonBlockingHashMap&lt;&gt;();</span>
+
+    public Set&lt;CompositeData&gt; getCurrentStreams()
+    {
+<span class="nc" id="L115">        return Sets.newHashSet(Iterables.transform(Iterables.concat(initiatedStreams.values(), receivingStreams.values()), new Function&lt;StreamResultFuture, CompositeData&gt;()</span>
+<span class="nc" id="L116">        {</span>
+            public CompositeData apply(StreamResultFuture input)
+            {
+<span class="nc" id="L119">                return StreamStateCompositeData.toCompositeData(input.getCurrentState());</span>
+            }
+        }));
+    }
+
+    public void register(final StreamResultFuture result)
+    {
+<span class="nc" id="L126">        result.addEventListener(notifier);</span>
+        // Make sure we remove the stream on completion (whether successful or not)
+<span class="nc" id="L128">        result.addListener(new Runnable()</span>
+<span class="nc" id="L129">        {</span>
+            public void run()
+            {
+<span class="nc" id="L132">                initiatedStreams.remove(result.planId);</span>
+<span class="nc" id="L133">            }</span>
+<span class="nc" id="L134">        }, MoreExecutors.directExecutor());</span>
+
+<span class="nc" id="L136">        initiatedStreams.put(result.planId, result);</span>
+<span class="nc" id="L137">    }</span>
+
+    public void registerReceiving(final StreamResultFuture result)
+    {
+<span class="nc" id="L141">        result.addEventListener(notifier);</span>
+        // Make sure we remove the stream on completion (whether successful or not)
+<span class="nc" id="L143">        result.addListener(new Runnable()</span>
+<span class="nc" id="L144">        {</span>
+            public void run()
+            {
+<span class="nc" id="L147">                receivingStreams.remove(result.planId);</span>
+<span class="nc" id="L148">            }</span>
+<span class="nc" id="L149">        }, MoreExecutors.directExecutor());</span>
+
+<span class="nc" id="L151">        receivingStreams.put(result.planId, result);</span>
+<span class="nc" id="L152">    }</span>
+
+    public StreamResultFuture getReceivingStream(UUID planId)
+    {
+<span class="nc" id="L156">        return receivingStreams.get(planId);</span>
+    }
+
+    public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback)
+    {
+<span class="nc" id="L161">        notifier.addNotificationListener(listener, filter, handback);</span>
+<span class="nc" id="L162">    }</span>
+
+    public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException
+    {
+<span class="nc" id="L166">        notifier.removeNotificationListener(listener);</span>
+<span class="nc" id="L167">    }</span>
+
+    public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException
+    {
+<span class="nc" id="L171">        notifier.removeNotificationListener(listener, filter, handback);</span>
+<span class="nc" id="L172">    }</span>
+
+    public MBeanNotificationInfo[] getNotificationInfo()
+    {
+<span class="fc" id="L176">        return notifier.getNotificationInfo();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

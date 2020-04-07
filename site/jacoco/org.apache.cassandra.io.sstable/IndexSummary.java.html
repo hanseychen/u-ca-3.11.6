@@ -1,0 +1,375 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IndexSummary.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">IndexSummary.java</span></div><h1>IndexSummary.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
+import org.apache.cassandra.utils.memory.MemoryUtil;
+
+import static org.apache.cassandra.io.sstable.Downsampling.BASE_SAMPLING_LEVEL;
+
+/*
+ * Layout of Memory for index summaries:
+ *
+ * There are two sections:
+ *  1. A &quot;header&quot; containing the offset into `bytes` of entries in the summary summary data, consisting of
+ *     one four byte position for each entry in the summary.  This allows us do simple math in getIndex()
+ *     to find the position in the Memory to start reading the actual index summary entry.
+ *     (This is necessary because keys can have different lengths.)
+ *  2.  A sequence of (DecoratedKey, position) pairs, where position is the offset into the actual index file.
+ */
+<span class="pc bpc" id="L51" title="1 of 2 branches missed.">public class IndexSummary extends WrappedSharedCloseable</span>
+{
+<span class="fc" id="L53">    private static final Logger logger = LoggerFactory.getLogger(IndexSummary.class);</span>
+<span class="fc" id="L54">    public static final IndexSummarySerializer serializer = new IndexSummarySerializer();</span>
+
+    /**
+     * A lower bound for the average number of partitions in between each index summary entry. A lower value means
+     * that more partitions will have an entry in the index summary when at the full sampling level.
+     */
+    private final int minIndexInterval;
+
+    private final IPartitioner partitioner;
+    private final int sizeAtFullSampling;
+    // we permit the memory to span a range larger than we use,
+    // so we have an accompanying count and length for each part
+    // we split our data into two ranges: offsets (indexing into entries),
+    // and entries containing the summary data
+    private final Memory offsets;
+    private final int offsetCount;
+    // entries is a list of (partition key, index file offset) pairs
+    private final Memory entries;
+    private final long entriesLength;
+
+    /**
+     * A value between 1 and BASE_SAMPLING_LEVEL that represents how many of the original
+     * index summary entries ((1 / indexInterval) * numKeys) have been retained.
+     *
+     * Thus, this summary contains (samplingLevel / BASE_SAMPLING_LEVEL) * ((1 / indexInterval) * numKeys)) entries.
+     */
+    private final int samplingLevel;
+
+    public IndexSummary(IPartitioner partitioner, Memory offsets, int offsetCount, Memory entries, long entriesLength,
+                        int sizeAtFullSampling, int minIndexInterval, int samplingLevel)
+    {
+<span class="fc" id="L85">        super(new Memory[] { offsets, entries });</span>
+<span class="pc bpc" id="L86" title="2 of 4 branches missed.">        assert offsets.getInt(0) == 0;</span>
+<span class="fc" id="L87">        this.partitioner = partitioner;</span>
+<span class="fc" id="L88">        this.minIndexInterval = minIndexInterval;</span>
+<span class="fc" id="L89">        this.offsetCount = offsetCount;</span>
+<span class="fc" id="L90">        this.entriesLength = entriesLength;</span>
+<span class="fc" id="L91">        this.sizeAtFullSampling = sizeAtFullSampling;</span>
+<span class="fc" id="L92">        this.offsets = offsets;</span>
+<span class="fc" id="L93">        this.entries = entries;</span>
+<span class="fc" id="L94">        this.samplingLevel = samplingLevel;</span>
+<span class="pc bpc" id="L95" title="2 of 4 branches missed.">        assert samplingLevel &gt; 0;</span>
+<span class="fc" id="L96">    }</span>
+
+    private IndexSummary(IndexSummary copy)
+    {
+<span class="nc" id="L100">        super(copy);</span>
+<span class="nc" id="L101">        this.partitioner = copy.partitioner;</span>
+<span class="nc" id="L102">        this.minIndexInterval = copy.minIndexInterval;</span>
+<span class="nc" id="L103">        this.offsetCount = copy.offsetCount;</span>
+<span class="nc" id="L104">        this.entriesLength = copy.entriesLength;</span>
+<span class="nc" id="L105">        this.sizeAtFullSampling = copy.sizeAtFullSampling;</span>
+<span class="nc" id="L106">        this.offsets = copy.offsets;</span>
+<span class="nc" id="L107">        this.entries = copy.entries;</span>
+<span class="nc" id="L108">        this.samplingLevel = copy.samplingLevel;</span>
+<span class="nc" id="L109">    }</span>
+
+    // binary search is notoriously more difficult to get right than it looks; this is lifted from
+    // Harmony's Collections implementation
+    public int binarySearch(PartitionPosition key)
+    {
+        // We will be comparing non-native Keys, so use a buffer with appropriate byte order
+<span class="fc" id="L116">        ByteBuffer hollow = MemoryUtil.getHollowDirectByteBuffer().order(ByteOrder.BIG_ENDIAN);</span>
+<span class="fc" id="L117">        int low = 0, mid = offsetCount, high = mid - 1, result = -1;</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        while (low &lt;= high)</span>
+        {
+<span class="fc" id="L120">            mid = (low + high) &gt;&gt; 1;</span>
+<span class="fc" id="L121">            fillTemporaryKey(mid, hollow);</span>
+<span class="fc" id="L122">            result = -DecoratedKey.compareTo(partitioner, hollow, key);</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">            if (result &gt; 0)</span>
+            {
+<span class="fc" id="L125">                low = mid + 1;</span>
+            }
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">            else if (result == 0)</span>
+            {
+<span class="fc" id="L129">                return mid;</span>
+            }
+            else
+            {
+<span class="nc" id="L133">                high = mid - 1;</span>
+            }
+        }
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        return -mid - (result &lt; 0 ? 1 : 2);</span>
+    }
+
+    /**
+     * Gets the position of the actual index summary entry in our Memory attribute, 'bytes'.
+     * @param index The index of the entry or key to get the position for
+     * @return an offset into our Memory attribute where the actual entry resides
+     */
+    public int getPositionInSummary(int index)
+    {
+        // The first section of bytes holds a four-byte position for each entry in the summary, so just multiply by 4.
+<span class="fc" id="L148">        return offsets.getInt(index &lt;&lt; 2);</span>
+    }
+
+    public byte[] getKey(int index)
+    {
+<span class="nc" id="L153">        long start = getPositionInSummary(index);</span>
+<span class="nc" id="L154">        int keySize = (int) (calculateEnd(index) - start - 8L);</span>
+<span class="nc" id="L155">        byte[] key = new byte[keySize];</span>
+<span class="nc" id="L156">        entries.getBytes(start, key, 0, keySize);</span>
+<span class="nc" id="L157">        return key;</span>
+    }
+
+    private void fillTemporaryKey(int index, ByteBuffer buffer)
+    {
+<span class="fc" id="L162">        long start = getPositionInSummary(index);</span>
+<span class="fc" id="L163">        int keySize = (int) (calculateEnd(index) - start - 8L);</span>
+<span class="fc" id="L164">        entries.setByteBuffer(buffer, start, keySize);</span>
+<span class="fc" id="L165">    }</span>
+
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L169">        super.addTo(identities);</span>
+<span class="nc" id="L170">        identities.add(offsets);</span>
+<span class="nc" id="L171">        identities.add(entries);</span>
+<span class="nc" id="L172">    }</span>
+
+    public long getPosition(int index)
+    {
+<span class="fc" id="L176">        return entries.getLong(calculateEnd(index) - 8);</span>
+    }
+
+    public long getEndInSummary(int index)
+    {
+<span class="nc" id="L181">        return calculateEnd(index);</span>
+    }
+
+    private long calculateEnd(int index)
+    {
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">        return index == (offsetCount - 1) ? entriesLength : getPositionInSummary(index + 1);</span>
+    }
+
+    public int getMinIndexInterval()
+    {
+<span class="nc" id="L191">        return minIndexInterval;</span>
+    }
+
+    public double getEffectiveIndexInterval()
+    {
+<span class="nc" id="L196">        return (BASE_SAMPLING_LEVEL / (double) samplingLevel) * minIndexInterval;</span>
+    }
+
+    /**
+     * Returns an estimate of the total number of keys in the SSTable.
+     */
+    public long getEstimatedKeyCount()
+    {
+<span class="nc" id="L204">        return ((long) getMaxNumberOfEntries() + 1) * minIndexInterval;</span>
+    }
+
+    public int size()
+    {
+<span class="fc" id="L209">        return offsetCount;</span>
+    }
+
+    public int getSamplingLevel()
+    {
+<span class="nc" id="L214">        return samplingLevel;</span>
+    }
+
+    /**
+     * Returns the number of entries this summary would have if it were at the full sampling level, which is equal
+     * to the number of entries in the primary on-disk index divided by the min index interval.
+     */
+    public int getMaxNumberOfEntries()
+    {
+<span class="nc" id="L223">        return sizeAtFullSampling;</span>
+    }
+
+    /**
+     * Returns the amount of off-heap memory used for the entries portion of this summary.
+     * @return size in bytes
+     */
+    long getEntriesLength()
+    {
+<span class="nc" id="L232">        return entriesLength;</span>
+    }
+
+    Memory getOffsets()
+    {
+<span class="nc" id="L237">        return offsets;</span>
+    }
+
+    Memory getEntries()
+    {
+<span class="nc" id="L242">        return entries;</span>
+    }
+
+    public long getOffHeapSize()
+    {
+<span class="fc" id="L247">        return offsetCount * 4 + entriesLength;</span>
+    }
+
+    /**
+     * Returns the number of primary (on-disk) index entries between the index summary entry at `index` and the next
+     * index summary entry (assuming there is one).  Without any downsampling, this will always be equivalent to
+     * the index interval.
+     *
+     * @param index the index of an index summary entry (between zero and the index entry size)
+     *
+     * @return the number of partitions after `index` until the next partition with a summary entry
+     */
+    public int getEffectiveIndexIntervalAfterIndex(int index)
+    {
+<span class="fc" id="L261">        return Downsampling.getEffectiveIndexIntervalAfterIndex(index, samplingLevel, minIndexInterval);</span>
+    }
+
+    public IndexSummary sharedCopy()
+    {
+<span class="nc" id="L266">        return new IndexSummary(this);</span>
+    }
+
+<span class="fc" id="L269">    public static class IndexSummarySerializer</span>
+    {
+        public void serialize(IndexSummary t, DataOutputPlus out, boolean withSamplingLevel) throws IOException
+        {
+<span class="fc" id="L273">            out.writeInt(t.minIndexInterval);</span>
+<span class="fc" id="L274">            out.writeInt(t.offsetCount);</span>
+<span class="fc" id="L275">            out.writeLong(t.getOffHeapSize());</span>
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">            if (withSamplingLevel)</span>
+            {
+<span class="fc" id="L278">                out.writeInt(t.samplingLevel);</span>
+<span class="fc" id="L279">                out.writeInt(t.sizeAtFullSampling);</span>
+            }
+            // our on-disk representation treats the offsets and the summary data as one contiguous structure,
+            // in which the offsets are based from the start of the structure. i.e., if the offsets occupy
+            // X bytes, the value of the first offset will be X. In memory we split the two regions up, so that
+            // the summary values are indexed from zero, so we apply a correction to the offsets when de/serializing.
+            // In this case adding X to each of the offsets.
+<span class="fc" id="L286">            int baseOffset = t.offsetCount * 4;</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">            for (int i = 0 ; i &lt; t.offsetCount ; i++)</span>
+            {
+<span class="fc" id="L289">                int offset = t.offsets.getInt(i * 4) + baseOffset;</span>
+                // our serialization format for this file uses native byte order, so if this is different to the
+                // default Java serialization order (BIG_ENDIAN) we have to reverse our bytes
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">                if (ByteOrder.nativeOrder() != ByteOrder.BIG_ENDIAN)</span>
+<span class="fc" id="L293">                    offset = Integer.reverseBytes(offset);</span>
+<span class="fc" id="L294">                out.writeInt(offset);</span>
+            }
+<span class="fc" id="L296">            out.write(t.entries, 0, t.entriesLength);</span>
+<span class="fc" id="L297">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public IndexSummary deserialize(DataInputStream in, IPartitioner partitioner, boolean haveSamplingLevel, int expectedMinIndexInterval, int maxIndexInterval) throws IOException
+        {
+<span class="nc" id="L302">            int minIndexInterval = in.readInt();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (minIndexInterval != expectedMinIndexInterval)</span>
+            {
+<span class="nc" id="L305">                throw new IOException(String.format(&quot;Cannot read index summary because min_index_interval changed from %d to %d.&quot;,</span>
+<span class="nc" id="L306">                                                    minIndexInterval, expectedMinIndexInterval));</span>
+            }
+
+<span class="nc" id="L309">            int offsetCount = in.readInt();</span>
+<span class="nc" id="L310">            long offheapSize = in.readLong();</span>
+            int samplingLevel, fullSamplingSummarySize;
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (haveSamplingLevel)</span>
+            {
+<span class="nc" id="L314">                samplingLevel = in.readInt();</span>
+<span class="nc" id="L315">                fullSamplingSummarySize = in.readInt();</span>
+            }
+            else
+            {
+<span class="nc" id="L319">                samplingLevel = BASE_SAMPLING_LEVEL;</span>
+<span class="nc" id="L320">                fullSamplingSummarySize = offsetCount;</span>
+            }
+
+<span class="nc" id="L323">            int effectiveIndexInterval = (int) Math.ceil((BASE_SAMPLING_LEVEL / (double) samplingLevel) * minIndexInterval);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            if (effectiveIndexInterval &gt; maxIndexInterval)</span>
+            {
+<span class="nc" id="L326">                throw new IOException(String.format(&quot;Rebuilding index summary because the effective index interval (%d) is higher than&quot; +</span>
+<span class="nc" id="L327">                                                    &quot; the current max index interval (%d)&quot;, effectiveIndexInterval, maxIndexInterval));</span>
+            }
+
+<span class="nc" id="L330">            Memory offsets = Memory.allocate(offsetCount * 4);</span>
+<span class="nc" id="L331">            Memory entries = Memory.allocate(offheapSize - offsets.size());</span>
+            try
+            {
+<span class="nc" id="L334">                FBUtilities.copy(in, new MemoryOutputStream(offsets), offsets.size());</span>
+<span class="nc" id="L335">                FBUtilities.copy(in, new MemoryOutputStream(entries), entries.size());</span>
+            }
+<span class="nc" id="L337">            catch (IOException ioe)</span>
+            {
+<span class="nc" id="L339">                offsets.free();</span>
+<span class="nc" id="L340">                entries.free();</span>
+<span class="nc" id="L341">                throw ioe;</span>
+<span class="nc" id="L342">            }</span>
+            // our on-disk representation treats the offsets and the summary data as one contiguous structure,
+            // in which the offsets are based from the start of the structure. i.e., if the offsets occupy
+            // X bytes, the value of the first offset will be X. In memory we split the two regions up, so that
+            // the summary values are indexed from zero, so we apply a correction to the offsets when de/serializing.
+            // In this case subtracting X from each of the offsets.
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            for (int i = 0 ; i &lt; offsets.size() ; i += 4)</span>
+<span class="nc" id="L349">                offsets.setInt(i, (int) (offsets.getInt(i) - offsets.size()));</span>
+<span class="nc" id="L350">            return new IndexSummary(partitioner, offsets, offsetCount, entries, entries.size(), fullSamplingSummarySize, minIndexInterval, samplingLevel);</span>
+        }
+
+        /**
+         * Deserializes the first and last key stored in the summary
+         *
+         * Only for use by offline tools like SSTableMetadataViewer, otherwise SSTable.first/last should be used.
+         */
+        public Pair&lt;DecoratedKey, DecoratedKey&gt; deserializeFirstLastKey(DataInputStream in, IPartitioner partitioner, boolean haveSamplingLevel) throws IOException
+        {
+<span class="nc" id="L360">            in.skipBytes(4); // minIndexInterval</span>
+<span class="nc" id="L361">            int offsetCount = in.readInt();</span>
+<span class="nc" id="L362">            long offheapSize = in.readLong();</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            if (haveSamplingLevel)</span>
+<span class="nc" id="L364">                in.skipBytes(8); // samplingLevel, fullSamplingSummarySize</span>
+
+<span class="nc" id="L366">            in.skip(offsetCount * 4);</span>
+<span class="nc" id="L367">            in.skip(offheapSize - offsetCount * 4);</span>
+
+<span class="nc" id="L369">            DecoratedKey first = partitioner.decorateKey(ByteBufferUtil.readWithLength(in));</span>
+<span class="nc" id="L370">            DecoratedKey last = partitioner.decorateKey(ByteBufferUtil.readWithLength(in));</span>
+<span class="nc" id="L371">            return Pair.create(first, last);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

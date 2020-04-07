@@ -1,0 +1,859 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LeveledManifest.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">LeveledManifest.java</span></div><h1>LeveledManifest.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.io.IOException;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableSortedSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+<span class="pc bpc" id="L46" title="1 of 2 branches missed.">public class LeveledManifest</span>
+{
+<span class="fc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(LeveledManifest.class);</span>
+
+    /**
+     * limit the number of L0 sstables we do at once, because compaction bloom filter creation
+     * uses a pessimistic estimate of how many keys overlap (none), so we risk wasting memory
+     * or even OOMing when compacting highly overlapping sstables
+     */
+    private static final int MAX_COMPACTING_L0 = 32;
+    /**
+     * If we go this many rounds without compacting
+     * in the highest level, we start bringing in sstables from
+     * that level into lower level compactions
+     */
+    private static final int NO_COMPACTION_LIMIT = 25;
+    // allocate enough generations for a PB of data, with a 1-MB sstable size.  (Note that if maxSSTableSize is
+    // updated, we will still have sstables of the older, potentially smaller size.  So don't make this
+    // dependent on maxSSTableSize.)
+<span class="fc" id="L65">    public static final int MAX_LEVEL_COUNT = (int) Math.log10(1000 * 1000 * 1000);</span>
+    private final ColumnFamilyStore cfs;
+    @VisibleForTesting
+    protected final List&lt;SSTableReader&gt;[] generations;
+    private final PartitionPosition[] lastCompactedKeys;
+    private final long maxSSTableSizeInBytes;
+    private final SizeTieredCompactionStrategyOptions options;
+    private final int [] compactionCounter;
+    private final int levelFanoutSize;
+
+    LeveledManifest(ColumnFamilyStore cfs, int maxSSTableSizeInMB, int fanoutSize, SizeTieredCompactionStrategyOptions options)
+<span class="fc" id="L76">    {</span>
+<span class="fc" id="L77">        this.cfs = cfs;</span>
+<span class="fc" id="L78">        this.maxSSTableSizeInBytes = maxSSTableSizeInMB * 1024L * 1024L;</span>
+<span class="fc" id="L79">        this.options = options;</span>
+<span class="fc" id="L80">        this.levelFanoutSize = fanoutSize;</span>
+
+<span class="fc" id="L82">        generations = new List[MAX_LEVEL_COUNT];</span>
+<span class="fc" id="L83">        lastCompactedKeys = new PartitionPosition[MAX_LEVEL_COUNT];</span>
+<span class="fc bfc" id="L84" title="All 2 branches covered.">        for (int i = 0; i &lt; generations.length; i++)</span>
+        {
+<span class="fc" id="L86">            generations[i] = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L87">            lastCompactedKeys[i] = cfs.getPartitioner().getMinimumToken().minKeyBound();</span>
+        }
+<span class="fc" id="L89">        compactionCounter = new int[MAX_LEVEL_COUNT];</span>
+<span class="fc" id="L90">    }</span>
+
+    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, int fanoutSize, List&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L94">        return create(cfs, maxSSTableSize, fanoutSize, sstables, new SizeTieredCompactionStrategyOptions());</span>
+    }
+
+    public static LeveledManifest create(ColumnFamilyStore cfs, int maxSSTableSize, int fanoutSize, Iterable&lt;SSTableReader&gt; sstables, SizeTieredCompactionStrategyOptions options)
+    {
+<span class="nc" id="L99">        LeveledManifest manifest = new LeveledManifest(cfs, maxSSTableSize, fanoutSize, options);</span>
+
+        // ensure all SSTables are in the manifest
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        for (SSTableReader ssTableReader : sstables)</span>
+        {
+<span class="nc" id="L104">            manifest.add(ssTableReader);</span>
+<span class="nc" id="L105">        }</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        for (int i = 1; i &lt; manifest.getAllLevelSize().length; i++)</span>
+        {
+<span class="nc" id="L108">            manifest.repairOverlappingSSTables(i);</span>
+        }
+<span class="nc" id="L110">        manifest.calculateLastCompactedKeys();</span>
+<span class="nc" id="L111">        return manifest;</span>
+    }
+
+    /**
+     * If we want to start compaction in level n, find the newest (by modification time) file in level n+1
+     * and use its last token for last compacted key in level n;
+     */
+    public void calculateLastCompactedKeys()
+    {
+<span class="fc bfc" id="L120" title="All 2 branches covered.">        for (int i = 0; i &lt; generations.length - 1; i++)</span>
+        {
+            // this level is empty
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            if (generations[i + 1].isEmpty())</span>
+<span class="fc" id="L124">                continue;</span>
+
+<span class="nc" id="L126">            SSTableReader sstableWithMaxModificationTime = null;</span>
+<span class="nc" id="L127">            long maxModificationTime = Long.MIN_VALUE;</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            for (SSTableReader ssTableReader : generations[i + 1])</span>
+            {
+<span class="nc" id="L130">                long modificationTime = ssTableReader.getCreationTimeFor(Component.DATA);</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                if (modificationTime &gt;= maxModificationTime)</span>
+                {
+<span class="nc" id="L133">                    sstableWithMaxModificationTime = ssTableReader;</span>
+<span class="nc" id="L134">                    maxModificationTime = modificationTime;</span>
+                }
+<span class="nc" id="L136">            }</span>
+
+<span class="nc" id="L138">            lastCompactedKeys[i] = sstableWithMaxModificationTime.last;</span>
+        }
+<span class="fc" id="L140">    }</span>
+
+    public synchronized void add(SSTableReader reader)
+    {
+<span class="nc" id="L144">        int level = reader.getSSTableLevel();</span>
+
+<span class="nc bnc" id="L146" title="All 4 branches missed.">        assert level &lt; generations.length : &quot;Invalid level &quot; + level + &quot; out of &quot; + (generations.length - 1);</span>
+<span class="nc" id="L147">        logDistribution();</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (canAddSSTable(reader))</span>
+        {
+            // adding the sstable does not cause overlap in the level
+<span class="nc" id="L151">            logger.trace(&quot;Adding {} to L{}&quot;, reader, level);</span>
+<span class="nc" id="L152">            generations[level].add(reader);</span>
+        }
+        else
+        {
+            // this can happen if:
+            // * a compaction has promoted an overlapping sstable to the given level, or
+            //   was also supposed to add an sstable at the given level.
+            // * we are moving sstables from unrepaired to repaired and the sstable
+            //   would cause overlap
+            //
+            // The add(..):ed sstable will be sent to level 0
+            try
+            {
+<span class="nc" id="L165">                reader.descriptor.getMetadataSerializer().mutateLevel(reader.descriptor, 0);</span>
+<span class="nc" id="L166">                reader.reloadSSTableMetadata();</span>
+            }
+<span class="nc" id="L168">            catch (IOException e)</span>
+            {
+<span class="nc" id="L170">                logger.error(&quot;Could not change sstable level - adding it at level 0 anyway, we will find it at restart.&quot;, e);</span>
+<span class="nc" id="L171">            }</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (!contains(reader))</span>
+            {
+<span class="nc" id="L174">                generations[0].add(reader);</span>
+            }
+            else
+            {
+                // An SSTable being added multiple times to this manifest indicates a programming error, but we don't
+                // throw an AssertionError because this shouldn't break the compaction strategy. Instead we log it
+                // together with a RuntimeException so the stack is print for troubleshooting if this ever happens.
+<span class="nc" id="L181">                logger.warn(&quot;SSTable {} is already present on leveled manifest and should not be re-added.&quot;, reader, new RuntimeException());</span>
+            }
+        }
+<span class="nc" id="L184">    }</span>
+
+    private boolean contains(SSTableReader reader)
+    {
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        for (int i = 0; i &lt; generations.length; i++)</span>
+        {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if (generations[i].contains(reader))</span>
+<span class="nc" id="L191">                return true;</span>
+        }
+<span class="nc" id="L193">        return false;</span>
+    }
+
+    public synchronized void replace(Collection&lt;SSTableReader&gt; removed, Collection&lt;SSTableReader&gt; added)
+    {
+<span class="nc bnc" id="L198" title="All 4 branches missed.">        assert !removed.isEmpty(); // use add() instead of promote when adding new sstables</span>
+<span class="nc" id="L199">        logDistribution();</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L201">            logger.trace(&quot;Replacing [{}]&quot;, toString(removed));</span>
+
+        // the level for the added sstables is the max of the removed ones,
+        // plus one if the removed were all on the same level
+<span class="nc" id="L205">        int minLevel = Integer.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        for (SSTableReader sstable : removed)</span>
+        {
+<span class="nc" id="L209">            int thisLevel = remove(sstable);</span>
+<span class="nc" id="L210">            minLevel = Math.min(minLevel, thisLevel);</span>
+<span class="nc" id="L211">        }</span>
+
+        // it's valid to do a remove w/o an add (e.g. on truncate)
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        if (added.isEmpty())</span>
+<span class="nc" id="L215">            return;</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L218">            logger.trace(&quot;Adding [{}]&quot;, toString(added));</span>
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (SSTableReader ssTableReader : added)</span>
+<span class="nc" id="L221">            add(ssTableReader);</span>
+<span class="nc" id="L222">        lastCompactedKeys[minLevel] = SSTableReader.sstableOrdering.max(added).last;</span>
+<span class="nc" id="L223">    }</span>
+
+    public synchronized void repairOverlappingSSTables(int level)
+    {
+<span class="nc" id="L227">        SSTableReader previous = null;</span>
+<span class="nc" id="L228">        Collections.sort(generations[level], SSTableReader.sstableComparator);</span>
+<span class="nc" id="L229">        List&lt;SSTableReader&gt; outOfOrderSSTables = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        for (SSTableReader current : generations[level])</span>
+        {
+<span class="nc bnc" id="L232" title="All 4 branches missed.">            if (previous != null &amp;&amp; current.first.compareTo(previous.last) &lt;= 0)</span>
+            {
+<span class="nc" id="L234">                logger.warn(&quot;At level {}, {} [{}, {}] overlaps {} [{}, {}].  This could be caused by a bug in Cassandra 1.1.0 .. 1.1.3 or due to the fact that you have dropped sstables from another node into the data directory. &quot; +</span>
+                            &quot;Sending back to L0.  If you didn't drop in sstables, and have not yet run scrub, you should do so since you may also have rows out-of-order within an sstable&quot;,
+<span class="nc" id="L236">                            level, previous, previous.first, previous.last, current, current.first, current.last);</span>
+<span class="nc" id="L237">                outOfOrderSSTables.add(current);</span>
+            }
+            else
+            {
+<span class="nc" id="L241">                previous = current;</span>
+            }
+<span class="nc" id="L243">        }</span>
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (!outOfOrderSSTables.isEmpty())</span>
+        {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            for (SSTableReader sstable : outOfOrderSSTables)</span>
+<span class="nc" id="L248">                sendBackToL0(sstable);</span>
+        }
+<span class="nc" id="L250">    }</span>
+
+    /**
+     * Checks if adding the sstable creates an overlap in the level
+     * @param sstable the sstable to add
+     * @return true if it is safe to add the sstable in the level.
+     */
+    private boolean canAddSSTable(SSTableReader sstable)
+    {
+<span class="nc" id="L259">        int level = sstable.getSSTableLevel();</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (level == 0)</span>
+<span class="nc" id="L261">            return true;</span>
+
+<span class="nc" id="L263">        List&lt;SSTableReader&gt; copyLevel = new ArrayList&lt;&gt;(generations[level]);</span>
+<span class="nc" id="L264">        copyLevel.add(sstable);</span>
+<span class="nc" id="L265">        Collections.sort(copyLevel, SSTableReader.sstableComparator);</span>
+
+<span class="nc" id="L267">        SSTableReader previous = null;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        for (SSTableReader current : copyLevel)</span>
+        {
+<span class="nc bnc" id="L270" title="All 4 branches missed.">            if (previous != null &amp;&amp; current.first.compareTo(previous.last) &lt;= 0)</span>
+<span class="nc" id="L271">                return false;</span>
+<span class="nc" id="L272">            previous = current;</span>
+<span class="nc" id="L273">        }</span>
+<span class="nc" id="L274">        return true;</span>
+    }
+
+    private synchronized void sendBackToL0(SSTableReader sstable)
+    {
+<span class="nc" id="L279">        remove(sstable);</span>
+        try
+        {
+<span class="nc" id="L282">            sstable.descriptor.getMetadataSerializer().mutateLevel(sstable.descriptor, 0);</span>
+<span class="nc" id="L283">            sstable.reloadSSTableMetadata();</span>
+<span class="nc" id="L284">            add(sstable);</span>
+        }
+<span class="nc" id="L286">        catch (IOException e)</span>
+        {
+<span class="nc" id="L288">            throw new RuntimeException(&quot;Could not reload sstable meta data&quot;, e);</span>
+<span class="nc" id="L289">        }</span>
+<span class="nc" id="L290">    }</span>
+
+    private String toString(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L294">        StringBuilder builder = new StringBuilder();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc" id="L297">            builder.append(sstable.descriptor.cfname)</span>
+<span class="nc" id="L298">                   .append('-')</span>
+<span class="nc" id="L299">                   .append(sstable.descriptor.generation)</span>
+<span class="nc" id="L300">                   .append(&quot;(L&quot;)</span>
+<span class="nc" id="L301">                   .append(sstable.getSSTableLevel())</span>
+<span class="nc" id="L302">                   .append(&quot;), &quot;);</span>
+<span class="nc" id="L303">        }</span>
+<span class="nc" id="L304">        return builder.toString();</span>
+    }
+
+    public long maxBytesForLevel(int level, long maxSSTableSizeInBytes)
+    {
+<span class="fc" id="L309">        return maxBytesForLevel(level, levelFanoutSize, maxSSTableSizeInBytes);</span>
+    }
+
+    public static long maxBytesForLevel(int level, int levelFanoutSize, long maxSSTableSizeInBytes)
+    {
+<span class="fc bfc" id="L314" title="All 2 branches covered.">        if (level == 0)</span>
+<span class="fc" id="L315">            return 4L * maxSSTableSizeInBytes;</span>
+<span class="fc" id="L316">        double bytes = Math.pow(levelFanoutSize, level) * maxSSTableSizeInBytes;</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (bytes &gt; Long.MAX_VALUE)</span>
+<span class="nc" id="L318">            throw new RuntimeException(&quot;At most &quot; + Long.MAX_VALUE + &quot; bytes may be in a compaction level; your maxSSTableSize must be absurdly high to compute &quot; + bytes);</span>
+<span class="fc" id="L319">        return (long) bytes;</span>
+    }
+
+    /**
+     * @return highest-priority sstables to compact, and level to compact them to
+     * If no compactions are necessary, will return null
+     */
+    public synchronized CompactionCandidate getCompactionCandidates()
+    {
+        // during bootstrap we only do size tiering in L0 to make sure
+        // the streamed files can be placed in their original levels
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">        if (StorageService.instance.isBootstrapMode())</span>
+        {
+<span class="nc" id="L332">            List&lt;SSTableReader&gt; mostInteresting = getSSTablesForSTCS(getLevel(0));</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (!mostInteresting.isEmpty())</span>
+            {
+<span class="nc" id="L335">                logger.info(&quot;Bootstrapping - doing STCS in L0&quot;);</span>
+<span class="nc" id="L336">                return new CompactionCandidate(mostInteresting, 0, Long.MAX_VALUE);</span>
+            }
+<span class="nc" id="L338">            return null;</span>
+        }
+        // LevelDB gives each level a score of how much data it contains vs its ideal amount, and
+        // compacts the level with the highest score. But this falls apart spectacularly once you
+        // get behind.  Consider this set of levels:
+        // L0: 988 [ideal: 4]
+        // L1: 117 [ideal: 10]
+        // L2: 12  [ideal: 100]
+        //
+        // The problem is that L0 has a much higher score (almost 250) than L1 (11), so what we'll
+        // do is compact a batch of MAX_COMPACTING_L0 sstables with all 117 L1 sstables, and put the
+        // result (say, 120 sstables) in L1. Then we'll compact the next batch of MAX_COMPACTING_L0,
+        // and so forth.  So we spend most of our i/o rewriting the L1 data with each batch.
+        //
+        // If we could just do *all* L0 a single time with L1, that would be ideal.  But we can't
+        // -- see the javadoc for MAX_COMPACTING_L0.
+        //
+        // LevelDB's way around this is to simply block writes if L0 compaction falls behind.
+        // We don't have that luxury.
+        //
+        // So instead, we
+        // 1) force compacting higher levels first, which minimizes the i/o needed to compact
+        //    optimially which gives us a long term win, and
+        // 2) if L0 falls behind, we will size-tiered compact it to reduce read overhead until
+        //    we can catch up on the higher levels.
+        //
+        // This isn't a magic wand -- if you are consistently writing too fast for LCS to keep
+        // up, you're still screwed.  But if instead you have intermittent bursts of activity,
+        // it can help a lot.
+<span class="fc bfc" id="L367" title="All 2 branches covered.">        for (int i = generations.length - 1; i &gt; 0; i--)</span>
+        {
+<span class="fc" id="L369">            List&lt;SSTableReader&gt; sstables = getLevel(i);</span>
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">            if (sstables.isEmpty())</span>
+<span class="fc" id="L371">                continue; // mostly this just avoids polluting the debug log with zero scores</span>
+            // we want to calculate score excluding compacting ones
+<span class="nc" id="L373">            Set&lt;SSTableReader&gt; sstablesInLevel = Sets.newHashSet(sstables);</span>
+<span class="nc" id="L374">            Set&lt;SSTableReader&gt; remaining = Sets.difference(sstablesInLevel, cfs.getTracker().getCompacting());</span>
+<span class="nc" id="L375">            double score = (double) SSTableReader.getTotalBytes(remaining) / (double)maxBytesForLevel(i, maxSSTableSizeInBytes);</span>
+<span class="nc" id="L376">            logger.trace(&quot;Compaction score for level {} is {}&quot;, i, score);</span>
+
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            if (score &gt; 1.001)</span>
+            {
+                // before proceeding with a higher level, let's see if L0 is far enough behind to warrant STCS
+<span class="nc" id="L381">                CompactionCandidate l0Compaction = getSTCSInL0CompactionCandidate();</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                if (l0Compaction != null)</span>
+<span class="nc" id="L383">                    return l0Compaction;</span>
+
+                // L0 is fine, proceed with this level
+<span class="nc" id="L386">                Collection&lt;SSTableReader&gt; candidates = getCandidatesFor(i);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                if (!candidates.isEmpty())</span>
+                {
+<span class="nc" id="L389">                    int nextLevel = getNextLevel(candidates);</span>
+<span class="nc" id="L390">                    candidates = getOverlappingStarvedSSTables(nextLevel, candidates);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L392">                        logger.trace(&quot;Compaction candidates for L{} are {}&quot;, i, toString(candidates));</span>
+<span class="nc" id="L393">                    return new CompactionCandidate(candidates, nextLevel, cfs.getCompactionStrategyManager().getMaxSSTableBytes());</span>
+                }
+                else
+                {
+<span class="nc" id="L397">                    logger.trace(&quot;No compaction candidates for L{}&quot;, i);</span>
+                }
+            }
+        }
+
+        // Higher levels are happy, time for a standard, non-STCS L0 compaction
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">        if (getLevel(0).isEmpty())</span>
+<span class="fc" id="L404">            return null;</span>
+<span class="nc" id="L405">        Collection&lt;SSTableReader&gt; candidates = getCandidatesFor(0);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (candidates.isEmpty())</span>
+        {
+            // Since we don't have any other compactions to do, see if there is a STCS compaction to perform in L0; if
+            // there is a long running compaction, we want to make sure that we continue to keep the number of SSTables
+            // small in L0.
+<span class="nc" id="L411">            return getSTCSInL0CompactionCandidate();</span>
+        }
+<span class="nc" id="L413">        return new CompactionCandidate(candidates, getNextLevel(candidates), maxSSTableSizeInBytes);</span>
+    }
+
+    private CompactionCandidate getSTCSInL0CompactionCandidate()
+    {
+<span class="nc bnc" id="L418" title="All 4 branches missed.">        if (!DatabaseDescriptor.getDisableSTCSInL0() &amp;&amp; getLevel(0).size() &gt; MAX_COMPACTING_L0)</span>
+        {
+<span class="nc" id="L420">            List&lt;SSTableReader&gt; mostInteresting = getSSTablesForSTCS(getLevel(0));</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">            if (!mostInteresting.isEmpty())</span>
+            {
+<span class="nc" id="L423">                logger.debug(&quot;L0 is too far behind, performing size-tiering there first&quot;);</span>
+<span class="nc" id="L424">                return new CompactionCandidate(mostInteresting, 0, Long.MAX_VALUE);</span>
+            }
+        }
+
+<span class="nc" id="L428">        return null;</span>
+    }
+
+    private List&lt;SSTableReader&gt; getSSTablesForSTCS(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L433">        Iterable&lt;SSTableReader&gt; candidates = cfs.getTracker().getUncompacting(sstables);</span>
+<span class="nc" id="L434">        List&lt;Pair&lt;SSTableReader,Long&gt;&gt; pairs = SizeTieredCompactionStrategy.createSSTableAndLengthPairs(AbstractCompactionStrategy.filterSuspectSSTables(candidates));</span>
+<span class="nc" id="L435">        List&lt;List&lt;SSTableReader&gt;&gt; buckets = SizeTieredCompactionStrategy.getBuckets(pairs,</span>
+                                                                                    options.bucketHigh,
+                                                                                    options.bucketLow,
+                                                                                    options.minSSTableSize);
+<span class="nc" id="L439">        return SizeTieredCompactionStrategy.mostInterestingBucket(buckets, 4, 32);</span>
+    }
+
+    /**
+     * If we do something that makes many levels contain too little data (cleanup, change sstable size) we will &quot;never&quot;
+     * compact the high levels.
+     *
+     * This method finds if we have gone many compaction rounds without doing any high-level compaction, if so
+     * we start bringing in one sstable from the highest level until that level is either empty or is doing compaction.
+     *
+     * @param targetLevel the level the candidates will be compacted into
+     * @param candidates the original sstables to compact
+     * @return
+     */
+    private Collection&lt;SSTableReader&gt; getOverlappingStarvedSSTables(int targetLevel, Collection&lt;SSTableReader&gt; candidates)
+    {
+<span class="nc" id="L455">        Set&lt;SSTableReader&gt; withStarvedCandidate = new HashSet&lt;&gt;(candidates);</span>
+
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        for (int i = generations.length - 1; i &gt; 0; i--)</span>
+<span class="nc" id="L458">            compactionCounter[i]++;</span>
+<span class="nc" id="L459">        compactionCounter[targetLevel] = 0;</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            for (int j = 0; j &lt; compactionCounter.length; j++)</span>
+<span class="nc" id="L463">                logger.trace(&quot;CompactionCounter: {}: {}&quot;, j, compactionCounter[j]);</span>
+        }
+
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        for (int i = generations.length - 1; i &gt; 0; i--)</span>
+        {
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (getLevelSize(i) &gt; 0)</span>
+            {
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                if (compactionCounter[i] &gt; NO_COMPACTION_LIMIT)</span>
+                {
+                    // we try to find an sstable that is fully contained within  the boundaries we are compacting;
+                    // say we are compacting 3 sstables: 0-&gt;30 in L1 and 0-&gt;12, 12-&gt;33 in L2
+                    // this means that we will not create overlap in L2 if we add an sstable
+                    // contained within 0 -&gt; 33 to the compaction
+<span class="nc" id="L476">                    PartitionPosition max = null;</span>
+<span class="nc" id="L477">                    PartitionPosition min = null;</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                    for (SSTableReader candidate : candidates)</span>
+                    {
+<span class="nc bnc" id="L480" title="All 4 branches missed.">                        if (min == null || candidate.first.compareTo(min) &lt; 0)</span>
+<span class="nc" id="L481">                            min = candidate.first;</span>
+<span class="nc bnc" id="L482" title="All 4 branches missed.">                        if (max == null || candidate.last.compareTo(max) &gt; 0)</span>
+<span class="nc" id="L483">                            max = candidate.last;</span>
+<span class="nc" id="L484">                    }</span>
+<span class="nc bnc" id="L485" title="All 6 branches missed.">                    if (min == null || max == null || min.equals(max)) // single partition sstables - we cannot include a high level sstable.</span>
+<span class="nc" id="L486">                        return candidates;</span>
+<span class="nc" id="L487">                    Set&lt;SSTableReader&gt; compacting = cfs.getTracker().getCompacting();</span>
+<span class="nc" id="L488">                    Range&lt;PartitionPosition&gt; boundaries = new Range&lt;&gt;(min, max);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">                    for (SSTableReader sstable : getLevel(i))</span>
+                    {
+<span class="nc" id="L491">                        Range&lt;PartitionPosition&gt; r = new Range&lt;PartitionPosition&gt;(sstable.first, sstable.last);</span>
+<span class="nc bnc" id="L492" title="All 4 branches missed.">                        if (boundaries.contains(r) &amp;&amp; !compacting.contains(sstable))</span>
+                        {
+<span class="nc" id="L494">                            logger.info(&quot;Adding high-level (L{}) {} to candidates&quot;, sstable.getSSTableLevel(), sstable);</span>
+<span class="nc" id="L495">                            withStarvedCandidate.add(sstable);</span>
+<span class="nc" id="L496">                            return withStarvedCandidate;</span>
+                        }
+<span class="nc" id="L498">                    }</span>
+                }
+<span class="nc" id="L500">                return candidates;</span>
+            }
+        }
+
+<span class="nc" id="L504">        return candidates;</span>
+    }
+
+    public synchronized int getLevelSize(int i)
+    {
+<span class="nc bnc" id="L509" title="All 2 branches missed.">        if (i &gt;= generations.length)</span>
+<span class="nc" id="L510">            throw new ArrayIndexOutOfBoundsException(&quot;Maximum valid generation is &quot; + (generations.length - 1));</span>
+<span class="nc" id="L511">        return getLevel(i).size();</span>
+    }
+
+    public synchronized int[] getAllLevelSize()
+    {
+<span class="nc" id="L516">        int[] counts = new int[generations.length];</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        for (int i = 0; i &lt; counts.length; i++)</span>
+<span class="nc" id="L518">            counts[i] = getLevel(i).size();</span>
+<span class="nc" id="L519">        return counts;</span>
+    }
+
+    private void logDistribution()
+    {
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            for (int i = 0; i &lt; generations.length; i++)</span>
+            {
+<span class="nc bnc" id="L528" title="All 2 branches missed.">                if (!getLevel(i).isEmpty())</span>
+                {
+<span class="nc" id="L530">                    logger.trace(&quot;L{} contains {} SSTables ({}) in {}&quot;,</span>
+<span class="nc" id="L531">                                 i,</span>
+<span class="nc" id="L532">                                 getLevel(i).size(),</span>
+<span class="nc" id="L533">                                 FBUtilities.prettyPrintMemory(SSTableReader.getTotalBytes(getLevel(i))),</span>
+                                 this);
+                }
+            }
+        }
+<span class="nc" id="L538">    }</span>
+
+    @VisibleForTesting
+    public synchronized int remove(SSTableReader reader)
+    {
+<span class="nc" id="L543">        int level = reader.getSSTableLevel();</span>
+<span class="nc bnc" id="L544" title="All 4 branches missed.">        assert level &gt;= 0 : reader + &quot; not present in manifest: &quot;+level;</span>
+<span class="nc" id="L545">        generations[level].remove(reader);</span>
+<span class="nc" id="L546">        return level;</span>
+    }
+
+    private static Set&lt;SSTableReader&gt; overlapping(Collection&lt;SSTableReader&gt; candidates, Iterable&lt;SSTableReader&gt; others)
+    {
+<span class="nc bnc" id="L551" title="All 4 branches missed.">        assert !candidates.isEmpty();</span>
+        /*
+         * Picking each sstable from others that overlap one of the sstable of candidates is not enough
+         * because you could have the following situation:
+         *   candidates = [ s1(a, c), s2(m, z) ]
+         *   others = [ s3(e, g) ]
+         * In that case, s2 overlaps none of s1 or s2, but if we compact s1 with s2, the resulting sstable will
+         * overlap s3, so we must return s3.
+         *
+         * Thus, the correct approach is to pick sstables overlapping anything between the first key in all
+         * the candidate sstables, and the last.
+         */
+<span class="nc" id="L563">        Iterator&lt;SSTableReader&gt; iter = candidates.iterator();</span>
+<span class="nc" id="L564">        SSTableReader sstable = iter.next();</span>
+<span class="nc" id="L565">        Token first = sstable.first.getToken();</span>
+<span class="nc" id="L566">        Token last = sstable.last.getToken();</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">        while (iter.hasNext())</span>
+        {
+<span class="nc" id="L569">            sstable = iter.next();</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            first = first.compareTo(sstable.first.getToken()) &lt;= 0 ? first : sstable.first.getToken();</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">            last = last.compareTo(sstable.last.getToken()) &gt;= 0 ? last : sstable.last.getToken();</span>
+        }
+<span class="nc" id="L573">        return overlapping(first, last, others);</span>
+    }
+
+    private static Set&lt;SSTableReader&gt; overlappingWithBounds(SSTableReader sstable, Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; others)
+    {
+<span class="nc" id="L578">        return overlappingWithBounds(sstable.first.getToken(), sstable.last.getToken(), others);</span>
+    }
+
+    /**
+     * @return sstables from @param sstables that contain keys between @param start and @param end, inclusive.
+     */
+    @VisibleForTesting
+    static Set&lt;SSTableReader&gt; overlapping(Token start, Token end, Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L587">        return overlappingWithBounds(start, end, genBounds(sstables));</span>
+    }
+
+    private static Set&lt;SSTableReader&gt; overlappingWithBounds(Token start, Token end, Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; sstables)
+    {
+<span class="nc bnc" id="L592" title="All 4 branches missed.">        assert start.compareTo(end) &lt;= 0;</span>
+<span class="nc" id="L593">        Set&lt;SSTableReader&gt; overlapped = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L594">        Bounds&lt;Token&gt; promotedBounds = new Bounds&lt;Token&gt;(start, end);</span>
+
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        for (Map.Entry&lt;SSTableReader, Bounds&lt;Token&gt;&gt; pair : sstables.entrySet())</span>
+        {
+<span class="nc bnc" id="L598" title="All 2 branches missed.">            if (pair.getValue().intersects(promotedBounds))</span>
+<span class="nc" id="L599">                overlapped.add(pair.getKey());</span>
+<span class="nc" id="L600">        }</span>
+<span class="nc" id="L601">        return overlapped;</span>
+    }
+
+<span class="fc" id="L604">    private static final Predicate&lt;SSTableReader&gt; suspectP = new Predicate&lt;SSTableReader&gt;()</span>
+<span class="fc" id="L605">    {</span>
+        public boolean apply(SSTableReader candidate)
+        {
+<span class="nc" id="L608">            return candidate.isMarkedSuspect();</span>
+        }
+    };
+
+    private static Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; genBounds(Iterable&lt;SSTableReader&gt; ssTableReaders)
+    {
+<span class="nc" id="L614">        Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; boundsMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">        for (SSTableReader sstable : ssTableReaders)</span>
+        {
+<span class="nc" id="L617">            boundsMap.put(sstable, new Bounds&lt;Token&gt;(sstable.first.getToken(), sstable.last.getToken()));</span>
+<span class="nc" id="L618">        }</span>
+<span class="nc" id="L619">        return boundsMap;</span>
+    }
+
+    /**
+     * @return highest-priority sstables to compact for the given level.
+     * If no compactions are possible (because of concurrent compactions or because some sstables are blacklisted
+     * for prior failure), will return an empty list.  Never returns null.
+     */
+    private Collection&lt;SSTableReader&gt; getCandidatesFor(int level)
+    {
+<span class="nc bnc" id="L629" title="All 4 branches missed.">        assert !getLevel(level).isEmpty();</span>
+<span class="nc" id="L630">        logger.trace(&quot;Choosing candidates for L{}&quot;, level);</span>
+
+<span class="nc" id="L632">        final Set&lt;SSTableReader&gt; compacting = cfs.getTracker().getCompacting();</span>
+
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        if (level == 0)</span>
+        {
+<span class="nc" id="L636">            Set&lt;SSTableReader&gt; compactingL0 = getCompacting(0);</span>
+
+<span class="nc" id="L638">            PartitionPosition lastCompactingKey = null;</span>
+<span class="nc" id="L639">            PartitionPosition firstCompactingKey = null;</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            for (SSTableReader candidate : compactingL0)</span>
+            {
+<span class="nc bnc" id="L642" title="All 4 branches missed.">                if (firstCompactingKey == null || candidate.first.compareTo(firstCompactingKey) &lt; 0)</span>
+<span class="nc" id="L643">                    firstCompactingKey = candidate.first;</span>
+<span class="nc bnc" id="L644" title="All 4 branches missed.">                if (lastCompactingKey == null || candidate.last.compareTo(lastCompactingKey) &gt; 0)</span>
+<span class="nc" id="L645">                    lastCompactingKey = candidate.last;</span>
+<span class="nc" id="L646">            }</span>
+
+            // L0 is the dumping ground for new sstables which thus may overlap each other.
+            //
+            // We treat L0 compactions specially:
+            // 1a. add sstables to the candidate set until we have at least maxSSTableSizeInMB
+            // 1b. prefer choosing older sstables as candidates, to newer ones
+            // 1c. any L0 sstables that overlap a candidate, will also become candidates
+            // 2. At most MAX_COMPACTING_L0 sstables from L0 will be compacted at once
+            // 3. If total candidate size is less than maxSSTableSizeInMB, we won't bother compacting with L1,
+            //    and the result of the compaction will stay in L0 instead of being promoted (see promote())
+            //
+            // Note that we ignore suspect-ness of L1 sstables here, since if an L1 sstable is suspect we're
+            // basically screwed, since we expect all or most L0 sstables to overlap with each L1 sstable.
+            // So if an L1 sstable is suspect we can't do much besides try anyway and hope for the best.
+<span class="nc" id="L661">            Set&lt;SSTableReader&gt; candidates = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L662">            Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; remaining = genBounds(Iterables.filter(getLevel(0), Predicates.not(suspectP)));</span>
+
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            for (SSTableReader sstable : ageSortedSSTables(remaining.keySet()))</span>
+            {
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                if (candidates.contains(sstable))</span>
+<span class="nc" id="L667">                    continue;</span>
+
+<span class="nc" id="L669">                Sets.SetView&lt;SSTableReader&gt; overlappedL0 = Sets.union(Collections.singleton(sstable), overlappingWithBounds(sstable, remaining));</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">                if (!Sets.intersection(overlappedL0, compactingL0).isEmpty())</span>
+<span class="nc" id="L671">                    continue;</span>
+
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                for (SSTableReader newCandidate : overlappedL0)</span>
+                {
+<span class="nc bnc" id="L675" title="All 6 branches missed.">                    if (firstCompactingKey == null || lastCompactingKey == null || overlapping(firstCompactingKey.getToken(), lastCompactingKey.getToken(), Arrays.asList(newCandidate)).size() == 0)</span>
+<span class="nc" id="L676">                        candidates.add(newCandidate);</span>
+<span class="nc" id="L677">                    remaining.remove(newCandidate);</span>
+<span class="nc" id="L678">                }</span>
+
+<span class="nc bnc" id="L680" title="All 2 branches missed.">                if (candidates.size() &gt; MAX_COMPACTING_L0)</span>
+                {
+                    // limit to only the MAX_COMPACTING_L0 oldest candidates
+<span class="nc" id="L683">                    candidates = new HashSet&lt;&gt;(ageSortedSSTables(candidates).subList(0, MAX_COMPACTING_L0));</span>
+<span class="nc" id="L684">                    break;</span>
+                }
+<span class="nc" id="L686">            }</span>
+
+            // leave everything in L0 if we didn't end up with a full sstable's worth of data
+<span class="nc bnc" id="L689" title="All 2 branches missed.">            if (SSTableReader.getTotalBytes(candidates) &gt; maxSSTableSizeInBytes)</span>
+            {
+                // add sstables from L1 that overlap candidates
+                // if the overlapping ones are already busy in a compaction, leave it out.
+                // TODO try to find a set of L0 sstables that only overlaps with non-busy L1 sstables
+<span class="nc" id="L694">                Set&lt;SSTableReader&gt; l1overlapping = overlapping(candidates, getLevel(1));</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                if (Sets.intersection(l1overlapping, compacting).size() &gt; 0)</span>
+<span class="nc" id="L696">                    return Collections.emptyList();</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">                if (!overlapping(candidates, compactingL0).isEmpty())</span>
+<span class="nc" id="L698">                    return Collections.emptyList();</span>
+<span class="nc" id="L699">                candidates = Sets.union(candidates, l1overlapping);</span>
+            }
+<span class="nc bnc" id="L701" title="All 2 branches missed.">            if (candidates.size() &lt; 2)</span>
+<span class="nc" id="L702">                return Collections.emptyList();</span>
+            else
+<span class="nc" id="L704">                return candidates;</span>
+        }
+
+        // for non-L0 compactions, pick up where we left off last time
+<span class="nc" id="L708">        Collections.sort(getLevel(level), SSTableReader.sstableComparator);</span>
+<span class="nc" id="L709">        int start = 0; // handles case where the prior compaction touched the very last range</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        for (int i = 0; i &lt; getLevel(level).size(); i++)</span>
+        {
+<span class="nc" id="L712">            SSTableReader sstable = getLevel(level).get(i);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            if (sstable.first.compareTo(lastCompactedKeys[level]) &gt; 0)</span>
+            {
+<span class="nc" id="L715">                start = i;</span>
+<span class="nc" id="L716">                break;</span>
+            }
+        }
+
+        // look for a non-suspect keyspace to compact with, starting with where we left off last time,
+        // and wrapping back to the beginning of the generation if necessary
+<span class="nc" id="L722">        Map&lt;SSTableReader, Bounds&lt;Token&gt;&gt; sstablesNextLevel = genBounds(getLevel(level + 1));</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        for (int i = 0; i &lt; getLevel(level).size(); i++)</span>
+        {
+<span class="nc" id="L725">            SSTableReader sstable = getLevel(level).get((start + i) % getLevel(level).size());</span>
+<span class="nc" id="L726">            Set&lt;SSTableReader&gt; candidates = Sets.union(Collections.singleton(sstable), overlappingWithBounds(sstable, sstablesNextLevel));</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            if (Iterables.any(candidates, suspectP))</span>
+<span class="nc" id="L728">                continue;</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">            if (Sets.intersection(candidates, compacting).isEmpty())</span>
+<span class="nc" id="L730">                return candidates;</span>
+        }
+
+        // all the sstables were suspect or overlapped with something suspect
+<span class="nc" id="L734">        return Collections.emptyList();</span>
+    }
+
+    private Set&lt;SSTableReader&gt; getCompacting(int level)
+    {
+<span class="nc" id="L739">        Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L740">        Set&lt;SSTableReader&gt; levelSSTables = new HashSet&lt;&gt;(getLevel(level));</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        for (SSTableReader sstable : cfs.getTracker().getCompacting())</span>
+        {
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            if (levelSSTables.contains(sstable))</span>
+<span class="nc" id="L744">                sstables.add(sstable);</span>
+<span class="nc" id="L745">        }</span>
+<span class="nc" id="L746">        return sstables;</span>
+    }
+
+    @VisibleForTesting
+    List&lt;SSTableReader&gt; ageSortedSSTables(Collection&lt;SSTableReader&gt; candidates)
+    {
+<span class="nc" id="L752">        List&lt;SSTableReader&gt; ageSortedCandidates = new ArrayList&lt;&gt;(candidates);</span>
+<span class="nc" id="L753">        Collections.sort(ageSortedCandidates, SSTableReader.maxTimestampAscending);</span>
+<span class="nc" id="L754">        return ageSortedCandidates;</span>
+    }
+
+    public synchronized Set&lt;SSTableReader&gt;[] getSStablesPerLevelSnapshot()
+    {
+<span class="nc" id="L759">        Set&lt;SSTableReader&gt;[] sstablesPerLevel = new Set[generations.length];</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        for (int i = 0; i &lt; generations.length; i++)</span>
+        {
+<span class="nc" id="L762">            sstablesPerLevel[i] = new HashSet&lt;&gt;(generations[i]);</span>
+        }
+<span class="nc" id="L764">        return sstablesPerLevel;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L770">        return &quot;Manifest@&quot; + hashCode();</span>
+    }
+
+    public int getLevelCount()
+    {
+<span class="fc bfc" id="L775" title="All 2 branches covered.">        for (int i = generations.length - 1; i &gt;= 0; i--)</span>
+        {
+<span class="pc bpc" id="L777" title="1 of 2 branches missed.">            if (getLevel(i).size() &gt; 0)</span>
+<span class="nc" id="L778">                return i;</span>
+        }
+<span class="fc" id="L780">        return 0;</span>
+    }
+
+    public synchronized SortedSet&lt;SSTableReader&gt; getLevelSorted(int level, Comparator&lt;SSTableReader&gt; comparator)
+    {
+<span class="fc" id="L785">        return ImmutableSortedSet.copyOf(comparator, getLevel(level));</span>
+    }
+
+    public List&lt;SSTableReader&gt; getLevel(int i)
+    {
+<span class="fc" id="L790">        return generations[i];</span>
+    }
+
+    public synchronized int getEstimatedTasks()
+    {
+<span class="fc" id="L795">        long tasks = 0;</span>
+<span class="fc" id="L796">        long[] estimated = new long[generations.length];</span>
+
+<span class="fc bfc" id="L798" title="All 2 branches covered.">        for (int i = generations.length - 1; i &gt;= 0; i--)</span>
+        {
+<span class="fc" id="L800">            List&lt;SSTableReader&gt; sstables = getLevel(i);</span>
+            // If there is 1 byte over TBL - (MBL * 1.001), there is still a task left, so we need to round up.
+<span class="fc" id="L802">            estimated[i] = (long)Math.ceil((double)Math.max(0L, SSTableReader.getTotalBytes(sstables) - (long)(maxBytesForLevel(i, maxSSTableSizeInBytes) * 1.001)) / (double)maxSSTableSizeInBytes);</span>
+<span class="fc" id="L803">            tasks += estimated[i];</span>
+        }
+
+<span class="fc" id="L806">        logger.trace(&quot;Estimating {} compactions to do for {}.{}&quot;,</span>
+<span class="fc" id="L807">                     Arrays.toString(estimated), cfs.keyspace.getName(), cfs.name);</span>
+<span class="fc" id="L808">        return Ints.checkedCast(tasks);</span>
+    }
+
+    public int getNextLevel(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L813">        int maximumLevel = Integer.MIN_VALUE;</span>
+<span class="nc" id="L814">        int minimumLevel = Integer.MAX_VALUE;</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="nc" id="L817">            maximumLevel = Math.max(sstable.getSSTableLevel(), maximumLevel);</span>
+<span class="nc" id="L818">            minimumLevel = Math.min(sstable.getSSTableLevel(), minimumLevel);</span>
+<span class="nc" id="L819">        }</span>
+
+        int newLevel;
+<span class="nc bnc" id="L822" title="All 6 branches missed.">        if (minimumLevel == 0 &amp;&amp; minimumLevel == maximumLevel &amp;&amp; SSTableReader.getTotalBytes(sstables) &lt; maxSSTableSizeInBytes)</span>
+        {
+<span class="nc" id="L824">            newLevel = 0;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L828" title="All 2 branches missed.">            newLevel = minimumLevel == maximumLevel ? maximumLevel + 1 : maximumLevel;</span>
+<span class="nc bnc" id="L829" title="All 4 branches missed.">            assert newLevel &gt; 0;</span>
+        }
+<span class="nc" id="L831">        return newLevel;</span>
+
+    }
+
+    public Iterable&lt;SSTableReader&gt; getAllSSTables()
+    {
+<span class="nc" id="L837">        Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        for (List&lt;SSTableReader&gt; generation : generations)</span>
+        {
+<span class="nc" id="L840">            sstables.addAll(generation);</span>
+        }
+<span class="nc" id="L842">        return sstables;</span>
+    }
+
+    public static class CompactionCandidate
+    {
+        public final Collection&lt;SSTableReader&gt; sstables;
+        public final int level;
+        public final long maxSSTableBytes;
+
+        public CompactionCandidate(Collection&lt;SSTableReader&gt; sstables, int level, long maxSSTableBytes)
+<span class="nc" id="L852">        {</span>
+<span class="nc" id="L853">            this.sstables = sstables;</span>
+<span class="nc" id="L854">            this.level = level;</span>
+<span class="nc" id="L855">            this.maxSSTableBytes = maxSSTableBytes;</span>
+<span class="nc" id="L856">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

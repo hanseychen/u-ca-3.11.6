@@ -1,0 +1,2729 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LegacyLayout.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">LegacyLayout.java</span></div><h1>LegacyLayout.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.DataInput;
+import java.io.IOException;
+import java.io.IOError;
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.SuperColumnCompatibility;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.utils.AbstractIterator;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
+import com.google.common.collect.PeekingIterator;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static com.google.common.collect.Iterables.all;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+
+/**
+ * Functions to deal with the old format.
+ */
+<span class="nc bnc" id="L58" title="All 2 branches missed.">public abstract class LegacyLayout</span>
+{
+<span class="nc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(LegacyLayout.class);</span>
+<span class="nc" id="L61">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1L, TimeUnit.MINUTES);</span>
+
+    public final static int MAX_CELL_NAME_LENGTH = FBUtilities.MAX_UNSIGNED_SHORT;
+
+    public final static int STATIC_PREFIX = 0xFFFF;
+
+    public final static int DELETION_MASK        = 0x01;
+    public final static int EXPIRATION_MASK      = 0x02;
+    public final static int COUNTER_MASK         = 0x04;
+    public final static int COUNTER_UPDATE_MASK  = 0x08;
+    private final static int RANGE_TOMBSTONE_MASK = 0x10;
+
+    // Used in decodeBound if the number of components in the legacy bound is greater than the clustering size,
+    // indicating a complex column deletion (i.e. a collection tombstone), but the referenced column is either
+    // not present in the current table metadata, or is not currently a complex column. In that case, we'll
+    // check the dropped columns for the table which should contain the previous column definition. If that
+    // previous definition is also not complex (indicating that the column may have been dropped and re-added
+    // with different types multiple times), we use this fake definition to ensure that the complex deletion
+    // can be safely processed. This resulting deletion should be filtered out of any row created by a
+    // CellGrouper by the dropped column check, but this gives us an extra level of confidence as that check
+    // is timestamp based and so is fallible in the face of clock drift.
+<span class="nc" id="L82">    private static final ColumnDefinition INVALID_DROPPED_COMPLEX_SUBSTITUTE_COLUMN =</span>
+        new ColumnDefinition(&quot;&quot;,
+                             &quot;&quot;,
+<span class="nc" id="L85">                             ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),</span>
+<span class="nc" id="L86">                             SetType.getInstance(UTF8Type.instance, true),</span>
+                             ColumnDefinition.NO_POSITION,
+                             ColumnDefinition.Kind.REGULAR);
+
+    private LegacyLayout() {}
+
+    public static AbstractType&lt;?&gt; makeLegacyComparator(CFMetaData metadata)
+    {
+<span class="nc" id="L94">        ClusteringComparator comparator = metadata.comparator;</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        if (!metadata.isCompound())</span>
+        {
+<span class="nc bnc" id="L97" title="All 4 branches missed.">            assert comparator.size() == 1;</span>
+<span class="nc" id="L98">            return comparator.subtype(0);</span>
+        }
+
+<span class="nc bnc" id="L101" title="All 4 branches missed.">        boolean hasCollections = metadata.hasCollectionColumns() || metadata.hasDroppedCollectionColumns();</span>
+<span class="nc bnc" id="L102" title="All 4 branches missed.">        List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(comparator.size() + (metadata.isDense() ? 0 : 1) + (hasCollections ? 1 : 0));</span>
+
+<span class="nc" id="L104">        types.addAll(comparator.subtypes());</span>
+
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        if (!metadata.isDense())</span>
+        {
+<span class="nc" id="L108">            types.add(UTF8Type.instance);</span>
+
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            if (hasCollections)</span>
+            {
+<span class="nc" id="L112">                Map&lt;ByteBuffer, CollectionType&gt; defined = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L114" title="All 2 branches missed.">                for (CFMetaData.DroppedColumn def : metadata.getDroppedColumns().values())</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">                    if (def.type instanceof CollectionType &amp;&amp; def.type.isMultiCell())</span>
+<span class="nc" id="L116">                        defined.put(bytes(def.name), (CollectionType) def.type);</span>
+
+<span class="nc bnc" id="L118" title="All 2 branches missed.">                for (ColumnDefinition def : metadata.partitionColumns())</span>
+<span class="nc bnc" id="L119" title="All 4 branches missed.">                    if (def.type instanceof CollectionType &amp;&amp; def.type.isMultiCell())</span>
+<span class="nc" id="L120">                        defined.put(def.name.bytes, (CollectionType) def.type);</span>
+
+<span class="nc" id="L122">                types.add(ColumnToCollectionType.getInstance(defined));</span>
+            }
+        }
+<span class="nc" id="L125">        return CompositeType.getInstance(types);</span>
+    }
+
+    public static LegacyCellName decodeCellName(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer cellname)
+    throws UnknownColumnException
+    {
+<span class="nc bnc" id="L131" title="All 4 branches missed.">        assert cellname != null;</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (metadata.isSuper())</span>
+        {
+<span class="nc bnc" id="L134" title="All 4 branches missed.">            assert superColumnName != null;</span>
+<span class="nc" id="L135">            return decodeForSuperColumn(metadata, Clustering.make(superColumnName), cellname);</span>
+        }
+
+<span class="nc bnc" id="L138" title="All 4 branches missed.">        assert superColumnName == null;</span>
+<span class="nc" id="L139">        return decodeCellName(metadata, cellname);</span>
+    }
+
+    private static LegacyCellName decodeForSuperColumn(CFMetaData metadata, Clustering clustering, ByteBuffer subcol)
+    {
+<span class="nc" id="L144">        ColumnDefinition def = metadata.getColumnDefinition(subcol);</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (def != null)</span>
+        {
+            // it's a statically defined subcolumn
+<span class="nc" id="L148">            return new LegacyCellName(clustering, def, null);</span>
+        }
+
+<span class="nc" id="L151">        def = metadata.compactValueColumn();</span>
+<span class="nc bnc" id="L152" title="All 6 branches missed.">        assert def != null &amp;&amp; def.type instanceof MapType;</span>
+<span class="nc" id="L153">        return new LegacyCellName(clustering, def, subcol);</span>
+    }
+
+    public static LegacyCellName decodeCellName(CFMetaData metadata, ByteBuffer cellname) throws UnknownColumnException
+    {
+<span class="nc" id="L158">        return decodeCellName(metadata, cellname, false);</span>
+    }
+
+    public static LegacyCellName decodeCellName(CFMetaData metadata, ByteBuffer cellname, boolean readAllAsDynamic) throws UnknownColumnException
+    {
+<span class="nc" id="L163">        Clustering clustering = decodeClustering(metadata, cellname);</span>
+
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (metadata.isSuper())</span>
+<span class="nc" id="L166">            return decodeForSuperColumn(metadata, clustering, CompositeType.extractComponent(cellname, 1));</span>
+
+<span class="nc bnc" id="L168" title="All 6 branches missed.">        if (metadata.isDense() || (metadata.isCompactTable() &amp;&amp; readAllAsDynamic))</span>
+<span class="nc" id="L169">            return new LegacyCellName(clustering, metadata.compactValueColumn(), null);</span>
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        ByteBuffer column = metadata.isCompound() ? CompositeType.extractComponent(cellname, metadata.comparator.size()) : cellname;</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (column == null)</span>
+        {
+            // Tables for composite 2ndary indexes used to be compound but dense, but we've transformed them into regular tables
+            // (non compact ones) but with no regular column (i.e. we only care about the clustering). So we'll get here
+            // in that case, and what we want to return is basically a row marker.
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if (metadata.partitionColumns().isEmpty())</span>
+<span class="nc" id="L178">                return new LegacyCellName(clustering, null, null);</span>
+
+            // Otherwise, we shouldn't get there
+<span class="nc" id="L181">            throw new IllegalArgumentException(&quot;No column name component found in cell name&quot;);</span>
+        }
+
+        // Row marker, this is ok
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (!column.hasRemaining())</span>
+<span class="nc" id="L186">            return new LegacyCellName(clustering, null, null);</span>
+
+<span class="nc" id="L188">        ColumnDefinition def = metadata.getColumnDefinition(column);</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (metadata.isCompactTable())</span>
+        {
+<span class="nc bnc" id="L192" title="All 4 branches missed.">            if (def == null || def.isPrimaryKeyColumn())</span>
+                // If it's a compact table, it means the column is in fact a &quot;dynamic&quot; one
+<span class="nc" id="L194">                return new LegacyCellName(Clustering.make(column), metadata.compactValueColumn(), null);</span>
+        }
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        else if (def == null)</span>
+        {
+<span class="nc" id="L198">            throw new UnknownColumnException(metadata, column);</span>
+        }
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        ByteBuffer collectionElement = metadata.isCompound() ? CompositeType.extractComponent(cellname, metadata.comparator.size() + 1) : null;</span>
+<span class="nc bnc" id="L202" title="All 4 branches missed.">        if (collectionElement != null &amp;&amp; def.type instanceof CollectionType)</span>
+        {
+<span class="nc" id="L204">            ((CollectionType)def.type).nameComparator().validateIfFixedSize(collectionElement);</span>
+        }
+
+        // Note that because static compact columns are translated to static defs in the new world order, we need to force a static
+        // clustering if the definition is static (as it might not be in this case).
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        return new LegacyCellName(def.isStatic() ? Clustering.STATIC_CLUSTERING : clustering, def, collectionElement);</span>
+    }
+
+    public static LegacyBound decodeSliceBound(CFMetaData metadata, ByteBuffer bound, boolean isStart)
+    {
+<span class="nc" id="L214">        return decodeBound(metadata, bound, isStart, false);</span>
+    }
+
+    public static LegacyBound decodeTombstoneBound(CFMetaData metadata, ByteBuffer bound, boolean isStart)
+    {
+<span class="nc" id="L219">        return decodeBound(metadata, bound, isStart, true);</span>
+    }
+
+    private static LegacyBound decodeBound(CFMetaData metadata, ByteBuffer bound, boolean isStart, boolean isDeletion)
+    {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (!bound.hasRemaining())</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">            return isStart ? LegacyBound.BOTTOM : LegacyBound.TOP;</span>
+
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        if (!metadata.isCompound())</span>
+        {
+            // The non compound case is a lot easier, in that there is no EOC nor collection to worry about, so dealing
+            // with that first.
+<span class="nc" id="L231">            metadata.comparator.subtype(0).validateIfFixedSize(bound);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            return new LegacyBound(isStart ? ClusteringBound.inclusiveStartOf(bound) : ClusteringBound.inclusiveEndOf(bound), false, null);</span>
+        }
+
+<span class="nc" id="L235">        int clusteringSize = metadata.comparator.size();</span>
+
+<span class="nc bnc" id="L237" title="All 4 branches missed.">        boolean isStatic = metadata.isCompound() &amp;&amp; CompositeType.isStaticName(bound);</span>
+<span class="nc" id="L238">        List&lt;ByteBuffer&gt; components = CompositeType.splitName(bound);</span>
+<span class="nc" id="L239">        byte eoc = CompositeType.lastEOC(bound);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (int i=0; i&lt;Math.min(clusteringSize, components.size()); i++)</span>
+        {
+<span class="nc" id="L242">            metadata.comparator.subtype(i).validateIfFixedSize(components.get(i));</span>
+        }
+
+        // if the bound we have decoded is static, 2.2 format requires there to be N empty clusterings
+<span class="nc bnc" id="L246" title="All 4 branches missed.">        assert !isStatic ||</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                (components.size() &gt;= clusteringSize</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                        &amp;&amp; all(components.subList(0, clusteringSize), ByteBufferUtil.EMPTY_BYTE_BUFFER::equals));</span>
+
+<span class="nc" id="L250">        ColumnDefinition collectionName = null;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (components.size() &gt; clusteringSize)</span>
+        {
+            // For a deletion, there can be more components than the clustering size only in the case this is the
+            // bound of a collection range tombstone. In such a case, there is exactly one more component, and that
+            // component is the name of the collection being deleted, since we do not support collection range deletions.
+            // If the bound is not part of a deletion, it is from slice query filter. The column name may be:
+            //   - a valid, non-collection column; in this case we expect a single extra component
+            //   - an empty buffer, representing a row marker; in this case we also expect a single extra empty component
+            //   - a valid collection column and the first part of a cell path; in this case we expect exactly two extra components
+            // In any of these slice cases, these items are unnecessary for the bound we construct,
+            // so we can simply remove them, after corroborating we have encountered one of these scenario.
+<span class="nc bnc" id="L262" title="All 4 branches missed.">            assert !metadata.isCompactTable() : toDebugHex(components);</span>
+
+            // In all cases, the element straight after the clusterings should contain the name of a column.
+<span class="nc bnc" id="L265" title="All 2 branches missed.">            if (components.size() &gt; clusteringSize + 1)</span>
+            {
+                // we accept bounds from paging state that occur inside a complex column - in this case, we expect
+                // two excess components, the first of which is a column name, the second a key into the collection
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                if (isDeletion)</span>
+<span class="nc" id="L270">                    throw new IllegalArgumentException(&quot;Invalid bound &quot; + toDebugHex(components) + &quot;: deletion can have at most one extra component&quot;);</span>
+
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                if (clusteringSize + 2 != components.size())</span>
+<span class="nc" id="L273">                    throw new IllegalArgumentException(&quot;Invalid bound &quot; + toDebugHex(components) + &quot;: complex slices require exactly two extra components&quot;);</span>
+
+                // decode simply to verify that we have (or may have had) a complex column; we assume the collection key is valid
+<span class="nc" id="L276">                decodeBoundLookupComplexColumn(metadata, components, clusteringSize, isStatic);</span>
+<span class="nc" id="L277">                components.remove(clusteringSize + 1);</span>
+            }
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            else if (isDeletion)</span>
+            {
+<span class="nc" id="L281">                collectionName = decodeBoundLookupComplexColumn(metadata, components, clusteringSize, isStatic);</span>
+            }
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            else if (components.get(clusteringSize).hasRemaining())</span>
+            {
+<span class="nc" id="L285">                decodeBoundVerifySimpleColumn(metadata, components, clusteringSize, isStatic);</span>
+            }
+<span class="nc" id="L287">            components.remove(clusteringSize);</span>
+        }
+
+        boolean isInclusive;
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (isStart)</span>
+        {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            isInclusive = eoc &lt;= 0;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            isInclusive = eoc &gt;= 0;</span>
+
+            // for an end bound, if we only have a prefix of all the components and the final EOC is zero,
+            // then it should only match up to the prefix but no further, that is, it is an inclusive bound
+            // of the exact prefix but an exclusive bound of anything beyond it, so adding an empty
+            // composite value ensures this behavior, see CASSANDRA-12423 for more details
+<span class="nc bnc" id="L303" title="All 4 branches missed.">            if (eoc == 0 &amp;&amp; components.size() &lt; clusteringSize)</span>
+            {
+<span class="nc" id="L305">                components.add(ByteBufferUtil.EMPTY_BYTE_BUFFER);</span>
+<span class="nc" id="L306">                isInclusive = false;</span>
+            }
+        }
+
+<span class="nc" id="L310">        ClusteringPrefix.Kind boundKind = ClusteringBound.boundKind(isStart, isInclusive);</span>
+<span class="nc" id="L311">        ClusteringBound cb = ClusteringBound.create(boundKind, components.toArray(new ByteBuffer[components.size()]));</span>
+<span class="nc" id="L312">        return new LegacyBound(cb, isStatic, collectionName);</span>
+    }
+
+    // finds the simple column definition associated with components.get(clusteringSize)
+    // if no such columns exists, or ever existed, we throw an exception; if we do not know, we return a dummy column definition
+    private static ColumnDefinition decodeBoundLookupComplexColumn(CFMetaData metadata, List&lt;ByteBuffer&gt; components, int clusteringSize, boolean isStatic)
+    {
+<span class="nc" id="L319">        ByteBuffer columnNameBytes = components.get(clusteringSize);</span>
+<span class="nc" id="L320">        ColumnDefinition columnName = metadata.getColumnDefinition(columnNameBytes);</span>
+<span class="nc bnc" id="L321" title="All 4 branches missed.">        if (columnName == null || !columnName.isComplex())</span>
+        {
+<span class="nc" id="L323">            columnName = metadata.getDroppedColumnDefinition(columnNameBytes, isStatic);</span>
+            // if no record of the column having ever existed is found, something is badly wrong
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (columnName == null)</span>
+<span class="nc" id="L326">                throw new IllegalArgumentException(&quot;Invalid bound &quot; + toDebugHex(components) + &quot;: expected complex column at position &quot; + clusteringSize);</span>
+
+            // if we do have a record of dropping this column but it wasn't previously complex, use a fake
+            // column definition for safety (see the comment on the constant declaration for details)
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if (!columnName.isComplex())</span>
+<span class="nc" id="L331">                columnName = INVALID_DROPPED_COMPLEX_SUBSTITUTE_COLUMN;</span>
+        }
+
+<span class="nc" id="L334">        return columnName;</span>
+    }
+
+    // finds the simple column definition associated with components.get(clusteringSize)
+    // if no such columns exists, and definitely never existed, we throw an exception
+    private static void decodeBoundVerifySimpleColumn(CFMetaData metadata, List&lt;ByteBuffer&gt; components, int clusteringSize, boolean isStatic)
+    {
+<span class="nc" id="L341">        ByteBuffer columnNameBytes = components.get(clusteringSize);</span>
+<span class="nc" id="L342">        ColumnDefinition columnName = metadata.getColumnDefinition(columnNameBytes);</span>
+<span class="nc bnc" id="L343" title="All 4 branches missed.">        if (columnName == null || !columnName.isSimple())</span>
+        {
+<span class="nc" id="L345">            columnName = metadata.getDroppedColumnDefinition(columnNameBytes, isStatic);</span>
+            // if no record of the column having ever existed is found, something is badly wrong
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (columnName == null)</span>
+<span class="nc" id="L348">                throw new IllegalArgumentException(&quot;Invalid bound &quot; + toDebugHex(components) + &quot;: expected simple column at position &quot; + clusteringSize);</span>
+        }
+<span class="nc" id="L350">    }</span>
+
+    private static String toDebugHex(Collection&lt;ByteBuffer&gt; buffers)
+    {
+<span class="nc" id="L354">        return buffers.stream().map(ByteBufferUtil::bytesToHex).collect(Collectors.joining());</span>
+    }
+
+    public static ByteBuffer encodeBound(CFMetaData metadata, ClusteringBound bound, boolean isStart)
+    {
+<span class="nc bnc" id="L359" title="All 6 branches missed.">        if (bound == ClusteringBound.BOTTOM || bound == ClusteringBound.TOP || metadata.comparator.size() == 0)</span>
+<span class="nc" id="L360">            return ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+
+<span class="nc" id="L362">        ClusteringPrefix clustering = bound.clustering();</span>
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (!metadata.isCompound())</span>
+        {
+<span class="nc bnc" id="L366" title="All 4 branches missed.">            assert clustering.size() == 1;</span>
+<span class="nc" id="L367">            return clustering.get(0);</span>
+        }
+
+<span class="nc" id="L370">        CompositeType ctype = CompositeType.getInstance(metadata.comparator.subtypes());</span>
+<span class="nc" id="L371">        CompositeType.Builder builder = ctype.builder();</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        for (int i = 0; i &lt; clustering.size(); i++)</span>
+<span class="nc" id="L373">            builder.add(clustering.get(i));</span>
+
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (isStart)</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            return bound.isInclusive() ? builder.build() : builder.buildAsEndOfRange();</span>
+        else
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            return bound.isInclusive() ? builder.buildAsEndOfRange() : builder.build();</span>
+    }
+
+    public static ByteBuffer encodeCellName(CFMetaData metadata, ClusteringPrefix clustering, ByteBuffer columnName, ByteBuffer collectionElement)
+    {
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;</span>
+
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (!metadata.isCompound())</span>
+        {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (isStatic)</span>
+<span class="nc" id="L388">                return columnName;</span>
+
+<span class="nc bnc" id="L390" title="All 4 branches missed.">            assert clustering.size() == 1 : &quot;Expected clustering size to be 1, but was &quot; + clustering.size();</span>
+<span class="nc" id="L391">            return clustering.get(0);</span>
+        }
+
+        // We use comparator.size() rather than clustering.size() because of static clusterings
+<span class="nc" id="L395">        int clusteringSize = metadata.comparator.size();</span>
+<span class="nc bnc" id="L396" title="All 4 branches missed.">        int size = clusteringSize + (metadata.isDense() ? 0 : 1) + (collectionElement == null ? 0 : 1);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (metadata.isSuper())</span>
+<span class="nc" id="L398">            size = clusteringSize + 1;</span>
+<span class="nc" id="L399">        ByteBuffer[] values = new ByteBuffer[size];</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        for (int i = 0; i &lt; clusteringSize; i++)</span>
+        {
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            if (isStatic)</span>
+            {
+<span class="nc" id="L404">                values[i] = ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+<span class="nc" id="L405">                continue;</span>
+            }
+
+<span class="nc" id="L408">            ByteBuffer v = clustering.get(i);</span>
+            // we can have null (only for dense compound tables for backward compatibility reasons) but that
+            // means we're done and should stop there as far as building the composite is concerned.
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (v == null)</span>
+<span class="nc" id="L412">                return CompositeType.build(Arrays.copyOfRange(values, 0, i));</span>
+
+<span class="nc" id="L414">            values[i] = v;</span>
+        }
+
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        if (metadata.isSuper())</span>
+        {
+            // We need to set the &quot;column&quot; (in thrift terms) name, i.e. the value corresponding to the subcomparator.
+            // What it is depends if this a cell for a declared &quot;static&quot; column or a &quot;dynamic&quot; column part of the
+            // super-column internal map.
+<span class="nc bnc" id="L422" title="All 4 branches missed.">            assert columnName != null; // This should never be null for supercolumns, see decodeForSuperColumn() above</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            values[clusteringSize] = columnName.equals(SuperColumnCompatibility.SUPER_COLUMN_MAP_COLUMN)</span>
+                                   ? collectionElement
+                                   : columnName;
+        }
+        else
+        {
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (!metadata.isDense())</span>
+<span class="nc" id="L430">                values[clusteringSize] = columnName;</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            if (collectionElement != null)</span>
+<span class="nc" id="L432">                values[clusteringSize + 1] = collectionElement;</span>
+        }
+
+<span class="nc" id="L435">        return CompositeType.build(isStatic, values);</span>
+    }
+
+    public static Clustering decodeClustering(CFMetaData metadata, ByteBuffer value)
+    {
+<span class="nc" id="L440">        int csize = metadata.comparator.size();</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (csize == 0)</span>
+<span class="nc" id="L442">            return Clustering.EMPTY;</span>
+
+<span class="nc bnc" id="L444" title="All 4 branches missed.">        if (metadata.isCompound() &amp;&amp; CompositeType.isStaticName(value))</span>
+<span class="nc" id="L445">            return Clustering.STATIC_CLUSTERING;</span>
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        List&lt;ByteBuffer&gt; components = metadata.isCompound()</span>
+<span class="nc" id="L448">                                    ? CompositeType.splitName(value)</span>
+<span class="nc" id="L449">                                    : Collections.singletonList(value);</span>
+
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        for (int i=0; i&lt;Math.min(csize, components.size()); i++)</span>
+        {
+<span class="nc" id="L453">            AbstractType&lt;?&gt; type = metadata.comparator.subtype(i);</span>
+<span class="nc" id="L454">            type.validateIfFixedSize(components.get(i));</span>
+        }
+<span class="nc" id="L456">        return Clustering.make(components.subList(0, Math.min(csize, components.size())).toArray(new ByteBuffer[csize]));</span>
+    }
+
+    public static ByteBuffer encodeClustering(CFMetaData metadata, ClusteringPrefix clustering)
+    {
+<span class="nc bnc" id="L461" title="All 2 branches missed.">        if (clustering.size() == 0)</span>
+<span class="nc" id="L462">            return ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (!metadata.isCompound())</span>
+        {
+<span class="nc bnc" id="L466" title="All 4 branches missed.">            assert clustering.size() == 1;</span>
+<span class="nc" id="L467">            return clustering.get(0);</span>
+        }
+
+<span class="nc" id="L470">        ByteBuffer[] values = new ByteBuffer[clustering.size()];</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        for (int i = 0; i &lt; clustering.size(); i++)</span>
+<span class="nc" id="L472">            values[i] = clustering.get(i);</span>
+<span class="nc" id="L473">        return CompositeType.build(values);</span>
+    }
+
+    /**
+     * The maximum number of cells to include per partition when converting to the old format.
+     * &lt;p&gt;
+     * We already apply the limit during the actual query, but for queries that counts cells and not rows (thrift queries
+     * and distinct queries as far as old nodes are concerned), we may still include a little bit more than requested
+     * because {@link DataLimits} always include full rows. So if the limit ends in the middle of a queried row, the
+     * full row will be part of our result. This would confuse old nodes however so we make sure to truncate it to
+     * what's expected before writting it on the wire.
+     *
+     * @param command the read commmand for which to determine the maximum cells per partition. This can be {@code null}
+     * in which case {@code Integer.MAX_VALUE} is returned.
+     * @return the maximum number of cells per partition that should be enforced according to the read command if
+     * post-query limitation are in order (see above). This will be {@code Integer.MAX_VALUE} if no such limits are
+     * necessary.
+     */
+    private static int maxLiveCellsPerPartition(ReadCommand command)
+    {
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if (command == null)</span>
+<span class="nc" id="L494">            return Integer.MAX_VALUE;</span>
+
+<span class="nc" id="L496">        DataLimits limits = command.limits();</span>
+
+        // There is 2 types of DISTINCT queries: those that includes only the partition key, and those that include static columns.
+        // On old nodes, the latter expects the first row in term of CQL count, which is what we already have and there is no additional
+        // limit to apply. The former however expect only one cell per partition and rely on it (See CASSANDRA-10762).
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (limits.isDistinct())</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">            return command.columnFilter().fetchedColumns().statics.isEmpty() ? 1 : Integer.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        switch (limits.kind())</span>
+        {
+            case THRIFT_LIMIT:
+            case SUPER_COLUMN_COUNTING_LIMIT:
+<span class="nc" id="L508">                return limits.perPartitionCount();</span>
+            default:
+<span class="nc" id="L510">                return Integer.MAX_VALUE;</span>
+        }
+    }
+
+    // For serializing to old wire format
+    public static LegacyUnfilteredPartition fromUnfilteredRowIterator(ReadCommand command, UnfilteredRowIterator iterator)
+    {
+        // we need to extract the range tombstone so materialize the partition. Since this is
+        // used for the on-wire format, this is not worst than it used to be.
+<span class="nc" id="L519">        final ImmutableBTreePartition partition = ImmutableBTreePartition.create(iterator);</span>
+<span class="nc" id="L520">        DeletionInfo info = partition.deletionInfo();</span>
+<span class="nc" id="L521">        Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; pair = fromRowIterator(partition.metadata(), partition.iterator(), partition.staticRow());</span>
+
+<span class="nc" id="L523">        LegacyLayout.LegacyRangeTombstoneList rtl = pair.left;</span>
+
+        // Processing the cell iterator results in the LegacyRangeTombstoneList being populated, so we do this
+        // before we use the LegacyRangeTombstoneList at all
+<span class="nc" id="L527">        List&lt;LegacyLayout.LegacyCell&gt; cells = Lists.newArrayList(pair.right);</span>
+
+<span class="nc" id="L529">        int maxCellsPerPartition = maxLiveCellsPerPartition(command);</span>
+<span class="nc" id="L530">        cells = maybeTrimLiveCells(cells, maxCellsPerPartition, command);</span>
+
+        // The LegacyRangeTombstoneList already has range tombstones for the single-row deletions and complex
+        // deletions.  Go through our normal range tombstones and add then to the LegacyRTL so that the range
+        // tombstones all get merged and sorted properly.
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (info.hasRanges())</span>
+        {
+<span class="nc" id="L537">            Iterator&lt;RangeTombstone&gt; rangeTombstoneIterator = info.rangeIterator(false);</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">            while (rangeTombstoneIterator.hasNext())</span>
+            {
+<span class="nc" id="L540">                RangeTombstone rt = rangeTombstoneIterator.next();</span>
+<span class="nc" id="L541">                Slice slice = rt.deletedSlice();</span>
+<span class="nc" id="L542">                LegacyLayout.LegacyBound start = new LegacyLayout.LegacyBound(slice.start(), false, null);</span>
+<span class="nc" id="L543">                LegacyLayout.LegacyBound end = new LegacyLayout.LegacyBound(slice.end(), false, null);</span>
+<span class="nc" id="L544">                rtl.add(start, end, rt.deletionTime().markedForDeleteAt(), rt.deletionTime().localDeletionTime());</span>
+<span class="nc" id="L545">            }</span>
+        }
+
+<span class="nc" id="L548">        return new LegacyUnfilteredPartition(info.getPartitionDeletion(), rtl, cells);</span>
+    }
+
+    private static List&lt;LegacyCell&gt; maybeTrimLiveCells(List&lt;LegacyCell&gt; cells, int maxLiveCells, ReadCommand command)
+    {
+<span class="nc bnc" id="L553" title="All 4 branches missed.">        if (null == command || maxLiveCells &gt;= cells.size())</span>
+<span class="nc" id="L554">            return cells;</span>
+
+<span class="nc" id="L556">        int nowInSec = command.nowInSec();</span>
+<span class="nc" id="L557">        int live = 0;</span>
+<span class="nc" id="L558">        int dead = 0;</span>
+
+<span class="nc bnc" id="L560" title="All 4 branches missed.">        for (int i = 0; i &lt; cells.size() &amp;&amp; live &lt; maxLiveCells; i++)</span>
+        {
+<span class="nc bnc" id="L562" title="All 2 branches missed.">            if (cells.get(i).isLive(nowInSec))</span>
+<span class="nc" id="L563">                live++;</span>
+            else
+<span class="nc" id="L565">                dead++;</span>
+        }
+
+<span class="nc" id="L568">        return cells.subList(0, live + dead);</span>
+    }
+
+    public static void serializeAsLegacyPartition(ReadCommand command, UnfilteredRowIterator partition, DataOutputPlus out, int version) throws IOException
+    {
+<span class="nc bnc" id="L573" title="All 4 branches missed.">        assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc" id="L575">        out.writeBoolean(true);</span>
+
+<span class="nc" id="L577">        LegacyLayout.LegacyUnfilteredPartition legacyPartition = LegacyLayout.fromUnfilteredRowIterator(command, partition);</span>
+
+<span class="nc" id="L579">        UUIDSerializer.serializer.serialize(partition.metadata().cfId, out, version);</span>
+<span class="nc" id="L580">        DeletionTime.serializer.serialize(legacyPartition.partitionDeletion, out);</span>
+
+<span class="nc" id="L582">        legacyPartition.rangeTombstones.serialize(out, partition.metadata());</span>
+
+        // begin cell serialization
+<span class="nc" id="L585">        out.writeInt(legacyPartition.cells.size());</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        for (LegacyLayout.LegacyCell cell : legacyPartition.cells)</span>
+        {
+<span class="nc" id="L588">            ByteBufferUtil.writeWithShortLength(cell.name.encode(partition.metadata()), out);</span>
+<span class="nc" id="L589">            out.writeByte(cell.serializationFlags());</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            if (cell.isExpiring())</span>
+            {
+<span class="nc" id="L592">                out.writeInt(cell.ttl);</span>
+<span class="nc" id="L593">                out.writeInt(cell.localDeletionTime);</span>
+            }
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            else if (cell.isTombstone())</span>
+            {
+<span class="nc" id="L597">                out.writeLong(cell.timestamp);</span>
+<span class="nc" id="L598">                out.writeInt(TypeSizes.sizeof(cell.localDeletionTime));</span>
+<span class="nc" id="L599">                out.writeInt(cell.localDeletionTime);</span>
+<span class="nc" id="L600">                continue;</span>
+            }
+<span class="nc bnc" id="L602" title="All 2 branches missed.">            else if (cell.isCounterUpdate())</span>
+            {
+<span class="nc" id="L604">                out.writeLong(cell.timestamp);</span>
+<span class="nc" id="L605">                long count = CounterContext.instance().getUpdateCount(cell.value);</span>
+<span class="nc" id="L606">                ByteBufferUtil.writeWithLength(ByteBufferUtil.bytes(count), out);</span>
+<span class="nc" id="L607">                continue;</span>
+            }
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            else if (cell.isCounter())</span>
+            {
+<span class="nc" id="L611">                out.writeLong(Long.MIN_VALUE);  // timestampOfLastDelete (not used, and MIN_VALUE is the default)</span>
+            }
+
+<span class="nc" id="L614">            out.writeLong(cell.timestamp);</span>
+<span class="nc" id="L615">            ByteBufferUtil.writeWithLength(cell.value, out);</span>
+<span class="nc" id="L616">        }</span>
+<span class="nc" id="L617">    }</span>
+
+    // For the old wire format
+    // Note: this can return null if an empty partition is serialized!
+    public static UnfilteredRowIterator deserializeLegacyPartition(DataInputPlus in, int version, SerializationHelper.Flag flag, ByteBuffer key) throws IOException
+    {
+<span class="nc bnc" id="L623" title="All 4 branches missed.">        assert version &lt; MessagingService.VERSION_30;</span>
+
+        // This is only used in mutation, and mutation have never allowed &quot;null&quot; column families
+<span class="nc" id="L626">        boolean present = in.readBoolean();</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        if (!present)</span>
+<span class="nc" id="L628">            return null;</span>
+
+<span class="nc" id="L630">        CFMetaData metadata = CFMetaData.serializer.deserialize(in, version);</span>
+<span class="nc" id="L631">        LegacyDeletionInfo info = LegacyDeletionInfo.deserialize(metadata, in);</span>
+<span class="nc" id="L632">        int size = in.readInt();</span>
+<span class="nc" id="L633">        Iterator&lt;LegacyCell&gt; cells = deserializeCells(metadata, in, flag, size);</span>
+<span class="nc" id="L634">        SerializationHelper helper = new SerializationHelper(metadata, version, flag);</span>
+<span class="nc" id="L635">        return onWireCellstoUnfilteredRowIterator(metadata, metadata.partitioner.decorateKey(key), info, cells, false, helper);</span>
+    }
+
+    // For the old wire format
+    public static long serializedSizeAsLegacyPartition(ReadCommand command, UnfilteredRowIterator partition, int version)
+    {
+<span class="nc bnc" id="L641" title="All 4 branches missed.">        assert version &lt; MessagingService.VERSION_30;</span>
+
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        if (partition.isEmpty())</span>
+<span class="nc" id="L644">            return TypeSizes.sizeof(false);</span>
+
+<span class="nc" id="L646">        long size = TypeSizes.sizeof(true);</span>
+
+<span class="nc" id="L648">        LegacyLayout.LegacyUnfilteredPartition legacyPartition = LegacyLayout.fromUnfilteredRowIterator(command, partition);</span>
+
+<span class="nc" id="L650">        size += UUIDSerializer.serializer.serializedSize(partition.metadata().cfId, version);</span>
+<span class="nc" id="L651">        size += DeletionTime.serializer.serializedSize(legacyPartition.partitionDeletion);</span>
+<span class="nc" id="L652">        size += legacyPartition.rangeTombstones.serializedSize(partition.metadata());</span>
+
+        // begin cell serialization
+<span class="nc" id="L655">        size += TypeSizes.sizeof(legacyPartition.cells.size());</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">        for (LegacyLayout.LegacyCell cell : legacyPartition.cells)</span>
+        {
+<span class="nc" id="L658">            size += ByteBufferUtil.serializedSizeWithShortLength(cell.name.encode(partition.metadata()));</span>
+<span class="nc" id="L659">            size += 1;  // serialization flags</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            if (cell.isExpiring())</span>
+            {
+<span class="nc" id="L662">                size += TypeSizes.sizeof(cell.ttl);</span>
+<span class="nc" id="L663">                size += TypeSizes.sizeof(cell.localDeletionTime);</span>
+            }
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            else if (cell.isTombstone())</span>
+            {
+<span class="nc" id="L667">                size += TypeSizes.sizeof(cell.timestamp);</span>
+                // localDeletionTime replaces cell.value as the body
+<span class="nc" id="L669">                size += TypeSizes.sizeof(TypeSizes.sizeof(cell.localDeletionTime));</span>
+<span class="nc" id="L670">                size += TypeSizes.sizeof(cell.localDeletionTime);</span>
+<span class="nc" id="L671">                continue;</span>
+            }
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            else if (cell.isCounterUpdate())</span>
+            {
+<span class="nc" id="L675">                size += TypeSizes.sizeof(cell.timestamp);</span>
+<span class="nc" id="L676">                long count = CounterContext.instance().getUpdateCount(cell.value);</span>
+<span class="nc" id="L677">                size += ByteBufferUtil.serializedSizeWithLength(ByteBufferUtil.bytes(count));</span>
+<span class="nc" id="L678">                continue;</span>
+            }
+<span class="nc bnc" id="L680" title="All 2 branches missed.">            else if (cell.isCounter())</span>
+            {
+<span class="nc" id="L682">                size += TypeSizes.sizeof(Long.MIN_VALUE);  // timestampOfLastDelete</span>
+            }
+
+<span class="nc" id="L685">            size += TypeSizes.sizeof(cell.timestamp);</span>
+<span class="nc" id="L686">            size += ByteBufferUtil.serializedSizeWithLength(cell.value);</span>
+<span class="nc" id="L687">        }</span>
+
+<span class="nc" id="L689">        return size;</span>
+    }
+
+    // For thrift sake
+    public static UnfilteredRowIterator toUnfilteredRowIterator(CFMetaData metadata,
+                                                                DecoratedKey key,
+                                                                LegacyDeletionInfo delInfo,
+                                                                Iterator&lt;LegacyCell&gt; cells)
+    {
+<span class="nc" id="L698">        SerializationHelper helper = new SerializationHelper(metadata, 0, SerializationHelper.Flag.LOCAL);</span>
+<span class="nc" id="L699">        return toUnfilteredRowIterator(metadata, key, delInfo, cells, false, helper);</span>
+    }
+
+    // For deserializing old wire format
+    public static UnfilteredRowIterator onWireCellstoUnfilteredRowIterator(CFMetaData metadata,
+                                                                           DecoratedKey key,
+                                                                           LegacyDeletionInfo delInfo,
+                                                                           Iterator&lt;LegacyCell&gt; cells,
+                                                                           boolean reversed,
+                                                                           SerializationHelper helper)
+    {
+
+        // If the table is a static compact, the &quot;column_metadata&quot; are now internally encoded as
+        // static. This has already been recognized by decodeCellName, but it means the cells
+        // provided are not in the expected order (the &quot;static&quot; cells are not necessarily at the front).
+        // So sort them to make sure toUnfilteredRowIterator works as expected.
+        // Further, if the query is reversed, then the on-wire format still has cells in non-reversed
+        // order, but we need to have them reverse in the final UnfilteredRowIterator. So reverse them.
+<span class="nc bnc" id="L717" title="All 4 branches missed.">        if (metadata.isStaticCompactTable() || reversed)</span>
+        {
+<span class="nc" id="L719">            List&lt;LegacyCell&gt; l = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L720">            Iterators.addAll(l, cells);</span>
+<span class="nc" id="L721">            Collections.sort(l, legacyCellComparator(metadata, reversed));</span>
+<span class="nc" id="L722">            cells = l.iterator();</span>
+        }
+
+<span class="nc" id="L725">        return toUnfilteredRowIterator(metadata, key, delInfo, cells, reversed, helper);</span>
+    }
+
+    private static UnfilteredRowIterator toUnfilteredRowIterator(CFMetaData metadata,
+                                                                 DecoratedKey key,
+                                                                 LegacyDeletionInfo delInfo,
+                                                                 Iterator&lt;LegacyCell&gt; cells,
+                                                                 boolean reversed,
+                                                                 SerializationHelper helper)
+    {
+        // A reducer that basically does nothing, we know the 2 merged iterators can't have conflicting atoms (since we merge cells with range tombstones).
+<span class="nc" id="L736">        MergeIterator.Reducer&lt;LegacyAtom, LegacyAtom&gt; reducer = new MergeIterator.Reducer&lt;LegacyAtom, LegacyAtom&gt;()</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        {</span>
+            private LegacyAtom atom;
+
+            public void reduce(int idx, LegacyAtom current)
+            {
+                // We're merging cell with range tombstones, so we should always only have a single atom to reduce.
+<span class="nc bnc" id="L743" title="All 4 branches missed.">                assert atom == null;</span>
+<span class="nc" id="L744">                atom = current;</span>
+<span class="nc" id="L745">            }</span>
+
+            protected LegacyAtom getReduced()
+            {
+<span class="nc" id="L749">                return atom;</span>
+            }
+
+            protected void onKeyChange()
+            {
+<span class="nc" id="L754">                atom = null;</span>
+<span class="nc" id="L755">            }</span>
+        };
+<span class="nc" id="L757">        List&lt;Iterator&lt;LegacyAtom&gt;&gt; iterators = Arrays.asList(asLegacyAtomIterator(cells), asLegacyAtomIterator(delInfo.inRowRangeTombstones()));</span>
+<span class="nc" id="L758">        PeekingIterator&lt;LegacyAtom&gt; atoms = Iterators.peekingIterator(MergeIterator.get(iterators, legacyAtomComparator(metadata), reducer));</span>
+
+        // Check if we have some static
+<span class="nc bnc" id="L761" title="All 4 branches missed.">        Row staticRow = atoms.hasNext() &amp;&amp; atoms.peek().isStatic()</span>
+<span class="nc" id="L762">                      ? getNextRow(CellGrouper.staticGrouper(metadata, helper), atoms)</span>
+                      : Rows.EMPTY_STATIC_ROW;
+
+<span class="nc" id="L765">        Iterator&lt;Row&gt; rows = convertToRows(new CellGrouper(metadata, helper), atoms);</span>
+<span class="nc" id="L766">        Iterator&lt;RangeTombstone&gt; ranges = delInfo.deletionInfo.rangeIterator(reversed);</span>
+<span class="nc" id="L767">        return new RowAndDeletionMergeIterator(metadata,</span>
+                                               key,
+<span class="nc" id="L769">                                               delInfo.deletionInfo.getPartitionDeletion(),</span>
+<span class="nc" id="L770">                                               ColumnFilter.all(metadata),</span>
+                                               staticRow,
+                                               reversed,
+                                               EncodingStats.NO_STATS,
+                                               rows,
+                                               ranges,
+                                               true);
+    }
+
+    public static Row extractStaticColumns(CFMetaData metadata, DataInputPlus in, Columns statics) throws IOException
+    {
+<span class="nc bnc" id="L781" title="All 4 branches missed.">        assert !statics.isEmpty();</span>
+<span class="nc bnc" id="L782" title="All 4 branches missed.">        assert metadata.isCompactTable();</span>
+
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (metadata.isSuper())</span>
+            // TODO: there is in practice nothing to do here, but we need to handle the column_metadata for super columns somewhere else
+<span class="nc" id="L786">            throw new UnsupportedOperationException();</span>
+
+<span class="nc" id="L788">        Set&lt;ByteBuffer&gt; columnsToFetch = new HashSet&lt;&gt;(statics.size());</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        for (ColumnDefinition column : statics)</span>
+<span class="nc" id="L790">            columnsToFetch.add(column.name.bytes);</span>
+
+<span class="nc" id="L792">        Row.Builder builder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L793">        builder.newRow(Clustering.STATIC_CLUSTERING);</span>
+
+<span class="nc" id="L795">        boolean foundOne = false;</span>
+        LegacyAtom atom;
+<span class="nc bnc" id="L797" title="All 2 branches missed.">        while ((atom = readLegacyAtomSkippingUnknownColumn(metadata,in)) != null)</span>
+        {
+<span class="nc bnc" id="L799" title="All 2 branches missed.">            if (atom.isCell())</span>
+            {
+<span class="nc" id="L801">                LegacyCell cell = atom.asCell();</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                if (!columnsToFetch.contains(cell.name.encode(metadata)))</span>
+<span class="nc" id="L803">                    continue;</span>
+
+<span class="nc" id="L805">                foundOne = true;</span>
+<span class="nc" id="L806">                cell.name.column.type.validateIfFixedSize(cell.value);</span>
+<span class="nc" id="L807">                builder.addCell(new BufferCell(cell.name.column, cell.timestamp, cell.ttl, cell.localDeletionTime, cell.value, null));</span>
+<span class="nc" id="L808">            }</span>
+            else
+            {
+<span class="nc" id="L811">                LegacyRangeTombstone tombstone = atom.asRangeTombstone();</span>
+                // TODO: we need to track tombstones and potentially ignore cells that are
+                // shadowed (or even better, replace them by tombstones).
+<span class="nc" id="L814">                throw new UnsupportedOperationException();</span>
+            }
+        }
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        return foundOne ? builder.build() : Rows.EMPTY_STATIC_ROW;</span>
+    }
+
+    private static LegacyAtom readLegacyAtomSkippingUnknownColumn(CFMetaData metadata, DataInputPlus in)
+    throws IOException
+    {
+        while (true)
+        {
+            try
+            {
+<span class="nc" id="L828">                return readLegacyAtom(metadata, in, false);</span>
+            }
+<span class="nc" id="L830">            catch (UnknownColumnException e)</span>
+            {
+                // Simply skip, as the method name implies.
+<span class="nc" id="L833">            }</span>
+        }
+
+    }
+
+    private static Row getNextRow(CellGrouper grouper, PeekingIterator&lt;? extends LegacyAtom&gt; cells)
+    {
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        if (!cells.hasNext())</span>
+<span class="nc" id="L841">            return null;</span>
+
+<span class="nc" id="L843">        grouper.reset();</span>
+<span class="nc bnc" id="L844" title="All 4 branches missed.">        while (cells.hasNext() &amp;&amp; grouper.addAtom(cells.peek()))</span>
+        {
+            // We've added the cell already in the grouper, so just skip it
+<span class="nc" id="L847">            cells.next();</span>
+        }
+<span class="nc" id="L849">        return grouper.getRow();</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static Iterator&lt;LegacyAtom&gt; asLegacyAtomIterator(Iterator&lt;? extends LegacyAtom&gt; iter)
+    {
+<span class="nc" id="L855">        return (Iterator&lt;LegacyAtom&gt;)iter;</span>
+    }
+
+    private static Iterator&lt;Row&gt; convertToRows(final CellGrouper grouper, final PeekingIterator&lt;LegacyAtom&gt; atoms)
+    {
+<span class="nc" id="L860">        return new AbstractIterator&lt;Row&gt;()</span>
+<span class="nc" id="L861">        {</span>
+            protected Row computeNext()
+            {
+<span class="nc bnc" id="L864" title="All 2 branches missed.">                if (!atoms.hasNext())</span>
+<span class="nc" id="L865">                    return endOfData();</span>
+
+<span class="nc" id="L867">                return getNextRow(grouper, atoms);</span>
+            }
+        };
+    }
+
+    public static Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; fromRowIterator(final RowIterator iterator)
+    {
+<span class="nc" id="L874">        return fromRowIterator(iterator.metadata(), iterator, iterator.staticRow());</span>
+    }
+
+    private static Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; fromRowIterator(final CFMetaData metadata, final Iterator&lt;Row&gt; iterator, final Row staticRow)
+    {
+<span class="nc" id="L879">        LegacyRangeTombstoneList deletions = new LegacyRangeTombstoneList(new LegacyBoundComparator(metadata.comparator), 10);</span>
+<span class="nc" id="L880">        Iterator&lt;LegacyCell&gt; cells = new AbstractIterator&lt;LegacyCell&gt;()</span>
+<span class="nc" id="L881">        {</span>
+<span class="nc" id="L882">            private Iterator&lt;LegacyCell&gt; currentRow = initializeRow();</span>
+
+            private Iterator&lt;LegacyCell&gt; initializeRow()
+            {
+<span class="nc bnc" id="L886" title="All 4 branches missed.">                if (staticRow == null || staticRow.isEmpty())</span>
+<span class="nc" id="L887">                    return Collections.&lt;LegacyLayout.LegacyCell&gt;emptyIterator();</span>
+
+<span class="nc" id="L889">                Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; row = fromRow(metadata, staticRow);</span>
+<span class="nc" id="L890">                deletions.addAll(row.left);</span>
+<span class="nc" id="L891">                return row.right;</span>
+            }
+
+            protected LegacyCell computeNext()
+            {
+                while (true)
+                {
+<span class="nc bnc" id="L898" title="All 2 branches missed.">                    if (currentRow.hasNext())</span>
+<span class="nc" id="L899">                        return currentRow.next();</span>
+
+<span class="nc bnc" id="L901" title="All 2 branches missed.">                    if (!iterator.hasNext())</span>
+<span class="nc" id="L902">                        return endOfData();</span>
+
+<span class="nc" id="L904">                    Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; row = fromRow(metadata, iterator.next());</span>
+<span class="nc" id="L905">                    deletions.addAll(row.left);</span>
+<span class="nc" id="L906">                    currentRow = row.right;</span>
+<span class="nc" id="L907">                }</span>
+            }
+        };
+
+<span class="nc" id="L911">        return Pair.create(deletions, cells);</span>
+    }
+
+    private static Pair&lt;LegacyRangeTombstoneList, Iterator&lt;LegacyCell&gt;&gt; fromRow(final CFMetaData metadata, final Row row)
+    {
+        // convert any complex deletions or row deletion into normal range tombstones so that we can build and send a proper RangeTombstoneList
+        // to legacy nodes
+<span class="nc" id="L918">        LegacyRangeTombstoneList deletions = new LegacyRangeTombstoneList(new LegacyBoundComparator(metadata.comparator), 10);</span>
+
+<span class="nc bnc" id="L920" title="All 2 branches missed.">        if (!row.deletion().isLive())</span>
+        {
+<span class="nc" id="L922">            Clustering clustering = row.clustering();</span>
+<span class="nc" id="L923">            ClusteringBound startBound = ClusteringBound.inclusiveStartOf(clustering);</span>
+<span class="nc" id="L924">            ClusteringBound endBound = ClusteringBound.inclusiveEndOf(clustering);</span>
+
+<span class="nc" id="L926">            LegacyBound start = new LegacyLayout.LegacyBound(startBound, false, null);</span>
+<span class="nc" id="L927">            LegacyBound end = new LegacyLayout.LegacyBound(endBound, false, null);</span>
+
+<span class="nc" id="L929">            deletions.add(start, end, row.deletion().time().markedForDeleteAt(), row.deletion().time().localDeletionTime());</span>
+        }
+
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        for (ColumnData cd : row)</span>
+        {
+<span class="nc" id="L934">            ColumnDefinition col = cd.column();</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">            if (col.isSimple())</span>
+<span class="nc" id="L936">                continue;</span>
+
+<span class="nc" id="L938">            DeletionTime delTime = ((ComplexColumnData)cd).complexDeletion();</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">            if (!delTime.isLive())</span>
+            {
+<span class="nc" id="L941">                Clustering clustering = row.clustering();</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">                boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;</span>
+<span class="nc bnc" id="L943" title="All 4 branches missed.">                assert isStatic == col.isStatic();</span>
+
+<span class="nc bnc" id="L945" title="All 2 branches missed.">                ClusteringBound startBound = isStatic</span>
+<span class="nc" id="L946">                        ? LegacyDeletionInfo.staticBound(metadata, true)</span>
+<span class="nc" id="L947">                        : ClusteringBound.inclusiveStartOf(clustering);</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                ClusteringBound endBound = isStatic</span>
+<span class="nc" id="L949">                        ? LegacyDeletionInfo.staticBound(metadata, false)</span>
+<span class="nc" id="L950">                        : ClusteringBound.inclusiveEndOf(clustering);</span>
+
+<span class="nc" id="L952">                LegacyLayout.LegacyBound start = new LegacyLayout.LegacyBound(startBound, isStatic, col);</span>
+<span class="nc" id="L953">                LegacyLayout.LegacyBound end = new LegacyLayout.LegacyBound(endBound, isStatic, col);</span>
+
+<span class="nc" id="L955">                deletions.add(start, end, delTime.markedForDeleteAt(), delTime.localDeletionTime());</span>
+            }
+<span class="nc" id="L957">        }</span>
+
+<span class="nc" id="L959">        Iterator&lt;LegacyCell&gt; cells = new AbstractIterator&lt;LegacyCell&gt;()</span>
+<span class="nc" id="L960">        {</span>
+<span class="nc" id="L961">            private final Iterator&lt;Cell&gt; cells = row.cellsInLegacyOrder(metadata, false).iterator();</span>
+            // we don't have (and shouldn't have) row markers for compact tables.
+<span class="nc" id="L963">            private boolean hasReturnedRowMarker = metadata.isCompactTable();</span>
+
+            protected LegacyCell computeNext()
+            {
+<span class="nc bnc" id="L967" title="All 2 branches missed.">                if (!hasReturnedRowMarker)</span>
+                {
+<span class="nc" id="L969">                    hasReturnedRowMarker = true;</span>
+
+                    // don't include a row marker if there's no timestamp on the primary key; this is the 3.0+ equivalent
+                    // of a row marker
+<span class="nc bnc" id="L973" title="All 2 branches missed.">                    if (!row.primaryKeyLivenessInfo().isEmpty())</span>
+                    {
+<span class="nc" id="L975">                        LegacyCellName cellName = new LegacyCellName(row.clustering(), null, null);</span>
+<span class="nc" id="L976">                        LivenessInfo info = row.primaryKeyLivenessInfo();</span>
+<span class="nc bnc" id="L977" title="All 2 branches missed.">                        return new LegacyCell(info.isExpiring() ? LegacyCell.Kind.EXPIRING : LegacyCell.Kind.REGULAR, cellName, ByteBufferUtil.EMPTY_BYTE_BUFFER, info.timestamp(), info.localExpirationTime(), info.ttl());</span>
+                    }
+                }
+
+<span class="nc bnc" id="L981" title="All 2 branches missed.">                if (!cells.hasNext())</span>
+<span class="nc" id="L982">                    return endOfData();</span>
+
+<span class="nc" id="L984">                return makeLegacyCell(row.clustering(), cells.next());</span>
+            }
+        };
+<span class="nc" id="L987">        return Pair.create(deletions, cells);</span>
+    }
+
+    private static LegacyCell makeLegacyCell(Clustering clustering, Cell cell)
+    {
+        LegacyCell.Kind kind;
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        if (cell.isCounterCell())</span>
+<span class="nc" id="L994">            kind = LegacyCell.Kind.COUNTER;</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">        else if (cell.isTombstone())</span>
+<span class="nc" id="L996">            kind = LegacyCell.Kind.DELETED;</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">        else if (cell.isExpiring())</span>
+<span class="nc" id="L998">            kind = LegacyCell.Kind.EXPIRING;</span>
+        else
+<span class="nc" id="L1000">            kind = LegacyCell.Kind.REGULAR;</span>
+
+<span class="nc" id="L1002">        CellPath path = cell.path();</span>
+<span class="nc bnc" id="L1003" title="All 6 branches missed.">        assert path == null || path.size() == 1;</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        LegacyCellName name = new LegacyCellName(clustering, cell.column(), path == null ? null : path.get(0));</span>
+<span class="nc" id="L1005">        return new LegacyCell(kind, name, cell.value(), cell.timestamp(), cell.localDeletionTime(), cell.ttl());</span>
+    }
+
+    public static RowIterator toRowIterator(final CFMetaData metadata,
+                                            final DecoratedKey key,
+                                            final Iterator&lt;LegacyCell&gt; cells,
+                                            final int nowInSec)
+    {
+<span class="nc" id="L1013">        SerializationHelper helper = new SerializationHelper(metadata, 0, SerializationHelper.Flag.LOCAL);</span>
+<span class="nc" id="L1014">        return UnfilteredRowIterators.filter(toUnfilteredRowIterator(metadata, key, LegacyDeletionInfo.live(), cells, false, helper), nowInSec);</span>
+    }
+
+    public static Comparator&lt;LegacyCell&gt; legacyCellComparator(CFMetaData metadata)
+    {
+<span class="nc" id="L1019">        return legacyCellComparator(metadata, false);</span>
+    }
+
+    public static Comparator&lt;LegacyCell&gt; legacyCellComparator(final CFMetaData metadata, final boolean reversed)
+    {
+<span class="nc" id="L1024">        final Comparator&lt;LegacyCellName&gt; cellNameComparator = legacyCellNameComparator(metadata, reversed);</span>
+<span class="nc" id="L1025">        return new Comparator&lt;LegacyCell&gt;()</span>
+<span class="nc" id="L1026">        {</span>
+            public int compare(LegacyCell cell1, LegacyCell cell2)
+            {
+<span class="nc" id="L1029">                LegacyCellName c1 = cell1.name;</span>
+<span class="nc" id="L1030">                LegacyCellName c2 = cell2.name;</span>
+
+<span class="nc" id="L1032">                int c = cellNameComparator.compare(c1, c2);</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">                if (c != 0)</span>
+<span class="nc" id="L1034">                    return c;</span>
+
+                // The actual sorting when the cellname is equal doesn't matter, we just want to make
+                // sure the cells are not considered equal.
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">                if (cell1.timestamp != cell2.timestamp)</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">                    return cell1.timestamp &lt; cell2.timestamp ? -1 : 1;</span>
+
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">                if (cell1.localDeletionTime != cell2.localDeletionTime)</span>
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">                    return cell1.localDeletionTime &lt; cell2.localDeletionTime ? -1 : 1;</span>
+
+<span class="nc" id="L1044">                return cell1.value.compareTo(cell2.value);</span>
+            }
+        };
+    }
+
+    // Note that this doesn't exactly compare cells as they were pre-3.0 because within a row they sort columns like
+    // in 3.0, that is, with simple columns before complex columns. In other words, this comparator makes sure cells
+    // are in the proper order to convert them to actual 3.0 rows.
+    public static Comparator&lt;LegacyCellName&gt; legacyCellNameComparator(final CFMetaData metadata, final boolean reversed)
+    {
+<span class="nc" id="L1054">        return new Comparator&lt;LegacyCellName&gt;()</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">        {</span>
+            public int compare(LegacyCellName c1, LegacyCellName c2)
+            {
+                // Compare clustering first
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">                if (c1.clustering == Clustering.STATIC_CLUSTERING)</span>
+                {
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">                    if (c2.clustering != Clustering.STATIC_CLUSTERING)</span>
+<span class="nc" id="L1062">                        return -1;</span>
+                }
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">                else if (c2.clustering == Clustering.STATIC_CLUSTERING)</span>
+                {
+<span class="nc" id="L1066">                    return 1;</span>
+                }
+                else
+                {
+<span class="nc" id="L1070">                    int c = metadata.comparator.compare(c1.clustering, c2.clustering);</span>
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">                    if (c != 0)</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">                        return reversed ? -c : c;</span>
+                }
+
+                // Note that when reversed, we only care about the clustering being reversed, so it's ok
+                // not to take reversed into account below.
+
+                // Then check the column name
+<span class="nc bnc" id="L1079" title="All 2 branches missed.">                if (c1.column != c2.column)</span>
+                {
+                    // A null for the column means it's a row marker
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">                    if (c1.column == null)</span>
+<span class="nc" id="L1083">                        return -1;</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">                    if (c2.column == null)</span>
+<span class="nc" id="L1085">                        return 1;</span>
+
+<span class="nc bnc" id="L1087" title="All 6 branches missed.">                    assert c1.column.isRegular() || c1.column.isStatic();</span>
+<span class="nc bnc" id="L1088" title="All 6 branches missed.">                    assert c2.column.isRegular() || c2.column.isStatic();</span>
+<span class="nc" id="L1089">                    int cmp = c1.column.compareTo(c2.column);</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">                    if (cmp != 0)</span>
+<span class="nc" id="L1091">                        return cmp;</span>
+                }
+
+<span class="nc bnc" id="L1094" title="All 8 branches missed.">                assert (c1.collectionElement == null) == (c2.collectionElement == null);</span>
+
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">                if (c1.collectionElement != null)</span>
+                {
+<span class="nc" id="L1098">                    AbstractType&lt;?&gt; colCmp = ((CollectionType)c1.column.type).nameComparator();</span>
+<span class="nc" id="L1099">                    return colCmp.compare(c1.collectionElement, c2.collectionElement);</span>
+                }
+<span class="nc" id="L1101">                return 0;</span>
+            }
+        };
+    }
+
+    private static boolean equalValues(ClusteringPrefix c1, ClusteringPrefix c2, ClusteringComparator comparator)
+    {
+<span class="nc bnc" id="L1108" title="All 4 branches missed.">        assert c1.size() == c2.size();</span>
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">        for (int i = 0; i &lt; c1.size(); i++)</span>
+        {
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">            if (comparator.compareComponent(i, c1.get(i), c2.get(i)) != 0)</span>
+<span class="nc" id="L1112">                return false;</span>
+        }
+<span class="nc" id="L1114">        return true;</span>
+    }
+
+    private static Comparator&lt;LegacyAtom&gt; legacyAtomComparator(CFMetaData metadata)
+    {
+<span class="nc" id="L1119">        return (o1, o2) -&gt;</span>
+        {
+            // First we want to compare by clustering, but we have to be careful with range tombstone, because
+            // we can have collection deletion and we want those to sort properly just before the column they
+            // delete, not before the whole row.
+            // We also want to special case static so they sort before any non-static. Note in particular that
+            // this special casing is important in the case of one of the Atom being Bound.BOTTOM: we want
+            // it to sort after the static as we deal with static first in toUnfilteredAtomIterator and having
+            // Bound.BOTTOM first would mess that up (note that static deletion is handled through a specific
+            // static tombstone, see LegacyDeletionInfo.add()).
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">            if (o1.isStatic() != o2.isStatic())</span>
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">                return o1.isStatic() ? -1 : 1;</span>
+
+<span class="nc" id="L1132">            ClusteringPrefix c1 = o1.clustering();</span>
+<span class="nc" id="L1133">            ClusteringPrefix c2 = o2.clustering();</span>
+
+            int clusteringComparison;
+<span class="nc bnc" id="L1136" title="All 6 branches missed.">            if (c1.size() != c2.size() || (o1.isCell() == o2.isCell()) || !equalValues(c1, c2, metadata.comparator))</span>
+            {
+<span class="nc" id="L1138">                clusteringComparison = metadata.comparator.compare(c1, c2);</span>
+            }
+            else
+            {
+                // one is a cell and one is a range tombstone, and both have the same prefix size (that is, the
+                // range tombstone is either a row deletion or a collection deletion).
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">                LegacyRangeTombstone rt = o1.isCell() ? o2.asRangeTombstone() : o1.asRangeTombstone();</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">                clusteringComparison = rt.isCollectionTombstone()</span>
+                                       ? 0
+<span class="nc" id="L1147">                                       : metadata.comparator.compare(c1, c2);</span>
+            }
+
+            // Note that if both are range tombstones and have the same clustering, then they are equal.
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">            if (clusteringComparison != 0)</span>
+<span class="nc" id="L1152">                return clusteringComparison;</span>
+
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">            if (o1.isCell())</span>
+            {
+<span class="nc" id="L1156">                LegacyCell cell1 = o1.asCell();</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">                if (o2.isCell())</span>
+                {
+<span class="nc" id="L1159">                    LegacyCell cell2 = o2.asCell();</span>
+                    // Check for row marker cells
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">                    if (cell1.name.column == null)</span>
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">                        return cell2.name.column == null ? 0 : -1;</span>
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">                    return cell2.name.column == null ? 1 : cell1.name.column.compareTo(cell2.name.column);</span>
+                }
+
+<span class="nc" id="L1166">                LegacyRangeTombstone rt2 = o2.asRangeTombstone();</span>
+<span class="nc bnc" id="L1167" title="All 4 branches missed.">                assert rt2.isCollectionTombstone(); // otherwise, we shouldn't have got a clustering equality</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">                if (cell1.name.column == null)</span>
+<span class="nc" id="L1169">                    return -1;</span>
+<span class="nc" id="L1170">                int cmp = cell1.name.column.compareTo(rt2.start.collectionName);</span>
+                // If both are for the same column, then the RT should come first
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">                return cmp == 0 ? 1 : cmp;</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L1176" title="All 4 branches missed.">                assert o2.isCell();</span>
+<span class="nc" id="L1177">                LegacyCell cell2 = o2.asCell();</span>
+
+<span class="nc" id="L1179">                LegacyRangeTombstone rt1 = o1.asRangeTombstone();</span>
+<span class="nc bnc" id="L1180" title="All 4 branches missed.">                assert rt1.isCollectionTombstone(); // otherwise, we shouldn't have got a clustering equality</span>
+
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">                if (cell2.name.column == null)</span>
+<span class="nc" id="L1183">                    return 1;</span>
+
+<span class="nc" id="L1185">                int cmp = rt1.start.collectionName.compareTo(cell2.name.column);</span>
+                // If both are for the same column, then the RT should come first
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">                return cmp == 0 ? -1 : cmp;</span>
+            }
+        };
+    }
+
+    public static LegacyAtom readLegacyAtom(CFMetaData metadata, DataInputPlus in, boolean readAllAsDynamic)
+    throws IOException, UnknownColumnException
+    {
+<span class="nc" id="L1195">        ByteBuffer cellname = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">        if (!cellname.hasRemaining())</span>
+<span class="nc" id="L1197">            return null; // END_OF_ROW</span>
+
+        try
+        {
+<span class="nc" id="L1201">            int b = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">            return (b &amp; RANGE_TOMBSTONE_MASK) != 0</span>
+<span class="nc" id="L1203">                   ? readLegacyRangeTombstoneBody(metadata, in, cellname)</span>
+<span class="nc" id="L1204">                   : readLegacyCellBody(metadata, in, cellname, b, SerializationHelper.Flag.LOCAL, readAllAsDynamic);</span>
+        }
+<span class="nc" id="L1206">        catch (UnknownColumnException e)</span>
+        {
+            // We legitimately can get here in 2 cases:
+            // 1) for system tables, because we've unceremoniously removed columns (without registering them as dropped)
+            // 2) for dropped columns.
+            // In any other case, there is a mismatch between the schema and the data, and we complain loudly in
+            // that case. Note that if we are in a legit case of an unknown column, we want to simply skip that cell,
+            // but we don't do this here and re-throw the exception because the calling code sometimes has to know
+            // about this happening. This does mean code calling this method should handle this case properly.
+<span class="nc bnc" id="L1215" title="All 4 branches missed.">            if (!metadata.ksName.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME) &amp;&amp; metadata.getDroppedColumnDefinition(e.columnName) == null)</span>
+<span class="nc" id="L1216">                logger.warn(String.format(&quot;Got cell for unknown column %s in sstable of %s.%s: &quot; +</span>
+                                          &quot;This suggest a problem with the schema which doesn't list &quot; +
+                                          &quot;this column. Even if that column was dropped, it should have &quot; +
+<span class="nc" id="L1219">                                          &quot;been listed as such&quot;, metadata.ksName, metadata.cfName, UTF8Type.instance.compose(e.columnName)), e);</span>
+
+<span class="nc" id="L1221">            throw e;</span>
+        }
+    }
+
+    public static LegacyCell readLegacyCell(CFMetaData metadata, DataInput in, SerializationHelper.Flag flag) throws IOException, UnknownColumnException
+    {
+<span class="nc" id="L1227">        ByteBuffer cellname = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L1228">        int b = in.readUnsignedByte();</span>
+<span class="nc" id="L1229">        return readLegacyCellBody(metadata, in, cellname, b, flag, false);</span>
+    }
+
+    public static LegacyCell readLegacyCellBody(CFMetaData metadata, DataInput in, ByteBuffer cellname, int mask, SerializationHelper.Flag flag, boolean readAllAsDynamic)
+    throws IOException, UnknownColumnException
+    {
+        // Note that we want to call decodeCellName only after we've deserialized other parts, since it can throw
+        // and we want to throw only after having deserialized the full cell.
+<span class="nc bnc" id="L1237" title="All 2 branches missed.">        if ((mask &amp; COUNTER_MASK) != 0)</span>
+        {
+<span class="nc" id="L1239">            in.readLong(); // timestampOfLastDelete: this has been unused for a long time so we ignore it</span>
+<span class="nc" id="L1240">            long ts = in.readLong();</span>
+<span class="nc" id="L1241">            ByteBuffer value = ByteBufferUtil.readWithLength(in);</span>
+<span class="nc bnc" id="L1242" title="All 6 branches missed.">            if (flag == SerializationHelper.Flag.FROM_REMOTE || (flag == SerializationHelper.Flag.LOCAL &amp;&amp; CounterContext.instance().shouldClearLocal(value)))</span>
+<span class="nc" id="L1243">                value = CounterContext.instance().clearAllLocal(value);</span>
+<span class="nc" id="L1244">            return new LegacyCell(LegacyCell.Kind.COUNTER, decodeCellName(metadata, cellname, readAllAsDynamic), value, ts, Cell.NO_DELETION_TIME, Cell.NO_TTL);</span>
+        }
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">        else if ((mask &amp; EXPIRATION_MASK) != 0)</span>
+        {
+<span class="nc" id="L1248">            int ttl = in.readInt();</span>
+<span class="nc" id="L1249">            int expiration = in.readInt();</span>
+<span class="nc" id="L1250">            long ts = in.readLong();</span>
+<span class="nc" id="L1251">            ByteBuffer value = ByteBufferUtil.readWithLength(in);</span>
+<span class="nc" id="L1252">            return new LegacyCell(LegacyCell.Kind.EXPIRING, decodeCellName(metadata, cellname, readAllAsDynamic), value, ts, expiration, ttl);</span>
+        }
+        else
+        {
+<span class="nc" id="L1256">            long ts = in.readLong();</span>
+<span class="nc" id="L1257">            ByteBuffer value = ByteBufferUtil.readWithLength(in);</span>
+<span class="nc" id="L1258">            LegacyCellName name = decodeCellName(metadata, cellname, readAllAsDynamic);</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">            return (mask &amp; COUNTER_UPDATE_MASK) != 0</span>
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">                ? new LegacyCell(LegacyCell.Kind.COUNTER, name, CounterContext.instance().createUpdate(ByteBufferUtil.toLong(value)), ts, Cell.NO_DELETION_TIME, Cell.NO_TTL)</span>
+                : ((mask &amp; DELETION_MASK) == 0
+                        ? new LegacyCell(LegacyCell.Kind.REGULAR, name, value, ts, Cell.NO_DELETION_TIME, Cell.NO_TTL)
+<span class="nc" id="L1263">                        : new LegacyCell(LegacyCell.Kind.DELETED, name, ByteBufferUtil.EMPTY_BYTE_BUFFER, ts, ByteBufferUtil.toInt(value), Cell.NO_TTL));</span>
+        }
+    }
+
+    public static LegacyRangeTombstone readLegacyRangeTombstoneBody(CFMetaData metadata, DataInputPlus in, ByteBuffer boundname) throws IOException
+    {
+<span class="nc" id="L1269">        LegacyBound min = decodeTombstoneBound(metadata, boundname, true);</span>
+<span class="nc" id="L1270">        LegacyBound max = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), false);</span>
+<span class="nc" id="L1271">        DeletionTime dt = DeletionTime.serializer.deserialize(in);</span>
+<span class="nc" id="L1272">        return new LegacyRangeTombstone(min, max, dt);</span>
+    }
+
+    public static Iterator&lt;LegacyCell&gt; deserializeCells(final CFMetaData metadata,
+                                                        final DataInput in,
+                                                        final SerializationHelper.Flag flag,
+                                                        final int size)
+    {
+<span class="nc" id="L1280">        return new AbstractIterator&lt;LegacyCell&gt;()</span>
+<span class="nc" id="L1281">        {</span>
+<span class="nc" id="L1282">            private int i = 0;</span>
+
+            protected LegacyCell computeNext()
+            {
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">                if (i &gt;= size)</span>
+<span class="nc" id="L1287">                    return endOfData();</span>
+
+<span class="nc" id="L1289">                ++i;</span>
+                try
+                {
+<span class="nc" id="L1292">                    return readLegacyCell(metadata, in, flag);</span>
+                }
+<span class="nc" id="L1294">                catch (UnknownColumnException e)</span>
+                {
+                    // We can get there if we read a cell for a dropped column, and if that is the case,
+                    // then simply ignore the cell is fine. But also not that we ignore if it's the
+                    // system keyspace because for those table we actually remove columns without registering
+                    // them in the dropped columns
+<span class="nc bnc" id="L1300" title="All 4 branches missed.">                    if (metadata.ksName.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME) || metadata.getDroppedColumnDefinition(e.columnName) != null)</span>
+<span class="nc" id="L1301">                        return computeNext();</span>
+                    else
+<span class="nc" id="L1303">                        throw new IOError(e);</span>
+                }
+<span class="nc" id="L1305">                catch (IOException e)</span>
+                {
+<span class="nc" id="L1307">                    throw new IOError(e);</span>
+                }
+            }
+        };
+    }
+
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">    public static class CellGrouper</span>
+    {
+        /**
+         * The fake TTL used for expired rows that have been compacted.
+         */
+        private static final int FAKE_TTL = 1;
+
+        public final CFMetaData metadata;
+        private final boolean isStatic;
+        private final SerializationHelper helper;
+        private final Row.Builder builder;
+        private Clustering clustering;
+
+        private LegacyRangeTombstone rowDeletion;
+        private LegacyRangeTombstone collectionDeletion;
+
+        /**
+         * Used to track if we need to add pk liveness info (row marker) when removing invalid legacy cells.
+         *
+         * In 2.1 these invalid cells existed but were not queryable, in this case specifically because they
+         * represented values for clustering key columns that were written as data cells.
+         *
+         * However, the presence (or not) of such cells on an otherwise empty CQL row (or partition) would decide
+         * if an empty result row were returned for the CQL row (or partition).  To maintain this behaviour we
+         * insert a row marker containing the liveness info of these invalid cells iff we have no other data
+         * on the row.
+         *
+         * See also CASSANDRA-15365
+         */
+<span class="nc" id="L1342">        private boolean hasValidCells = false;</span>
+<span class="nc" id="L1343">        private LivenessInfo invalidLivenessInfo = null;</span>
+
+        public CellGrouper(CFMetaData metadata, SerializationHelper helper)
+        {
+<span class="nc" id="L1347">            this(metadata, helper, false);</span>
+<span class="nc" id="L1348">        }</span>
+
+        private CellGrouper(CFMetaData metadata, SerializationHelper helper, boolean isStatic)
+<span class="nc" id="L1351">        {</span>
+<span class="nc" id="L1352">            this.metadata = metadata;</span>
+<span class="nc" id="L1353">            this.isStatic = isStatic;</span>
+<span class="nc" id="L1354">            this.helper = helper;</span>
+            // We cannot use a sorted builder because we don't have exactly the same ordering in 3.0 and pre-3.0. More precisely, within a row, we
+            // store all simple columns before the complex ones in 3.0, which we use to sort everything sorted by the column name before. Note however
+            // that the unsorted builder won't have to reconcile cells, so the exact value we pass for nowInSec doesn't matter.
+<span class="nc" id="L1358">            this.builder = BTreeRow.unsortedBuilder(FBUtilities.nowInSeconds());</span>
+<span class="nc" id="L1359">        }</span>
+
+        public static CellGrouper staticGrouper(CFMetaData metadata, SerializationHelper helper)
+        {
+<span class="nc" id="L1363">            return new CellGrouper(metadata, helper, true);</span>
+        }
+
+        public void reset()
+        {
+<span class="nc" id="L1368">            this.clustering = null;</span>
+<span class="nc" id="L1369">            this.rowDeletion = null;</span>
+<span class="nc" id="L1370">            this.collectionDeletion = null;</span>
+<span class="nc" id="L1371">            this.invalidLivenessInfo = null;</span>
+<span class="nc" id="L1372">            this.hasValidCells = false;</span>
+<span class="nc" id="L1373">        }</span>
+
+        public boolean addAtom(LegacyAtom atom)
+        {
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">            return atom.isCell()</span>
+<span class="nc" id="L1378">                 ? addCell(atom.asCell())</span>
+<span class="nc" id="L1379">                 : addRangeTombstone(atom.asRangeTombstone());</span>
+        }
+
+        private boolean addCell(LegacyCell cell)
+        {
+<span class="nc bnc" id="L1384" title="All 2 branches missed.">            if (clustering == null)</span>
+            {
+<span class="nc" id="L1386">                clustering = cell.name.clustering;</span>
+<span class="nc bnc" id="L1387" title="All 6 branches missed.">                assert !isStatic || clustering == Clustering.STATIC_CLUSTERING;</span>
+<span class="nc" id="L1388">                builder.newRow(clustering);</span>
+            }
+<span class="nc bnc" id="L1390" title="All 2 branches missed.">            else if (!clustering.equals(cell.name.clustering))</span>
+            {
+<span class="nc" id="L1392">                return false;</span>
+            }
+
+            // Ignore shadowed cells
+<span class="nc bnc" id="L1396" title="All 4 branches missed.">            if (rowDeletion != null &amp;&amp; rowDeletion.deletionTime.deletes(cell.timestamp))</span>
+<span class="nc" id="L1397">                return true;</span>
+
+<span class="nc" id="L1399">            ColumnDefinition column = cell.name.column;</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">            if (column == null)</span>
+            {
+                // It's the row marker
+<span class="nc bnc" id="L1403" title="All 4 branches missed.">                assert !cell.value.hasRemaining();</span>
+
+                // In 2.1, the row marker expired cell might have been converted into a deleted one by compaction.
+                // If we do not set the primary key liveness info for this row and it does not contains any regular columns
+                // the row will be empty. To avoid that, we reuse the localDeletionTime but use a fake TTL.
+                // The only time in 2.x that we actually delete a row marker is in 2i tables, so in that case we do
+                // want to actually propagate the row deletion. (CASSANDRA-13320)
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">                if (!cell.isTombstone())</span>
+<span class="nc" id="L1411">                    builder.addPrimaryKeyLivenessInfo(LivenessInfo.withExpirationTime(cell.timestamp, cell.ttl, cell.localDeletionTime));</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">                else if (metadata.isIndex())</span>
+<span class="nc" id="L1413">                    builder.addRowDeletion(Row.Deletion.regular(new DeletionTime(cell.timestamp, cell.localDeletionTime)));</span>
+                else
+<span class="nc" id="L1415">                    builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(cell.timestamp, FAKE_TTL, cell.localDeletionTime));</span>
+<span class="nc" id="L1416">                hasValidCells = true;</span>
+            }
+<span class="nc bnc" id="L1418" title="All 4 branches missed.">            else if (column.isPrimaryKeyColumn() &amp;&amp; metadata.isCQLTable())</span>
+            {
+                // SSTables generated offline and side-loaded may include invalid cells which have the column name
+                // of a primary key column. So that we don't fail when encountering these cells, we treat them the
+                // same way as 2.1 did, namely we include their clusterings in the new CQL row, but drop the invalid
+                // column part of the cell
+<span class="nc" id="L1424">                noSpamLogger.warn(&quot;Illegal cell name for CQL3 table {}.{}. {} is defined as a primary key column&quot;,</span>
+                                  metadata.ksName, metadata.cfName, column.name);
+
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">                if (invalidLivenessInfo != null)</span>
+                {
+                    // when we have several invalid cells we follow the logic in LivenessInfo#supersedes when picking the PKLI to keep:
+<span class="nc bnc" id="L1430" title="All 2 branches missed.">                    LivenessInfo newInvalidLiveness = LivenessInfo.create(cell.timestamp, cell.isTombstone() ? FAKE_TTL : cell.ttl, cell.localDeletionTime);</span>
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">                    if (newInvalidLiveness.supersedes(invalidLivenessInfo))</span>
+<span class="nc" id="L1432">                        invalidLivenessInfo = newInvalidLiveness;</span>
+<span class="nc" id="L1433">                }</span>
+                else
+                {
+<span class="nc bnc" id="L1436" title="All 2 branches missed.">                    invalidLivenessInfo = LivenessInfo.create(cell.timestamp, cell.isTombstone() ? FAKE_TTL : cell.ttl, cell.localDeletionTime);</span>
+                }
+<span class="nc" id="L1438">                return true;</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L1442" title="All 6 branches missed.">                if (collectionDeletion != null &amp;&amp; collectionDeletion.start.collectionName.name.equals(column.name) &amp;&amp; collectionDeletion.deletionTime.deletes(cell.timestamp))</span>
+<span class="nc" id="L1443">                    return true;</span>
+
+<span class="nc bnc" id="L1445" title="All 2 branches missed.">                if (helper.includes(column))</span>
+                {
+<span class="nc" id="L1447">                    hasValidCells = true;</span>
+<span class="nc" id="L1448">                    CellPath path = null;</span>
+<span class="nc bnc" id="L1449" title="All 2 branches missed.">                    if (column.isComplex())</span>
+                    {
+                        // Recalling startOfComplexColumn for every cell is a big inefficient, but it's ok in practice
+                        // and it's simpler. And since 1) this only matter for super column selection in thrift in
+                        // practice and 2) is only used during upgrade, it's probably worth keeping things simple.
+<span class="nc" id="L1454">                        helper.startOfComplexColumn(column);</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">                        path = cell.name.collectionElement == null ? null : CellPath.create(cell.name.collectionElement);</span>
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">                        if (!helper.includes(path))</span>
+<span class="nc" id="L1457">                            return true;</span>
+                    }
+<span class="nc" id="L1459">                    column.type.validateIfFixedSize(cell.value);</span>
+<span class="nc" id="L1460">                    Cell c = new BufferCell(column, cell.timestamp, cell.ttl, cell.localDeletionTime, cell.value, path);</span>
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">                    if (!helper.isDropped(c, column.isComplex()))</span>
+<span class="nc" id="L1462">                        builder.addCell(c);</span>
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">                    if (column.isComplex())</span>
+                    {
+<span class="nc" id="L1465">                        helper.endOfComplexColumn();</span>
+                    }
+                }
+            }
+<span class="nc" id="L1469">            return true;</span>
+        }
+
+        private boolean addRangeTombstone(LegacyRangeTombstone tombstone)
+        {
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">            if (tombstone.isRowDeletion(metadata))</span>
+<span class="nc" id="L1475">                return addRowTombstone(tombstone);</span>
+<span class="nc bnc" id="L1476" title="All 2 branches missed.">            else if (tombstone.isCollectionTombstone())</span>
+<span class="nc" id="L1477">                return addCollectionTombstone(tombstone);</span>
+            else
+<span class="nc" id="L1479">                return addGenericRangeTombstone(tombstone);</span>
+        }
+
+        private boolean addRowTombstone(LegacyRangeTombstone tombstone)
+        {
+<span class="nc bnc" id="L1484" title="All 2 branches missed.">            if (clustering != null)</span>
+            {
+                // If we're already in the row, there might be a chance that there were two range tombstones
+                // written, as 2.x storage format does not guarantee just one range tombstone, unlike 3.x.
+                // We have to make sure that clustering matches, which would mean that tombstone is for the
+                // same row.
+<span class="nc bnc" id="L1490" title="All 4 branches missed.">                if (rowDeletion != null &amp;&amp; clustering.equals(tombstone.start.getAsClustering(metadata)))</span>
+                {
+                    // If the tombstone superceeds the previous delete, we discard the previous one
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">                    if (tombstone.deletionTime.supersedes(rowDeletion.deletionTime))</span>
+                    {
+<span class="nc" id="L1495">                        builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));</span>
+<span class="nc" id="L1496">                        rowDeletion = tombstone;</span>
+<span class="nc" id="L1497">                        hasValidCells = true;</span>
+                    }
+<span class="nc" id="L1499">                    return true;</span>
+                }
+
+                // If we're already within a row and there was no delete written before that one, it can't be the same one
+<span class="nc" id="L1503">                return false;</span>
+            }
+
+<span class="nc" id="L1506">            clustering = tombstone.start.getAsClustering(metadata);</span>
+<span class="nc" id="L1507">            builder.newRow(clustering);</span>
+<span class="nc" id="L1508">            builder.addRowDeletion(Row.Deletion.regular(tombstone.deletionTime));</span>
+<span class="nc" id="L1509">            rowDeletion = tombstone;</span>
+<span class="nc" id="L1510">            hasValidCells = true;</span>
+
+<span class="nc" id="L1512">            return true;</span>
+        }
+
+        private boolean addCollectionTombstone(LegacyRangeTombstone tombstone)
+        {
+<span class="nc bnc" id="L1517" title="All 2 branches missed.">            if (!helper.includes(tombstone.start.collectionName))</span>
+<span class="nc" id="L1518">                return false; // see CASSANDRA-13109</span>
+
+            // The helper needs to be informed about the current complex column identifier before
+            // it can perform the comparison between the recorded drop time and the RT deletion time.
+            // If the RT has been superceded by a drop, we still return true as we don't want the
+            // grouper to terminate yet.
+<span class="nc" id="L1524">            helper.startOfComplexColumn(tombstone.start.collectionName);</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">            if (helper.isDroppedComplexDeletion(tombstone.deletionTime))</span>
+<span class="nc" id="L1526">                return true;</span>
+
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">            if (clustering == null)</span>
+            {
+<span class="nc" id="L1530">                clustering = tombstone.start.getAsClustering(metadata);</span>
+<span class="nc" id="L1531">                builder.newRow(clustering);</span>
+            }
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">            else if (!clustering.equals(tombstone.start.getAsClustering(metadata)))</span>
+            {
+<span class="nc" id="L1535">                return false;</span>
+            }
+
+<span class="nc" id="L1538">            builder.addComplexDeletion(tombstone.start.collectionName, tombstone.deletionTime);</span>
+<span class="nc bnc" id="L1539" title="All 4 branches missed.">            if (rowDeletion == null || tombstone.deletionTime.supersedes(rowDeletion.deletionTime))</span>
+<span class="nc" id="L1540">                collectionDeletion = tombstone;</span>
+<span class="nc" id="L1541">            hasValidCells = true;</span>
+
+<span class="nc" id="L1543">            return true;</span>
+        }
+
+        private boolean addGenericRangeTombstone(LegacyRangeTombstone tombstone)
+        {
+            /*
+             * We can see a non-collection, non-row deletion in two scenarios:
+             *
+             * 1. Most commonly, the tombstone's start bound is bigger than current row's clustering, which means that
+             *    the current row is over, and we should move on to the next row or RT;
+             *
+             * 2. Less commonly, the tombstone's start bound is smaller than current row's clustering, which means that
+             *    we've crossed an index boundary and are seeing a non-closed RT from the previous block, repeated;
+             *    we should ignore it and stay in the current row.
+             *
+             *  In either case, clustering should be non-null, or we shouldn't have gotten to this method at all
+             *  However, to be absolutely SURE we're in case two above, we check here.
+             */
+<span class="nc bnc" id="L1561" title="All 4 branches missed.">            return clustering != null &amp;&amp; metadata.comparator.compare(clustering, tombstone.start.bound.clustering()) &gt; 0;</span>
+        }
+
+        public Row getRow()
+        {
+<span class="nc bnc" id="L1566" title="All 4 branches missed.">            if (!hasValidCells &amp;&amp; invalidLivenessInfo != null)</span>
+<span class="nc" id="L1567">                builder.addPrimaryKeyLivenessInfo(invalidLivenessInfo);</span>
+<span class="nc" id="L1568">            return builder.build();</span>
+        }
+    }
+
+    public static class LegacyUnfilteredPartition
+    {
+        public final DeletionTime partitionDeletion;
+        public final LegacyRangeTombstoneList rangeTombstones;
+        public final List&lt;LegacyCell&gt; cells;
+
+        private LegacyUnfilteredPartition(DeletionTime partitionDeletion, LegacyRangeTombstoneList rangeTombstones, List&lt;LegacyCell&gt; cells)
+<span class="nc" id="L1579">        {</span>
+<span class="nc" id="L1580">            this.partitionDeletion = partitionDeletion;</span>
+<span class="nc" id="L1581">            this.rangeTombstones = rangeTombstones;</span>
+<span class="nc" id="L1582">            this.cells = cells;</span>
+<span class="nc" id="L1583">        }</span>
+
+        public void digest(CFMetaData metadata, MessageDigest digest)
+        {
+<span class="nc bnc" id="L1587" title="All 2 branches missed.">            for (LegacyCell cell : cells)</span>
+            {
+<span class="nc" id="L1589">                digest.update(cell.name.encode(metadata).duplicate());</span>
+
+<span class="nc bnc" id="L1591" title="All 2 branches missed.">                if (cell.isCounter())</span>
+<span class="nc" id="L1592">                    CounterContext.instance().updateDigest(digest, cell.value);</span>
+                else
+<span class="nc" id="L1594">                    digest.update(cell.value.duplicate());</span>
+
+<span class="nc" id="L1596">                FBUtilities.updateWithLong(digest, cell.timestamp);</span>
+<span class="nc" id="L1597">                FBUtilities.updateWithByte(digest, cell.serializationFlags());</span>
+
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">                if (cell.isExpiring())</span>
+<span class="nc" id="L1600">                    FBUtilities.updateWithInt(digest, cell.ttl);</span>
+
+<span class="nc bnc" id="L1602" title="All 2 branches missed.">                if (cell.isCounter())</span>
+                {
+                    // Counters used to have the timestampOfLastDelete field, which we stopped using long ago and has been hard-coded
+                    // to Long.MIN_VALUE but was still taken into account in 2.2 counter digests (to maintain backward compatibility
+                    // in the first place).
+<span class="nc" id="L1607">                    FBUtilities.updateWithLong(digest, Long.MIN_VALUE);</span>
+                }
+<span class="nc" id="L1609">            }</span>
+
+<span class="nc bnc" id="L1611" title="All 2 branches missed.">            if (partitionDeletion.markedForDeleteAt() != Long.MIN_VALUE)</span>
+<span class="nc" id="L1612">                digest.update(ByteBufferUtil.bytes(partitionDeletion.markedForDeleteAt()));</span>
+
+<span class="nc bnc" id="L1614" title="All 2 branches missed.">            if (!rangeTombstones.isEmpty())</span>
+<span class="nc" id="L1615">                rangeTombstones.updateDigest(digest);</span>
+<span class="nc" id="L1616">        }</span>
+    }
+
+<span class="nc bnc" id="L1619" title="All 2 branches missed.">    public static class LegacyCellName</span>
+    {
+        public final Clustering clustering;
+        public final ColumnDefinition column;
+        public final ByteBuffer collectionElement;
+
+        private LegacyCellName(Clustering clustering, ColumnDefinition column, ByteBuffer collectionElement)
+<span class="nc" id="L1626">        {</span>
+<span class="nc" id="L1627">            this.clustering = clustering;</span>
+<span class="nc" id="L1628">            this.column = column;</span>
+<span class="nc" id="L1629">            this.collectionElement = collectionElement;</span>
+<span class="nc" id="L1630">        }</span>
+
+        public static LegacyCellName create(Clustering clustering, ColumnDefinition column)
+        {
+<span class="nc" id="L1634">            return new LegacyCellName(clustering, column, null);</span>
+        }
+
+        public ByteBuffer encode(CFMetaData metadata)
+        {
+<span class="nc bnc" id="L1639" title="All 2 branches missed.">            return encodeCellName(metadata, clustering, column == null ? ByteBufferUtil.EMPTY_BYTE_BUFFER : column.name.bytes, collectionElement);</span>
+        }
+
+        public ByteBuffer superColumnSubName()
+        {
+<span class="nc bnc" id="L1644" title="All 4 branches missed.">            assert collectionElement != null;</span>
+<span class="nc" id="L1645">            return collectionElement;</span>
+        }
+
+        public ByteBuffer superColumnName()
+        {
+<span class="nc" id="L1650">            return clustering.get(0);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1656">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">            for (int i = 0; i &lt; clustering.size(); i++)</span>
+<span class="nc bnc" id="L1658" title="All 4 branches missed.">                sb.append(i &gt; 0 ? &quot;:&quot; : &quot;&quot;).append(clustering.get(i) == null ? &quot;null&quot; : ByteBufferUtil.bytesToHex(clustering.get(i)));</span>
+<span class="nc bnc" id="L1659" title="All 4 branches missed.">            return String.format(&quot;Cellname(clustering=%s, column=%s, collElt=%s)&quot;, sb.toString(), column == null ? &quot;null&quot; : column.name, collectionElement == null ? &quot;null&quot; : ByteBufferUtil.bytesToHex(collectionElement));</span>
+        }
+    }
+
+<span class="nc bnc" id="L1663" title="All 2 branches missed.">    public static class LegacyBound</span>
+    {
+<span class="nc" id="L1665">        public static final LegacyBound BOTTOM = new LegacyBound(ClusteringBound.BOTTOM, false, null);</span>
+<span class="nc" id="L1666">        public static final LegacyBound TOP = new LegacyBound(ClusteringBound.TOP, false, null);</span>
+
+        public final ClusteringBound bound;
+        public final boolean isStatic;
+        public final ColumnDefinition collectionName;
+
+        public LegacyBound(ClusteringBound bound, boolean isStatic, ColumnDefinition collectionName)
+<span class="nc" id="L1673">        {</span>
+<span class="nc" id="L1674">            this.bound = bound;</span>
+<span class="nc" id="L1675">            this.isStatic = isStatic;</span>
+<span class="nc" id="L1676">            this.collectionName = collectionName;</span>
+<span class="nc" id="L1677">        }</span>
+
+        public Clustering getAsClustering(CFMetaData metadata)
+        {
+<span class="nc bnc" id="L1681" title="All 2 branches missed.">            if (isStatic)</span>
+<span class="nc" id="L1682">                return Clustering.STATIC_CLUSTERING;</span>
+
+<span class="nc bnc" id="L1684" title="All 4 branches missed.">            assert bound.size() == metadata.comparator.size();</span>
+<span class="nc" id="L1685">            ByteBuffer[] values = new ByteBuffer[bound.size()];</span>
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">            for (int i = 0; i &lt; bound.size(); i++)</span>
+<span class="nc" id="L1687">                values[i] = bound.get(i);</span>
+<span class="nc" id="L1688">            return Clustering.make(values);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1694">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1695">            sb.append(bound.kind()).append('(');</span>
+<span class="nc bnc" id="L1696" title="All 2 branches missed.">            for (int i = 0; i &lt; bound.size(); i++)</span>
+<span class="nc bnc" id="L1697" title="All 4 branches missed.">                sb.append(i &gt; 0 ? &quot;:&quot; : &quot;&quot;).append(bound.get(i) == null ? &quot;null&quot; : ByteBufferUtil.bytesToHex(bound.get(i)));</span>
+<span class="nc" id="L1698">            sb.append(')');</span>
+<span class="nc bnc" id="L1699" title="All 2 branches missed.">            return String.format(&quot;Bound(%s, collection=%s)&quot;, sb.toString(), collectionName == null ? &quot;null&quot; : collectionName.name);</span>
+        }
+    }
+
+    public interface LegacyAtom
+    {
+        public boolean isCell();
+
+        // note that for static atoms, LegacyCell and LegacyRangeTombstone behave differently here:
+        //  - LegacyCell returns the modern Clustering.STATIC_CLUSTERING
+        //  - LegacyRangeTombstone returns the 2.2 bound (i.e. N empty ByteBuffer, where N is number of clusterings)
+        // in LegacyDeletionInfo.add(), we split any LRT with a static bound out into the inRowRangeTombstones collection
+        // these are merged with regular row cells, in the CellGrouper, and their clustering is obtained via start.bound.getAsClustering
+        // (also, it should be impossibly to issue raw static row deletions anyway)
+        public ClusteringPrefix clustering();
+        public boolean isStatic();
+
+        public LegacyCell asCell();
+        public LegacyRangeTombstone asRangeTombstone();
+    }
+
+    /**
+     * A legacy cell.
+     * &lt;p&gt;
+     * This is used as a temporary object to facilitate dealing with the legacy format, this
+     * is not meant to be optimal.
+     */
+    public static class LegacyCell implements LegacyAtom
+    {
+        private final static int DELETION_MASK        = 0x01;
+        private final static int EXPIRATION_MASK      = 0x02;
+        private final static int COUNTER_MASK         = 0x04;
+        private final static int COUNTER_UPDATE_MASK  = 0x08;
+        private final static int RANGE_TOMBSTONE_MASK = 0x10;
+
+<span class="nc" id="L1734">        public enum Kind { REGULAR, EXPIRING, DELETED, COUNTER }</span>
+
+        public final Kind kind;
+
+        public final LegacyCellName name;
+        public final ByteBuffer value;
+
+        public final long timestamp;
+        public final int localDeletionTime;
+        public final int ttl;
+
+        private LegacyCell(Kind kind, LegacyCellName name, ByteBuffer value, long timestamp, int localDeletionTime, int ttl)
+<span class="nc" id="L1746">        {</span>
+<span class="nc" id="L1747">            this.kind = kind;</span>
+<span class="nc" id="L1748">            this.name = name;</span>
+<span class="nc" id="L1749">            this.value = value;</span>
+<span class="nc" id="L1750">            this.timestamp = timestamp;</span>
+<span class="nc" id="L1751">            this.localDeletionTime = localDeletionTime;</span>
+<span class="nc" id="L1752">            this.ttl = ttl;</span>
+<span class="nc" id="L1753">        }</span>
+
+        public static LegacyCell regular(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, ByteBuffer value, long timestamp)
+        throws UnknownColumnException
+        {
+<span class="nc" id="L1758">            return new LegacyCell(Kind.REGULAR, decodeCellName(metadata, superColumnName, name), value, timestamp, Cell.NO_DELETION_TIME, Cell.NO_TTL);</span>
+        }
+
+        public static LegacyCell expiring(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, ByteBuffer value, long timestamp, int ttl, int nowInSec)
+        throws UnknownColumnException
+        {
+            /*
+             * CASSANDRA-14092: Max expiration date capping is maybe performed here, expiration overflow policy application
+             * is done at {@link org.apache.cassandra.thrift.ThriftValidation#validateTtl(CFMetaData, Column)}
+             */
+<span class="nc" id="L1768">            return new LegacyCell(Kind.EXPIRING, decodeCellName(metadata, superColumnName, name), value, timestamp, ExpirationDateOverflowHandling.computeLocalExpirationTime(nowInSec, ttl), ttl);</span>
+        }
+
+        public static LegacyCell tombstone(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, long timestamp, int nowInSec)
+        throws UnknownColumnException
+        {
+<span class="nc" id="L1774">            return new LegacyCell(Kind.DELETED, decodeCellName(metadata, superColumnName, name), ByteBufferUtil.EMPTY_BYTE_BUFFER, timestamp, nowInSec, LivenessInfo.NO_TTL);</span>
+        }
+
+        public static LegacyCell counterUpdate(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, long value)
+        throws UnknownColumnException
+        {
+            // See UpdateParameters.addCounter() for more details on this
+<span class="nc" id="L1781">            ByteBuffer counterValue = CounterContext.instance().createUpdate(value);</span>
+<span class="nc" id="L1782">            return counter(decodeCellName(metadata, superColumnName, name), counterValue);</span>
+        }
+
+        public static LegacyCell counter(LegacyCellName name, ByteBuffer value)
+        {
+<span class="nc" id="L1787">            return new LegacyCell(Kind.COUNTER, name, value, FBUtilities.timestampMicros(), Cell.NO_DELETION_TIME, Cell.NO_TTL);</span>
+        }
+
+        public byte serializationFlags()
+        {
+<span class="nc bnc" id="L1792" title="All 2 branches missed.">            if (isExpiring())</span>
+<span class="nc" id="L1793">                return EXPIRATION_MASK;</span>
+<span class="nc bnc" id="L1794" title="All 2 branches missed.">            if (isTombstone())</span>
+<span class="nc" id="L1795">                return DELETION_MASK;</span>
+<span class="nc bnc" id="L1796" title="All 2 branches missed.">            if (isCounterUpdate())</span>
+<span class="nc" id="L1797">                return COUNTER_UPDATE_MASK;</span>
+<span class="nc bnc" id="L1798" title="All 2 branches missed.">            if (isCounter())</span>
+<span class="nc" id="L1799">                return COUNTER_MASK;</span>
+<span class="nc" id="L1800">            return 0;</span>
+        }
+
+        public boolean isCounterUpdate()
+        {
+            // See UpdateParameters.addCounter() for more details on this
+<span class="nc bnc" id="L1806" title="All 4 branches missed.">            return isCounter() &amp;&amp; CounterContext.instance().isUpdate(value);</span>
+        }
+
+        public ClusteringPrefix clustering()
+        {
+<span class="nc" id="L1811">            return name.clustering;</span>
+        }
+
+        public boolean isStatic()
+        {
+<span class="nc bnc" id="L1816" title="All 2 branches missed.">            return name.clustering == Clustering.STATIC_CLUSTERING;</span>
+        }
+
+        public boolean isCell()
+        {
+<span class="nc" id="L1821">            return true;</span>
+        }
+
+        public LegacyCell asCell()
+        {
+<span class="nc" id="L1826">            return this;</span>
+        }
+
+        public LegacyRangeTombstone asRangeTombstone()
+        {
+<span class="nc" id="L1831">            throw new UnsupportedOperationException();</span>
+        }
+
+        public boolean isCounter()
+        {
+<span class="nc bnc" id="L1836" title="All 2 branches missed.">            return kind == Kind.COUNTER;</span>
+        }
+
+        public boolean isExpiring()
+        {
+<span class="nc bnc" id="L1841" title="All 2 branches missed.">            return kind == Kind.EXPIRING;</span>
+        }
+
+        public boolean isTombstone()
+        {
+<span class="nc bnc" id="L1846" title="All 2 branches missed.">            return kind == Kind.DELETED;</span>
+        }
+
+        public boolean isLive(int nowInSec)
+        {
+<span class="nc bnc" id="L1851" title="All 2 branches missed.">            if (isTombstone())</span>
+<span class="nc" id="L1852">                return false;</span>
+
+<span class="nc bnc" id="L1854" title="All 4 branches missed.">            return !isExpiring() || nowInSec &lt; localDeletionTime;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1860">            return String.format(&quot;LegacyCell(%s, name=%s, v=%s, ts=%s, ldt=%s, ttl=%s)&quot;, kind, name, ByteBufferUtil.bytesToHex(value), timestamp, localDeletionTime, ttl);</span>
+        }
+    }
+
+    /**
+     * A legacy range tombstone.
+     * &lt;p&gt;
+     * This is used as a temporary object to facilitate dealing with the legacy format, this
+     * is not meant to be optimal.
+     */
+    public static class LegacyRangeTombstone implements LegacyAtom
+    {
+        public final LegacyBound start;
+        public final LegacyBound stop;
+        public final DeletionTime deletionTime;
+
+        public LegacyRangeTombstone(LegacyBound start, LegacyBound stop, DeletionTime deletionTime)
+<span class="nc" id="L1877">        {</span>
+            // Because of the way RangeTombstoneList work, we can have a tombstone where only one of
+            // the bound has a collectionName. That happens if we have a big tombstone A (spanning one
+            // or multiple rows) and a collection tombstone B. In that case, RangeTombstoneList will
+            // split this into 3 RTs: the first one from the beginning of A to the beginning of B,
+            // then B, then a third one from the end of B to the end of A. To make this simpler, if
+            // we detect that case we transform the 1st and 3rd tombstone so they don't end in the middle
+            // of a row (which is still correct).
+<span class="nc bnc" id="L1885" title="All 6 branches missed.">            if ((start.collectionName == null) != (stop.collectionName == null))</span>
+            {
+<span class="nc bnc" id="L1887" title="All 2 branches missed.">                if (start.collectionName == null)</span>
+<span class="nc" id="L1888">                    stop = new LegacyBound(stop.bound, stop.isStatic, null);</span>
+                else
+<span class="nc" id="L1890">                    start = new LegacyBound(start.bound, start.isStatic, null);</span>
+            }
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">            else if (!Objects.equals(start.collectionName, stop.collectionName))</span>
+            {
+                // We're in the similar but slightly more complex case where on top of the big tombstone
+                // A, we have 2 (or more) collection tombstones B and C within A. So we also end up with
+                // a tombstone that goes between the end of B and the start of C.
+<span class="nc" id="L1897">                start = new LegacyBound(start.bound, start.isStatic, null);</span>
+<span class="nc" id="L1898">                stop = new LegacyBound(stop.bound, stop.isStatic, null);</span>
+            }
+
+<span class="nc" id="L1901">            this.start = start;</span>
+<span class="nc" id="L1902">            this.stop = stop;</span>
+<span class="nc" id="L1903">            this.deletionTime = deletionTime;</span>
+<span class="nc" id="L1904">        }</span>
+
+        /** @see LegacyAtom#clustering for static inconsistencies explained */
+        public ClusteringPrefix clustering()
+        {
+<span class="nc" id="L1909">            return start.bound;</span>
+        }
+
+        public LegacyRangeTombstone withNewStart(LegacyBound newStart)
+        {
+<span class="nc" id="L1914">            return new LegacyRangeTombstone(newStart, stop, deletionTime);</span>
+        }
+
+        public LegacyRangeTombstone withNewEnd(LegacyBound newStop)
+        {
+<span class="nc" id="L1919">            return new LegacyRangeTombstone(start, newStop, deletionTime);</span>
+        }
+
+        public boolean isCell()
+        {
+<span class="nc" id="L1924">            return false;</span>
+        }
+
+        public boolean isStatic()
+        {
+<span class="nc bnc" id="L1929" title="All 4 branches missed.">            return start.isStatic || stop.isStatic;</span>
+        }
+
+        public LegacyCell asCell()
+        {
+<span class="nc" id="L1934">            throw new UnsupportedOperationException();</span>
+        }
+
+        public LegacyRangeTombstone asRangeTombstone()
+        {
+<span class="nc" id="L1939">            return this;</span>
+        }
+
+        public boolean isCollectionTombstone()
+        {
+<span class="nc bnc" id="L1944" title="All 2 branches missed.">            return start.collectionName != null;</span>
+        }
+
+        public boolean isRowDeletion(CFMetaData metadata)
+        {
+<span class="nc bnc" id="L1949" title="All 4 branches missed.">            if (start.collectionName != null</span>
+                || stop.collectionName != null
+<span class="nc bnc" id="L1951" title="All 2 branches missed.">                || start.bound.size() != metadata.comparator.size()</span>
+<span class="nc bnc" id="L1952" title="All 2 branches missed.">                || stop.bound.size() != metadata.comparator.size())</span>
+<span class="nc" id="L1953">                return false;</span>
+
+<span class="nc bnc" id="L1955" title="All 2 branches missed.">            for (int i = 0; i &lt; start.bound.size(); i++)</span>
+<span class="nc bnc" id="L1956" title="All 2 branches missed.">                if (!Objects.equals(start.bound.get(i), stop.bound.get(i)))</span>
+<span class="nc" id="L1957">                    return false;</span>
+<span class="nc" id="L1958">            return true;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1964">            return String.format(&quot;RT(%s-%s, %s)&quot;, start, stop, deletionTime);</span>
+        }
+    }
+
+    public static class LegacyDeletionInfo
+    {
+        public final MutableDeletionInfo deletionInfo;
+<span class="nc" id="L1971">        public final List&lt;LegacyRangeTombstone&gt; inRowTombstones = new ArrayList&lt;&gt;();</span>
+
+        private LegacyDeletionInfo(MutableDeletionInfo deletionInfo)
+<span class="nc" id="L1974">        {</span>
+<span class="nc" id="L1975">            this.deletionInfo = deletionInfo;</span>
+<span class="nc" id="L1976">        }</span>
+
+        public static LegacyDeletionInfo live()
+        {
+<span class="nc" id="L1980">            return new LegacyDeletionInfo(MutableDeletionInfo.live());</span>
+        }
+
+        public void add(DeletionTime topLevel)
+        {
+<span class="nc" id="L1985">            deletionInfo.add(topLevel);</span>
+<span class="nc" id="L1986">        }</span>
+
+        private static ClusteringBound staticBound(CFMetaData metadata, boolean isStart)
+        {
+            // In pre-3.0 nodes, static row started by a clustering with all empty values so we
+            // preserve that here. Note that in practice, it doesn't really matter since the rest
+            // of the code will ignore the bound for RT that have their static flag set.
+<span class="nc" id="L1993">            ByteBuffer[] values = new ByteBuffer[metadata.comparator.size()];</span>
+<span class="nc bnc" id="L1994" title="All 2 branches missed.">            for (int i = 0; i &lt; values.length; i++)</span>
+<span class="nc" id="L1995">                values[i] = ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+<span class="nc bnc" id="L1996" title="All 2 branches missed.">            return isStart</span>
+<span class="nc" id="L1997">                 ? ClusteringBound.inclusiveStartOf(values)</span>
+<span class="nc" id="L1998">                 : ClusteringBound.inclusiveEndOf(values);</span>
+        }
+
+        public void add(CFMetaData metadata, LegacyRangeTombstone tombstone)
+        {
+<span class="nc bnc" id="L2003" title="All 2 branches missed.">            if (metadata.hasStaticColumns())</span>
+            {
+                /*
+                 * For table having static columns we have to deal with the following cases:
+                 *  1. the end of the tombstone is static (in which case either the start is static or is BOTTOM, which is the same
+                 *     for our consideration). This mean that either the range only delete the static row, or that it's a collection
+                 *     tombstone of a static collection. In both case, we just add the tombstone to the inRowTombstones.
+                 *  2. only the start is static. There is then 2 subcase: either the start is inclusive, and that mean we include the
+                 *     static row and more (so we add an inRowTombstone for the static and deal with the rest normally). Or the start
+                 *     is exclusive, and that means we explicitely exclude the static (in which case we can just add the tombstone
+                 *     as if it started at BOTTOM).
+                 *  3. none of the bound are static but the start is BOTTOM. This means we intended to delete the static row so we
+                 *     need to add it to the inRowTombstones (and otherwise handle the range normally).
+                 */
+<span class="nc bnc" id="L2017" title="All 2 branches missed.">                if (tombstone.stop.isStatic)</span>
+                {
+                    // If the start is BOTTOM, we replace it by the beginning of the starting row so as to not confuse the
+                    // RangeTombstone.isRowDeletion() method
+<span class="nc bnc" id="L2021" title="All 2 branches missed.">                    if (tombstone.start == LegacyBound.BOTTOM)</span>
+<span class="nc" id="L2022">                        tombstone = tombstone.withNewStart(new LegacyBound(staticBound(metadata, true), true, null));</span>
+<span class="nc" id="L2023">                    inRowTombstones.add(tombstone);</span>
+<span class="nc" id="L2024">                    return;</span>
+                }
+
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">                if (tombstone.start.isStatic)</span>
+                {
+<span class="nc bnc" id="L2029" title="All 2 branches missed.">                    if (tombstone.start.bound.isInclusive())</span>
+<span class="nc" id="L2030">                        inRowTombstones.add(tombstone.withNewEnd(new LegacyBound(staticBound(metadata, false), true, null)));</span>
+
+<span class="nc" id="L2032">                    tombstone = tombstone.withNewStart(LegacyBound.BOTTOM);</span>
+                }
+<span class="nc bnc" id="L2034" title="All 2 branches missed.">                else if (tombstone.start == LegacyBound.BOTTOM)</span>
+                {
+<span class="nc" id="L2036">                    inRowTombstones.add(new LegacyRangeTombstone(new LegacyBound(staticBound(metadata, true), true, null),</span>
+<span class="nc" id="L2037">                                                                 new LegacyBound(staticBound(metadata, false), true, null),</span>
+                                                                 tombstone.deletionTime));
+                }
+            }
+
+<span class="nc bnc" id="L2042" title="All 4 branches missed.">            if (tombstone.isCollectionTombstone() || tombstone.isRowDeletion(metadata))</span>
+<span class="nc" id="L2043">                inRowTombstones.add(tombstone);</span>
+            else
+<span class="nc" id="L2045">                add(metadata, new RangeTombstone(Slice.make(tombstone.start.bound, tombstone.stop.bound), tombstone.deletionTime));</span>
+<span class="nc" id="L2046">        }</span>
+
+        public void add(CFMetaData metadata, RangeTombstone tombstone)
+        {
+<span class="nc" id="L2050">            deletionInfo.add(tombstone, metadata.comparator);</span>
+<span class="nc" id="L2051">        }</span>
+
+        public Iterator&lt;LegacyRangeTombstone&gt; inRowRangeTombstones()
+        {
+<span class="nc" id="L2055">            return inRowTombstones.iterator();</span>
+        }
+
+        public static LegacyDeletionInfo deserialize(CFMetaData metadata, DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L2060">            DeletionTime topLevel = DeletionTime.serializer.deserialize(in);</span>
+
+<span class="nc" id="L2062">            int rangeCount = in.readInt();</span>
+<span class="nc bnc" id="L2063" title="All 2 branches missed.">            if (rangeCount == 0)</span>
+<span class="nc" id="L2064">                return new LegacyDeletionInfo(new MutableDeletionInfo(topLevel));</span>
+
+<span class="nc" id="L2066">            LegacyDeletionInfo delInfo = new LegacyDeletionInfo(new MutableDeletionInfo(topLevel));</span>
+<span class="nc bnc" id="L2067" title="All 2 branches missed.">            for (int i = 0; i &lt; rangeCount; i++)</span>
+            {
+<span class="nc" id="L2069">                LegacyBound start = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), true);</span>
+<span class="nc" id="L2070">                LegacyBound end = decodeTombstoneBound(metadata, ByteBufferUtil.readWithShortLength(in), false);</span>
+<span class="nc" id="L2071">                int delTime =  in.readInt();</span>
+<span class="nc" id="L2072">                long markedAt = in.readLong();</span>
+
+<span class="nc" id="L2074">                delInfo.add(metadata, new LegacyRangeTombstone(start, end, new DeletionTime(markedAt, delTime)));</span>
+            }
+<span class="nc" id="L2076">            return delInfo;</span>
+        }
+    }
+
+    /**
+     * A helper class for LegacyRangeTombstoneList.  This replaces the Comparator&lt;Composite&gt; that RTL used before 3.0.
+     */
+    private static class LegacyBoundComparator implements Comparator&lt;LegacyBound&gt;
+    {
+        ClusteringComparator clusteringComparator;
+
+        public LegacyBoundComparator(ClusteringComparator clusteringComparator)
+<span class="nc" id="L2088">        {</span>
+<span class="nc" id="L2089">            this.clusteringComparator = clusteringComparator;</span>
+<span class="nc" id="L2090">        }</span>
+
+        public int compare(LegacyBound a, LegacyBound b)
+        {
+            // In the legacy sorting, BOTTOM comes before anything else
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">            if (a == LegacyBound.BOTTOM)</span>
+<span class="nc bnc" id="L2096" title="All 2 branches missed.">                return b == LegacyBound.BOTTOM ? 0 : -1;</span>
+<span class="nc bnc" id="L2097" title="All 2 branches missed.">            if (b == LegacyBound.BOTTOM)</span>
+<span class="nc" id="L2098">                return 1;</span>
+
+            // Excluding BOTTOM, statics are always before anything else.
+<span class="nc bnc" id="L2101" title="All 2 branches missed.">            if (a.isStatic != b.isStatic)</span>
+<span class="nc bnc" id="L2102" title="All 2 branches missed.">                return a.isStatic ? -1 : 1;</span>
+
+            // We have to be careful with bound comparison because of collections. Namely, if the 2 bounds represent the
+            // same prefix, then we should take the collectionName into account before taking the bounds kind
+            // (ClusteringPrefix.Kind). This means we can't really call ClusteringComparator.compare() directly.
+            // For instance, if
+            //    a is (bound=INCL_START_BOUND('x'), collectionName='d')
+            //    b is (bound=INCL_END_BOUND('x'),   collectionName='c')
+            // Ten b &lt; a since the element 'c' of collection 'x' comes before element 'd', but calling
+            // clusteringComparator.compare(a.bound, b.bound) returns -1.
+            // See CASSANDRA-13125 for details.
+<span class="nc" id="L2113">            int sa = a.bound.size();</span>
+<span class="nc" id="L2114">            int sb = b.bound.size();</span>
+<span class="nc bnc" id="L2115" title="All 2 branches missed.">            for (int i = 0; i &lt; Math.min(sa, sb); i++)</span>
+            {
+<span class="nc" id="L2117">                int cmp = clusteringComparator.compareComponent(i, a.bound.get(i), b.bound.get(i));</span>
+<span class="nc bnc" id="L2118" title="All 2 branches missed.">                if (cmp != 0)</span>
+<span class="nc" id="L2119">                    return cmp;</span>
+            }
+
+<span class="nc bnc" id="L2122" title="All 2 branches missed.">            if (sa != sb)</span>
+<span class="nc bnc" id="L2123" title="All 2 branches missed.">                return sa &lt; sb ? a.bound.kind().comparedToClustering : -b.bound.kind().comparedToClustering;</span>
+
+            // Both bound represent the same prefix, compare the collection names
+            // If one has a collection name and the other doesn't, the other comes before as it points to the beginning of the row.
+<span class="nc bnc" id="L2127" title="All 6 branches missed.">            if ((a.collectionName == null) != (b.collectionName == null))</span>
+<span class="nc bnc" id="L2128" title="All 2 branches missed.">                return a.collectionName == null ? -1 : 1;</span>
+
+            // If they both have a collection, compare that first
+<span class="nc bnc" id="L2131" title="All 2 branches missed.">            if (a.collectionName != null)</span>
+            {
+<span class="nc" id="L2133">                int cmp = UTF8Type.instance.compare(a.collectionName.name.bytes, b.collectionName.name.bytes);</span>
+<span class="nc bnc" id="L2134" title="All 2 branches missed.">                if (cmp != 0)</span>
+<span class="nc" id="L2135">                    return cmp;</span>
+            }
+
+            // Lastly, if everything so far is equal, compare their clustering kind
+<span class="nc" id="L2139">            return ClusteringPrefix.Kind.compare(a.bound.kind(), b.bound.kind());</span>
+        }
+    }
+
+    /**
+     * Almost an entire copy of RangeTombstoneList from C* 2.1.  The main difference is that LegacyBoundComparator
+     * is used in place of {@code Comparator&lt;Composite&gt;} (because Composite doesn't exist any more).
+     *
+     * This class is needed to allow us to convert single-row deletions and complex deletions into range tombstones
+     * and properly merge them into the normal set of range tombstones.
+     */
+<span class="nc bnc" id="L2150" title="All 2 branches missed.">    public static class LegacyRangeTombstoneList</span>
+    {
+        private final LegacyBoundComparator comparator;
+
+        // Note: we don't want to use a List for the markedAts and delTimes to avoid boxing. We could
+        // use a List for starts and ends, but having arrays everywhere is almost simpler.
+        LegacyBound[] starts;
+        LegacyBound[] ends;
+        private long[] markedAts;
+        private int[] delTimes;
+
+        private int size;
+
+        private LegacyRangeTombstoneList(LegacyBoundComparator comparator, LegacyBound[] starts, LegacyBound[] ends, long[] markedAts, int[] delTimes, int size)
+<span class="nc" id="L2164">        {</span>
+<span class="nc bnc" id="L2165" title="All 8 branches missed.">            assert starts.length == ends.length &amp;&amp; starts.length == markedAts.length &amp;&amp; starts.length == delTimes.length;</span>
+<span class="nc" id="L2166">            this.comparator = comparator;</span>
+<span class="nc" id="L2167">            this.starts = starts;</span>
+<span class="nc" id="L2168">            this.ends = ends;</span>
+<span class="nc" id="L2169">            this.markedAts = markedAts;</span>
+<span class="nc" id="L2170">            this.delTimes = delTimes;</span>
+<span class="nc" id="L2171">            this.size = size;</span>
+<span class="nc" id="L2172">        }</span>
+
+        public LegacyRangeTombstoneList(LegacyBoundComparator comparator, int capacity)
+        {
+<span class="nc" id="L2176">            this(comparator, new LegacyBound[capacity], new LegacyBound[capacity], new long[capacity], new int[capacity], 0);</span>
+<span class="nc" id="L2177">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L2182">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L2183">            sb.append('[');</span>
+<span class="nc bnc" id="L2184" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc bnc" id="L2186" title="All 2 branches missed.">                if (i &gt; 0)</span>
+<span class="nc" id="L2187">                    sb.append(',');</span>
+<span class="nc" id="L2188">                sb.append('(').append(starts[i]).append(&quot;, &quot;).append(ends[i]).append(')');</span>
+            }
+<span class="nc" id="L2190">            return sb.append(']').toString();</span>
+        }
+
+        public boolean isEmpty()
+        {
+<span class="nc bnc" id="L2195" title="All 2 branches missed.">            return size == 0;</span>
+        }
+
+        public int size()
+        {
+<span class="nc" id="L2200">            return size;</span>
+        }
+
+        /**
+         * Adds a new range tombstone.
+         *
+         * This method will be faster if the new tombstone sort after all the currently existing ones (this is a common use case),
+         * but it doesn't assume it.
+         */
+        public void add(LegacyBound start, LegacyBound end, long markedAt, int delTime)
+        {
+<span class="nc bnc" id="L2211" title="All 2 branches missed.">            if (isEmpty())</span>
+            {
+<span class="nc" id="L2213">                addInternal(0, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2214">                return;</span>
+            }
+
+<span class="nc" id="L2217">            int c = comparator.compare(ends[size-1], start);</span>
+
+            // Fast path if we add in sorted order
+<span class="nc bnc" id="L2220" title="All 2 branches missed.">            if (c &lt;= 0)</span>
+            {
+<span class="nc" id="L2222">                addInternal(size, start, end, markedAt, delTime);</span>
+            }
+            else
+            {
+                // Note: insertFrom expect i to be the insertion point in term of interval ends
+<span class="nc" id="L2227">                int pos = Arrays.binarySearch(ends, 0, size, start, comparator);</span>
+<span class="nc bnc" id="L2228" title="All 2 branches missed.">                insertFrom((pos &gt;= 0 ? pos : -pos-1), start, end, markedAt, delTime);</span>
+            }
+<span class="nc" id="L2230">        }</span>
+
+        /*
+         * Inserts a new element starting at index i. This method assumes that:
+         *    ends[i-1] &lt;= start &lt;= ends[i]
+         *
+         * A RangeTombstoneList is a list of range [s_0, e_0]...[s_n, e_n] such that:
+         *   - s_i &lt;= e_i
+         *   - e_i &lt;= s_i+1
+         *   - if s_i == e_i and e_i == s_i+1 then s_i+1 &lt; e_i+1
+         * Basically, range are non overlapping except for their bound and in order. And while
+         * we allow ranges with the same value for the start and end, we don't allow repeating
+         * such range (so we can't have [0, 0][0, 0] even though it would respect the first 2
+         * conditions).
+         *
+         */
+
+        /**
+         * Adds all the range tombstones of {@code tombstones} to this RangeTombstoneList.
+         */
+        public void addAll(LegacyRangeTombstoneList tombstones)
+        {
+<span class="nc bnc" id="L2252" title="All 2 branches missed.">            if (tombstones.isEmpty())</span>
+<span class="nc" id="L2253">                return;</span>
+
+<span class="nc bnc" id="L2255" title="All 2 branches missed.">            if (isEmpty())</span>
+            {
+<span class="nc" id="L2257">                copyArrays(tombstones, this);</span>
+<span class="nc" id="L2258">                return;</span>
+            }
+
+            /*
+             * We basically have 2 techniques we can use here: either we repeatedly call add() on tombstones values,
+             * or we do a merge of both (sorted) lists. If this lists is bigger enough than the one we add, then
+             * calling add() will be faster, otherwise it's merging that will be faster.
+             *
+             * Let's note that during memtables updates, it might not be uncommon that a new update has only a few range
+             * tombstones, while the CF we're adding it to (the one in the memtable) has many. In that case, using add() is
+             * likely going to be faster.
+             *
+             * In other cases however, like when diffing responses from multiple nodes, the tombstone lists we &quot;merge&quot; will
+             * be likely sized, so using add() might be a bit inefficient.
+             *
+             * Roughly speaking (this ignore the fact that updating an element is not exactly constant but that's not a big
+             * deal), if n is the size of this list and m is tombstones size, merging is O(n+m) while using add() is O(m*log(n)).
+             *
+             * But let's not crank up a logarithm computation for that. Long story short, merging will be a bad choice only
+             * if this list size is lot bigger that the other one, so let's keep it simple.
+             */
+<span class="nc bnc" id="L2279" title="All 2 branches missed.">            if (size &gt; 10 * tombstones.size)</span>
+            {
+<span class="nc bnc" id="L2281" title="All 2 branches missed.">                for (int i = 0; i &lt; tombstones.size; i++)</span>
+<span class="nc" id="L2282">                    add(tombstones.starts[i], tombstones.ends[i], tombstones.markedAts[i], tombstones.delTimes[i]);</span>
+            }
+            else
+            {
+<span class="nc" id="L2286">                int i = 0;</span>
+<span class="nc" id="L2287">                int j = 0;</span>
+<span class="nc bnc" id="L2288" title="All 4 branches missed.">                while (i &lt; size &amp;&amp; j &lt; tombstones.size)</span>
+                {
+<span class="nc bnc" id="L2290" title="All 2 branches missed.">                    if (comparator.compare(tombstones.starts[j], ends[i]) &lt;= 0)</span>
+                    {
+<span class="nc" id="L2292">                        insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);</span>
+<span class="nc" id="L2293">                        j++;</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L2297">                        i++;</span>
+                    }
+                }
+                // Addds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
+<span class="nc bnc" id="L2301" title="All 2 branches missed.">                for (; j &lt; tombstones.size; j++)</span>
+<span class="nc" id="L2302">                    addInternal(size, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);</span>
+            }
+<span class="nc" id="L2304">        }</span>
+
+        private static void copyArrays(LegacyRangeTombstoneList src, LegacyRangeTombstoneList dst)
+        {
+<span class="nc" id="L2308">            dst.grow(src.size);</span>
+<span class="nc" id="L2309">            System.arraycopy(src.starts, 0, dst.starts, 0, src.size);</span>
+<span class="nc" id="L2310">            System.arraycopy(src.ends, 0, dst.ends, 0, src.size);</span>
+<span class="nc" id="L2311">            System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);</span>
+<span class="nc" id="L2312">            System.arraycopy(src.delTimes, 0, dst.delTimes, 0, src.size);</span>
+<span class="nc" id="L2313">            dst.size = src.size;</span>
+<span class="nc" id="L2314">        }</span>
+
+        private void insertFrom(int i, LegacyBound start, LegacyBound end, long markedAt, int delTime)
+        {
+<span class="nc bnc" id="L2318" title="All 2 branches missed.">            while (i &lt; size)</span>
+            {
+<span class="nc bnc" id="L2320" title="All 6 branches missed.">                assert i == 0 || comparator.compare(ends[i-1], start) &lt;= 0;</span>
+
+<span class="nc" id="L2322">                int c = comparator.compare(start, ends[i]);</span>
+<span class="nc bnc" id="L2323" title="All 4 branches missed.">                assert c &lt;= 0;</span>
+<span class="nc bnc" id="L2324" title="All 2 branches missed.">                if (c == 0)</span>
+                {
+                    // If start == ends[i], then we can insert from the next one (basically the new element
+                    // really start at the next element), except for the case where starts[i] == ends[i].
+                    // In this latter case, if we were to move to next element, we could end up with ...[x, x][x, x]...
+<span class="nc bnc" id="L2329" title="All 2 branches missed.">                    if (comparator.compare(starts[i], ends[i]) == 0)</span>
+                    {
+                        // The current element cover a single value which is equal to the start of the inserted
+                        // element. If the inserted element overwrites the current one, just remove the current
+                        // (it's included in what we insert) and proceed with the insert.
+<span class="nc bnc" id="L2334" title="All 2 branches missed.">                        if (markedAt &gt; markedAts[i])</span>
+                        {
+<span class="nc" id="L2336">                            removeInternal(i);</span>
+<span class="nc" id="L2337">                            continue;</span>
+                        }
+
+                        // Otherwise (the current singleton interval override the new one), we want to leave the
+                        // current element and move to the next, unless start == end since that means the new element
+                        // is in fact fully covered by the current one (so we're done)
+<span class="nc bnc" id="L2343" title="All 2 branches missed.">                        if (comparator.compare(start, end) == 0)</span>
+<span class="nc" id="L2344">                            return;</span>
+                    }
+<span class="nc" id="L2346">                    i++;</span>
+<span class="nc" id="L2347">                    continue;</span>
+                }
+
+                // Do we overwrite the current element?
+<span class="nc bnc" id="L2351" title="All 2 branches missed.">                if (markedAt &gt; markedAts[i])</span>
+                {
+                    // We do overwrite.
+
+                    // First deal with what might come before the newly added one.
+<span class="nc bnc" id="L2356" title="All 2 branches missed.">                    if (comparator.compare(starts[i], start) &lt; 0)</span>
+                    {
+<span class="nc" id="L2358">                        addInternal(i, starts[i], start, markedAts[i], delTimes[i]);</span>
+<span class="nc" id="L2359">                        i++;</span>
+                        // We don't need to do the following line, but in spirit that's what we want to do
+                        // setInternal(i, start, ends[i], markedAts, delTime])
+                    }
+
+                    // now, start &lt;= starts[i]
+
+                    // Does the new element stops before/at the current one,
+<span class="nc" id="L2367">                    int endCmp = comparator.compare(end, starts[i]);</span>
+<span class="nc bnc" id="L2368" title="All 2 branches missed.">                    if (endCmp &lt;= 0)</span>
+                    {
+                        // Here start &lt;= starts[i] and end &lt;= starts[i]
+                        // This means the current element is before the current one. However, one special
+                        // case is if end == starts[i] and starts[i] == ends[i]. In that case,
+                        // the new element entirely overwrite the current one and we can just overwrite
+<span class="nc bnc" id="L2374" title="All 4 branches missed.">                        if (endCmp == 0 &amp;&amp; comparator.compare(starts[i], ends[i]) == 0)</span>
+<span class="nc" id="L2375">                            setInternal(i, start, end, markedAt, delTime);</span>
+                        else
+<span class="nc" id="L2377">                            addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2378">                        return;</span>
+                    }
+
+                    // Do we overwrite the current element fully?
+<span class="nc" id="L2382">                    int cmp = comparator.compare(ends[i], end);</span>
+<span class="nc bnc" id="L2383" title="All 2 branches missed.">                    if (cmp &lt;= 0)</span>
+                    {
+                        // We do overwrite fully:
+                        // update the current element until it's end and continue
+                        // on with the next element (with the new inserted start == current end).
+
+                        // If we're on the last element, we can optimize
+<span class="nc bnc" id="L2390" title="All 2 branches missed.">                        if (i == size-1)</span>
+                        {
+<span class="nc" id="L2392">                            setInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2393">                            return;</span>
+                        }
+
+<span class="nc" id="L2396">                        setInternal(i, start, ends[i], markedAt, delTime);</span>
+<span class="nc bnc" id="L2397" title="All 2 branches missed.">                        if (cmp == 0)</span>
+<span class="nc" id="L2398">                            return;</span>
+
+<span class="nc" id="L2400">                        start = ends[i];</span>
+<span class="nc" id="L2401">                        i++;</span>
+                    }
+                    else
+                    {
+                        // We don't ovewrite fully. Insert the new interval, and then update the now next
+                        // one to reflect the not overwritten parts. We're then done.
+<span class="nc" id="L2407">                        addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2408">                        i++;</span>
+<span class="nc" id="L2409">                        setInternal(i, end, ends[i], markedAts[i], delTimes[i]);</span>
+<span class="nc" id="L2410">                        return;</span>
+                    }
+<span class="nc" id="L2412">                }</span>
+                else
+                {
+                    // we don't overwrite the current element
+
+                    // If the new interval starts before the current one, insert that new interval
+<span class="nc bnc" id="L2418" title="All 2 branches missed.">                    if (comparator.compare(start, starts[i]) &lt; 0)</span>
+                    {
+                        // If we stop before the start of the current element, just insert the new
+                        // interval and we're done; otherwise insert until the beginning of the
+                        // current element
+<span class="nc bnc" id="L2423" title="All 2 branches missed.">                        if (comparator.compare(end, starts[i]) &lt;= 0)</span>
+                        {
+<span class="nc" id="L2425">                            addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2426">                            return;</span>
+                        }
+<span class="nc" id="L2428">                        addInternal(i, start, starts[i], markedAt, delTime);</span>
+<span class="nc" id="L2429">                        i++;</span>
+                    }
+
+                    // After that, we're overwritten on the current element but might have
+                    // some residual parts after ...
+
+                    // ... unless we don't extend beyond it.
+<span class="nc bnc" id="L2436" title="All 2 branches missed.">                    if (comparator.compare(end, ends[i]) &lt;= 0)</span>
+<span class="nc" id="L2437">                        return;</span>
+
+<span class="nc" id="L2439">                    start = ends[i];</span>
+<span class="nc" id="L2440">                    i++;</span>
+                }
+<span class="nc" id="L2442">            }</span>
+
+            // If we got there, then just insert the remainder at the end
+<span class="nc" id="L2445">            addInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2446">        }</span>
+
+        private int capacity()
+        {
+<span class="nc" id="L2450">            return starts.length;</span>
+        }
+
+        private void addInternal(int i, LegacyBound start, LegacyBound end, long markedAt, int delTime)
+        {
+<span class="nc bnc" id="L2455" title="All 4 branches missed.">            assert i &gt;= 0;</span>
+
+<span class="nc bnc" id="L2457" title="All 2 branches missed.">            if (size == capacity())</span>
+<span class="nc" id="L2458">                growToFree(i);</span>
+<span class="nc bnc" id="L2459" title="All 2 branches missed.">            else if (i &lt; size)</span>
+<span class="nc" id="L2460">                moveElements(i);</span>
+
+<span class="nc" id="L2462">            setInternal(i, start, end, markedAt, delTime);</span>
+<span class="nc" id="L2463">            size++;</span>
+<span class="nc" id="L2464">        }</span>
+
+        private void removeInternal(int i)
+        {
+<span class="nc bnc" id="L2468" title="All 4 branches missed.">            assert i &gt;= 0;</span>
+
+<span class="nc" id="L2470">            System.arraycopy(starts, i+1, starts, i, size - i - 1);</span>
+<span class="nc" id="L2471">            System.arraycopy(ends, i+1, ends, i, size - i - 1);</span>
+<span class="nc" id="L2472">            System.arraycopy(markedAts, i+1, markedAts, i, size - i - 1);</span>
+<span class="nc" id="L2473">            System.arraycopy(delTimes, i+1, delTimes, i, size - i - 1);</span>
+
+<span class="nc" id="L2475">            --size;</span>
+<span class="nc" id="L2476">            starts[size] = null;</span>
+<span class="nc" id="L2477">            ends[size] = null;</span>
+<span class="nc" id="L2478">        }</span>
+
+        /*
+         * Grow the arrays, leaving index i &quot;free&quot; in the process.
+         */
+        private void growToFree(int i)
+        {
+<span class="nc" id="L2485">            int newLength = (capacity() * 3) / 2 + 1;</span>
+<span class="nc" id="L2486">            grow(i, newLength);</span>
+<span class="nc" id="L2487">        }</span>
+
+        /*
+         * Grow the arrays to match newLength capacity.
+         */
+        private void grow(int newLength)
+        {
+<span class="nc bnc" id="L2494" title="All 2 branches missed.">            if (capacity() &lt; newLength)</span>
+<span class="nc" id="L2495">                grow(-1, newLength);</span>
+<span class="nc" id="L2496">        }</span>
+
+        private void grow(int i, int newLength)
+        {
+<span class="nc" id="L2500">            starts = grow(starts, size, newLength, i);</span>
+<span class="nc" id="L2501">            ends = grow(ends, size, newLength, i);</span>
+<span class="nc" id="L2502">            markedAts = grow(markedAts, size, newLength, i);</span>
+<span class="nc" id="L2503">            delTimes = grow(delTimes, size, newLength, i);</span>
+<span class="nc" id="L2504">        }</span>
+
+        private static LegacyBound[] grow(LegacyBound[] a, int size, int newLength, int i)
+        {
+<span class="nc bnc" id="L2508" title="All 4 branches missed.">            if (i &lt; 0 || i &gt;= size)</span>
+<span class="nc" id="L2509">                return Arrays.copyOf(a, newLength);</span>
+
+<span class="nc" id="L2511">            LegacyBound[] newA = new LegacyBound[newLength];</span>
+<span class="nc" id="L2512">            System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="nc" id="L2513">            System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="nc" id="L2514">            return newA;</span>
+        }
+
+        private static long[] grow(long[] a, int size, int newLength, int i)
+        {
+<span class="nc bnc" id="L2519" title="All 4 branches missed.">            if (i &lt; 0 || i &gt;= size)</span>
+<span class="nc" id="L2520">                return Arrays.copyOf(a, newLength);</span>
+
+<span class="nc" id="L2522">            long[] newA = new long[newLength];</span>
+<span class="nc" id="L2523">            System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="nc" id="L2524">            System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="nc" id="L2525">            return newA;</span>
+        }
+
+        private static int[] grow(int[] a, int size, int newLength, int i)
+        {
+<span class="nc bnc" id="L2530" title="All 4 branches missed.">            if (i &lt; 0 || i &gt;= size)</span>
+<span class="nc" id="L2531">                return Arrays.copyOf(a, newLength);</span>
+
+<span class="nc" id="L2533">            int[] newA = new int[newLength];</span>
+<span class="nc" id="L2534">            System.arraycopy(a, 0, newA, 0, i);</span>
+<span class="nc" id="L2535">            System.arraycopy(a, i, newA, i+1, size - i);</span>
+<span class="nc" id="L2536">            return newA;</span>
+        }
+
+        /*
+         * Move elements so that index i is &quot;free&quot;, assuming the arrays have at least one free slot at the end.
+         */
+        private void moveElements(int i)
+        {
+<span class="nc bnc" id="L2544" title="All 2 branches missed.">            if (i &gt;= size)</span>
+<span class="nc" id="L2545">                return;</span>
+
+<span class="nc" id="L2547">            System.arraycopy(starts, i, starts, i+1, size - i);</span>
+<span class="nc" id="L2548">            System.arraycopy(ends, i, ends, i+1, size - i);</span>
+<span class="nc" id="L2549">            System.arraycopy(markedAts, i, markedAts, i+1, size - i);</span>
+<span class="nc" id="L2550">            System.arraycopy(delTimes, i, delTimes, i+1, size - i);</span>
+            // we set starts[i] to null to indicate the position is now empty, so that we update boundaryHeapSize
+            // when we set it
+<span class="nc" id="L2553">            starts[i] = null;</span>
+<span class="nc" id="L2554">        }</span>
+
+        private void setInternal(int i, LegacyBound start, LegacyBound end, long markedAt, int delTime)
+        {
+<span class="nc" id="L2558">            starts[i] = start;</span>
+<span class="nc" id="L2559">            ends[i] = end;</span>
+<span class="nc" id="L2560">            markedAts[i] = markedAt;</span>
+<span class="nc" id="L2561">            delTimes[i] = delTime;</span>
+<span class="nc" id="L2562">        }</span>
+
+        public void updateDigest(MessageDigest digest)
+        {
+<span class="nc" id="L2566">            ByteBuffer longBuffer = ByteBuffer.allocate(8);</span>
+<span class="nc bnc" id="L2567" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc bnc" id="L2569" title="All 2 branches missed.">                for (int j = 0; j &lt; starts[i].bound.size(); j++)</span>
+<span class="nc" id="L2570">                    digest.update(starts[i].bound.get(j).duplicate());</span>
+<span class="nc bnc" id="L2571" title="All 2 branches missed.">                if (starts[i].collectionName != null)</span>
+<span class="nc" id="L2572">                    digest.update(starts[i].collectionName.name.bytes.duplicate());</span>
+<span class="nc bnc" id="L2573" title="All 2 branches missed.">                for (int j = 0; j &lt; ends[i].bound.size(); j++)</span>
+<span class="nc" id="L2574">                    digest.update(ends[i].bound.get(j).duplicate());</span>
+<span class="nc bnc" id="L2575" title="All 2 branches missed.">                if (ends[i].collectionName != null)</span>
+<span class="nc" id="L2576">                    digest.update(ends[i].collectionName.name.bytes.duplicate());</span>
+
+<span class="nc" id="L2578">                longBuffer.putLong(0, markedAts[i]);</span>
+<span class="nc" id="L2579">                digest.update(longBuffer.array(), 0, 8);</span>
+            }
+<span class="nc" id="L2581">        }</span>
+
+        public void serialize(DataOutputPlus out, CFMetaData metadata) throws IOException
+        {
+<span class="nc" id="L2585">            out.writeInt(size);</span>
+<span class="nc bnc" id="L2586" title="All 2 branches missed.">            if (size == 0)</span>
+<span class="nc" id="L2587">                return;</span>
+
+<span class="nc bnc" id="L2589" title="All 2 branches missed.">            if (metadata.isCompound())</span>
+<span class="nc" id="L2590">                serializeCompound(out, metadata.isDense());</span>
+            else
+<span class="nc" id="L2592">                serializeSimple(out);</span>
+<span class="nc" id="L2593">        }</span>
+
+        private void serializeCompound(DataOutputPlus out, boolean isDense) throws IOException
+        {
+<span class="nc" id="L2597">            List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(comparator.clusteringComparator.subtypes());</span>
+
+<span class="nc bnc" id="L2599" title="All 2 branches missed.">            if (!isDense)</span>
+<span class="nc" id="L2600">                types.add(UTF8Type.instance);</span>
+
+<span class="nc" id="L2602">            CompositeType type = CompositeType.getInstance(types);</span>
+
+<span class="nc bnc" id="L2604" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L2606">                LegacyBound start = starts[i];</span>
+<span class="nc" id="L2607">                LegacyBound end = ends[i];</span>
+
+<span class="nc" id="L2609">                CompositeType.Builder startBuilder = type.builder(start.isStatic);</span>
+<span class="nc" id="L2610">                CompositeType.Builder endBuilder = type.builder(end.isStatic);</span>
+<span class="nc bnc" id="L2611" title="All 2 branches missed.">                for (int j = 0; j &lt; start.bound.clustering().size(); j++)</span>
+                {
+<span class="nc" id="L2613">                    startBuilder.add(start.bound.get(j));</span>
+<span class="nc" id="L2614">                    endBuilder.add(end.bound.get(j));</span>
+                }
+
+<span class="nc bnc" id="L2617" title="All 2 branches missed.">                if (start.collectionName != null)</span>
+<span class="nc" id="L2618">                    startBuilder.add(start.collectionName.name.bytes);</span>
+<span class="nc bnc" id="L2619" title="All 2 branches missed.">                if (end.collectionName != null)</span>
+<span class="nc" id="L2620">                    endBuilder.add(end.collectionName.name.bytes);</span>
+
+<span class="nc" id="L2622">                ByteBufferUtil.writeWithShortLength(startBuilder.build(), out);</span>
+<span class="nc" id="L2623">                ByteBufferUtil.writeWithShortLength(endBuilder.buildAsEndOfRange(), out);</span>
+
+<span class="nc" id="L2625">                out.writeInt(delTimes[i]);</span>
+<span class="nc" id="L2626">                out.writeLong(markedAts[i]);</span>
+            }
+<span class="nc" id="L2628">        }</span>
+
+        private void serializeSimple(DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L2632">            List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(comparator.clusteringComparator.subtypes());</span>
+<span class="nc bnc" id="L2633" title="All 4 branches missed.">            assert types.size() == 1 : types;</span>
+
+<span class="nc bnc" id="L2635" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L2637">                LegacyBound start = starts[i];</span>
+<span class="nc" id="L2638">                LegacyBound end = ends[i];</span>
+
+<span class="nc" id="L2640">                ClusteringPrefix startClustering = start.bound.clustering();</span>
+<span class="nc" id="L2641">                ClusteringPrefix endClustering = end.bound.clustering();</span>
+
+<span class="nc bnc" id="L2643" title="All 4 branches missed.">                assert startClustering.size() == 1;</span>
+<span class="nc bnc" id="L2644" title="All 4 branches missed.">                assert endClustering.size() == 1;</span>
+
+<span class="nc" id="L2646">                ByteBufferUtil.writeWithShortLength(startClustering.get(0), out);</span>
+<span class="nc" id="L2647">                ByteBufferUtil.writeWithShortLength(endClustering.get(0), out);</span>
+
+<span class="nc" id="L2649">                out.writeInt(delTimes[i]);</span>
+<span class="nc" id="L2650">                out.writeLong(markedAts[i]);</span>
+            }
+<span class="nc" id="L2652">        }</span>
+
+        public long serializedSize(CFMetaData metadata)
+        {
+<span class="nc" id="L2656">            long size = 0;</span>
+<span class="nc" id="L2657">            size += TypeSizes.sizeof(this.size);</span>
+
+<span class="nc bnc" id="L2659" title="All 2 branches missed.">            if (this.size == 0)</span>
+<span class="nc" id="L2660">                return size;</span>
+
+<span class="nc bnc" id="L2662" title="All 2 branches missed.">            if (metadata.isCompound())</span>
+<span class="nc" id="L2663">                return size + serializedSizeCompound(metadata.isDense());</span>
+            else
+<span class="nc" id="L2665">                return size + serializedSizeSimple();</span>
+        }
+
+        private long serializedSizeCompound(boolean isDense)
+        {
+<span class="nc" id="L2670">            long size = 0;</span>
+<span class="nc" id="L2671">            List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(comparator.clusteringComparator.subtypes());</span>
+<span class="nc bnc" id="L2672" title="All 2 branches missed.">            if (!isDense)</span>
+<span class="nc" id="L2673">                types.add(UTF8Type.instance);</span>
+<span class="nc" id="L2674">            CompositeType type = CompositeType.getInstance(types);</span>
+
+<span class="nc bnc" id="L2676" title="All 2 branches missed.">            for (int i = 0; i &lt; this.size; i++)</span>
+            {
+<span class="nc" id="L2678">                LegacyBound start = starts[i];</span>
+<span class="nc" id="L2679">                LegacyBound end = ends[i];</span>
+
+<span class="nc" id="L2681">                CompositeType.Builder startBuilder = type.builder();</span>
+<span class="nc" id="L2682">                CompositeType.Builder endBuilder = type.builder();</span>
+<span class="nc bnc" id="L2683" title="All 2 branches missed.">                for (int j = 0; j &lt; start.bound.size(); j++)</span>
+<span class="nc" id="L2684">                    startBuilder.add(start.bound.get(j));</span>
+<span class="nc bnc" id="L2685" title="All 2 branches missed.">                for (int j = 0; j &lt; end.bound.size(); j++)</span>
+<span class="nc" id="L2686">                    endBuilder.add(end.bound.get(j));</span>
+
+<span class="nc bnc" id="L2688" title="All 2 branches missed.">                if (start.collectionName != null)</span>
+<span class="nc" id="L2689">                    startBuilder.add(start.collectionName.name.bytes);</span>
+<span class="nc bnc" id="L2690" title="All 2 branches missed.">                if (end.collectionName != null)</span>
+<span class="nc" id="L2691">                    endBuilder.add(end.collectionName.name.bytes);</span>
+
+<span class="nc" id="L2693">                size += ByteBufferUtil.serializedSizeWithShortLength(startBuilder.build());</span>
+<span class="nc" id="L2694">                size += ByteBufferUtil.serializedSizeWithShortLength(endBuilder.buildAsEndOfRange());</span>
+
+<span class="nc" id="L2696">                size += TypeSizes.sizeof(delTimes[i]);</span>
+<span class="nc" id="L2697">                size += TypeSizes.sizeof(markedAts[i]);</span>
+            }
+<span class="nc" id="L2699">            return size;</span>
+        }
+
+        private long serializedSizeSimple()
+        {
+<span class="nc" id="L2704">            long size = 0;</span>
+<span class="nc" id="L2705">            List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(comparator.clusteringComparator.subtypes());</span>
+<span class="nc bnc" id="L2706" title="All 4 branches missed.">            assert types.size() == 1 : types;</span>
+
+<span class="nc bnc" id="L2708" title="All 2 branches missed.">            for (int i = 0; i &lt; this.size; i++)</span>
+            {
+<span class="nc" id="L2710">                LegacyBound start = starts[i];</span>
+<span class="nc" id="L2711">                LegacyBound end = ends[i];</span>
+
+<span class="nc" id="L2713">                ClusteringPrefix startClustering = start.bound.clustering();</span>
+<span class="nc" id="L2714">                ClusteringPrefix endClustering = end.bound.clustering();</span>
+
+<span class="nc bnc" id="L2716" title="All 4 branches missed.">                assert startClustering.size() == 1;</span>
+<span class="nc bnc" id="L2717" title="All 4 branches missed.">                assert endClustering.size() == 1;</span>
+
+<span class="nc" id="L2719">                size += ByteBufferUtil.serializedSizeWithShortLength(startClustering.get(0));</span>
+<span class="nc" id="L2720">                size += ByteBufferUtil.serializedSizeWithShortLength(endClustering.get(0));</span>
+
+<span class="nc" id="L2722">                size += TypeSizes.sizeof(delTimes[i]);</span>
+<span class="nc" id="L2723">                size += TypeSizes.sizeof(markedAts[i]);</span>
+            }
+<span class="nc" id="L2725">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,603 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UnfilteredRowIterators.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">UnfilteredRowIterators.java</span></div><h1>UnfilteredRowIterators.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.util.*;
+import java.security.MessageDigest;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.transform.FilteredRows;
+import org.apache.cassandra.db.transform.MoreRows;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.IMergeIterator;
+import org.apache.cassandra.utils.MergeIterator;
+
+/**
+ * Static methods to work with atom iterators.
+ */
+<span class="pc bpc" id="L43" title="1 of 2 branches missed.">public abstract class UnfilteredRowIterators</span>
+{
+<span class="fc" id="L45">    private static final Logger logger = LoggerFactory.getLogger(UnfilteredRowIterators.class);</span>
+
+    private UnfilteredRowIterators() {}
+
+    /**
+     * Interface for a listener interested in the result of merging multiple versions of a given row.
+     * &lt;p&gt;
+     * Implementors of this interface are given enough information that they can easily reconstruct the difference
+     * between the merged result and each individual input. This is used when reconciling results on replias for
+     * instance to figure out what to send as read-repair to each source.
+     */
+    public interface MergeListener
+    {
+        /**
+         * Called once for the merged partition.
+         *
+         * @param mergedDeletion the partition level deletion for the merged partition. Implementors can test if the
+         * merged partition actually has a partition level deletion or not by calling {@code mergedDeletion.isLive()}.
+         * @param versions the partition level deletion for the sources of the merge. Elements of the array will never
+         * be null, but be &quot;live&quot;.
+         **/
+        public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions);
+
+        /**
+         * Called once for every row participating in the merge.
+         * &lt;p&gt;
+         * Note that this is called for every clustering where at least one of the source merged has a row. In
+         * particular, this may be called in cases where there is no row in the merged output (if a source has a row
+         * that is shadowed by another source range tombstone or partition level deletion).
+         *
+         * @param merged the result of the merge. This cannot be {@code null} but can be empty, in which case this is a
+         * placeholder for when at least one source has a row, but that row is shadowed in the merged output.
+         * @param versions for each source, the row in that source corresponding to {@code merged}. This can be
+         * {@code null} for some sources if the source has not such row.
+         */
+        public void onMergedRows(Row merged, Row[] versions);
+
+        /**
+         * Called once for every range tombstone marker participating in the merge.
+         * &lt;p&gt;
+         * Note that this is called for every &quot;clustering position&quot; where at least one of the source merged has a range
+         * tombstone marker.
+         *
+         * @param merged the marker in the merged output. This can be {@code null} if there is no such marker, which
+         * means that at least one source has a marker in {@code versions} but the merged out has nothing corresponding
+         * (this basically mean the merged output has a currently open deletion that shadows whatever marker the source
+         * had).
+         * @param versions the marker for each source merged. This can be {@code null} for some source if that source
+         * has not such marker.
+         */
+        public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions);
+
+        public void close();
+    }
+
+    /**
+     * Returns a iterator that only returns rows with only live content.
+     *
+     * This is mainly used in the CQL layer when we know we don't care about deletion
+     * infos (and since an UnfilteredRowIterator cannot shadow it's own data, we know everyting
+     * returned isn't shadowed by a tombstone).
+     */
+    public static RowIterator filter(UnfilteredRowIterator iter, int nowInSec)
+    {
+<span class="nc" id="L109">        return FilteredRows.filter(iter, nowInSec);</span>
+    }
+
+    /**
+     * Returns an iterator that is the result of merging other iterators.
+     */
+    public static UnfilteredRowIterator merge(List&lt;UnfilteredRowIterator&gt; iterators, int nowInSec)
+    {
+<span class="pc bpc" id="L117" title="2 of 4 branches missed.">        assert !iterators.isEmpty();</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        if (iterators.size() == 1)</span>
+<span class="fc" id="L119">            return iterators.get(0);</span>
+
+<span class="fc" id="L121">        return UnfilteredRowMergeIterator.create(iterators, nowInSec, null);</span>
+    }
+
+    /**
+     * Returns an iterator that is the result of merging other iterators, and (optionally) using
+     * specific MergeListener.
+     *
+     * Note that this method assumes that there is at least 2 iterators to merge.
+     */
+    public static UnfilteredRowIterator merge(List&lt;UnfilteredRowIterator&gt; iterators, int nowInSec, MergeListener mergeListener)
+    {
+<span class="fc" id="L132">        return UnfilteredRowMergeIterator.create(iterators, nowInSec, mergeListener);</span>
+    }
+
+    /**
+     * Returns an empty unfiltered iterator for a given partition.
+     */
+    public static UnfilteredRowIterator noRowsIterator(final CFMetaData cfm, final DecoratedKey partitionKey, final Row staticRow, final DeletionTime partitionDeletion, final boolean isReverseOrder)
+    {
+<span class="fc" id="L140">        return EmptyIterators.unfilteredRow(cfm, partitionKey, isReverseOrder, staticRow, partitionDeletion);</span>
+    }
+
+    public static UnfilteredRowIterator singleton(Unfiltered unfiltered,
+                                                  CFMetaData metadata,
+                                                  DecoratedKey partitionKey,
+                                                  DeletionTime partitionLevelDeletion,
+                                                  PartitionColumns columns,
+                                                  Row staticRow,
+                                                  boolean isReverseOrder,
+                                                  EncodingStats encodingStats)
+    {
+<span class="nc" id="L152">        return new AbstractUnfilteredRowIterator(metadata, partitionKey, partitionLevelDeletion, columns, staticRow, isReverseOrder, encodingStats)</span>
+<span class="nc" id="L153">        {</span>
+<span class="nc" id="L154">            boolean isDone = false;</span>
+
+            protected Unfiltered computeNext()
+            {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                if (!isDone)</span>
+                {
+<span class="nc" id="L160">                    isDone = true;</span>
+<span class="nc" id="L161">                    return unfiltered;</span>
+                }
+
+<span class="nc" id="L164">                return endOfData();</span>
+            }
+        };
+    }
+
+    /**
+     * Digests the partition represented by the provided iterator.
+     *
+     * @param command the command that has yield {@code iterator}. This can be null if {@code version &gt;= MessagingService.VERSION_30}
+     * as this is only used when producing digest to be sent to legacy nodes.
+     * @param iterator the iterator to digest.
+     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param version the messaging protocol to use when producing the digest.
+     */
+    public static void digest(ReadCommand command, UnfilteredRowIterator iterator, MessageDigest digest, int version)
+    {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        if (version &lt; MessagingService.VERSION_30)</span>
+        {
+<span class="nc" id="L182">            LegacyLayout.fromUnfilteredRowIterator(command, iterator).digest(iterator.metadata(), digest);</span>
+<span class="nc" id="L183">            return;</span>
+        }
+
+<span class="nc" id="L186">        digest.update(iterator.partitionKey().getKey().duplicate());</span>
+<span class="nc" id="L187">        iterator.partitionLevelDeletion().digest(digest);</span>
+<span class="nc" id="L188">        iterator.columns().regulars.digest(digest);</span>
+        // When serializing an iterator, we skip the static columns if the iterator has not static row, even if the
+        // columns() object itself has some (the columns() is a superset of what the iterator actually contains, and
+        // will correspond to the queried columns pre-serialization). So we must avoid taking the satic column names
+        // into account if there is no static row or we'd have a digest mismatch between depending on whether the digest
+        // is computed on an iterator that has been serialized or not (see CASSANDRA-12090)
+        // TODO: in practice we could completely skip digesting the columns since they are more informative of what the
+        // iterator may contain, and digesting the actual content is enough. And in fact, that would be more correct
+        // (since again, the columns could be different without the information represented by the iterator being
+        // different), but removing them entirely is stricly speaking a breaking change (it would create mismatches on
+        // upgrade) so we can only do on the next protocol version bump.
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        if (iterator.staticRow() != Rows.EMPTY_STATIC_ROW)</span>
+<span class="nc" id="L200">            iterator.columns().statics.digest(digest);</span>
+<span class="nc" id="L201">        FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());</span>
+<span class="nc" id="L202">        iterator.staticRow().digest(digest);</span>
+
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        while (iterator.hasNext())</span>
+        {
+<span class="nc" id="L206">            Unfiltered unfiltered = iterator.next();</span>
+<span class="nc" id="L207">            unfiltered.digest(digest);</span>
+<span class="nc" id="L208">        }</span>
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * Filter the provided iterator to exclude cells that have been fetched but are not queried by the user
+     * (see ColumnFilter for detailes).
+     *
+     * @param iterator the iterator to filter.
+     * @param filter the {@code ColumnFilter} to use when deciding which columns are the one queried by the
+     * user. This should be the filter that was used when querying {@code iterator}.
+     * @return the filtered iterator..
+     */
+    public static UnfilteredRowIterator withOnlyQueriedData(UnfilteredRowIterator iterator, ColumnFilter filter)
+    {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (filter.allFetchedColumnsAreQueried())</span>
+<span class="nc" id="L223">            return iterator;</span>
+
+<span class="nc" id="L225">        return Transformation.apply(iterator, new WithOnlyQueriedData(filter));</span>
+    }
+
+    /**
+     * Returns an iterator that concatenate two atom iterators.
+     * This method assumes that both iterator are from the same partition and that the atom from
+     * {@code iter2} come after the ones of {@code iter1} (that is, that concatenating the iterator
+     * make sense).
+     */
+    public static UnfilteredRowIterator concat(final UnfilteredRowIterator iter1, final UnfilteredRowIterator iter2)
+    {
+<span class="nc bnc" id="L236" title="All 4 branches missed.">        assert iter1.metadata().cfId.equals(iter2.metadata().cfId)</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            &amp;&amp; iter1.partitionKey().equals(iter2.partitionKey())</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            &amp;&amp; iter1.partitionLevelDeletion().equals(iter2.partitionLevelDeletion())</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            &amp;&amp; iter1.isReverseOrder() == iter2.isReverseOrder()</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            &amp;&amp; iter1.staticRow().equals(iter2.staticRow());</span>
+
+<span class="nc" id="L242">        class Extend implements MoreRows&lt;UnfilteredRowIterator&gt;</span>
+        {
+<span class="nc" id="L244">            boolean returned = false;</span>
+            public UnfilteredRowIterator moreContents()
+            {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                if (returned)</span>
+<span class="nc" id="L248">                    return null;</span>
+<span class="nc" id="L249">                returned = true;</span>
+<span class="nc" id="L250">                return iter2;</span>
+            }
+        }
+
+<span class="nc" id="L254">        return MoreRows.extend(iter1, new Extend(), iter1.columns().mergeTo(iter2.columns()));</span>
+    }
+
+    /**
+     * Returns an iterator that concatenate the specified atom with the iterator.
+     */
+    public static UnfilteredRowIterator concat(final Unfiltered first, final UnfilteredRowIterator rest)
+    {
+<span class="nc" id="L262">        return new WrappingUnfilteredRowIterator(rest)</span>
+<span class="nc" id="L263">        {</span>
+            private boolean hasReturnedFirst;
+
+            @Override
+            public boolean hasNext()
+            {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                return hasReturnedFirst ? super.hasNext() : true;</span>
+            }
+
+            @Override
+            public Unfiltered next()
+            {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">                if (!hasReturnedFirst)</span>
+                {
+<span class="nc" id="L277">                    hasReturnedFirst = true;</span>
+<span class="nc" id="L278">                    return first;</span>
+                }
+<span class="nc" id="L280">                return super.next();</span>
+            }
+        };
+    }
+
+    /**
+     * Validate that the data of the provided iterator is valid, that is that the values
+     * it contains are valid for the type they represent, and more generally that the
+     * infos stored are sensible.
+     *
+     * This is mainly used by scrubber to detect problems in sstables.
+     *
+     * @param iterator the partition to check.
+     * @param filename the name of the file the data is comming from.
+     * @return an iterator that returns the same data than {@code iterator} but that
+     * checks said data and throws a {@code CorruptedSSTableException} if it detects
+     * invalid data.
+     */
+    public static UnfilteredRowIterator withValidation(UnfilteredRowIterator iterator, final String filename)
+    {
+<span class="nc" id="L300">        class Validator extends Transformation</span>
+        {
+            @Override
+            public Row applyToStatic(Row row)
+            {
+<span class="nc" id="L305">                validate(row);</span>
+<span class="nc" id="L306">                return row;</span>
+            }
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+<span class="nc" id="L312">                validate(row);</span>
+<span class="nc" id="L313">                return row;</span>
+            }
+
+            @Override
+            public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+            {
+<span class="nc" id="L319">                validate(marker);</span>
+<span class="nc" id="L320">                return marker;</span>
+            }
+
+            private void validate(Unfiltered unfiltered)
+            {
+                try
+                {
+<span class="nc" id="L327">                    unfiltered.validateData(iterator.metadata());</span>
+                }
+<span class="nc" id="L329">                catch (MarshalException me)</span>
+                {
+<span class="nc" id="L331">                    throw new CorruptSSTableException(me, filename);</span>
+<span class="nc" id="L332">                }</span>
+<span class="nc" id="L333">            }</span>
+        }
+<span class="nc" id="L335">        return Transformation.apply(iterator, new Validator());</span>
+    }
+
+    /**
+     * Wraps the provided iterator so it logs the returned atoms for debugging purposes.
+     * &lt;p&gt;
+     * Note that this is only meant for debugging as this can log a very large amount of
+     * logging at INFO.
+     */
+    public static UnfilteredRowIterator loggingIterator(UnfilteredRowIterator iterator, final String id, final boolean fullDetails)
+    {
+<span class="nc" id="L346">        CFMetaData metadata = iterator.metadata();</span>
+<span class="nc" id="L347">        logger.info(&quot;[{}] Logging iterator on {}.{}, partition key={}, reversed={}, deletion={}&quot;,</span>
+                    id,
+                    metadata.ksName,
+                    metadata.cfName,
+<span class="nc" id="L351">                    metadata.getKeyValidator().getString(iterator.partitionKey().getKey()),</span>
+<span class="nc" id="L352">                    iterator.isReverseOrder(),</span>
+<span class="nc" id="L353">                    iterator.partitionLevelDeletion().markedForDeleteAt());</span>
+
+<span class="nc" id="L355">        class Logger extends Transformation</span>
+        {
+            @Override
+            public Row applyToStatic(Row row)
+            {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">                if (!row.isEmpty())</span>
+<span class="nc" id="L361">                    logger.info(&quot;[{}] {}&quot;, id, row.toString(metadata, fullDetails));</span>
+<span class="nc" id="L362">                return row;</span>
+            }
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+<span class="nc" id="L368">                logger.info(&quot;[{}] {}&quot;, id, row.toString(metadata, fullDetails));</span>
+<span class="nc" id="L369">                return row;</span>
+            }
+
+            @Override
+            public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+            {
+<span class="nc" id="L375">                logger.info(&quot;[{}] {}&quot;, id, marker.toString(metadata));</span>
+<span class="nc" id="L376">                return marker;</span>
+            }
+        }
+<span class="nc" id="L379">        return Transformation.apply(iterator, new Logger());</span>
+    }
+
+    /**
+     * A wrapper over MergeIterator to implement the UnfilteredRowIterator interface.
+     */
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">    private static class UnfilteredRowMergeIterator extends AbstractUnfilteredRowIterator</span>
+    {
+        private final IMergeIterator&lt;Unfiltered, Unfiltered&gt; mergeIterator;
+        private final MergeListener listener;
+
+        private UnfilteredRowMergeIterator(CFMetaData metadata,
+                                           List&lt;UnfilteredRowIterator&gt; iterators,
+                                           PartitionColumns columns,
+                                           DeletionTime partitionDeletion,
+                                           int nowInSec,
+                                           boolean reversed,
+                                           MergeListener listener)
+        {
+<span class="fc" id="L398">            super(metadata,</span>
+<span class="fc" id="L399">                  iterators.get(0).partitionKey(),</span>
+                  partitionDeletion,
+                  columns,
+<span class="fc" id="L402">                  mergeStaticRows(iterators, columns.statics, nowInSec, listener, partitionDeletion),</span>
+                  reversed,
+<span class="fc" id="L404">                  mergeStats(iterators));</span>
+
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">            this.mergeIterator = MergeIterator.get(iterators,</span>
+<span class="pc" id="L407">                                                   reversed ? metadata.comparator.reversed() : metadata.comparator,</span>
+<span class="fc" id="L408">                                                   new MergeReducer(iterators.size(), reversed, nowInSec, listener));</span>
+<span class="fc" id="L409">            this.listener = listener;</span>
+<span class="fc" id="L410">        }</span>
+
+        private static UnfilteredRowMergeIterator create(List&lt;UnfilteredRowIterator&gt; iterators, int nowInSec, MergeListener listener)
+        {
+            try
+            {
+<span class="fc" id="L416">                checkForInvalidInput(iterators);</span>
+<span class="fc" id="L417">                return new UnfilteredRowMergeIterator(iterators.get(0).metadata(),</span>
+                                                      iterators,
+<span class="fc" id="L419">                                                      collectColumns(iterators),</span>
+<span class="fc" id="L420">                                                      collectPartitionLevelDeletion(iterators, listener),</span>
+                                                      nowInSec,
+<span class="fc" id="L422">                                                      iterators.get(0).isReverseOrder(),</span>
+                                                      listener);
+            }
+<span class="nc" id="L425">            catch (RuntimeException | Error e)</span>
+            {
+                try
+                {
+<span class="nc" id="L429">                    FBUtilities.closeAll(iterators);</span>
+                }
+<span class="nc" id="L431">                catch (Exception suppressed)</span>
+                {
+<span class="nc" id="L433">                    e.addSuppressed(suppressed);</span>
+<span class="nc" id="L434">                }</span>
+<span class="nc" id="L435">                throw e;</span>
+            }
+        }
+
+        @SuppressWarnings(&quot;resource&quot;) // We're not really creating any resource here
+        private static void checkForInvalidInput(List&lt;UnfilteredRowIterator&gt; iterators)
+        {
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">            if (iterators.isEmpty())</span>
+<span class="nc" id="L443">                return;</span>
+
+<span class="fc" id="L445">            UnfilteredRowIterator first = iterators.get(0);</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">            for (int i = 1; i &lt; iterators.size(); i++)</span>
+            {
+<span class="fc" id="L448">                UnfilteredRowIterator iter = iterators.get(i);</span>
+<span class="pc bpc" id="L449" title="2 of 4 branches missed.">                assert first.metadata().cfId.equals(iter.metadata().cfId);</span>
+<span class="pc bpc" id="L450" title="2 of 4 branches missed.">                assert first.partitionKey().equals(iter.partitionKey());</span>
+<span class="pc bpc" id="L451" title="2 of 4 branches missed.">                assert first.isReverseOrder() == iter.isReverseOrder();</span>
+            }
+<span class="fc" id="L453">        }</span>
+
+        @SuppressWarnings(&quot;resource&quot;) // We're not really creating any resource here
+        private static DeletionTime collectPartitionLevelDeletion(List&lt;UnfilteredRowIterator&gt; iterators, MergeListener listener)
+        {
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">            DeletionTime[] versions = listener == null ? null : new DeletionTime[iterators.size()];</span>
+
+<span class="fc" id="L460">            DeletionTime delTime = DeletionTime.LIVE;</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">            for (int i = 0; i &lt; iterators.size(); i++)</span>
+            {
+<span class="fc" id="L463">                UnfilteredRowIterator iter = iterators.get(i);</span>
+<span class="fc" id="L464">                DeletionTime iterDeletion = iter.partitionLevelDeletion();</span>
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">                if (listener != null)</span>
+<span class="nc" id="L466">                    versions[i] = iterDeletion;</span>
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">                if (!delTime.supersedes(iterDeletion))</span>
+<span class="fc" id="L468">                    delTime = iterDeletion;</span>
+            }
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">            if (listener != null)</span>
+<span class="nc" id="L471">                listener.onMergedPartitionLevelDeletion(delTime, versions);</span>
+<span class="fc" id="L472">            return delTime;</span>
+        }
+
+        private static Row mergeStaticRows(List&lt;UnfilteredRowIterator&gt; iterators,
+                                           Columns columns,
+                                           int nowInSec,
+                                           MergeListener listener,
+                                           DeletionTime partitionDeletion)
+        {
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">            if (columns.isEmpty())</span>
+<span class="fc" id="L482">                return Rows.EMPTY_STATIC_ROW;</span>
+
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (iterators.stream().allMatch(iter -&gt; iter.staticRow().isEmpty()))</span>
+<span class="nc" id="L485">                return Rows.EMPTY_STATIC_ROW;</span>
+
+<span class="nc" id="L487">            Row.Merger merger = new Row.Merger(iterators.size(), nowInSec, columns.hasComplex());</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            for (int i = 0; i &lt; iterators.size(); i++)</span>
+<span class="nc" id="L489">                merger.add(i, iterators.get(i).staticRow());</span>
+
+<span class="nc" id="L491">            Row merged = merger.merge(partitionDeletion);</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">            if (merged == null)</span>
+<span class="nc" id="L493">                merged = Rows.EMPTY_STATIC_ROW;</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            if (listener != null)</span>
+<span class="nc" id="L495">                listener.onMergedRows(merged, merger.mergedRows());</span>
+<span class="nc" id="L496">            return merged;</span>
+        }
+
+        private static PartitionColumns collectColumns(List&lt;UnfilteredRowIterator&gt; iterators)
+        {
+<span class="fc" id="L501">            PartitionColumns first = iterators.get(0).columns();</span>
+<span class="fc" id="L502">            Columns statics = first.statics;</span>
+<span class="fc" id="L503">            Columns regulars = first.regulars;</span>
+<span class="fc bfc" id="L504" title="All 2 branches covered.">            for (int i = 1; i &lt; iterators.size(); i++)</span>
+            {
+<span class="fc" id="L506">                PartitionColumns cols = iterators.get(i).columns();</span>
+<span class="fc" id="L507">                statics = statics.mergeTo(cols.statics);</span>
+<span class="fc" id="L508">                regulars = regulars.mergeTo(cols.regulars);</span>
+            }
+<span class="pc bpc" id="L510" title="2 of 4 branches missed.">            return statics == first.statics &amp;&amp; regulars == first.regulars</span>
+                 ? first
+                 : new PartitionColumns(statics, regulars);
+        }
+
+        private static EncodingStats mergeStats(List&lt;UnfilteredRowIterator&gt; iterators)
+        {
+<span class="fc" id="L517">            EncodingStats stats = EncodingStats.NO_STATS;</span>
+<span class="fc bfc" id="L518" title="All 2 branches covered.">            for (UnfilteredRowIterator iter : iterators)</span>
+<span class="fc" id="L519">                stats = stats.mergeWith(iter.stats());</span>
+<span class="fc" id="L520">            return stats;</span>
+        }
+
+        protected Unfiltered computeNext()
+        {
+<span class="fc bfc" id="L525" title="All 2 branches covered.">            while (mergeIterator.hasNext())</span>
+            {
+<span class="fc" id="L527">                Unfiltered merged = mergeIterator.next();</span>
+<span class="fc bfc" id="L528" title="All 2 branches covered.">                if (merged != null)</span>
+<span class="fc" id="L529">                    return merged;</span>
+<span class="fc" id="L530">            }</span>
+<span class="fc" id="L531">            return endOfData();</span>
+        }
+
+        public void close()
+        {
+            // This will close the input iterators
+<span class="fc" id="L537">            FileUtils.closeQuietly(mergeIterator);</span>
+
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">            if (listener != null)</span>
+<span class="nc" id="L540">                listener.close();</span>
+<span class="fc" id="L541">        }</span>
+
+        private class MergeReducer extends MergeIterator.Reducer&lt;Unfiltered, Unfiltered&gt;
+        {
+            private final MergeListener listener;
+
+            private Unfiltered.Kind nextKind;
+
+            private final Row.Merger rowMerger;
+            private final RangeTombstoneMarker.Merger markerMerger;
+
+            private MergeReducer(int size, boolean reversed, int nowInSec, MergeListener listener)
+<span class="fc" id="L553">            {</span>
+<span class="fc" id="L554">                this.rowMerger = new Row.Merger(size, nowInSec, columns().regulars.hasComplex());</span>
+<span class="fc" id="L555">                this.markerMerger = new RangeTombstoneMarker.Merger(size, partitionLevelDeletion(), reversed);</span>
+<span class="fc" id="L556">                this.listener = listener;</span>
+<span class="fc" id="L557">            }</span>
+
+            @Override
+            public boolean trivialReduceIsTrivial()
+            {
+                // If we have a listener, we must signal it even when we have a single version
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                return listener == null;</span>
+            }
+
+            public void reduce(int idx, Unfiltered current)
+            {
+<span class="fc" id="L568">                nextKind = current.kind();</span>
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">                if (nextKind == Unfiltered.Kind.ROW)</span>
+<span class="fc" id="L570">                    rowMerger.add(idx, (Row)current);</span>
+                else
+<span class="nc" id="L572">                    markerMerger.add(idx, (RangeTombstoneMarker)current);</span>
+<span class="fc" id="L573">            }</span>
+
+            protected Unfiltered getReduced()
+            {
+<span class="fc bfc" id="L577" title="All 2 branches covered.">                if (nextKind == Unfiltered.Kind.ROW)</span>
+                {
+<span class="fc" id="L579">                    Row merged = rowMerger.merge(markerMerger.activeDeletion());</span>
+<span class="pc bpc" id="L580" title="1 of 2 branches missed.">                    if (listener != null)</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                        listener.onMergedRows(merged == null ? BTreeRow.emptyRow(rowMerger.mergedClustering()) : merged, rowMerger.mergedRows());</span>
+<span class="fc" id="L582">                    return merged;</span>
+                }
+                else
+                {
+<span class="fc" id="L586">                    RangeTombstoneMarker merged = markerMerger.merge();</span>
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">                    if (listener != null)</span>
+<span class="nc" id="L588">                        listener.onMergedRangeTombstoneMarkers(merged, markerMerger.mergedMarkers());</span>
+<span class="fc" id="L589">                    return merged;</span>
+                }
+            }
+
+            protected void onKeyChange()
+            {
+<span class="pc bpc" id="L595" title="1 of 2 branches missed.">                if (nextKind == Unfiltered.Kind.ROW)</span>
+<span class="nc" id="L596">                    rowMerger.clear();</span>
+                else
+<span class="fc" id="L598">                    markerMerger.clear();</span>
+<span class="fc" id="L599">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,2650 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraServer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.thrift</a> &gt; <span class="el_source">CassandraServer.java</span></div><h1>CassandraServer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.thrift;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeoutException;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
+
+import com.google.common.base.Joiner;
+import com.google.common.collect.*;
+import com.google.common.primitives.Longs;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.SuperColumnCompatibility;
+import org.apache.cassandra.cql3.statements.ParsedStatement;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.TimeUUIDType;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.locator.DynamicEndpointSnitch;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.scheduler.IRequestScheduler;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.service.*;
+import org.apache.cassandra.service.pager.QueryPagers;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.btree.BTreeSet;
+import org.apache.thrift.TException;
+
+<span class="nc bnc" id="L65" title="All 2 branches missed.">public class CassandraServer implements Cassandra.Iface</span>
+{
+<span class="nc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(CassandraServer.class);</span>
+
+    private final static int COUNT_PAGE_SIZE = 1024;
+
+<span class="nc" id="L71">    private final static List&lt;ColumnOrSuperColumn&gt; EMPTY_COLUMNS = Collections.emptyList();</span>
+
+    /*
+     * RequestScheduler to perform the scheduling of incoming requests
+     */
+    private final IRequestScheduler requestScheduler;
+
+    public CassandraServer()
+<span class="nc" id="L79">    {</span>
+<span class="nc" id="L80">        requestScheduler = DatabaseDescriptor.getRequestScheduler();</span>
+<span class="nc" id="L81">        registerMetrics();</span>
+<span class="nc" id="L82">    }</span>
+
+    public ThriftClientState state()
+    {
+<span class="nc" id="L86">        return ThriftSessionManager.instance.currentSession();</span>
+    }
+
+    protected PartitionIterator read(List&lt;SinglePartitionReadCommand&gt; commands, org.apache.cassandra.db.ConsistencyLevel consistency_level, ClientState cState, long queryStartNanoTime)
+    throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
+    {
+        try
+        {
+<span class="nc" id="L94">            schedule(DatabaseDescriptor.getReadRpcTimeout());</span>
+            try
+            {
+<span class="nc" id="L97">                return StorageProxy.read(new SinglePartitionReadCommand.Group(commands, DataLimits.NONE), consistency_level, cState, queryStartNanoTime);</span>
+            }
+            finally
+            {
+<span class="nc" id="L101">                release();</span>
+            }
+        }
+<span class="nc" id="L104">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L106">            throw ThriftConversion.rethrow(e);</span>
+        }
+    }
+
+    public List&lt;ColumnOrSuperColumn&gt; thriftifyColumns(CFMetaData metadata, Iterator&lt;LegacyLayout.LegacyCell&gt; cells)
+    {
+<span class="nc" id="L112">        ArrayList&lt;ColumnOrSuperColumn&gt; thriftColumns = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        while (cells.hasNext())</span>
+        {
+<span class="nc" id="L115">            LegacyLayout.LegacyCell cell = cells.next();</span>
+<span class="nc" id="L116">            thriftColumns.add(thriftifyColumnWithName(metadata, cell, cell.name.encode(metadata)));</span>
+<span class="nc" id="L117">        }</span>
+<span class="nc" id="L118">        return thriftColumns;</span>
+    }
+
+    private ColumnOrSuperColumn thriftifyColumnWithName(CFMetaData metadata, LegacyLayout.LegacyCell cell, ByteBuffer newName)
+    {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (cell.isCounter())</span>
+<span class="nc" id="L124">            return new ColumnOrSuperColumn().setCounter_column(thriftifySubCounter(metadata, cell).setName(newName));</span>
+        else
+<span class="nc" id="L126">            return new ColumnOrSuperColumn().setColumn(thriftifySubColumn(cell, newName));</span>
+    }
+
+    private Column thriftifySubColumn(CFMetaData metadata, LegacyLayout.LegacyCell cell)
+    {
+<span class="nc" id="L131">        return thriftifySubColumn(cell, cell.name.encode(metadata));</span>
+    }
+
+    private Column thriftifySubColumn(LegacyLayout.LegacyCell cell, ByteBuffer name)
+    {
+<span class="nc bnc" id="L136" title="All 4 branches missed.">        assert !cell.isCounter();</span>
+
+<span class="nc" id="L138">        Column thrift_column = new Column(name).setValue(cell.value).setTimestamp(cell.timestamp);</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (cell.isExpiring())</span>
+<span class="nc" id="L140">            thrift_column.setTtl(cell.ttl);</span>
+<span class="nc" id="L141">        return thrift_column;</span>
+    }
+
+    private List&lt;Column&gt; thriftifyColumnsAsColumns(CFMetaData metadata, Iterator&lt;LegacyLayout.LegacyCell&gt; cells)
+    {
+<span class="nc" id="L146">        List&lt;Column&gt; thriftColumns = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        while (cells.hasNext())</span>
+<span class="nc" id="L148">            thriftColumns.add(thriftifySubColumn(metadata, cells.next()));</span>
+<span class="nc" id="L149">        return thriftColumns;</span>
+    }
+
+    private CounterColumn thriftifySubCounter(CFMetaData metadata, LegacyLayout.LegacyCell cell)
+    {
+<span class="nc bnc" id="L154" title="All 4 branches missed.">        assert cell.isCounter();</span>
+<span class="nc" id="L155">        return new CounterColumn(cell.name.encode(metadata), CounterContext.instance().total(cell.value));</span>
+    }
+
+    private List&lt;ColumnOrSuperColumn&gt; thriftifySuperColumns(CFMetaData metadata,
+                                                            Iterator&lt;LegacyLayout.LegacyCell&gt; cells,
+                                                            boolean subcolumnsOnly,
+                                                            boolean isCounterCF,
+                                                            boolean reversed)
+    {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (subcolumnsOnly)</span>
+        {
+<span class="nc" id="L166">            ArrayList&lt;ColumnOrSuperColumn&gt; thriftSuperColumns = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            while (cells.hasNext())</span>
+            {
+<span class="nc" id="L169">                LegacyLayout.LegacyCell cell = cells.next();</span>
+<span class="nc" id="L170">                thriftSuperColumns.add(thriftifyColumnWithName(metadata, cell, cell.name.superColumnSubName()));</span>
+<span class="nc" id="L171">            }</span>
+            // Generally, cells come reversed if the query is reverse. However, this is not the case within a super column because
+            // internally a super column is a map within a row and those are never returned reversed.
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (reversed)</span>
+<span class="nc" id="L175">                Collections.reverse(thriftSuperColumns);</span>
+<span class="nc" id="L176">            return thriftSuperColumns;</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            if (isCounterCF)</span>
+<span class="nc" id="L181">                return thriftifyCounterSuperColumns(metadata, cells, reversed);</span>
+            else
+<span class="nc" id="L183">                return thriftifySuperColumns(cells, reversed);</span>
+        }
+    }
+
+    private List&lt;ColumnOrSuperColumn&gt; thriftifySuperColumns(Iterator&lt;LegacyLayout.LegacyCell&gt; cells, boolean reversed)
+    {
+<span class="nc" id="L189">        ArrayList&lt;ColumnOrSuperColumn&gt; thriftSuperColumns = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L190">        SuperColumn current = null;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        while (cells.hasNext())</span>
+        {
+<span class="nc" id="L193">            LegacyLayout.LegacyCell cell = cells.next();</span>
+<span class="nc" id="L194">            ByteBuffer scName = cell.name.superColumnName();</span>
+<span class="nc bnc" id="L195" title="All 4 branches missed.">            if (current == null || !scName.equals(current.bufferForName()))</span>
+            {
+                // Generally, cells come reversed if the query is reverse. However, this is not the case within a super column because
+                // internally a super column is a map within a row and those are never returned reversed.
+<span class="nc bnc" id="L199" title="All 4 branches missed.">                if (current != null &amp;&amp; reversed)</span>
+<span class="nc" id="L200">                    Collections.reverse(current.columns);</span>
+
+<span class="nc" id="L202">                current = new SuperColumn(scName, new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L203">                thriftSuperColumns.add(new ColumnOrSuperColumn().setSuper_column(current));</span>
+            }
+<span class="nc" id="L205">            current.getColumns().add(thriftifySubColumn(cell, cell.name.superColumnSubName()));</span>
+<span class="nc" id="L206">        }</span>
+
+<span class="nc bnc" id="L208" title="All 4 branches missed.">        if (current != null &amp;&amp; reversed)</span>
+<span class="nc" id="L209">            Collections.reverse(current.columns);</span>
+
+<span class="nc" id="L211">        return thriftSuperColumns;</span>
+    }
+
+    private List&lt;ColumnOrSuperColumn&gt; thriftifyCounterSuperColumns(CFMetaData metadata, Iterator&lt;LegacyLayout.LegacyCell&gt; cells, boolean reversed)
+    {
+<span class="nc" id="L216">        ArrayList&lt;ColumnOrSuperColumn&gt; thriftSuperColumns = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L217">        CounterSuperColumn current = null;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        while (cells.hasNext())</span>
+        {
+<span class="nc" id="L220">            LegacyLayout.LegacyCell cell = cells.next();</span>
+<span class="nc" id="L221">            ByteBuffer scName = cell.name.superColumnName();</span>
+<span class="nc bnc" id="L222" title="All 4 branches missed.">            if (current == null || !scName.equals(current.bufferForName()))</span>
+            {
+                // Generally, cells come reversed if the query is reverse. However, this is not the case within a super column because
+                // internally a super column is a map within a row and those are never returned reversed.
+<span class="nc bnc" id="L226" title="All 4 branches missed.">                if (current != null &amp;&amp; reversed)</span>
+<span class="nc" id="L227">                    Collections.reverse(current.columns);</span>
+
+<span class="nc" id="L229">                current = new CounterSuperColumn(scName, new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L230">                thriftSuperColumns.add(new ColumnOrSuperColumn().setCounter_super_column(current));</span>
+            }
+<span class="nc" id="L232">            current.getColumns().add(thriftifySubCounter(metadata, cell).setName(cell.name.superColumnSubName()));</span>
+<span class="nc" id="L233">        }</span>
+<span class="nc" id="L234">        return thriftSuperColumns;</span>
+    }
+
+    private List&lt;ColumnOrSuperColumn&gt; thriftifyPartition(RowIterator partition, boolean subcolumnsOnly, boolean reversed, int cellLimit)
+    {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (partition.isEmpty())</span>
+<span class="nc" id="L240">            return EMPTY_COLUMNS;</span>
+
+<span class="nc" id="L242">        Iterator&lt;LegacyLayout.LegacyCell&gt; cells = LegacyLayout.fromRowIterator(partition).right;</span>
+        List&lt;ColumnOrSuperColumn&gt; result;
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (partition.metadata().isSuper())</span>
+        {
+<span class="nc" id="L246">            boolean isCounterCF = partition.metadata().isCounter();</span>
+<span class="nc" id="L247">            result = thriftifySuperColumns(partition.metadata(), cells, subcolumnsOnly, isCounterCF, reversed);</span>
+<span class="nc" id="L248">        }</span>
+        else
+        {
+<span class="nc" id="L251">            result = thriftifyColumns(partition.metadata(), cells);</span>
+        }
+
+        // Thrift count cells, but internally we only count them at &quot;row&quot; boundaries, which means that if the limit stops in the middle
+        // of an internal row we'll include a few additional cells. So trim it here.
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        return result.size() &gt; cellLimit</span>
+<span class="nc" id="L257">             ? result.subList(0, cellLimit)</span>
+             : result;
+    }
+
+    private Map&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; getSlice(List&lt;SinglePartitionReadCommand&gt; commands, boolean subColumnsOnly, int cellLimit, org.apache.cassandra.db.ConsistencyLevel consistency_level, ClientState cState, long queryStartNanoTime)
+    throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L264">        try (PartitionIterator results = read(commands, consistency_level, cState, queryStartNanoTime))</span>
+        {
+<span class="nc" id="L266">            Map&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; columnFamiliesMap = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            while (results.hasNext())</span>
+            {
+<span class="nc" id="L269">                try (RowIterator iter = results.next())</span>
+                {
+<span class="nc" id="L271">                    List&lt;ColumnOrSuperColumn&gt; thriftifiedColumns = thriftifyPartition(iter, subColumnsOnly, iter.isReverseOrder(), cellLimit);</span>
+<span class="nc" id="L272">                    columnFamiliesMap.put(iter.partitionKey().getKey(), thriftifiedColumns);</span>
+<span class="nc" id="L273">                }</span>
+            }
+<span class="nc" id="L275">            return columnFamiliesMap;</span>
+        }
+    }
+
+    public List&lt;ColumnOrSuperColumn&gt; get_slice(ByteBuffer key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L282">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L285">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L286">                                                                  &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L287">                                                                  &quot;predicate&quot;, predicate.toString(),</span>
+<span class="nc" id="L288">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L289">            Tracing.instance.begin(&quot;get_slice&quot;, traceParameters);</span>
+<span class="nc" id="L290">        }</span>
+        else
+        {
+<span class="nc" id="L293">            logger.trace(&quot;get_slice&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L298">            ClientState cState = state();</span>
+<span class="nc" id="L299">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L300">            state().hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+<span class="nc" id="L301">            List&lt;ColumnOrSuperColumn&gt; result = getSliceInternal(keyspace, key, column_parent, FBUtilities.nowInSeconds(), predicate, consistency_level, cState, queryStartNanoTime);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            return result == null ? Collections.&lt;ColumnOrSuperColumn&gt;emptyList() : result;</span>
+        }
+<span class="nc" id="L304">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L306">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L310">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    private List&lt;ColumnOrSuperColumn&gt; getSliceInternal(String keyspace,
+                                                       ByteBuffer key,
+                                                       ColumnParent column_parent,
+                                                       int nowInSec,
+                                                       SlicePredicate predicate,
+                                                       ConsistencyLevel consistency_level,
+                                                       ClientState cState,
+                                                       long queryStartNanoTime)
+    throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L324">        return multigetSliceInternal(keyspace, Collections.singletonList(key), column_parent, nowInSec, predicate, consistency_level, cState, queryStartNanoTime).get(key);</span>
+    }
+
+    public Map&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; multiget_slice(List&lt;ByteBuffer&gt; keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L330">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L333">            List&lt;String&gt; keysList = Lists.newArrayList();</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            for (ByteBuffer key : keys)</span>
+<span class="nc" id="L335">                keysList.add(ByteBufferUtil.bytesToHex(key));</span>
+<span class="nc" id="L336">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;keys&quot;, keysList.toString(),</span>
+<span class="nc" id="L337">                                                                  &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L338">                                                                  &quot;predicate&quot;, predicate.toString(),</span>
+<span class="nc" id="L339">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L340">            Tracing.instance.begin(&quot;multiget_slice&quot;, traceParameters);</span>
+<span class="nc" id="L341">        }</span>
+        else
+        {
+<span class="nc" id="L344">            logger.trace(&quot;multiget_slice&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L349">            ClientState cState = state();</span>
+<span class="nc" id="L350">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L351">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+<span class="nc" id="L352">            return multigetSliceInternal(keyspace, keys, column_parent, FBUtilities.nowInSeconds(), predicate, consistency_level, cState, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L354">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L356">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L360">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    private ClusteringIndexFilter toInternalFilter(CFMetaData metadata, ColumnParent parent, SliceRange range)
+    {
+<span class="nc bnc" id="L366" title="All 4 branches missed.">        if (metadata.isSuper() &amp;&amp; parent.isSetSuper_column())</span>
+<span class="nc" id="L367">            return new ClusteringIndexNamesFilter(FBUtilities.singleton(Clustering.make(parent.bufferForSuper_column()), metadata.comparator), range.reversed);</span>
+        else
+<span class="nc" id="L369">            return new ClusteringIndexSliceFilter(makeSlices(metadata, range), range.reversed);</span>
+    }
+
+    private Slices makeSlices(CFMetaData metadata, SliceRange range)
+    {
+        // Note that in thrift, the bounds are reversed if the query is reversed, but not internally.
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        ByteBuffer start = range.reversed ? range.finish : range.start;</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        ByteBuffer finish = range.reversed ? range.start : range.finish;</span>
+<span class="nc" id="L377">        return Slices.with(metadata.comparator, Slice.make(LegacyLayout.decodeSliceBound(metadata, start, true).bound, LegacyLayout.decodeSliceBound(metadata, finish, false).bound));</span>
+    }
+
+    private ClusteringIndexFilter toInternalFilter(CFMetaData metadata, ColumnParent parent, SlicePredicate predicate)
+    throws org.apache.cassandra.exceptions.InvalidRequestException
+    {
+        try
+        {
+<span class="nc bnc" id="L385" title="All 2 branches missed.">            if (predicate.column_names != null)</span>
+            {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                if (metadata.isSuper())</span>
+                {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                    if (parent.isSetSuper_column())</span>
+                    {
+<span class="nc" id="L391">                        return new ClusteringIndexNamesFilter(FBUtilities.singleton(Clustering.make(parent.bufferForSuper_column()), metadata.comparator), false);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L395">                        NavigableSet&lt;Clustering&gt; clusterings = new TreeSet&lt;&gt;(metadata.comparator);</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">                        for (ByteBuffer bb : predicate.column_names)</span>
+<span class="nc" id="L397">                            clusterings.add(Clustering.make(bb));</span>
+<span class="nc" id="L398">                        return new ClusteringIndexNamesFilter(clusterings, false);</span>
+                    }
+                }
+                else
+                {
+<span class="nc" id="L403">                    NavigableSet&lt;Clustering&gt; clusterings = new TreeSet&lt;&gt;(metadata.comparator);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                    for (ByteBuffer bb : predicate.column_names)</span>
+                    {
+<span class="nc" id="L406">                        LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, parent.bufferForSuper_column(), bb);</span>
+
+<span class="nc bnc" id="L408" title="All 2 branches missed.">                        if (!name.clustering.equals(Clustering.STATIC_CLUSTERING))</span>
+<span class="nc" id="L409">                            clusterings.add(name.clustering);</span>
+<span class="nc" id="L410">                    }</span>
+
+                    // clusterings cannot include STATIC_CLUSTERING, so if the names filter is for static columns, clusterings
+                    // will be empty.  However, by requesting the static columns in our ColumnFilter, this will still work.
+<span class="nc" id="L414">                    return new ClusteringIndexNamesFilter(clusterings, false);</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L419">                return toInternalFilter(metadata, parent, predicate.slice_range);</span>
+            }
+        }
+<span class="nc" id="L422">        catch (UnknownColumnException e)</span>
+        {
+<span class="nc" id="L424">            throw new org.apache.cassandra.exceptions.InvalidRequestException(e.getMessage());</span>
+        }
+    }
+
+    private ColumnFilter makeColumnFilter(CFMetaData metadata, ColumnParent parent, SliceRange range)
+    {
+<span class="nc bnc" id="L430" title="All 4 branches missed.">        if (metadata.isSuper() &amp;&amp; parent.isSetSuper_column())</span>
+        {
+            // We want a slice of the dynamic columns
+<span class="nc" id="L433">            ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();</span>
+<span class="nc" id="L434">            ColumnDefinition def = metadata.compactValueColumn();</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            ByteBuffer start = range.reversed ? range.finish : range.start;</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            ByteBuffer finish = range.reversed ? range.start : range.finish;</span>
+<span class="nc bnc" id="L437" title="All 4 branches missed.">            builder.slice(def, start.hasRemaining() ? CellPath.create(start) : CellPath.BOTTOM, finish.hasRemaining() ? CellPath.create(finish) : CellPath.TOP);</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            if (metadata.isDense())</span>
+<span class="nc" id="L440">                return builder.build();</span>
+
+            // We also want to add any staticly defined column if it's within the range
+<span class="nc" id="L443">            AbstractType&lt;?&gt; cmp = metadata.thriftColumnNameType();</span>
+
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            for (ColumnDefinition column : metadata.partitionColumns())</span>
+            {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (SuperColumnCompatibility.isSuperColumnMapColumn(column))</span>
+<span class="nc" id="L448">                    continue;</span>
+
+<span class="nc" id="L450">                ByteBuffer name = column.name.bytes;</span>
+<span class="nc bnc" id="L451" title="All 4 branches missed.">                if (cmp.compare(name, start) &lt; 0 || cmp.compare(finish, name) &gt; 0)</span>
+<span class="nc" id="L452">                    continue;</span>
+
+<span class="nc" id="L454">                builder.add(column);</span>
+<span class="nc" id="L455">            }</span>
+<span class="nc" id="L456">            return builder.build();</span>
+        }
+<span class="nc" id="L458">        return makeColumnFilter(metadata, makeSlices(metadata, range));</span>
+    }
+
+    private ColumnFilter makeColumnFilter(CFMetaData metadata, Slices slices)
+    {
+<span class="nc" id="L463">        PartitionColumns columns = metadata.partitionColumns();</span>
+<span class="nc bnc" id="L464" title="All 4 branches missed.">        if (metadata.isStaticCompactTable() &amp;&amp; !columns.statics.isEmpty())</span>
+        {
+<span class="nc" id="L466">            PartitionColumns.Builder builder = PartitionColumns.builder();</span>
+<span class="nc" id="L467">            builder.addAll(columns.regulars);</span>
+            // We only want to include the static columns that are selected by the slices
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            for (ColumnDefinition def : columns.statics)</span>
+            {
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (slices.selects(Clustering.make(def.name.bytes)))</span>
+<span class="nc" id="L472">                    builder.add(def);</span>
+<span class="nc" id="L473">            }</span>
+<span class="nc" id="L474">            columns = builder.build();</span>
+        }
+<span class="nc" id="L476">        return ColumnFilter.selection(columns);</span>
+    }
+
+    private ColumnFilter makeColumnFilter(CFMetaData metadata, ColumnParent parent, SlicePredicate predicate)
+    throws org.apache.cassandra.exceptions.InvalidRequestException
+    {
+        try
+        {
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if (predicate.column_names != null)</span>
+            {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                if (metadata.isSuper())</span>
+                {
+<span class="nc bnc" id="L488" title="All 2 branches missed.">                    if (parent.isSetSuper_column())</span>
+                    {
+<span class="nc" id="L490">                        ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();</span>
+<span class="nc" id="L491">                        ColumnDefinition dynamicDef = metadata.compactValueColumn();</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                        for (ByteBuffer bb : predicate.column_names)</span>
+                        {
+<span class="nc" id="L494">                            ColumnDefinition staticDef = metadata.getColumnDefinition(bb);</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                            if (staticDef == null)</span>
+<span class="nc" id="L496">                                builder.select(dynamicDef, CellPath.create(bb));</span>
+                            else
+<span class="nc" id="L498">                                builder.add(staticDef);</span>
+<span class="nc" id="L499">                        }</span>
+<span class="nc" id="L500">                        return builder.build();</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L504">                        return ColumnFilter.all(metadata);</span>
+                    }
+                }
+                else
+                {
+<span class="nc" id="L509">                    PartitionColumns.Builder builder = PartitionColumns.builder();</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">                    for (ByteBuffer bb : predicate.column_names)</span>
+                    {
+<span class="nc" id="L512">                        LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, parent.bufferForSuper_column(), bb);</span>
+<span class="nc" id="L513">                        builder.add(name.column);</span>
+<span class="nc" id="L514">                    }</span>
+
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                    if (metadata.isStaticCompactTable())</span>
+<span class="nc" id="L517">                        builder.add(metadata.compactValueColumn());</span>
+
+<span class="nc" id="L519">                    return ColumnFilter.selection(builder.build());</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L524">                return makeColumnFilter(metadata, parent, predicate.slice_range);</span>
+            }
+        }
+<span class="nc" id="L527">        catch (UnknownColumnException e)</span>
+        {
+<span class="nc" id="L529">            throw new org.apache.cassandra.exceptions.InvalidRequestException(e.getMessage());</span>
+        }
+    }
+
+    private DataLimits getLimits(int partitionLimit, boolean countSuperColumns, SlicePredicate predicate)
+    {
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        int cellsPerPartition = predicate.slice_range == null ? Integer.MAX_VALUE : predicate.slice_range.count;</span>
+<span class="nc" id="L536">        return getLimits(partitionLimit, countSuperColumns, cellsPerPartition);</span>
+    }
+
+    private DataLimits getLimits(int partitionLimit, boolean countSuperColumns, int perPartitionCount)
+    {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        return countSuperColumns</span>
+<span class="nc" id="L542">             ? DataLimits.superColumnCountingLimits(partitionLimit, perPartitionCount)</span>
+<span class="nc" id="L543">             : DataLimits.thriftLimits(partitionLimit, perPartitionCount);</span>
+    }
+
+    private Map&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; multigetSliceInternal(String keyspace,
+                                                                             List&lt;ByteBuffer&gt; keys,
+                                                                             ColumnParent column_parent,
+                                                                             int nowInSec,
+                                                                             SlicePredicate predicate,
+                                                                             ConsistencyLevel consistency_level,
+                                                                             ClientState cState,
+                                                                             long queryStartNanoTime)
+    throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L556">        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family);</span>
+<span class="nc" id="L557">        ThriftValidation.validateColumnParent(metadata, column_parent);</span>
+<span class="nc" id="L558">        ThriftValidation.validatePredicate(metadata, column_parent, predicate);</span>
+
+<span class="nc" id="L560">        org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L561">        consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L563">        List&lt;SinglePartitionReadCommand&gt; commands = new ArrayList&lt;&gt;(keys.size());</span>
+<span class="nc" id="L564">        ColumnFilter columnFilter = makeColumnFilter(metadata, column_parent, predicate);</span>
+<span class="nc" id="L565">        ClusteringIndexFilter filter = toInternalFilter(metadata, column_parent, predicate);</span>
+<span class="nc bnc" id="L566" title="All 4 branches missed.">        DataLimits limits = getLimits(1, metadata.isSuper() &amp;&amp; !column_parent.isSetSuper_column(), predicate);</span>
+
+<span class="nc bnc" id="L568" title="All 2 branches missed.">        for (ByteBuffer key: keys)</span>
+        {
+<span class="nc" id="L570">            ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc" id="L571">            DecoratedKey dk = metadata.decorateKey(key);</span>
+<span class="nc" id="L572">            commands.add(SinglePartitionReadCommand.create(true, metadata, nowInSec, columnFilter, RowFilter.NONE, limits, dk, filter));</span>
+<span class="nc" id="L573">        }</span>
+
+<span class="nc" id="L575">        return getSlice(commands, column_parent.isSetSuper_column(), limits.perPartitionCount(), consistencyLevel, cState, queryStartNanoTime);</span>
+    }
+
+    public ColumnOrSuperColumn get(ByteBuffer key, ColumnPath column_path, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, NotFoundException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L581">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L584">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L585">                                                                  &quot;column_path&quot;, column_path.toString(),</span>
+<span class="nc" id="L586">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L587">            Tracing.instance.begin(&quot;get&quot;, traceParameters);</span>
+<span class="nc" id="L588">        }</span>
+        else
+        {
+<span class="nc" id="L591">            logger.trace(&quot;get&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L596">            ThriftClientState cState = state();</span>
+<span class="nc" id="L597">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L598">            cState.hasColumnFamilyAccess(keyspace, column_path.column_family, Permission.SELECT);</span>
+
+<span class="nc" id="L600">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_path.column_family);</span>
+<span class="nc" id="L601">            ThriftValidation.validateColumnPath(metadata, column_path);</span>
+<span class="nc" id="L602">            org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L603">            consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L605">            ThriftValidation.validateKey(metadata, key);</span>
+
+            ColumnFilter columns;
+            ClusteringIndexFilter filter;
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            if (metadata.isSuper())</span>
+            {
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (column_path.column == null)</span>
+                {
+                    // Selects a full super column
+<span class="nc" id="L614">                    columns = ColumnFilter.all(metadata);</span>
+                }
+                else
+                {
+                    // Selects a single column within a super column
+<span class="nc" id="L619">                    ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();</span>
+<span class="nc" id="L620">                    ColumnDefinition staticDef = metadata.getColumnDefinition(column_path.column);</span>
+<span class="nc" id="L621">                    ColumnDefinition dynamicDef = metadata.compactValueColumn();</span>
+
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                    if (staticDef != null)</span>
+<span class="nc" id="L624">                        builder.add(staticDef);</span>
+                    // Note that even if there is a staticDef, we still query the dynamicDef since we can't guarantee the static one hasn't
+                    // been created after data has been inserted for that definition
+<span class="nc" id="L627">                    builder.select(dynamicDef, CellPath.create(column_path.column));</span>
+<span class="nc" id="L628">                    columns = builder.build();</span>
+                }
+<span class="nc" id="L630">                filter = new ClusteringIndexNamesFilter(FBUtilities.singleton(Clustering.make(column_path.super_column), metadata.comparator),</span>
+                                                  false);
+            }
+            else
+            {
+<span class="nc" id="L635">                LegacyLayout.LegacyCellName cellname = LegacyLayout.decodeCellName(metadata, column_path.super_column, column_path.column);</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                if (cellname.clustering == Clustering.STATIC_CLUSTERING)</span>
+                {
+                    // Same as above: even if we're querying a static column, we still query the equivalent dynamic column and value as some
+                    // values might have been created post creation of the column (ThriftResultMerger then ensures we get only one result).
+<span class="nc" id="L640">                    ColumnFilter.Builder builder = ColumnFilter.selectionBuilder();</span>
+<span class="nc" id="L641">                    builder.add(cellname.column);</span>
+<span class="nc" id="L642">                    builder.add(metadata.compactValueColumn());</span>
+<span class="nc" id="L643">                    columns = builder.build();</span>
+<span class="nc" id="L644">                    filter = new ClusteringIndexNamesFilter(FBUtilities.singleton(Clustering.make(column_path.column), metadata.comparator), false);</span>
+<span class="nc" id="L645">                }</span>
+                else
+                {
+<span class="nc" id="L648">                    columns = ColumnFilter.selection(PartitionColumns.of(cellname.column));</span>
+<span class="nc" id="L649">                    filter = new ClusteringIndexNamesFilter(FBUtilities.singleton(cellname.clustering, metadata.comparator), false);</span>
+                }
+            }
+
+<span class="nc" id="L653">            DecoratedKey dk = metadata.decorateKey(key);</span>
+<span class="nc" id="L654">            SinglePartitionReadCommand command = SinglePartitionReadCommand.create(true, metadata, FBUtilities.nowInSeconds(), columns, RowFilter.NONE, DataLimits.NONE, dk, filter);</span>
+
+<span class="nc" id="L656">            try (RowIterator result = PartitionIterators.getOnlyElement(read(Arrays.asList(command), consistencyLevel, cState, queryStartNanoTime), command))</span>
+            {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">                if (!result.hasNext())</span>
+<span class="nc" id="L659">                    throw new NotFoundException();</span>
+
+<span class="nc bnc" id="L661" title="All 4 branches missed.">                List&lt;ColumnOrSuperColumn&gt; tcolumns = thriftifyPartition(result, metadata.isSuper() &amp;&amp; column_path.column != null, result.isReverseOrder(), 1);</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">                if (tcolumns.isEmpty())</span>
+<span class="nc" id="L663">                    throw new NotFoundException();</span>
+<span class="nc bnc" id="L664" title="All 4 branches missed.">                assert tcolumns.size() == 1;</span>
+<span class="nc" id="L665">                return tcolumns.get(0);</span>
+            }
+        }
+<span class="nc" id="L668">        catch (UnknownColumnException e)</span>
+        {
+<span class="nc" id="L670">            throw new InvalidRequestException(e.getMessage());</span>
+        }
+<span class="nc" id="L672">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L674">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L678">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    public int get_count(ByteBuffer key, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L685">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L688">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L689">                                                                  &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L690">                                                                  &quot;predicate&quot;, predicate.toString(),</span>
+<span class="nc" id="L691">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L692">            Tracing.instance.begin(&quot;get_count&quot;, traceParameters);</span>
+<span class="nc" id="L693">        }</span>
+        else
+        {
+<span class="nc" id="L696">            logger.trace(&quot;get_count&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L701">            ThriftClientState cState = state();</span>
+<span class="nc" id="L702">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L703">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+<span class="nc" id="L704">            Keyspace keyspaceName = Keyspace.open(keyspace);</span>
+<span class="nc" id="L705">            ColumnFamilyStore cfs = keyspaceName.getColumnFamilyStore(column_parent.column_family);</span>
+<span class="nc" id="L706">            int nowInSec = FBUtilities.nowInSeconds();</span>
+
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            if (predicate.column_names != null)</span>
+<span class="nc" id="L709">                return getSliceInternal(keyspace, key, column_parent, nowInSec, predicate, consistency_level, cState, queryStartNanoTime).size();</span>
+
+            int pageSize;
+            // request by page if this is a large row
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            if (cfs.getMeanColumns() &gt; 0)</span>
+            {
+<span class="nc" id="L715">                int averageColumnSize = (int) (cfs.metric.meanPartitionSize.getValue() / cfs.getMeanColumns());</span>
+<span class="nc" id="L716">                pageSize = Math.min(COUNT_PAGE_SIZE, 4 * 1024 * 1024 / averageColumnSize);</span>
+<span class="nc" id="L717">                pageSize = Math.max(2, pageSize);</span>
+<span class="nc" id="L718">                logger.trace(&quot;average row column size is {}; using pageSize of {}&quot;, averageColumnSize, pageSize);</span>
+<span class="nc" id="L719">            }</span>
+            else
+            {
+<span class="nc" id="L722">                pageSize = COUNT_PAGE_SIZE;</span>
+            }
+
+<span class="nc bnc" id="L725" title="All 2 branches missed.">            SliceRange sliceRange = predicate.slice_range == null</span>
+                                  ? new SliceRange(ByteBufferUtil.EMPTY_BYTE_BUFFER, ByteBufferUtil.EMPTY_BYTE_BUFFER, false, Integer.MAX_VALUE)
+                                  : predicate.slice_range;
+
+            ColumnFilter columnFilter;
+            ClusteringIndexFilter filter;
+<span class="nc" id="L731">            CFMetaData metadata = cfs.metadata;</span>
+<span class="nc bnc" id="L732" title="All 4 branches missed.">            if (metadata.isSuper() &amp;&amp; !column_parent.isSetSuper_column())</span>
+            {
+                // If we count on a super column table without having set the super column name, we're in fact interested by the count of super columns
+<span class="nc" id="L735">                columnFilter = ColumnFilter.all(metadata);</span>
+<span class="nc" id="L736">                filter = new ClusteringIndexSliceFilter(makeSlices(metadata, sliceRange), sliceRange.reversed);</span>
+            }
+            else
+            {
+<span class="nc" id="L740">                columnFilter = makeColumnFilter(metadata, column_parent, sliceRange);</span>
+<span class="nc" id="L741">                filter = toInternalFilter(metadata, column_parent, sliceRange);</span>
+            }
+
+<span class="nc bnc" id="L744" title="All 4 branches missed.">            DataLimits limits = getLimits(1, metadata.isSuper() &amp;&amp; !column_parent.isSetSuper_column(), predicate);</span>
+<span class="nc" id="L745">            DecoratedKey dk = metadata.decorateKey(key);</span>
+
+<span class="nc" id="L747">            return QueryPagers.countPaged(metadata,</span>
+                                          dk,
+                                          columnFilter,
+                                          filter,
+                                          limits,
+<span class="nc" id="L752">                                          ThriftConversion.fromThrift(consistency_level),</span>
+                                          cState,
+                                          pageSize,
+                                          nowInSec,
+                                          true,
+                                          queryStartNanoTime);
+        }
+<span class="nc" id="L759">        catch (IllegalArgumentException e)</span>
+        {
+            // CASSANDRA-5701
+<span class="nc" id="L762">            throw new InvalidRequestException(e.getMessage());</span>
+        }
+<span class="nc" id="L764">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L766">            throw ThriftConversion.rethrow(e);</span>
+        }
+<span class="nc" id="L768">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L770">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L774">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    public Map&lt;ByteBuffer, Integer&gt; multiget_count(List&lt;ByteBuffer&gt; keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L781">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L784">            List&lt;String&gt; keysList = Lists.newArrayList();</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="nc" id="L787">                keysList.add(ByteBufferUtil.bytesToHex(key));</span>
+<span class="nc" id="L788">            }</span>
+<span class="nc" id="L789">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;keys&quot;, keysList.toString(),</span>
+<span class="nc" id="L790">                                                                  &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L791">                                                                  &quot;predicate&quot;, predicate.toString(),</span>
+<span class="nc" id="L792">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L793">            Tracing.instance.begin(&quot;multiget_count&quot;, traceParameters);</span>
+<span class="nc" id="L794">        }</span>
+        else
+        {
+<span class="nc" id="L797">            logger.trace(&quot;multiget_count&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L802">            ThriftClientState cState = state();</span>
+<span class="nc" id="L803">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L804">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+
+<span class="nc" id="L806">            Map&lt;ByteBuffer, Integer&gt; counts = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L807">            Map&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; columnFamiliesMap = multigetSliceInternal(keyspace,</span>
+                                                                                                 keys,
+                                                                                                 column_parent,
+<span class="nc" id="L810">                                                                                                 FBUtilities.nowInSeconds(),</span>
+                                                                                                 predicate,
+                                                                                                 consistency_level,
+                                                                                                 cState,
+                                                                                                 queryStartNanoTime);
+
+<span class="nc bnc" id="L816" title="All 2 branches missed.">            for (Map.Entry&lt;ByteBuffer, List&lt;ColumnOrSuperColumn&gt;&gt; cf : columnFamiliesMap.entrySet())</span>
+<span class="nc" id="L817">                counts.put(cf.getKey(), cf.getValue().size());</span>
+<span class="nc" id="L818">            return counts;</span>
+        }
+<span class="nc" id="L820">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L822">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L826">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    private Cell cellFromColumn(CFMetaData metadata, LegacyLayout.LegacyCellName name, Column column)
+    {
+<span class="nc bnc" id="L832" title="All 2 branches missed.">        CellPath path = name.collectionElement == null ? null : CellPath.create(name.collectionElement);</span>
+<span class="nc" id="L833">        int ttl = getTtl(metadata, column);</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">        return ttl == LivenessInfo.NO_TTL</span>
+<span class="nc" id="L835">             ? BufferCell.live(name.column, column.timestamp, column.value, path)</span>
+<span class="nc" id="L836">             : BufferCell.expiring(name.column, column.timestamp, ttl, FBUtilities.nowInSeconds(), column.value, path);</span>
+    }
+
+    private int getTtl(CFMetaData metadata,Column column)
+    {
+<span class="nc bnc" id="L841" title="All 2 branches missed.">        if (!column.isSetTtl())</span>
+<span class="nc" id="L842">            return metadata.params.defaultTimeToLive;</span>
+
+<span class="nc bnc" id="L844" title="All 4 branches missed.">        if (column.ttl == LivenessInfo.NO_TTL &amp;&amp; metadata.params.defaultTimeToLive != LivenessInfo.NO_TTL)</span>
+<span class="nc" id="L845">            return LivenessInfo.NO_TTL;</span>
+
+<span class="nc" id="L847">        return column.ttl;</span>
+    }
+
+    private void internal_insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level, long queryStartNanoTime)
+    throws RequestValidationException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L853">        ThriftClientState cState = state();</span>
+<span class="nc" id="L854">        String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L855">        cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.MODIFY);</span>
+
+<span class="nc" id="L857">        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, false);</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        if (metadata.isView())</span>
+<span class="nc" id="L859">            throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot modify Materialized Views directly&quot;);</span>
+
+<span class="nc" id="L861">        ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc" id="L862">        ThriftValidation.validateColumnParent(metadata, column_parent);</span>
+        // SuperColumn field is usually optional, but not when we're inserting
+<span class="nc bnc" id="L864" title="All 4 branches missed.">        if (metadata.isSuper() &amp;&amp; column_parent.super_column == null)</span>
+        {
+<span class="nc" id="L866">            throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;missing mandatory super column name for super CF &quot; + column_parent.column_family);</span>
+        }
+<span class="nc" id="L868">        ThriftValidation.validateColumnNames(metadata, column_parent, Collections.singletonList(column.name));</span>
+<span class="nc" id="L869">        ThriftValidation.validateColumnData(metadata, column_parent.super_column, column);</span>
+
+        org.apache.cassandra.db.Mutation mutation;
+        try
+        {
+<span class="nc" id="L874">            LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, column_parent.super_column, column.name);</span>
+<span class="nc" id="L875">            Cell cell = cellFromColumn(metadata, name, column);</span>
+<span class="nc" id="L876">            PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeRow.singleCellRow(name.clustering, cell));</span>
+
+            // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+<span class="nc" id="L879">            Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(update);</span>
+
+<span class="nc" id="L881">            mutation = new org.apache.cassandra.db.Mutation(update);</span>
+        }
+<span class="nc" id="L883">        catch (MarshalException|UnknownColumnException e)</span>
+        {
+<span class="nc" id="L885">            throw new org.apache.cassandra.exceptions.InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L886">        }</span>
+<span class="nc" id="L887">        doInsert(consistency_level, Collections.singletonList(mutation), queryStartNanoTime);</span>
+<span class="nc" id="L888">    }</span>
+
+    public void insert(ByteBuffer key, ColumnParent column_parent, Column column, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L893">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L896">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L897">                                                                  &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L898">                                                                  &quot;column&quot;, column.toString(),</span>
+<span class="nc" id="L899">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L900">            Tracing.instance.begin(&quot;insert&quot;, traceParameters);</span>
+<span class="nc" id="L901">        }</span>
+        else
+        {
+<span class="nc" id="L904">            logger.trace(&quot;insert&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L909">            internal_insert(key, column_parent, column, consistency_level, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L911">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L913">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L917">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L919">    }</span>
+
+    public CASResult cas(ByteBuffer key,
+                         String column_family,
+                         List&lt;Column&gt; expected,
+                         List&lt;Column&gt; updates,
+                         ConsistencyLevel serial_consistency_level,
+                         ConsistencyLevel commit_consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L929">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L932">            ImmutableMap.Builder&lt;String,String&gt; builder = ImmutableMap.builder();</span>
+<span class="nc" id="L933">            builder.put(&quot;key&quot;, ByteBufferUtil.bytesToHex(key));</span>
+<span class="nc" id="L934">            builder.put(&quot;column_family&quot;, column_family);</span>
+<span class="nc" id="L935">            builder.put(&quot;old&quot;, expected.toString());</span>
+<span class="nc" id="L936">            builder.put(&quot;updates&quot;, updates.toString());</span>
+<span class="nc" id="L937">            builder.put(&quot;consistency_level&quot;, commit_consistency_level.name());</span>
+<span class="nc" id="L938">            builder.put(&quot;serial_consistency_level&quot;, serial_consistency_level.name());</span>
+<span class="nc" id="L939">            Map&lt;String,String&gt; traceParameters = builder.build();</span>
+
+<span class="nc" id="L941">            Tracing.instance.begin(&quot;cas&quot;, traceParameters);</span>
+<span class="nc" id="L942">        }</span>
+        else
+        {
+<span class="nc" id="L945">            logger.trace(&quot;cas&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L950">            ThriftClientState cState = state();</span>
+<span class="nc" id="L951">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L952">            cState.hasColumnFamilyAccess(keyspace, column_family, Permission.MODIFY);</span>
+            // CAS updates can be used to simulate a get request, so should require Permission.SELECT.
+<span class="nc" id="L954">            cState.hasColumnFamilyAccess(keyspace, column_family, Permission.SELECT);</span>
+
+<span class="nc" id="L956">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_family, false);</span>
+<span class="nc bnc" id="L957" title="All 2 branches missed.">            if (metadata.isView())</span>
+<span class="nc" id="L958">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot modify Materialized Views directly&quot;);</span>
+
+<span class="nc" id="L960">            ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">            if (metadata.isSuper())</span>
+<span class="nc" id="L962">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;CAS does not support supercolumns&quot;);</span>
+
+<span class="nc" id="L964">            Iterable&lt;ByteBuffer&gt; names = Iterables.transform(updates, column -&gt; column.name);</span>
+<span class="nc" id="L965">            ThriftValidation.validateColumnNames(metadata, new ColumnParent(column_family), names);</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">            for (Column column : updates)</span>
+<span class="nc" id="L967">                ThriftValidation.validateColumnData(metadata, null, column);</span>
+
+<span class="nc" id="L969">            DecoratedKey dk = metadata.decorateKey(key);</span>
+<span class="nc" id="L970">            int nowInSec = FBUtilities.nowInSeconds();</span>
+
+<span class="nc" id="L972">            PartitionUpdate partitionUpdates = PartitionUpdate.fromIterator(LegacyLayout.toRowIterator(metadata, dk, toLegacyCells(metadata, updates, nowInSec).iterator(), nowInSec), ColumnFilter.all(metadata));</span>
+            // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+<span class="nc" id="L974">            Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(partitionUpdates);</span>
+
+<span class="nc" id="L976">            schedule(DatabaseDescriptor.getWriteRpcTimeout());</span>
+<span class="nc" id="L977">            try (RowIterator result = StorageProxy.cas(cState.getKeyspace(),</span>
+                                                       column_family,
+                                                       dk,
+<span class="nc" id="L980">                                                       new ThriftCASRequest(toLegacyCells(metadata, expected, nowInSec), partitionUpdates, nowInSec),</span>
+<span class="nc" id="L981">                                                       ThriftConversion.fromThrift(serial_consistency_level),</span>
+<span class="nc" id="L982">                                                       ThriftConversion.fromThrift(commit_consistency_level),</span>
+                                                       cState,
+                                                       queryStartNanoTime))
+            {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">                return result == null</span>
+                     ? new CASResult(true)
+<span class="nc" id="L988">                     : new CASResult(false).setCurrent_values(thriftifyColumnsAsColumns(metadata, LegacyLayout.fromRowIterator(result).right));</span>
+            }
+        }
+<span class="nc" id="L991">        catch (UnknownColumnException e)</span>
+        {
+<span class="nc" id="L993">            throw new InvalidRequestException(e.getMessage());</span>
+        }
+<span class="nc" id="L995">        catch (RequestTimeoutException e)</span>
+        {
+<span class="nc" id="L997">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L999">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1001">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L1003">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L1005">            throw ThriftConversion.rethrow(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1009">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    private LegacyLayout.LegacyCell toLegacyCell(CFMetaData metadata, Column column, int nowInSec) throws UnknownColumnException
+    {
+<span class="nc" id="L1015">        return toLegacyCell(metadata, null, column, nowInSec);</span>
+    }
+
+    private LegacyLayout.LegacyCell toLegacyCell(CFMetaData metadata, ByteBuffer superColumnName, Column column, int nowInSec)
+    throws UnknownColumnException
+    {
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">        return column.ttl &gt; 0</span>
+<span class="nc" id="L1022">             ? LegacyLayout.LegacyCell.expiring(metadata, superColumnName, column.name, column.value, column.timestamp, column.ttl, nowInSec)</span>
+<span class="nc" id="L1023">             : LegacyLayout.LegacyCell.regular(metadata, superColumnName, column.name, column.value, column.timestamp);</span>
+    }
+
+    private LegacyLayout.LegacyCell toLegacyDeletion(CFMetaData metadata, ByteBuffer name, long timestamp, int nowInSec)
+    throws UnknownColumnException
+    {
+<span class="nc" id="L1029">        return toLegacyDeletion(metadata, null, name, timestamp, nowInSec);</span>
+    }
+
+    private LegacyLayout.LegacyCell toLegacyDeletion(CFMetaData metadata, ByteBuffer superColumnName, ByteBuffer name, long timestamp, int nowInSec)
+    throws UnknownColumnException
+    {
+<span class="nc" id="L1035">        return LegacyLayout.LegacyCell.tombstone(metadata, superColumnName, name, timestamp, nowInSec);</span>
+    }
+
+    private LegacyLayout.LegacyCell toCounterLegacyCell(CFMetaData metadata, CounterColumn column)
+    throws UnknownColumnException
+    {
+<span class="nc" id="L1041">        return toCounterLegacyCell(metadata, null, column);</span>
+    }
+
+    private LegacyLayout.LegacyCell toCounterLegacyCell(CFMetaData metadata, ByteBuffer superColumnName, CounterColumn column)
+    throws UnknownColumnException
+    {
+<span class="nc" id="L1047">        return LegacyLayout.LegacyCell.counterUpdate(metadata, superColumnName, column.name, column.value);</span>
+    }
+
+    private void sortAndMerge(CFMetaData metadata, List&lt;LegacyLayout.LegacyCell&gt; cells, int nowInSec)
+    {
+<span class="nc" id="L1052">        Collections.sort(cells, LegacyLayout.legacyCellComparator(metadata));</span>
+
+        // After sorting, if we have multiple cells for the same &quot;cellname&quot;, we want to merge those together.
+<span class="nc" id="L1055">        Comparator&lt;LegacyLayout.LegacyCellName&gt; comparator = LegacyLayout.legacyCellNameComparator(metadata, false);</span>
+
+<span class="nc" id="L1057">        int previous = 0; // The last element that was set</span>
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">        for (int current = 1; current &lt; cells.size(); current++)</span>
+        {
+<span class="nc" id="L1060">            LegacyLayout.LegacyCell pc = cells.get(previous);</span>
+<span class="nc" id="L1061">            LegacyLayout.LegacyCell cc = cells.get(current);</span>
+
+            // There is really only 2 possible comparison: &lt; 0 or == 0 since we've sorted already
+<span class="nc" id="L1064">            int cmp = comparator.compare(pc.name, cc.name);</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">            if (cmp == 0)</span>
+            {
+                // current and previous are the same cell. Merge current into previous
+                // (and so previous + 1 will be &quot;free&quot;).
+                Conflicts.Resolution res;
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">                if (metadata.isCounter())</span>
+                {
+<span class="nc" id="L1072">                    res = Conflicts.resolveCounter(pc.timestamp, pc.isLive(nowInSec), pc.value,</span>
+<span class="nc" id="L1073">                                                   cc.timestamp, cc.isLive(nowInSec), cc.value);</span>
+
+                }
+                else
+                {
+<span class="nc" id="L1078">                    res = Conflicts.resolveRegular(pc.timestamp, pc.isLive(nowInSec), pc.localDeletionTime, pc.value,</span>
+<span class="nc" id="L1079">                                                   cc.timestamp, cc.isLive(nowInSec), cc.localDeletionTime, cc.value);</span>
+                }
+
+<span class="nc bnc" id="L1082" title="All 4 branches missed.">                switch (res)</span>
+                {
+                    case LEFT_WINS:
+                        // The previous cell wins, we'll just ignore current
+<span class="nc" id="L1086">                        break;</span>
+                    case RIGHT_WINS:
+<span class="nc" id="L1088">                        cells.set(previous, cc);</span>
+<span class="nc" id="L1089">                        break;</span>
+                    case MERGE:
+<span class="nc bnc" id="L1091" title="All 4 branches missed.">                        assert metadata.isCounter();</span>
+<span class="nc" id="L1092">                        ByteBuffer merged = Conflicts.mergeCounterValues(pc.value, cc.value);</span>
+<span class="nc" id="L1093">                        cells.set(previous, LegacyLayout.LegacyCell.counter(pc.name, merged));</span>
+                        break;
+                }
+<span class="nc" id="L1096">            }</span>
+            else
+            {
+                // cell.get(previous) &lt; cells.get(current), so move current just after previous if needs be
+<span class="nc" id="L1100">                ++previous;</span>
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">                if (previous != current)</span>
+<span class="nc" id="L1102">                    cells.set(previous, cc);</span>
+            }
+        }
+
+        // The last element we want is previous, so trim anything after that
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">        for (int i = cells.size() - 1; i &gt; previous; i--)</span>
+<span class="nc" id="L1108">            cells.remove(i);</span>
+<span class="nc" id="L1109">    }</span>
+
+    private List&lt;LegacyLayout.LegacyCell&gt; toLegacyCells(CFMetaData metadata, List&lt;Column&gt; columns, int nowInSec)
+    throws UnknownColumnException
+    {
+<span class="nc" id="L1114">        List&lt;LegacyLayout.LegacyCell&gt; cells = new ArrayList&lt;&gt;(columns.size());</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        for (Column column : columns)</span>
+<span class="nc" id="L1116">            cells.add(toLegacyCell(metadata, column, nowInSec));</span>
+
+<span class="nc" id="L1118">        sortAndMerge(metadata, cells, nowInSec);</span>
+<span class="nc" id="L1119">        return cells;</span>
+    }
+
+    private List&lt;IMutation&gt; createMutationList(ConsistencyLevel consistency_level,
+                                               Map&lt;ByteBuffer,Map&lt;String,List&lt;Mutation&gt;&gt;&gt; mutation_map,
+                                               boolean allowCounterMutations)
+    throws RequestValidationException, InvalidRequestException
+    {
+<span class="nc" id="L1127">        List&lt;IMutation&gt; mutations = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1128">        ThriftClientState cState = state();</span>
+<span class="nc" id="L1129">        String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1130">        int nowInSec = FBUtilities.nowInSeconds();</span>
+
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">        for (Map.Entry&lt;ByteBuffer, Map&lt;String, List&lt;Mutation&gt;&gt;&gt; mutationEntry: mutation_map.entrySet())</span>
+        {
+<span class="nc" id="L1134">            ByteBuffer key = mutationEntry.getKey();</span>
+
+            // We need to separate mutation for standard cf and counter cf (that will be encapsulated in a
+            // CounterMutation) because it doesn't follow the same code path
+<span class="nc" id="L1138">            org.apache.cassandra.db.Mutation standardMutation = null;</span>
+<span class="nc" id="L1139">            org.apache.cassandra.db.Mutation counterMutation = null;</span>
+
+<span class="nc" id="L1141">            Map&lt;String, List&lt;Mutation&gt;&gt; columnFamilyToMutations = mutationEntry.getValue();</span>
+<span class="nc bnc" id="L1142" title="All 2 branches missed.">            for (Map.Entry&lt;String, List&lt;Mutation&gt;&gt; columnFamilyMutations : columnFamilyToMutations.entrySet())</span>
+            {
+<span class="nc" id="L1144">                String cfName = columnFamilyMutations.getKey();</span>
+<span class="nc" id="L1145">                List&lt;Mutation&gt; muts = columnFamilyMutations.getValue();</span>
+
+<span class="nc" id="L1147">                cState.hasColumnFamilyAccess(keyspace, cfName, Permission.MODIFY);</span>
+
+<span class="nc" id="L1149">                CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, cfName);</span>
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">                if (metadata.isView())</span>
+<span class="nc" id="L1151">                    throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot modify Materialized Views directly&quot;);</span>
+
+<span class="nc" id="L1153">                ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">                if (metadata.isCounter())</span>
+<span class="nc" id="L1155">                    ThriftConversion.fromThrift(consistency_level).validateCounterForWrite(metadata);</span>
+
+<span class="nc" id="L1157">                LegacyLayout.LegacyDeletionInfo delInfo = LegacyLayout.LegacyDeletionInfo.live();</span>
+<span class="nc" id="L1158">                List&lt;LegacyLayout.LegacyCell&gt; cells = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">                for (Mutation m : muts)</span>
+                {
+<span class="nc" id="L1161">                    ThriftValidation.validateMutation(metadata, m);</span>
+
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">                    if (m.deletion != null)</span>
+                    {
+<span class="nc" id="L1165">                        deleteColumnOrSuperColumn(delInfo, cells, metadata, m.deletion, nowInSec);</span>
+                    }
+<span class="nc bnc" id="L1167" title="All 2 branches missed.">                    if (m.column_or_supercolumn != null)</span>
+                    {
+<span class="nc" id="L1169">                        addColumnOrSuperColumn(cells, metadata, m.column_or_supercolumn, nowInSec);</span>
+                    }
+<span class="nc" id="L1171">                }</span>
+
+<span class="nc" id="L1173">                sortAndMerge(metadata, cells, nowInSec);</span>
+<span class="nc" id="L1174">                DecoratedKey dk = metadata.decorateKey(key);</span>
+<span class="nc" id="L1175">                PartitionUpdate update = PartitionUpdate.fromIterator(LegacyLayout.toUnfilteredRowIterator(metadata, dk, delInfo, cells.iterator()), ColumnFilter.all(metadata));</span>
+
+                // Indexed column values cannot be larger than 64K.  See CASSANDRA-3057/4240 for more details
+<span class="nc" id="L1178">                Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName).indexManager.validate(update);</span>
+
+                org.apache.cassandra.db.Mutation mutation;
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">                if (metadata.isCounter())</span>
+                {
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">                    counterMutation = counterMutation == null ? new org.apache.cassandra.db.Mutation(keyspace, dk) : counterMutation;</span>
+<span class="nc" id="L1184">                    mutation = counterMutation;</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">                    standardMutation = standardMutation == null ? new org.apache.cassandra.db.Mutation(keyspace, dk) : standardMutation;</span>
+<span class="nc" id="L1189">                    mutation = standardMutation;</span>
+                }
+<span class="nc" id="L1191">                mutation.add(update);</span>
+<span class="nc" id="L1192">            }</span>
+<span class="nc bnc" id="L1193" title="All 4 branches missed.">            if (standardMutation != null &amp;&amp; !standardMutation.isEmpty())</span>
+<span class="nc" id="L1194">                mutations.add(standardMutation);</span>
+
+<span class="nc bnc" id="L1196" title="All 4 branches missed.">            if (counterMutation != null &amp;&amp; !counterMutation.isEmpty())</span>
+            {
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">                if (allowCounterMutations)</span>
+<span class="nc" id="L1199">                    mutations.add(new CounterMutation(counterMutation, ThriftConversion.fromThrift(consistency_level)));</span>
+                else
+<span class="nc" id="L1201">                    throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Counter mutations are not allowed in atomic batches&quot;);</span>
+            }
+<span class="nc" id="L1203">        }</span>
+
+<span class="nc" id="L1205">        return mutations;</span>
+    }
+
+    private void addColumnOrSuperColumn(List&lt;LegacyLayout.LegacyCell&gt; cells, CFMetaData cfm, ColumnOrSuperColumn cosc, int nowInSec)
+    throws InvalidRequestException
+    {
+        try
+        {
+<span class="nc bnc" id="L1213" title="All 2 branches missed.">            if (cosc.super_column != null)</span>
+            {
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">                for (Column column : cosc.super_column.columns)</span>
+<span class="nc" id="L1216">                    cells.add(toLegacyCell(cfm, cosc.super_column.name, column, nowInSec));</span>
+            }
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">            else if (cosc.column != null)</span>
+            {
+<span class="nc" id="L1220">                cells.add(toLegacyCell(cfm, cosc.column, nowInSec));</span>
+            }
+<span class="nc bnc" id="L1222" title="All 2 branches missed.">            else if (cosc.counter_super_column != null)</span>
+            {
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">                for (CounterColumn column : cosc.counter_super_column.columns)</span>
+<span class="nc" id="L1225">                    cells.add(toCounterLegacyCell(cfm, cosc.counter_super_column.name, column));</span>
+            }
+            else // cosc.counter_column != null
+            {
+<span class="nc" id="L1229">                cells.add(toCounterLegacyCell(cfm, cosc.counter_column));</span>
+            }
+        }
+<span class="nc" id="L1232">        catch (UnknownColumnException e)</span>
+        {
+<span class="nc" id="L1234">            throw new InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L1235">        }</span>
+<span class="nc" id="L1236">    }</span>
+
+    private void addRange(CFMetaData cfm, LegacyLayout.LegacyDeletionInfo delInfo, ClusteringBound start, ClusteringBound end, long timestamp, int nowInSec)
+    {
+<span class="nc" id="L1240">        delInfo.add(cfm, new RangeTombstone(Slice.make(start, end), new DeletionTime(timestamp, nowInSec)));</span>
+<span class="nc" id="L1241">    }</span>
+
+    private void deleteColumnOrSuperColumn(LegacyLayout.LegacyDeletionInfo delInfo, List&lt;LegacyLayout.LegacyCell&gt; cells, CFMetaData cfm, Deletion del, int nowInSec)
+    throws InvalidRequestException
+    {
+<span class="nc bnc" id="L1246" title="All 4 branches missed.">        if (del.predicate != null &amp;&amp; del.predicate.column_names != null)</span>
+        {
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">            for (ByteBuffer c : del.predicate.column_names)</span>
+            {
+                try
+                {
+<span class="nc bnc" id="L1252" title="All 4 branches missed.">                    if (del.super_column == null &amp;&amp; cfm.isSuper())</span>
+<span class="nc" id="L1253">                        addRange(cfm, delInfo, ClusteringBound.inclusiveStartOf(c), ClusteringBound.inclusiveEndOf(c), del.timestamp, nowInSec);</span>
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">                    else if (del.super_column != null)</span>
+<span class="nc" id="L1255">                        cells.add(toLegacyDeletion(cfm, del.super_column, c, del.timestamp, nowInSec));</span>
+                    else
+<span class="nc" id="L1257">                        cells.add(toLegacyDeletion(cfm, c, del.timestamp, nowInSec));</span>
+                }
+<span class="nc" id="L1259">                catch (UnknownColumnException e)</span>
+                {
+<span class="nc" id="L1261">                    throw new InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L1262">                }</span>
+<span class="nc" id="L1263">            }</span>
+        }
+<span class="nc bnc" id="L1265" title="All 4 branches missed.">        else if (del.predicate != null &amp;&amp; del.predicate.slice_range != null)</span>
+        {
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">            if (del.super_column == null)</span>
+            {
+<span class="nc" id="L1269">                LegacyLayout.LegacyBound start = LegacyLayout.decodeTombstoneBound(cfm, del.predicate.getSlice_range().start, true);</span>
+<span class="nc" id="L1270">                LegacyLayout.LegacyBound end = LegacyLayout.decodeTombstoneBound(cfm, del.predicate.getSlice_range().finish, false);</span>
+<span class="nc" id="L1271">                delInfo.add(cfm, new LegacyLayout.LegacyRangeTombstone(start, end, new DeletionTime(del.timestamp, nowInSec)));</span>
+<span class="nc" id="L1272">            }</span>
+            else
+            {
+                // Since we use a map for subcolumns, we would need range tombstone for collections to support this.
+                // And while we may want those some day, this require a bit of additional work. And since super columns
+                // are basically deprecated since a long time, and range tombstone on them has been only very recently
+                // added so that no thrift driver actually supports it to the best of my knowledge, it's likely ok to
+                // discontinue support for this. If it turns out that this is blocking the update of someone, we can
+                // decide then if we want to tackle the addition of range tombstone for collections then.
+<span class="nc" id="L1281">                throw new InvalidRequestException(&quot;Cannot delete a range of subcolumns in a super column&quot;);</span>
+            }
+        }
+        else
+        {
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">            if (del.super_column != null)</span>
+<span class="nc" id="L1287">                addRange(cfm, delInfo, ClusteringBound.inclusiveStartOf(del.super_column), ClusteringBound.inclusiveEndOf(del.super_column), del.timestamp, nowInSec);</span>
+            else
+<span class="nc" id="L1289">                delInfo.add(new DeletionTime(del.timestamp, nowInSec));</span>
+        }
+<span class="nc" id="L1291">    }</span>
+
+    public void batch_mutate(Map&lt;ByteBuffer,Map&lt;String,List&lt;Mutation&gt;&gt;&gt; mutation_map, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L1296">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1299">            Map&lt;String, String&gt; traceParameters = Maps.newLinkedHashMap();</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">            for (Map.Entry&lt;ByteBuffer, Map&lt;String, List&lt;Mutation&gt;&gt;&gt; mutationEntry : mutation_map.entrySet())</span>
+            {
+<span class="nc" id="L1302">                traceParameters.put(ByteBufferUtil.bytesToHex(mutationEntry.getKey()),</span>
+<span class="nc" id="L1303">                                    Joiner.on(&quot;;&quot;).withKeyValueSeparator(&quot;:&quot;).join(mutationEntry.getValue()));</span>
+<span class="nc" id="L1304">            }</span>
+<span class="nc" id="L1305">            traceParameters.put(&quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1306">            Tracing.instance.begin(&quot;batch_mutate&quot;, traceParameters);</span>
+<span class="nc" id="L1307">        }</span>
+        else
+        {
+<span class="nc" id="L1310">            logger.trace(&quot;batch_mutate&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L1315">            doInsert(consistency_level, createMutationList(consistency_level, mutation_map, true), queryStartNanoTime);</span>
+        }
+<span class="nc" id="L1317">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1319">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1323">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L1325">    }</span>
+
+    public void atomic_batch_mutate(Map&lt;ByteBuffer,Map&lt;String,List&lt;Mutation&gt;&gt;&gt; mutation_map, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L1330">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1331" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1333">            Map&lt;String, String&gt; traceParameters = Maps.newLinkedHashMap();</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">            for (Map.Entry&lt;ByteBuffer, Map&lt;String, List&lt;Mutation&gt;&gt;&gt; mutationEntry : mutation_map.entrySet())</span>
+            {
+<span class="nc" id="L1336">                traceParameters.put(ByteBufferUtil.bytesToHex(mutationEntry.getKey()),</span>
+<span class="nc" id="L1337">                                    Joiner.on(&quot;;&quot;).withKeyValueSeparator(&quot;:&quot;).join(mutationEntry.getValue()));</span>
+<span class="nc" id="L1338">            }</span>
+<span class="nc" id="L1339">            traceParameters.put(&quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1340">            Tracing.instance.begin(&quot;atomic_batch_mutate&quot;, traceParameters);</span>
+<span class="nc" id="L1341">        }</span>
+        else
+        {
+<span class="nc" id="L1344">            logger.trace(&quot;atomic_batch_mutate&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L1349">            doInsert(consistency_level, createMutationList(consistency_level, mutation_map, false), true, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L1351">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1353">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1357">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L1359">    }</span>
+
+    private void internal_remove(ByteBuffer key, ColumnPath column_path, long timestamp, ConsistencyLevel consistency_level, boolean isCommutativeOp, long queryStartNanoTime)
+    throws RequestValidationException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L1364">        ThriftClientState cState = state();</span>
+<span class="nc" id="L1365">        String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1366">        cState.hasColumnFamilyAccess(keyspace, column_path.column_family, Permission.MODIFY);</span>
+
+<span class="nc" id="L1368">        CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_path.column_family, isCommutativeOp);</span>
+<span class="nc bnc" id="L1369" title="All 2 branches missed.">        if (metadata.isView())</span>
+<span class="nc" id="L1370">            throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot modify Materialized Views directly&quot;);</span>
+
+<span class="nc" id="L1372">        ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc" id="L1373">        ThriftValidation.validateColumnPathOrParent(metadata, column_path);</span>
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">        if (isCommutativeOp)</span>
+<span class="nc" id="L1375">            ThriftConversion.fromThrift(consistency_level).validateCounterForWrite(metadata);</span>
+
+<span class="nc" id="L1377">        DecoratedKey dk = metadata.decorateKey(key);</span>
+
+<span class="nc" id="L1379">        int nowInSec = FBUtilities.nowInSeconds();</span>
+        PartitionUpdate update;
+<span class="nc bnc" id="L1381" title="All 4 branches missed.">        if (column_path.super_column == null &amp;&amp; column_path.column == null)</span>
+        {
+<span class="nc" id="L1383">            update = PartitionUpdate.fullPartitionDelete(metadata, dk, timestamp, nowInSec);</span>
+        }
+<span class="nc bnc" id="L1385" title="All 4 branches missed.">        else if (column_path.super_column != null &amp;&amp; column_path.column == null)</span>
+        {
+<span class="nc" id="L1387">            Row row = BTreeRow.emptyDeletedRow(Clustering.make(column_path.super_column), Row.Deletion.regular(new DeletionTime(timestamp, nowInSec)));</span>
+<span class="nc" id="L1388">            update = PartitionUpdate.singleRowUpdate(metadata, dk, row);</span>
+<span class="nc" id="L1389">        }</span>
+        else
+        {
+            try
+            {
+<span class="nc" id="L1394">                LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, column_path.super_column, column_path.column);</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">                CellPath path = name.collectionElement == null ? null : CellPath.create(name.collectionElement);</span>
+<span class="nc" id="L1396">                Cell cell = BufferCell.tombstone(name.column, timestamp, nowInSec, path);</span>
+<span class="nc" id="L1397">                update = PartitionUpdate.singleRowUpdate(metadata, dk, BTreeRow.singleCellRow(name.clustering, cell));</span>
+            }
+<span class="nc" id="L1399">            catch (UnknownColumnException e)</span>
+            {
+<span class="nc" id="L1401">                throw new org.apache.cassandra.exceptions.InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L1402">            }</span>
+        }
+
+<span class="nc" id="L1405">        org.apache.cassandra.db.Mutation mutation = new org.apache.cassandra.db.Mutation(update);</span>
+
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">        if (isCommutativeOp)</span>
+<span class="nc" id="L1408">            doInsert(consistency_level, Collections.singletonList(new CounterMutation(mutation, ThriftConversion.fromThrift(consistency_level))), queryStartNanoTime);</span>
+        else
+<span class="nc" id="L1410">            doInsert(consistency_level, Collections.singletonList(mutation), queryStartNanoTime);</span>
+<span class="nc" id="L1411">    }</span>
+
+    public void remove(ByteBuffer key, ColumnPath column_path, long timestamp, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L1416">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1419">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L1420">                                                                  &quot;column_path&quot;, column_path.toString(),</span>
+                                                                  &quot;timestamp&quot;, timestamp + &quot;&quot;,
+<span class="nc" id="L1422">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1423">            Tracing.instance.begin(&quot;remove&quot;, traceParameters);</span>
+<span class="nc" id="L1424">        }</span>
+        else
+        {
+<span class="nc" id="L1427">            logger.trace(&quot;remove&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L1432">            internal_remove(key, column_path, timestamp, consistency_level, false, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L1434">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1436">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1440">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L1442">    }</span>
+
+    private void doInsert(ConsistencyLevel consistency_level, List&lt;? extends IMutation&gt; mutations, long queryStartNanoTime)
+    throws UnavailableException, TimedOutException, org.apache.cassandra.exceptions.InvalidRequestException
+    {
+<span class="nc" id="L1447">        doInsert(consistency_level, mutations, false, queryStartNanoTime);</span>
+<span class="nc" id="L1448">    }</span>
+
+    private void doInsert(ConsistencyLevel consistency_level, List&lt;? extends IMutation&gt; mutations, boolean mutateAtomically, long queryStartNanoTime)
+    throws UnavailableException, TimedOutException, org.apache.cassandra.exceptions.InvalidRequestException
+    {
+<span class="nc" id="L1453">        org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L1454">        consistencyLevel.validateForWrite(state().getKeyspace());</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">        if (mutations.isEmpty())</span>
+<span class="nc" id="L1456">            return;</span>
+
+<span class="nc" id="L1458">        long timeout = Long.MAX_VALUE;</span>
+<span class="nc bnc" id="L1459" title="All 2 branches missed.">        for (IMutation m : mutations)</span>
+<span class="nc" id="L1460">            timeout = Longs.min(timeout, m.getTimeout());</span>
+
+<span class="nc" id="L1462">        schedule(timeout);</span>
+        try
+        {
+<span class="nc" id="L1465">            StorageProxy.mutateWithTriggers(mutations, consistencyLevel, mutateAtomically, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L1467">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L1469">            ThriftConversion.rethrow(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1473">            release();</span>
+        }
+<span class="nc" id="L1475">    }</span>
+
+    private void validateLogin() throws InvalidRequestException
+    {
+        try
+        {
+<span class="nc" id="L1481">            state().validateLogin();</span>
+        }
+<span class="nc" id="L1483">        catch (UnauthorizedException e)</span>
+        {
+<span class="nc" id="L1485">            throw new InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L1486">        }</span>
+<span class="nc" id="L1487">    }</span>
+
+    public KsDef describe_keyspace(String keyspaceName) throws NotFoundException, InvalidRequestException
+    {
+<span class="nc" id="L1491">        validateLogin();</span>
+
+<span class="nc" id="L1493">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspaceName);</span>
+<span class="nc bnc" id="L1494" title="All 2 branches missed.">        if (ksm == null)</span>
+<span class="nc" id="L1495">            throw new NotFoundException();</span>
+
+<span class="nc" id="L1497">        return ThriftConversion.toThrift(ksm);</span>
+    }
+
+    public List&lt;KeySlice&gt; get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TException, TimedOutException
+    {
+<span class="nc" id="L1503">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1506">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(</span>
+<span class="nc" id="L1507">                    &quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L1508">                    &quot;predicate&quot;, predicate.toString(),</span>
+<span class="nc" id="L1509">                    &quot;range&quot;, range.toString(),</span>
+<span class="nc" id="L1510">                    &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1511">            Tracing.instance.begin(&quot;get_range_slices&quot;, traceParameters);</span>
+<span class="nc" id="L1512">        }</span>
+        else
+        {
+<span class="nc" id="L1515">            logger.trace(&quot;range_slice&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L1520">            ThriftClientState cState = state();</span>
+<span class="nc" id="L1521">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1522">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+
+<span class="nc" id="L1524">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family);</span>
+<span class="nc" id="L1525">            ThriftValidation.validateColumnParent(metadata, column_parent);</span>
+<span class="nc" id="L1526">            ThriftValidation.validatePredicate(metadata, column_parent, predicate);</span>
+<span class="nc" id="L1527">            ThriftValidation.validateKeyRange(metadata, column_parent.super_column, range);</span>
+
+<span class="nc" id="L1529">            org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L1530">            consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L1532">            IPartitioner p = metadata.partitioner;</span>
+            AbstractBounds&lt;PartitionPosition&gt; bounds;
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">            if (range.start_key == null)</span>
+            {
+<span class="nc" id="L1536">                Token.TokenFactory tokenFactory = p.getTokenFactory();</span>
+<span class="nc" id="L1537">                Token left = tokenFactory.fromString(range.start_token);</span>
+<span class="nc" id="L1538">                Token right = tokenFactory.fromString(range.end_token);</span>
+<span class="nc" id="L1539">                bounds = Range.makeRowRange(left, right);</span>
+<span class="nc" id="L1540">            }</span>
+            else
+            {
+<span class="nc bnc" id="L1543" title="All 2 branches missed.">                PartitionPosition end = range.end_key == null</span>
+<span class="nc" id="L1544">                                ? p.getTokenFactory().fromString(range.end_token).maxKeyBound()</span>
+<span class="nc" id="L1545">                                : PartitionPosition.ForKey.get(range.end_key, p);</span>
+<span class="nc" id="L1546">                bounds = new Bounds&lt;&gt;(PartitionPosition.ForKey.get(range.start_key, p), end);</span>
+            }
+<span class="nc" id="L1548">            int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L1549">            schedule(DatabaseDescriptor.getRangeRpcTimeout());</span>
+            try
+            {
+<span class="nc" id="L1552">                ColumnFilter columns = makeColumnFilter(metadata, column_parent, predicate);</span>
+<span class="nc" id="L1553">                ClusteringIndexFilter filter = toInternalFilter(metadata, column_parent, predicate);</span>
+<span class="nc bnc" id="L1554" title="All 4 branches missed.">                DataLimits limits = getLimits(range.count, metadata.isSuper() &amp;&amp; !column_parent.isSetSuper_column(), predicate);</span>
+
+<span class="nc" id="L1556">                PartitionRangeReadCommand cmd =</span>
+<span class="nc" id="L1557">                    PartitionRangeReadCommand.create(true,</span>
+                                                     metadata,
+                                                     nowInSec,
+                                                     columns,
+<span class="nc" id="L1561">                                                     ThriftConversion.rowFilterFromThrift(metadata, range.row_filter),</span>
+                                                     limits,
+                                                     new DataRange(bounds, filter));
+
+<span class="nc" id="L1565">                try (PartitionIterator results = StorageProxy.getRangeSlice(cmd, consistencyLevel, queryStartNanoTime))</span>
+                {
+<span class="nc bnc" id="L1567" title="All 4 branches missed.">                    assert results != null;</span>
+<span class="nc" id="L1568">                    return thriftifyKeySlices(results, column_parent, limits.perPartitionCount());</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L1573">                release();</span>
+            }
+        }
+<span class="nc" id="L1576">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1578">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L1580">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L1582">            throw ThriftConversion.rethrow(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1586">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    public List&lt;KeySlice&gt; get_paged_slice(String column_family, KeyRange range, ByteBuffer start_column, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    {
+<span class="nc" id="L1593">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1594" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1596">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;column_family&quot;, column_family,</span>
+<span class="nc" id="L1597">                                                                  &quot;range&quot;, range.toString(),</span>
+<span class="nc" id="L1598">                                                                  &quot;start_column&quot;, ByteBufferUtil.bytesToHex(start_column),</span>
+<span class="nc" id="L1599">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1600">            Tracing.instance.begin(&quot;get_paged_slice&quot;, traceParameters);</span>
+<span class="nc" id="L1601">        }</span>
+        else
+        {
+<span class="nc" id="L1604">            logger.trace(&quot;get_paged_slice&quot;);</span>
+        }
+
+        try
+        {
+
+<span class="nc" id="L1610">            ThriftClientState cState = state();</span>
+<span class="nc" id="L1611">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1612">            cState.hasColumnFamilyAccess(keyspace, column_family, Permission.SELECT);</span>
+
+<span class="nc" id="L1614">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_family);</span>
+<span class="nc" id="L1615">            ThriftValidation.validateKeyRange(metadata, null, range);</span>
+
+<span class="nc" id="L1617">            org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L1618">            consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L1620">            IPartitioner p = metadata.partitioner;</span>
+            AbstractBounds&lt;PartitionPosition&gt; bounds;
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">            if (range.start_key == null)</span>
+            {
+                // (token, key) is unsupported, assume (token, token)
+<span class="nc" id="L1625">                Token.TokenFactory tokenFactory = p.getTokenFactory();</span>
+<span class="nc" id="L1626">                Token left = tokenFactory.fromString(range.start_token);</span>
+<span class="nc" id="L1627">                Token right = tokenFactory.fromString(range.end_token);</span>
+<span class="nc" id="L1628">                bounds = Range.makeRowRange(left, right);</span>
+<span class="nc" id="L1629">            }</span>
+            else
+            {
+<span class="nc bnc" id="L1632" title="All 2 branches missed.">                PartitionPosition end = range.end_key == null</span>
+<span class="nc" id="L1633">                                ? p.getTokenFactory().fromString(range.end_token).maxKeyBound()</span>
+<span class="nc" id="L1634">                                : PartitionPosition.ForKey.get(range.end_key, p);</span>
+<span class="nc" id="L1635">                bounds = new Bounds&lt;&gt;(PartitionPosition.ForKey.get(range.start_key, p), end);</span>
+            }
+
+<span class="nc bnc" id="L1638" title="All 4 branches missed.">            if (range.row_filter != null &amp;&amp; !range.row_filter.isEmpty())</span>
+<span class="nc" id="L1639">                throw new InvalidRequestException(&quot;Cross-row paging is not supported along with index clauses&quot;);</span>
+
+<span class="nc" id="L1641">            int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L1642">            schedule(DatabaseDescriptor.getRangeRpcTimeout());</span>
+            try
+            {
+<span class="nc" id="L1645">                ClusteringIndexFilter filter = new ClusteringIndexSliceFilter(Slices.ALL, false);</span>
+<span class="nc" id="L1646">                DataLimits limits = getLimits(range.count, true, Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L1647" title="All 2 branches missed.">                Clustering pageFrom = metadata.isSuper()</span>
+<span class="nc" id="L1648">                                    ? Clustering.make(start_column)</span>
+<span class="nc" id="L1649">                                    : LegacyLayout.decodeCellName(metadata, start_column).clustering;</span>
+
+<span class="nc" id="L1651">                PartitionRangeReadCommand cmd =</span>
+<span class="nc" id="L1652">                    PartitionRangeReadCommand.create(true,</span>
+                                                     metadata,
+                                                     nowInSec,
+<span class="nc" id="L1655">                                                     ColumnFilter.all(metadata),</span>
+                                                     RowFilter.NONE,
+                                                     limits,
+<span class="nc" id="L1658">                                                     new DataRange(bounds, filter).forPaging(bounds, metadata.comparator, pageFrom, true));</span>
+
+<span class="nc" id="L1660">                try (PartitionIterator results = StorageProxy.getRangeSlice(cmd, consistencyLevel, queryStartNanoTime))</span>
+                {
+<span class="nc" id="L1662">                    return thriftifyKeySlices(results, new ColumnParent(column_family), limits.perPartitionCount());</span>
+                }
+            }
+<span class="nc" id="L1665">            catch (UnknownColumnException e)</span>
+            {
+<span class="nc" id="L1667">                throw new InvalidRequestException(e.getMessage());</span>
+            }
+            finally
+            {
+<span class="nc" id="L1671">                release();</span>
+            }
+        }
+<span class="nc" id="L1674">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1676">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L1678">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L1680">            throw ThriftConversion.rethrow(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1684">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    private List&lt;KeySlice&gt; thriftifyKeySlices(PartitionIterator results, ColumnParent column_parent, int cellLimit)
+    {
+<span class="nc" id="L1690">        try (PartitionIterator iter = results)</span>
+        {
+<span class="nc" id="L1692">            List&lt;KeySlice&gt; keySlices = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">            while (iter.hasNext())</span>
+            {
+<span class="nc" id="L1695">                try (RowIterator partition = iter.next())</span>
+                {
+<span class="nc bnc" id="L1697" title="All 2 branches missed.">                    List&lt;ColumnOrSuperColumn&gt; thriftifiedColumns = thriftifyPartition(partition, column_parent.super_column != null, partition.isReverseOrder(), cellLimit);</span>
+<span class="nc" id="L1698">                    keySlices.add(new KeySlice(partition.partitionKey().getKey(), thriftifiedColumns));</span>
+<span class="nc" id="L1699">                }</span>
+            }
+
+<span class="nc" id="L1702">            return keySlices;</span>
+        }
+    }
+
+    public List&lt;KeySlice&gt; get_indexed_slices(ColumnParent column_parent, IndexClause index_clause, SlicePredicate column_predicate, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    {
+<span class="nc" id="L1709">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L1710" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L1712">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L1713">                                                                  &quot;index_clause&quot;, index_clause.toString(),</span>
+<span class="nc" id="L1714">                                                                  &quot;slice_predicate&quot;, column_predicate.toString(),</span>
+<span class="nc" id="L1715">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L1716">            Tracing.instance.begin(&quot;get_indexed_slices&quot;, traceParameters);</span>
+<span class="nc" id="L1717">        }</span>
+        else
+        {
+<span class="nc" id="L1720">            logger.trace(&quot;scan&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L1725">            ThriftClientState cState = state();</span>
+<span class="nc" id="L1726">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1727">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);</span>
+<span class="nc" id="L1728">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, false);</span>
+<span class="nc" id="L1729">            ThriftValidation.validateColumnParent(metadata, column_parent);</span>
+<span class="nc" id="L1730">            ThriftValidation.validatePredicate(metadata, column_parent, column_predicate);</span>
+<span class="nc" id="L1731">            ThriftValidation.validateIndexClauses(metadata, index_clause);</span>
+<span class="nc" id="L1732">            org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(consistency_level);</span>
+<span class="nc" id="L1733">            consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L1735">            IPartitioner p = metadata.partitioner;</span>
+<span class="nc" id="L1736">            AbstractBounds&lt;PartitionPosition&gt; bounds = new Bounds&lt;&gt;(PartitionPosition.ForKey.get(index_clause.start_key, p),</span>
+<span class="nc" id="L1737">                                                                    p.getMinimumToken().minKeyBound());</span>
+
+<span class="nc" id="L1739">            int nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L1740">            ColumnFilter columns = makeColumnFilter(metadata, column_parent, column_predicate);</span>
+<span class="nc" id="L1741">            ClusteringIndexFilter filter = toInternalFilter(metadata, column_parent, column_predicate);</span>
+<span class="nc bnc" id="L1742" title="All 4 branches missed.">            DataLimits limits = getLimits(index_clause.count, metadata.isSuper() &amp;&amp; !column_parent.isSetSuper_column(), column_predicate);</span>
+
+<span class="nc" id="L1744">            PartitionRangeReadCommand cmd =</span>
+<span class="nc" id="L1745">                PartitionRangeReadCommand.create(true,</span>
+                                                 metadata,
+                                                 nowInSec,
+                                                 columns,
+<span class="nc" id="L1749">                                                 ThriftConversion.rowFilterFromThrift(metadata, index_clause.expressions),</span>
+                                                 limits,
+                                                 new DataRange(bounds, filter));
+
+            // If there's a secondary index that the command can use, have it validate the request parameters.
+<span class="nc" id="L1754">            cmd.maybeValidateIndex();</span>
+
+<span class="nc" id="L1756">            try (PartitionIterator results = StorageProxy.getRangeSlice(cmd, consistencyLevel, queryStartNanoTime))</span>
+            {
+<span class="nc" id="L1758">                return thriftifyKeySlices(results, column_parent, limits.perPartitionCount());</span>
+            }
+        }
+<span class="nc" id="L1761">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1763">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L1765">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L1767">            throw ThriftConversion.rethrow(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L1771">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    public List&lt;KsDef&gt; describe_keyspaces() throws TException, InvalidRequestException
+    {
+<span class="nc" id="L1777">        validateLogin();</span>
+
+<span class="nc" id="L1779">        Set&lt;String&gt; keyspaces = Schema.instance.getKeyspaces();</span>
+<span class="nc" id="L1780">        List&lt;KsDef&gt; ksset = new ArrayList&lt;&gt;(keyspaces.size());</span>
+<span class="nc bnc" id="L1781" title="All 2 branches missed.">        for (String ks : keyspaces)</span>
+        {
+            try
+            {
+<span class="nc" id="L1785">                ksset.add(describe_keyspace(ks));</span>
+            }
+<span class="nc" id="L1787">            catch (NotFoundException nfe)</span>
+            {
+<span class="nc" id="L1789">                logger.info(&quot;Failed to find metadata for keyspace '{}'. Continuing... &quot;, ks);</span>
+<span class="nc" id="L1790">            }</span>
+<span class="nc" id="L1791">        }</span>
+<span class="nc" id="L1792">        return ksset;</span>
+    }
+
+    public String describe_cluster_name() throws TException
+    {
+<span class="nc" id="L1797">        return DatabaseDescriptor.getClusterName();</span>
+    }
+
+    public String describe_version() throws TException
+    {
+<span class="nc" id="L1802">        return cassandraConstants.VERSION;</span>
+    }
+
+    public List&lt;TokenRange&gt; describe_ring(String keyspace) throws InvalidRequestException
+    {
+        try
+        {
+<span class="nc" id="L1809">            return StorageService.instance.describeRing(keyspace);</span>
+        }
+<span class="nc" id="L1811">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1813">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    @Override
+    public List&lt;TokenRange&gt; describe_local_ring(String keyspace) throws InvalidRequestException, TException
+    {
+        try
+        {
+<span class="nc" id="L1822">            return StorageService.instance.describeLocalRing(keyspace);</span>
+        }
+<span class="nc" id="L1824">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1826">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public Map&lt;String, String&gt; describe_token_map() throws InvalidRequestException
+    {
+<span class="nc" id="L1832">        return StorageService.instance.getTokenToEndpointMap();</span>
+    }
+
+    public String describe_partitioner() throws TException
+    {
+<span class="nc" id="L1837">        return StorageService.instance.getPartitionerName();</span>
+    }
+
+    public String describe_snitch() throws TException
+    {
+<span class="nc bnc" id="L1842" title="All 2 branches missed.">        if (DatabaseDescriptor.getEndpointSnitch() instanceof DynamicEndpointSnitch)</span>
+<span class="nc" id="L1843">            return ((DynamicEndpointSnitch)DatabaseDescriptor.getEndpointSnitch()).subsnitch.getClass().getName();</span>
+<span class="nc" id="L1844">        return DatabaseDescriptor.getEndpointSnitch().getClass().getName();</span>
+    }
+
+    @Deprecated
+    public List&lt;String&gt; describe_splits(String cfName, String start_token, String end_token, int keys_per_split)
+    throws TException, InvalidRequestException
+    {
+<span class="nc" id="L1851">        List&lt;CfSplit&gt; splits = describe_splits_ex(cfName, start_token, end_token, keys_per_split);</span>
+<span class="nc" id="L1852">        List&lt;String&gt; result = new ArrayList&lt;&gt;(splits.size() + 1);</span>
+
+<span class="nc" id="L1854">        result.add(splits.get(0).getStart_token());</span>
+<span class="nc bnc" id="L1855" title="All 2 branches missed.">        for (CfSplit cfSplit : splits)</span>
+<span class="nc" id="L1856">            result.add(cfSplit.getEnd_token());</span>
+
+<span class="nc" id="L1858">        return result;</span>
+    }
+
+    public List&lt;CfSplit&gt; describe_splits_ex(String cfName, String start_token, String end_token, int keys_per_split)
+    throws InvalidRequestException, TException
+    {
+        try
+        {
+<span class="nc" id="L1866">            Token.TokenFactory tf = StorageService.instance.getTokenFactory();</span>
+<span class="nc" id="L1867">            Range&lt;Token&gt; tr = new Range&lt;Token&gt;(tf.fromString(start_token), tf.fromString(end_token));</span>
+<span class="nc" id="L1868">            List&lt;Pair&lt;Range&lt;Token&gt;, Long&gt;&gt; splits =</span>
+<span class="nc" id="L1869">                    StorageService.instance.getSplits(state().getKeyspace(), cfName, tr, keys_per_split);</span>
+<span class="nc" id="L1870">            List&lt;CfSplit&gt; result = new ArrayList&lt;&gt;(splits.size());</span>
+<span class="nc bnc" id="L1871" title="All 2 branches missed.">            for (Pair&lt;Range&lt;Token&gt;, Long&gt; split : splits)</span>
+<span class="nc" id="L1872">                result.add(new CfSplit(split.left.left.toString(), split.left.right.toString(), split.right));</span>
+<span class="nc" id="L1873">            return result;</span>
+        }
+<span class="nc" id="L1875">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1877">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public void login(AuthenticationRequest auth_request) throws TException
+    {
+        try
+        {
+<span class="nc" id="L1885">            state().login(DatabaseDescriptor.getAuthenticator().legacyAuthenticate(auth_request.getCredentials()));</span>
+        }
+<span class="nc" id="L1887">        catch (org.apache.cassandra.exceptions.AuthenticationException e)</span>
+        {
+<span class="nc" id="L1889">            throw ThriftConversion.toThrift(e);</span>
+<span class="nc" id="L1890">        }</span>
+<span class="nc" id="L1891">    }</span>
+
+    /**
+     * Schedule the current thread for access to the required services
+     */
+    private void schedule(long timeoutMS) throws UnavailableException
+    {
+        try
+        {
+<span class="nc" id="L1900">            requestScheduler.queue(Thread.currentThread(), state().getSchedulingValue(), timeoutMS);</span>
+        }
+<span class="nc" id="L1902">        catch (TimeoutException e)</span>
+        {
+<span class="nc" id="L1904">            throw new UnavailableException();</span>
+<span class="nc" id="L1905">        }</span>
+<span class="nc" id="L1906">    }</span>
+
+    /**
+     * Release count for the used up resources
+     */
+    private void release()
+    {
+<span class="nc" id="L1913">        requestScheduler.release();</span>
+<span class="nc" id="L1914">    }</span>
+
+    public String system_add_column_family(CfDef cf_def) throws TException
+    {
+<span class="nc" id="L1918">        logger.trace(&quot;add_column_family&quot;);</span>
+
+        try
+        {
+<span class="nc" id="L1922">            ClientState cState = state();</span>
+<span class="nc" id="L1923">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1924">            cState.hasKeyspaceAccess(keyspace, Permission.CREATE);</span>
+<span class="nc" id="L1925">            cf_def.unsetId(); // explicitly ignore any id set by client (Hector likes to set zero)</span>
+<span class="nc" id="L1926">            CFMetaData cfm = ThriftConversion.fromThrift(cf_def);</span>
+<span class="nc" id="L1927">            cfm.params.compaction.validate();</span>
+
+<span class="nc bnc" id="L1929" title="All 2 branches missed.">            if (!cfm.getTriggers().isEmpty())</span>
+<span class="nc" id="L1930">                state().ensureIsSuper(&quot;Only superusers are allowed to add triggers.&quot;);</span>
+
+<span class="nc" id="L1932">            MigrationManager.announceNewColumnFamily(cfm);</span>
+<span class="nc" id="L1933">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L1935">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1937">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public String system_drop_column_family(String column_family)
+    throws InvalidRequestException, SchemaDisagreementException, TException
+    {
+<span class="nc" id="L1944">        logger.trace(&quot;drop_column_family&quot;);</span>
+
+<span class="nc" id="L1946">        ThriftClientState cState = state();</span>
+
+        try
+        {
+<span class="nc" id="L1950">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L1951">            cState.hasColumnFamilyAccess(keyspace, column_family, Permission.DROP);</span>
+
+<span class="nc" id="L1953">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_family);</span>
+<span class="nc bnc" id="L1954" title="All 2 branches missed.">            if (metadata.isView())</span>
+<span class="nc" id="L1955">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot drop Materialized Views from Thrift&quot;);</span>
+
+<span class="nc" id="L1957">            MigrationManager.announceColumnFamilyDrop(keyspace, column_family);</span>
+<span class="nc" id="L1958">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L1960">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L1962">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public String system_add_keyspace(KsDef ks_def)
+    throws InvalidRequestException, SchemaDisagreementException, TException
+    {
+<span class="nc" id="L1969">        logger.trace(&quot;add_keyspace&quot;);</span>
+
+        try
+        {
+<span class="nc" id="L1973">            ThriftValidation.validateKeyspaceNotSystem(ks_def.name);</span>
+<span class="nc" id="L1974">            state().hasAllKeyspacesAccess(Permission.CREATE);</span>
+<span class="nc" id="L1975">            ThriftValidation.validateKeyspaceNotYetExisting(ks_def.name);</span>
+
+            // generate a meaningful error if the user setup keyspace and/or column definition incorrectly
+<span class="nc bnc" id="L1978" title="All 2 branches missed.">            for (CfDef cf : ks_def.cf_defs)</span>
+            {
+<span class="nc bnc" id="L1980" title="All 2 branches missed.">                if (!cf.getKeyspace().equals(ks_def.getName()))</span>
+                {
+<span class="nc" id="L1982">                    throw new InvalidRequestException(&quot;CfDef (&quot; + cf.getName() +&quot;) had a keyspace definition that did not match KsDef&quot;);</span>
+                }
+<span class="nc" id="L1984">            }</span>
+
+<span class="nc" id="L1986">            Collection&lt;CFMetaData&gt; cfDefs = new ArrayList&lt;CFMetaData&gt;(ks_def.cf_defs.size());</span>
+<span class="nc bnc" id="L1987" title="All 2 branches missed.">            for (CfDef cf_def : ks_def.cf_defs)</span>
+            {
+<span class="nc" id="L1989">                cf_def.unsetId(); // explicitly ignore any id set by client (same as system_add_column_family)</span>
+<span class="nc" id="L1990">                CFMetaData cfm = ThriftConversion.fromThrift(cf_def);</span>
+
+<span class="nc bnc" id="L1992" title="All 2 branches missed.">                if (!cfm.getTriggers().isEmpty())</span>
+<span class="nc" id="L1993">                    state().ensureIsSuper(&quot;Only superusers are allowed to add triggers.&quot;);</span>
+
+<span class="nc" id="L1995">                cfDefs.add(cfm);</span>
+<span class="nc" id="L1996">            }</span>
+<span class="nc" id="L1997">            MigrationManager.announceNewKeyspace(ThriftConversion.fromThrift(ks_def, cfDefs.toArray(new CFMetaData[cfDefs.size()])));</span>
+<span class="nc" id="L1998">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L2000">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2002">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public String system_drop_keyspace(String keyspace)
+    throws InvalidRequestException, SchemaDisagreementException, TException
+    {
+<span class="nc" id="L2009">        logger.trace(&quot;drop_keyspace&quot;);</span>
+
+        try
+        {
+<span class="nc" id="L2013">            ThriftValidation.validateKeyspaceNotSystem(keyspace);</span>
+<span class="nc" id="L2014">            state().hasKeyspaceAccess(keyspace, Permission.DROP);</span>
+
+<span class="nc" id="L2016">            MigrationManager.announceKeyspaceDrop(keyspace);</span>
+<span class="nc" id="L2017">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L2019">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2021">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    /** update an existing keyspace, but do not allow column family modifications.
+     * @throws SchemaDisagreementException
+     */
+    public String system_update_keyspace(KsDef ks_def)
+    throws InvalidRequestException, SchemaDisagreementException, TException
+    {
+<span class="nc" id="L2031">        logger.trace(&quot;update_keyspace&quot;);</span>
+
+        try
+        {
+<span class="nc" id="L2035">            ThriftValidation.validateKeyspaceNotSystem(ks_def.name);</span>
+<span class="nc" id="L2036">            state().hasKeyspaceAccess(ks_def.name, Permission.ALTER);</span>
+<span class="nc" id="L2037">            ThriftValidation.validateKeyspace(ks_def.name);</span>
+<span class="nc bnc" id="L2038" title="All 4 branches missed.">            if (ks_def.getCf_defs() != null &amp;&amp; ks_def.getCf_defs().size() &gt; 0)</span>
+<span class="nc" id="L2039">                throw new InvalidRequestException(&quot;Keyspace update must not contain any table definitions.&quot;);</span>
+
+<span class="nc" id="L2041">            MigrationManager.announceKeyspaceUpdate(ThriftConversion.fromThrift(ks_def));</span>
+<span class="nc" id="L2042">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L2044">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2046">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public String system_update_column_family(CfDef cf_def)
+    throws InvalidRequestException, SchemaDisagreementException, TException
+    {
+<span class="nc" id="L2053">        logger.trace(&quot;update_column_family&quot;);</span>
+
+        try
+        {
+<span class="nc bnc" id="L2057" title="All 4 branches missed.">            if (cf_def.keyspace == null || cf_def.name == null)</span>
+<span class="nc" id="L2058">                throw new InvalidRequestException(&quot;Keyspace and CF name must be set.&quot;);</span>
+
+<span class="nc" id="L2060">            state().hasColumnFamilyAccess(cf_def.keyspace, cf_def.name, Permission.ALTER);</span>
+<span class="nc" id="L2061">            CFMetaData oldCfm = Schema.instance.getCFMetaData(cf_def.keyspace, cf_def.name);</span>
+
+<span class="nc bnc" id="L2063" title="All 2 branches missed.">            if (oldCfm == null)</span>
+<span class="nc" id="L2064">                throw new InvalidRequestException(&quot;Could not find table definition to modify.&quot;);</span>
+
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">            if (oldCfm.isView())</span>
+<span class="nc" id="L2067">                throw new InvalidRequestException(&quot;Cannot modify Materialized View table &quot; + oldCfm.cfName + &quot; as it may break the schema. You should use cqlsh to modify Materialized View tables instead.&quot;);</span>
+<span class="nc bnc" id="L2068" title="All 2 branches missed.">            if (!Iterables.isEmpty(View.findAll(cf_def.keyspace, cf_def.name)))</span>
+<span class="nc" id="L2069">                throw new InvalidRequestException(&quot;Cannot modify table with Materialized View &quot; + oldCfm.cfName + &quot; as it may break the schema. You should use cqlsh to modify tables with Materialized Views instead.&quot;);</span>
+
+<span class="nc bnc" id="L2071" title="All 2 branches missed.">            if (!oldCfm.isThriftCompatible())</span>
+<span class="nc" id="L2072">                throw new InvalidRequestException(&quot;Cannot modify CQL3 table &quot; + oldCfm.cfName + &quot; as it may break the schema. You should use cqlsh to modify CQL3 tables instead.&quot;);</span>
+
+<span class="nc" id="L2074">            CFMetaData cfm = ThriftConversion.fromThriftForUpdate(cf_def, oldCfm);</span>
+<span class="nc" id="L2075">            cfm.params.compaction.validate();</span>
+
+<span class="nc bnc" id="L2077" title="All 2 branches missed.">            if (!oldCfm.getTriggers().equals(cfm.getTriggers()))</span>
+<span class="nc" id="L2078">                state().ensureIsSuper(&quot;Only superusers are allowed to add or remove triggers.&quot;);</span>
+
+<span class="nc" id="L2080">            MigrationManager.announceColumnFamilyUpdate(cfm);</span>
+<span class="nc" id="L2081">            return Schema.instance.getVersion().toString();</span>
+        }
+<span class="nc" id="L2083">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2085">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public void truncate(String cfname) throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    {
+<span class="nc" id="L2091">        ClientState cState = state();</span>
+
+        try
+        {
+<span class="nc" id="L2095">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L2096">            cState.hasColumnFamilyAccess(keyspace, cfname, Permission.MODIFY);</span>
+<span class="nc" id="L2097">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, cfname, false);</span>
+<span class="nc bnc" id="L2098" title="All 2 branches missed.">            if (metadata.isView())</span>
+<span class="nc" id="L2099">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot truncate Materialized Views&quot;);</span>
+
+<span class="nc bnc" id="L2101" title="All 2 branches missed.">            if (startSessionIfRequested())</span>
+            {
+<span class="nc" id="L2103">                Tracing.instance.begin(&quot;truncate&quot;, ImmutableMap.of(&quot;cf&quot;, cfname, &quot;ks&quot;, keyspace));</span>
+            }
+            else
+            {
+<span class="nc" id="L2107">                logger.trace(&quot;truncating {}.{}&quot;, cState.getKeyspace(), cfname);</span>
+            }
+
+<span class="nc" id="L2110">            schedule(DatabaseDescriptor.getTruncateRpcTimeout());</span>
+            try
+            {
+<span class="nc" id="L2113">                StorageProxy.truncateBlocking(cState.getKeyspace(), cfname);</span>
+            }
+            finally
+            {
+<span class="nc" id="L2117">                release();</span>
+            }
+        }
+<span class="nc" id="L2120">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2122">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L2124">        catch (org.apache.cassandra.exceptions.UnavailableException e)</span>
+        {
+<span class="nc" id="L2126">            throw ThriftConversion.toThrift(e);</span>
+        }
+<span class="nc" id="L2128">        catch (TimeoutException e)</span>
+        {
+<span class="nc" id="L2130">            throw new TimedOutException();</span>
+        }
+        finally
+        {
+<span class="nc" id="L2134">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L2136">    }</span>
+
+    public void set_keyspace(String keyspace) throws InvalidRequestException, TException
+    {
+        try
+        {
+<span class="nc" id="L2142">            state().setKeyspace(keyspace);</span>
+        }
+<span class="nc" id="L2144">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2146">            throw ThriftConversion.toThrift(e);</span>
+<span class="nc" id="L2147">        }</span>
+<span class="nc" id="L2148">    }</span>
+
+    public Map&lt;String, List&lt;String&gt;&gt; describe_schema_versions() throws TException, InvalidRequestException
+    {
+<span class="nc" id="L2152">        logger.trace(&quot;checking schema agreement&quot;);</span>
+<span class="nc" id="L2153">        return StorageProxy.describeSchemaVersions();</span>
+    }
+
+    // counter methods
+
+    public void add(ByteBuffer key, ColumnParent column_parent, CounterColumn column, ConsistencyLevel consistency_level)
+            throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    {
+<span class="nc" id="L2161">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L2162" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L2164">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;column_parent&quot;, column_parent.toString(),</span>
+<span class="nc" id="L2165">                                                                  &quot;column&quot;, column.toString(),</span>
+<span class="nc" id="L2166">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L2167">            Tracing.instance.begin(&quot;add&quot;, traceParameters);</span>
+<span class="nc" id="L2168">        }</span>
+        else
+        {
+<span class="nc" id="L2171">            logger.trace(&quot;add&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L2176">            ClientState cState = state();</span>
+<span class="nc" id="L2177">            String keyspace = cState.getKeyspace();</span>
+
+<span class="nc" id="L2179">            cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.MODIFY);</span>
+
+<span class="nc" id="L2181">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family, true);</span>
+<span class="nc bnc" id="L2182" title="All 2 branches missed.">            if (metadata.isView())</span>
+<span class="nc" id="L2183">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;Cannot modify Materialized Views directly&quot;);</span>
+
+<span class="nc" id="L2185">            ThriftValidation.validateKey(metadata, key);</span>
+<span class="nc" id="L2186">            ThriftConversion.fromThrift(consistency_level).validateCounterForWrite(metadata);</span>
+<span class="nc" id="L2187">            ThriftValidation.validateColumnParent(metadata, column_parent);</span>
+            // SuperColumn field is usually optional, but not when we're adding
+<span class="nc bnc" id="L2189" title="All 4 branches missed.">            if (metadata.isSuper() &amp;&amp; column_parent.super_column == null)</span>
+<span class="nc" id="L2190">                throw new InvalidRequestException(&quot;missing mandatory super column name for super CF &quot; + column_parent.column_family);</span>
+
+<span class="nc" id="L2192">            ThriftValidation.validateColumnNames(metadata, column_parent, Arrays.asList(column.name));</span>
+
+            try
+            {
+<span class="nc" id="L2196">                LegacyLayout.LegacyCellName name = LegacyLayout.decodeCellName(metadata, column_parent.super_column, column.name);</span>
+
+                // See UpdateParameters.addCounter() for more details on this
+<span class="nc" id="L2199">                ByteBuffer value = CounterContext.instance().createUpdate(column.value);</span>
+<span class="nc bnc" id="L2200" title="All 2 branches missed.">                CellPath path = name.collectionElement == null ? null : CellPath.create(name.collectionElement);</span>
+<span class="nc" id="L2201">                Cell cell = BufferCell.live(name.column, FBUtilities.timestampMicros(), value, path);</span>
+
+<span class="nc" id="L2203">                PartitionUpdate update = PartitionUpdate.singleRowUpdate(metadata, key, BTreeRow.singleCellRow(name.clustering, cell));</span>
+
+<span class="nc" id="L2205">                org.apache.cassandra.db.Mutation mutation = new org.apache.cassandra.db.Mutation(update);</span>
+<span class="nc" id="L2206">                doInsert(consistency_level, Arrays.asList(new CounterMutation(mutation, ThriftConversion.fromThrift(consistency_level))), queryStartNanoTime);</span>
+            }
+<span class="nc" id="L2208">            catch (MarshalException|UnknownColumnException e)</span>
+            {
+<span class="nc" id="L2210">                throw new InvalidRequestException(e.getMessage());</span>
+<span class="nc" id="L2211">            }</span>
+        }
+<span class="nc" id="L2213">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2215">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L2219">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L2221">    }</span>
+
+    public void remove_counter(ByteBuffer key, ColumnPath path, ConsistencyLevel consistency_level)
+    throws InvalidRequestException, UnavailableException, TimedOutException, TException
+    {
+<span class="nc" id="L2226">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L2227" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L2229">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(key),</span>
+<span class="nc" id="L2230">                                                                  &quot;column_path&quot;, path.toString(),</span>
+<span class="nc" id="L2231">                                                                  &quot;consistency_level&quot;, consistency_level.name());</span>
+<span class="nc" id="L2232">            Tracing.instance.begin(&quot;remove_counter&quot;, traceParameters);</span>
+<span class="nc" id="L2233">        }</span>
+        else
+        {
+<span class="nc" id="L2236">            logger.trace(&quot;remove_counter&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L2241">            internal_remove(key, path, FBUtilities.timestampMicros(), consistency_level, true, queryStartNanoTime);</span>
+        }
+<span class="nc" id="L2243">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2245">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L2249">            Tracing.instance.stopSession();</span>
+        }
+<span class="nc" id="L2251">    }</span>
+
+    private static String uncompress(ByteBuffer query, Compression compression) throws InvalidRequestException
+    {
+<span class="nc" id="L2255">        String queryString = null;</span>
+
+        // Decompress the query string.
+        try
+        {
+<span class="nc bnc" id="L2260" title="All 3 branches missed.">            switch (compression)</span>
+            {
+                case GZIP:
+<span class="nc" id="L2263">                    DataOutputBuffer decompressed = new DataOutputBuffer();</span>
+<span class="nc" id="L2264">                    byte[] outBuffer = new byte[1024], inBuffer = new byte[1024];</span>
+
+<span class="nc" id="L2266">                    Inflater decompressor = new Inflater();</span>
+
+<span class="nc" id="L2268">                    int lenRead = 0;</span>
+                    while (true)
+                    {
+<span class="nc bnc" id="L2271" title="All 2 branches missed.">                        if (decompressor.needsInput())</span>
+<span class="nc bnc" id="L2272" title="All 2 branches missed.">                            lenRead = query.remaining() &lt; 1024 ? query.remaining() : 1024;</span>
+<span class="nc" id="L2273">                        query.get(inBuffer, 0, lenRead);</span>
+<span class="nc" id="L2274">                        decompressor.setInput(inBuffer, 0, lenRead);</span>
+
+<span class="nc" id="L2276">                        int lenWrite = 0;</span>
+<span class="nc bnc" id="L2277" title="All 2 branches missed.">                        while ((lenWrite = decompressor.inflate(outBuffer)) != 0)</span>
+<span class="nc" id="L2278">                            decompressed.write(outBuffer, 0, lenWrite);</span>
+
+<span class="nc bnc" id="L2280" title="All 2 branches missed.">                        if (decompressor.finished())</span>
+<span class="nc" id="L2281">                            break;</span>
+<span class="nc" id="L2282">                    }</span>
+
+<span class="nc" id="L2284">                    decompressor.end();</span>
+
+<span class="nc" id="L2286">                    queryString = new String(decompressed.getData(), 0, decompressed.getLength(), StandardCharsets.UTF_8);</span>
+<span class="nc" id="L2287">                    break;</span>
+                case NONE:
+                    try
+                    {
+<span class="nc" id="L2291">                        queryString = ByteBufferUtil.string(query);</span>
+                    }
+<span class="nc" id="L2293">                    catch (CharacterCodingException ex)</span>
+                    {
+<span class="nc" id="L2295">                        throw new InvalidRequestException(ex.getMessage());</span>
+<span class="nc" id="L2296">                    }</span>
+                    break;
+            }
+        }
+<span class="nc" id="L2300">        catch (DataFormatException e)</span>
+        {
+<span class="nc" id="L2302">            throw new InvalidRequestException(&quot;Error deflating query string.&quot;);</span>
+        }
+<span class="nc" id="L2304">        catch (IOException e)</span>
+        {
+<span class="nc" id="L2306">            throw new AssertionError(e);</span>
+<span class="nc" id="L2307">        }</span>
+<span class="nc" id="L2308">        return queryString;</span>
+    }
+
+    public CqlResult execute_cql_query(ByteBuffer query, Compression compression) throws TException
+    {
+<span class="nc" id="L2313">        throw new InvalidRequestException(&quot;CQL2 has been removed in Cassandra 3.0. Please use CQL3 instead&quot;);</span>
+    }
+
+    public CqlResult execute_cql3_query(ByteBuffer query, Compression compression, ConsistencyLevel cLevel) throws TException
+    {
+        try
+        {
+<span class="nc" id="L2320">            long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc" id="L2321">            String queryString = uncompress(query, compression);</span>
+<span class="nc bnc" id="L2322" title="All 2 branches missed.">            if (startSessionIfRequested())</span>
+            {
+<span class="nc" id="L2324">                Tracing.instance.begin(&quot;execute_cql3_query&quot;,</span>
+<span class="nc" id="L2325">                                       ImmutableMap.of(&quot;query&quot;, queryString,</span>
+<span class="nc" id="L2326">                                                       &quot;consistency_level&quot;, cLevel.name()));</span>
+            }
+            else
+            {
+<span class="nc" id="L2330">                logger.trace(&quot;execute_cql3_query&quot;);</span>
+            }
+
+<span class="nc" id="L2333">            ThriftClientState cState = state();</span>
+<span class="nc" id="L2334">            return ClientState.getCQLQueryHandler().process(queryString,</span>
+<span class="nc" id="L2335">                                                            cState.getQueryState(),</span>
+<span class="nc" id="L2336">                                                            QueryOptions.fromThrift(ThriftConversion.fromThrift(cLevel),</span>
+<span class="nc" id="L2337">                                                            Collections.&lt;ByteBuffer&gt;emptyList()),</span>
+                                                            null,
+<span class="nc" id="L2339">                                                            queryStartNanoTime).toThriftResult();</span>
+        }
+<span class="nc" id="L2341">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L2343">            throw ThriftConversion.rethrow(e);</span>
+        }
+<span class="nc" id="L2345">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2347">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L2351">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    public CqlPreparedResult prepare_cql_query(ByteBuffer query, Compression compression) throws TException
+    {
+<span class="nc" id="L2357">        throw new InvalidRequestException(&quot;CQL2 has been removed in Cassandra 3.0. Please use CQL3 instead&quot;);</span>
+    }
+
+    public CqlPreparedResult prepare_cql3_query(ByteBuffer query, Compression compression) throws TException
+    {
+<span class="nc" id="L2362">        logger.trace(&quot;prepare_cql3_query&quot;);</span>
+
+<span class="nc" id="L2364">        String queryString = uncompress(query, compression);</span>
+<span class="nc" id="L2365">        ThriftClientState cState = state();</span>
+
+        try
+        {
+<span class="nc" id="L2369">            cState.validateLogin();</span>
+<span class="nc" id="L2370">            return ClientState.getCQLQueryHandler().prepare(queryString, cState.getQueryState(), null).toThriftPreparedResult();</span>
+        }
+<span class="nc" id="L2372">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2374">            throw ThriftConversion.toThrift(e);</span>
+        }
+    }
+
+    public CqlResult execute_prepared_cql_query(int itemId, List&lt;ByteBuffer&gt; bindVariables) throws TException
+    {
+<span class="nc" id="L2380">        throw new InvalidRequestException(&quot;CQL2 has been removed in Cassandra 3.0. Please use CQL3 instead&quot;);</span>
+    }
+
+    public CqlResult execute_prepared_cql3_query(int itemId, List&lt;ByteBuffer&gt; bindVariables, ConsistencyLevel cLevel) throws TException
+    {
+<span class="nc" id="L2385">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L2386" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+            // TODO we don't have [typed] access to CQL bind variables here.  CASSANDRA-4560 is open to add support.
+<span class="nc" id="L2389">            Tracing.instance.begin(&quot;execute_prepared_cql3_query&quot;, ImmutableMap.of(&quot;consistency_level&quot;, cLevel.name()));</span>
+        }
+        else
+        {
+<span class="nc" id="L2393">            logger.trace(&quot;execute_prepared_cql3_query&quot;);</span>
+        }
+
+        try
+        {
+<span class="nc" id="L2398">            ThriftClientState cState = state();</span>
+<span class="nc" id="L2399">            ParsedStatement.Prepared prepared = ClientState.getCQLQueryHandler().getPreparedForThrift(itemId);</span>
+
+<span class="nc bnc" id="L2401" title="All 2 branches missed.">            if (prepared == null)</span>
+<span class="nc" id="L2402">                throw new InvalidRequestException(String.format(&quot;Prepared query with ID %d not found&quot; +</span>
+                                                                &quot; (either the query was not prepared on this host (maybe the host has been restarted?)&quot; +
+                                                                &quot; or you have prepared too many queries and it has been evicted from the internal cache)&quot;,
+<span class="nc" id="L2405">                                                                itemId));</span>
+<span class="nc" id="L2406">            logger.trace(&quot;Retrieved prepared statement #{} with {} bind markers&quot;, itemId, prepared.statement.getBoundTerms());</span>
+
+<span class="nc" id="L2408">            return ClientState.getCQLQueryHandler().processPrepared(prepared.statement,</span>
+<span class="nc" id="L2409">                                                                    cState.getQueryState(),</span>
+<span class="nc" id="L2410">                                                                    QueryOptions.fromThrift(ThriftConversion.fromThrift(cLevel), bindVariables),</span>
+                                                                    null,
+<span class="nc" id="L2412">                                                                    queryStartNanoTime).toThriftResult();</span>
+        }
+<span class="nc" id="L2414">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L2416">            throw ThriftConversion.rethrow(e);</span>
+        }
+<span class="nc" id="L2418">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2420">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L2424">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    @Override
+    public List&lt;ColumnOrSuperColumn&gt; get_multi_slice(MultiSliceRequest request)
+            throws InvalidRequestException, UnavailableException, TimedOutException
+    {
+<span class="nc" id="L2432">        long queryStartNanoTime = System.nanoTime();</span>
+<span class="nc bnc" id="L2433" title="All 2 branches missed.">        if (startSessionIfRequested())</span>
+        {
+<span class="nc" id="L2435">            Map&lt;String, String&gt; traceParameters = ImmutableMap.of(&quot;key&quot;, ByteBufferUtil.bytesToHex(request.key),</span>
+<span class="nc" id="L2436">                                                                  &quot;column_parent&quot;, request.column_parent.toString(),</span>
+<span class="nc" id="L2437">                                                                  &quot;consistency_level&quot;, request.consistency_level.name(),</span>
+<span class="nc" id="L2438">                                                                  &quot;count&quot;, String.valueOf(request.count),</span>
+<span class="nc" id="L2439">                                                                  &quot;column_slices&quot;, request.column_slices.toString());</span>
+<span class="nc" id="L2440">            Tracing.instance.begin(&quot;get_multi_slice&quot;, traceParameters);</span>
+<span class="nc" id="L2441">        }</span>
+        else
+        {
+<span class="nc" id="L2444">            logger.trace(&quot;get_multi_slice&quot;);</span>
+        }
+        try
+        {
+<span class="nc" id="L2448">            ClientState cState = state();</span>
+<span class="nc" id="L2449">            String keyspace = cState.getKeyspace();</span>
+<span class="nc" id="L2450">            state().hasColumnFamilyAccess(keyspace, request.getColumn_parent().column_family, Permission.SELECT);</span>
+<span class="nc" id="L2451">            CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, request.getColumn_parent().column_family);</span>
+<span class="nc bnc" id="L2452" title="All 2 branches missed.">            if (metadata.isSuper())</span>
+<span class="nc" id="L2453">                throw new org.apache.cassandra.exceptions.InvalidRequestException(&quot;get_multi_slice does not support super columns&quot;);</span>
+<span class="nc" id="L2454">            ThriftValidation.validateColumnParent(metadata, request.getColumn_parent());</span>
+<span class="nc" id="L2455">            org.apache.cassandra.db.ConsistencyLevel consistencyLevel = ThriftConversion.fromThrift(request.getConsistency_level());</span>
+<span class="nc" id="L2456">            consistencyLevel.validateForRead(keyspace);</span>
+
+<span class="nc" id="L2458">            Slices.Builder builder = new Slices.Builder(metadata.comparator, request.getColumn_slices().size());</span>
+<span class="nc bnc" id="L2459" title="All 2 branches missed.">            for (int i = 0 ; i &lt; request.getColumn_slices().size() ; i++)</span>
+            {
+<span class="nc" id="L2461">                fixOptionalSliceParameters(request.getColumn_slices().get(i));</span>
+<span class="nc" id="L2462">                ClusteringBound start = LegacyLayout.decodeSliceBound(metadata, request.getColumn_slices().get(i).start, true).bound;</span>
+<span class="nc" id="L2463">                ClusteringBound finish = LegacyLayout.decodeSliceBound(metadata, request.getColumn_slices().get(i).finish, false).bound;</span>
+
+<span class="nc" id="L2465">                int compare = metadata.comparator.compare(start, finish);</span>
+<span class="nc bnc" id="L2466" title="All 4 branches missed.">                if (!request.reversed &amp;&amp; compare &gt; 0)</span>
+<span class="nc" id="L2467">                    throw new InvalidRequestException(String.format(&quot;Column slice at index %d had start greater than finish&quot;, i));</span>
+<span class="nc bnc" id="L2468" title="All 4 branches missed.">                else if (request.reversed &amp;&amp; compare &lt; 0)</span>
+<span class="nc" id="L2469">                    throw new InvalidRequestException(String.format(&quot;Reversed column slice at index %d had start less than finish&quot;, i));</span>
+
+<span class="nc bnc" id="L2471" title="All 2 branches missed.">                builder.add(request.reversed ? Slice.make(finish, start) : Slice.make(start, finish));</span>
+            }
+
+<span class="nc" id="L2474">            Slices slices = builder.build();</span>
+<span class="nc" id="L2475">            ColumnFilter columns = makeColumnFilter(metadata, slices);</span>
+<span class="nc" id="L2476">            ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(slices, request.reversed);</span>
+<span class="nc" id="L2477">            DataLimits limits = getLimits(1, false, request.count);</span>
+
+<span class="nc" id="L2479">            ThriftValidation.validateKey(metadata, request.key);</span>
+<span class="nc" id="L2480">            DecoratedKey dk = metadata.decorateKey(request.key);</span>
+<span class="nc" id="L2481">            SinglePartitionReadCommand cmd = SinglePartitionReadCommand.create(true, metadata, FBUtilities.nowInSeconds(), columns, RowFilter.NONE, limits, dk, filter);</span>
+<span class="nc" id="L2482">            return getSlice(Collections.&lt;SinglePartitionReadCommand&gt;singletonList(cmd),</span>
+                            false,
+<span class="nc" id="L2484">                            limits.perPartitionCount(),</span>
+                            consistencyLevel,
+                            cState,
+<span class="nc" id="L2487">                            queryStartNanoTime).entrySet().iterator().next().getValue();</span>
+        }
+<span class="nc" id="L2489">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L2491">            throw ThriftConversion.toThrift(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L2495">            Tracing.instance.stopSession();</span>
+        }
+    }
+
+    /**
+     * Set the to start-of end-of value of &quot;&quot; for start and finish.
+     * @param columnSlice
+     */
+    private static void fixOptionalSliceParameters(org.apache.cassandra.thrift.ColumnSlice columnSlice)
+    {
+<span class="nc bnc" id="L2505" title="All 2 branches missed.">        if (!columnSlice.isSetStart())</span>
+<span class="nc" id="L2506">            columnSlice.setStart(new byte[0]);</span>
+<span class="nc bnc" id="L2507" title="All 2 branches missed.">        if (!columnSlice.isSetFinish())</span>
+<span class="nc" id="L2508">            columnSlice.setFinish(new byte[0]);</span>
+<span class="nc" id="L2509">    }</span>
+
+    /*
+     * No-op since 3.0.
+     */
+    public void set_cql_version(String version)
+    {
+<span class="nc" id="L2516">    }</span>
+
+    public ByteBuffer trace_next_query() throws TException
+    {
+<span class="nc" id="L2520">        UUID sessionId = UUIDGen.getTimeUUID();</span>
+<span class="nc" id="L2521">        state().getQueryState().prepareTracingSession(sessionId);</span>
+<span class="nc" id="L2522">        return TimeUUIDType.instance.decompose(sessionId);</span>
+    }
+
+    private boolean startSessionIfRequested()
+    {
+<span class="nc bnc" id="L2527" title="All 2 branches missed.">        if (state().getQueryState().traceNextQuery())</span>
+        {
+<span class="nc" id="L2529">            state().getQueryState().createTracingSession(Collections.EMPTY_MAP);</span>
+<span class="nc" id="L2530">            return true;</span>
+        }
+<span class="nc" id="L2532">        return false;</span>
+    }
+
+    private void registerMetrics()
+    {
+<span class="nc" id="L2537">        ClientMetrics.instance.addCounter(&quot;connectedThriftClients&quot;, new Callable&lt;Integer&gt;()</span>
+<span class="nc" id="L2538">        {</span>
+            @Override
+            public Integer call() throws Exception
+            {
+<span class="nc" id="L2542">                return ThriftSessionManager.instance.getConnectedClients();</span>
+            }
+        });
+<span class="nc" id="L2545">    }</span>
+
+    private static class ThriftCASRequest implements CASRequest
+    {
+        private final CFMetaData metadata;
+        private final DecoratedKey key;
+        private final List&lt;LegacyLayout.LegacyCell&gt; expected;
+        private final PartitionUpdate updates;
+        private final int nowInSec;
+
+        private ThriftCASRequest(List&lt;LegacyLayout.LegacyCell&gt; expected, PartitionUpdate updates, int nowInSec)
+<span class="nc" id="L2556">        {</span>
+<span class="nc" id="L2557">            this.metadata = updates.metadata();</span>
+<span class="nc" id="L2558">            this.key = updates.partitionKey();</span>
+<span class="nc" id="L2559">            this.expected = expected;</span>
+<span class="nc" id="L2560">            this.updates = updates;</span>
+<span class="nc" id="L2561">            this.nowInSec = nowInSec;</span>
+<span class="nc" id="L2562">        }</span>
+
+        public SinglePartitionReadCommand readCommand(int nowInSec)
+        {
+<span class="nc bnc" id="L2566" title="All 2 branches missed.">            if (expected.isEmpty())</span>
+            {
+                // We want to know if the partition exists, so just fetch a single cell.
+<span class="nc" id="L2569">                ClusteringIndexSliceFilter filter = new ClusteringIndexSliceFilter(Slices.ALL, false);</span>
+<span class="nc" id="L2570">                DataLimits limits = DataLimits.thriftLimits(1, 1);</span>
+<span class="nc" id="L2571">                return SinglePartitionReadCommand.create(true, metadata, nowInSec, ColumnFilter.all(metadata), RowFilter.NONE, limits, key, filter);</span>
+            }
+
+            // Gather the clustering for the expected values and query those.
+<span class="nc" id="L2575">            BTreeSet.Builder&lt;Clustering&gt; clusterings = BTreeSet.builder(metadata.comparator);</span>
+<span class="nc" id="L2576">            FilteredPartition expectedPartition =</span>
+<span class="nc" id="L2577">                FilteredPartition.create(LegacyLayout.toRowIterator(metadata, key, expected.iterator(), nowInSec));</span>
+
+<span class="nc bnc" id="L2579" title="All 2 branches missed.">            for (Row row : expectedPartition)</span>
+<span class="nc" id="L2580">                clusterings.add(row.clustering());</span>
+
+<span class="nc bnc" id="L2582" title="All 2 branches missed.">            PartitionColumns columns = expectedPartition.staticRow().isEmpty()</span>
+<span class="nc" id="L2583">                                     ? metadata.partitionColumns().withoutStatics()</span>
+<span class="nc" id="L2584">                                     : metadata.partitionColumns();</span>
+<span class="nc" id="L2585">            ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(clusterings.build(), false);</span>
+<span class="nc" id="L2586">            return SinglePartitionReadCommand.create(true, metadata, nowInSec, ColumnFilter.selection(columns), RowFilter.NONE, DataLimits.NONE, key, filter);</span>
+        }
+
+        public boolean appliesTo(FilteredPartition current)
+        {
+<span class="nc bnc" id="L2591" title="All 2 branches missed.">            if (expected.isEmpty())</span>
+<span class="nc" id="L2592">                return current.isEmpty();</span>
+<span class="nc bnc" id="L2593" title="All 2 branches missed.">            else if (current.isEmpty())</span>
+<span class="nc" id="L2594">                return false;</span>
+
+            // Push the expected results through ThriftResultsMerger to translate any static
+            // columns into clusterings. The current partition is retrieved in the same so
+            // unless they're both handled the same, they won't match.
+<span class="nc" id="L2599">            FilteredPartition expectedPartition =</span>
+<span class="nc" id="L2600">                FilteredPartition.create(</span>
+<span class="nc" id="L2601">                    UnfilteredRowIterators.filter(</span>
+<span class="nc" id="L2602">                        ThriftResultsMerger.maybeWrap(expectedToUnfilteredRowIterator(), nowInSec), nowInSec));</span>
+
+            // Check that for everything we expected, the fetched values exists and correspond.
+<span class="nc bnc" id="L2605" title="All 2 branches missed.">            for (Row e : expectedPartition)</span>
+            {
+<span class="nc" id="L2607">                Row c = current.getRow(e.clustering());</span>
+<span class="nc bnc" id="L2608" title="All 2 branches missed.">                if (c == null)</span>
+<span class="nc" id="L2609">                    return false;</span>
+
+<span class="nc" id="L2611">                SearchIterator&lt;ColumnDefinition, ColumnData&gt; searchIter = c.searchIterator();</span>
+<span class="nc bnc" id="L2612" title="All 2 branches missed.">                for (ColumnData expectedData : e)</span>
+                {
+<span class="nc" id="L2614">                    ColumnDefinition column = expectedData.column();</span>
+<span class="nc" id="L2615">                    ColumnData currentData = searchIter.next(column);</span>
+<span class="nc bnc" id="L2616" title="All 2 branches missed.">                    if (currentData == null)</span>
+<span class="nc" id="L2617">                        return false;</span>
+
+<span class="nc bnc" id="L2619" title="All 2 branches missed.">                    if (column.isSimple())</span>
+                    {
+<span class="nc bnc" id="L2621" title="All 2 branches missed.">                        if (!((Cell)currentData).value().equals(((Cell)expectedData).value()))</span>
+<span class="nc" id="L2622">                            return false;</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L2626">                        ComplexColumnData currentComplexData = (ComplexColumnData)currentData;</span>
+<span class="nc bnc" id="L2627" title="All 2 branches missed.">                        for (Cell expectedCell : (ComplexColumnData)expectedData)</span>
+                        {
+<span class="nc" id="L2629">                            Cell currentCell = currentComplexData.getCell(expectedCell.path());</span>
+<span class="nc bnc" id="L2630" title="All 4 branches missed.">                            if (currentCell == null || !currentCell.value().equals(expectedCell.value()))</span>
+<span class="nc" id="L2631">                                return false;</span>
+<span class="nc" id="L2632">                        }</span>
+                    }
+<span class="nc" id="L2634">                }</span>
+<span class="nc" id="L2635">            }</span>
+<span class="nc" id="L2636">            return true;</span>
+        }
+
+        public PartitionUpdate makeUpdates(FilteredPartition current)
+        {
+<span class="nc" id="L2641">            return updates;</span>
+        }
+
+        private UnfilteredRowIterator expectedToUnfilteredRowIterator()
+        {
+<span class="nc" id="L2646">            return LegacyLayout.toUnfilteredRowIterator(metadata, key, LegacyLayout.LegacyDeletionInfo.live(), expected.iterator());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

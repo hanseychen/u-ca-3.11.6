@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamReader.java</span></div><h1>StreamReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.io.*;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import java.util.Collection;
+import java.util.UUID;
+
+import com.google.common.base.Throwables;
+import com.google.common.collect.UnmodifiableIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.ning.compress.lzf.LZFInputStream;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.SSTableSimpleIterator;
+import org.apache.cassandra.io.sstable.format.RangeAwareSSTableWriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.util.RewindableDataInputStreamPlus;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.streaming.messages.FileMessageHeader;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.io.util.TrackedInputStream;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * StreamReader reads from stream and writes to SSTable.
+ */
+public class StreamReader
+{
+<span class="nc" id="L58">    private static final Logger logger = LoggerFactory.getLogger(StreamReader.class);</span>
+    protected final UUID cfId;
+    protected final long estimatedKeys;
+    protected final Collection&lt;Pair&lt;Long, Long&gt;&gt; sections;
+    protected final StreamSession session;
+    protected final Version inputVersion;
+    protected final long repairedAt;
+    protected final SSTableFormat.Type format;
+    protected final int sstableLevel;
+    protected final SerializationHeader.Component header;
+    protected final int fileSeqNum;
+
+    public StreamReader(FileMessageHeader header, StreamSession session)
+<span class="nc" id="L71">    {</span>
+<span class="nc" id="L72">        this.session = session;</span>
+<span class="nc" id="L73">        this.cfId = header.cfId;</span>
+<span class="nc" id="L74">        this.estimatedKeys = header.estimatedKeys;</span>
+<span class="nc" id="L75">        this.sections = header.sections;</span>
+<span class="nc" id="L76">        this.inputVersion = header.version;</span>
+<span class="nc" id="L77">        this.repairedAt = header.repairedAt;</span>
+<span class="nc" id="L78">        this.format = header.format;</span>
+<span class="nc" id="L79">        this.sstableLevel = header.sstableLevel;</span>
+<span class="nc" id="L80">        this.header = header.header;</span>
+<span class="nc" id="L81">        this.fileSeqNum = header.sequenceNumber;</span>
+<span class="nc" id="L82">    }</span>
+
+    /**
+     * @param channel where this reads data from
+     * @return SSTable transferred
+     * @throws IOException if reading the remote sstable fails. Will throw an RTE if local write fails.
+     */
+    @SuppressWarnings(&quot;resource&quot;) // channel needs to remain open, streams on top of it can't be closed
+    public SSTableMultiWriter read(ReadableByteChannel channel) throws IOException
+    {
+<span class="nc" id="L92">        long totalSize = totalSize();</span>
+
+<span class="nc" id="L94">        Pair&lt;String, String&gt; kscf = Schema.instance.getCF(cfId);</span>
+<span class="nc" id="L95">        ColumnFamilyStore cfs = null;</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">        if (kscf != null)</span>
+<span class="nc" id="L97">            cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);</span>
+
+<span class="nc bnc" id="L99" title="All 4 branches missed.">        if (kscf == null || cfs == null)</span>
+        {
+            // schema was dropped during streaming
+<span class="nc" id="L102">            throw new IOException(&quot;CF &quot; + cfId + &quot; was dropped during streaming&quot;);</span>
+        }
+
+<span class="nc" id="L105">        logger.debug(&quot;[Stream #{}] Start receiving file #{} from {}, repairedAt = {}, size = {}, ks = '{}', table = '{}'.&quot;,</span>
+<span class="nc" id="L106">                     session.planId(), fileSeqNum, session.peer, repairedAt, totalSize, cfs.keyspace.getName(),</span>
+<span class="nc" id="L107">                     cfs.getColumnFamilyName());</span>
+
+<span class="nc" id="L109">        TrackedInputStream in = new TrackedInputStream(new LZFInputStream(Channels.newInputStream(channel)));</span>
+<span class="nc" id="L110">        StreamDeserializer deserializer = new StreamDeserializer(cfs.metadata, in, inputVersion, getHeader(cfs.metadata),</span>
+<span class="nc" id="L111">                                                                 totalSize, session.planId());</span>
+<span class="nc" id="L112">        SSTableMultiWriter writer = null;</span>
+        try
+        {
+<span class="nc" id="L115">            writer = createWriter(cfs, totalSize, repairedAt, format);</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            while (in.getBytesRead() &lt; totalSize)</span>
+            {
+<span class="nc" id="L118">                writePartition(deserializer, writer);</span>
+                // TODO move this to BytesReadTracker
+<span class="nc" id="L120">                session.progress(writer.getFilename(), ProgressInfo.Direction.IN, in.getBytesRead(), totalSize);</span>
+            }
+<span class="nc" id="L122">            logger.debug(&quot;[Stream #{}] Finished receiving file #{} from {} readBytes = {}, totalSize = {}&quot;,</span>
+<span class="nc" id="L123">                         session.planId(), fileSeqNum, session.peer, FBUtilities.prettyPrintMemory(in.getBytesRead()), FBUtilities.prettyPrintMemory(totalSize));</span>
+<span class="nc" id="L124">            return writer;</span>
+        }
+<span class="nc" id="L126">        catch (Throwable e)</span>
+        {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (deserializer != null)</span>
+<span class="nc" id="L129">                logger.warn(&quot;[Stream {}] Error while reading partition {} from stream on ks='{}' and table='{}'.&quot;,</span>
+<span class="nc" id="L130">                            session.planId(), deserializer.partitionKey(), cfs.keyspace.getName(), cfs.getTableName(), e);</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">            if (writer != null)</span>
+            {
+<span class="nc" id="L133">                writer.abort(e);</span>
+            }
+<span class="nc" id="L135">            throw Throwables.propagate(e);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">            if (deserializer != null)</span>
+<span class="nc" id="L140">                deserializer.cleanup();</span>
+        }
+    }
+
+    protected SerializationHeader getHeader(CFMetaData metadata)
+    {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        return header != null? header.toHeader(metadata) : null; //pre-3.0 sstable have no SerializationHeader</span>
+    }
+
+    protected SSTableMultiWriter createWriter(ColumnFamilyStore cfs, long totalSize, long repairedAt, SSTableFormat.Type format) throws IOException
+    {
+<span class="nc" id="L151">        Directories.DataDirectory localDir = cfs.getDirectories().getWriteableLocation(totalSize);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (localDir == null)</span>
+<span class="nc" id="L153">            throw new IOException(String.format(&quot;Insufficient disk space to store %s&quot;, FBUtilities.prettyPrintMemory(totalSize)));</span>
+
+<span class="nc" id="L155">        LifecycleNewTracker lifecycleNewTracker = session.getReceivingTask(cfId).createLifecycleNewTracker();</span>
+<span class="nc" id="L156">        RangeAwareSSTableWriter writer = new RangeAwareSSTableWriter(cfs, estimatedKeys, repairedAt, format, sstableLevel, totalSize, lifecycleNewTracker, getHeader(cfs.metadata));</span>
+<span class="nc" id="L157">        StreamHook.instance.reportIncomingFile(cfs, writer, session, fileSeqNum);</span>
+<span class="nc" id="L158">        return writer;</span>
+    }
+
+    protected long totalSize()
+    {
+<span class="nc" id="L163">        long size = 0;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (Pair&lt;Long, Long&gt; section : sections)</span>
+<span class="nc" id="L165">            size += section.right - section.left;</span>
+<span class="nc" id="L166">        return size;</span>
+    }
+
+    protected void writePartition(StreamDeserializer deserializer, SSTableMultiWriter writer) throws IOException
+    {
+<span class="nc" id="L171">        writer.append(deserializer.newPartition());</span>
+<span class="nc" id="L172">        deserializer.checkForExceptions();</span>
+<span class="nc" id="L173">    }</span>
+
+    public static class StreamDeserializer extends UnmodifiableIterator&lt;Unfiltered&gt; implements UnfilteredRowIterator
+    {
+<span class="nc" id="L177">        public static final int INITIAL_MEM_BUFFER_SIZE = Integer.getInteger(&quot;cassandra.streamdes.initial_mem_buffer_size&quot;, 32768);</span>
+<span class="nc" id="L178">        public static final int MAX_MEM_BUFFER_SIZE = Integer.getInteger(&quot;cassandra.streamdes.max_mem_buffer_size&quot;, 1048576);</span>
+<span class="nc" id="L179">        public static final int MAX_SPILL_FILE_SIZE = Integer.getInteger(&quot;cassandra.streamdes.max_spill_file_size&quot;, Integer.MAX_VALUE);</span>
+
+        public static final String BUFFER_FILE_PREFIX = &quot;buf&quot;;
+        public static final String BUFFER_FILE_SUFFIX = &quot;dat&quot;;
+
+        private final CFMetaData metadata;
+        private final DataInputPlus in;
+        private final SerializationHeader header;
+        private final SerializationHelper helper;
+
+        private DecoratedKey key;
+        private DeletionTime partitionLevelDeletion;
+        private SSTableSimpleIterator iterator;
+        private Row staticRow;
+        private IOException exception;
+
+        public StreamDeserializer(CFMetaData metadata, InputStream in, Version version, SerializationHeader header,
+                                  long totalSize, UUID sessionId) throws IOException
+<span class="nc" id="L197">        {</span>
+<span class="nc" id="L198">            this.metadata = metadata;</span>
+            // streaming pre-3.0 sstables require mark/reset support from source stream
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (version.correspondingMessagingVersion() &lt; MessagingService.VERSION_30)</span>
+            {
+<span class="nc" id="L202">                logger.trace(&quot;Initializing rewindable input stream for reading legacy sstable with {} bytes with following &quot; +</span>
+                             &quot;parameters: initial_mem_buffer_size={}, max_mem_buffer_size={}, max_spill_file_size={}.&quot;,
+<span class="nc" id="L204">                             totalSize, INITIAL_MEM_BUFFER_SIZE, MAX_MEM_BUFFER_SIZE, MAX_SPILL_FILE_SIZE);</span>
+<span class="nc" id="L205">                File bufferFile = getTempBufferFile(metadata, totalSize, sessionId);</span>
+<span class="nc" id="L206">                this.in = new RewindableDataInputStreamPlus(in, INITIAL_MEM_BUFFER_SIZE, MAX_MEM_BUFFER_SIZE, bufferFile, MAX_SPILL_FILE_SIZE);</span>
+<span class="nc" id="L207">            } else</span>
+<span class="nc" id="L208">                this.in = new DataInputPlus.DataInputStreamPlus(in);</span>
+<span class="nc" id="L209">            this.helper = new SerializationHelper(metadata, version.correspondingMessagingVersion(), SerializationHelper.Flag.PRESERVE_SIZE);</span>
+<span class="nc" id="L210">            this.header = header;</span>
+<span class="nc" id="L211">        }</span>
+
+        public StreamDeserializer newPartition() throws IOException
+        {
+<span class="nc" id="L215">            key = metadata.decorateKey(ByteBufferUtil.readWithShortLength(in));</span>
+<span class="nc" id="L216">            partitionLevelDeletion = DeletionTime.serializer.deserialize(in);</span>
+<span class="nc" id="L217">            iterator = SSTableSimpleIterator.create(metadata, in, header, helper, partitionLevelDeletion);</span>
+<span class="nc" id="L218">            staticRow = iterator.readStaticRow();</span>
+<span class="nc" id="L219">            return this;</span>
+        }
+
+        public CFMetaData metadata()
+        {
+<span class="nc" id="L224">            return metadata;</span>
+        }
+
+        public PartitionColumns columns()
+        {
+            // We don't know which columns we'll get so assume it can be all of them
+<span class="nc" id="L230">            return metadata.partitionColumns();</span>
+        }
+
+        public boolean isReverseOrder()
+        {
+<span class="nc" id="L235">            return false;</span>
+        }
+
+        public DecoratedKey partitionKey()
+        {
+<span class="nc" id="L240">            return key;</span>
+        }
+
+        public DeletionTime partitionLevelDeletion()
+        {
+<span class="nc" id="L245">            return partitionLevelDeletion;</span>
+        }
+
+        public Row staticRow()
+        {
+<span class="nc" id="L250">            return staticRow;</span>
+        }
+
+        public EncodingStats stats()
+        {
+<span class="nc" id="L255">            return header.stats();</span>
+        }
+
+        public boolean hasNext()
+        {
+            try
+            {
+<span class="nc" id="L262">                return iterator.hasNext();</span>
+            }
+<span class="nc" id="L264">            catch (IOError e)</span>
+            {
+<span class="nc bnc" id="L266" title="All 4 branches missed.">                if (e.getCause() != null &amp;&amp; e.getCause() instanceof IOException)</span>
+                {
+<span class="nc" id="L268">                    exception = (IOException)e.getCause();</span>
+<span class="nc" id="L269">                    return false;</span>
+                }
+<span class="nc" id="L271">                throw e;</span>
+            }
+        }
+
+        public Unfiltered next()
+        {
+            // Note that in practice we know that IOException will be thrown by hasNext(), because that's
+            // where the actual reading happens, so we don't bother catching RuntimeException here (contrarily
+            // to what we do in hasNext)
+<span class="nc" id="L280">            Unfiltered unfiltered = iterator.next();</span>
+<span class="nc bnc" id="L281" title="All 4 branches missed.">            return metadata.isCounter() &amp;&amp; unfiltered.kind() == Unfiltered.Kind.ROW</span>
+<span class="nc" id="L282">                 ? maybeMarkLocalToBeCleared((Row) unfiltered)</span>
+                 : unfiltered;
+        }
+
+        private Row maybeMarkLocalToBeCleared(Row row)
+        {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            return metadata.isCounter() ? row.markCounterLocalToBeCleared() : row;</span>
+        }
+
+        public void checkForExceptions() throws IOException
+        {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            if (exception != null)</span>
+<span class="nc" id="L294">                throw exception;</span>
+<span class="nc" id="L295">        }</span>
+
+        public void close()
+        {
+<span class="nc" id="L299">        }</span>
+
+        /* We have a separate cleanup method because sometimes close is called before exhausting the
+           StreamDeserializer (for instance, when enclosed in an try-with-resources wrapper, such as in
+           BigTableWriter.append()).
+         */
+        public void cleanup()
+        {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (in instanceof RewindableDataInputStreamPlus)</span>
+            {
+                try
+                {
+<span class="nc" id="L311">                    ((RewindableDataInputStreamPlus) in).close(false);</span>
+                }
+<span class="nc" id="L313">                catch (IOException e)</span>
+                {
+<span class="nc" id="L315">                    logger.warn(&quot;Error while closing RewindableDataInputStreamPlus.&quot;, e);</span>
+<span class="nc" id="L316">                }</span>
+            }
+<span class="nc" id="L318">        }</span>
+
+        private static File getTempBufferFile(CFMetaData metadata, long totalSize, UUID sessionId) throws IOException
+        {
+<span class="nc" id="L322">            ColumnFamilyStore cfs = Keyspace.open(metadata.ksName).getColumnFamilyStore(metadata.cfName);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (cfs == null)</span>
+            {
+                // schema was dropped during streaming
+<span class="nc" id="L326">                throw new RuntimeException(String.format(&quot;CF %s.%s was dropped during streaming&quot;, metadata.ksName, metadata.cfName));</span>
+            }
+
+<span class="nc" id="L329">            long maxSize = Math.min(MAX_SPILL_FILE_SIZE, totalSize);</span>
+<span class="nc" id="L330">            File tmpDir = cfs.getDirectories().getTemporaryWriteableDirectoryAsFile(maxSize);</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            if (tmpDir == null)</span>
+<span class="nc" id="L332">                throw new IOException(String.format(&quot;No sufficient disk space to stream legacy sstable from {}.{}. &quot; +</span>
+<span class="nc" id="L333">                                                         &quot;Required disk space: %s.&quot;, FBUtilities.prettyPrintMemory(maxSize)));</span>
+<span class="nc" id="L334">            return new File(tmpDir, String.format(&quot;%s-%s.%s&quot;, BUFFER_FILE_PREFIX, sessionId, BUFFER_FILE_SUFFIX));</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

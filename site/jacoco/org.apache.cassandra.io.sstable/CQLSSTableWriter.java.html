@@ -1,0 +1,606 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CQLSSTableWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">CQLSSTableWriter.java</span></div><h1>CQLSSTableWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedSet;
+import java.util.stream.Collectors;
+
+import com.datastax.driver.core.ProtocolVersion;
+import com.datastax.driver.core.TypeCodec;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UpdateParameters;
+import org.apache.cassandra.cql3.functions.UDHelper;
+import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.CreateTypeStatement;
+import org.apache.cassandra.cql3.statements.ModificationStatement;
+import org.apache.cassandra.cql3.statements.ParsedStatement;
+import org.apache.cassandra.cql3.statements.UpdateStatement;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.schema.Functions;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.schema.Types;
+import org.apache.cassandra.schema.Views;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+
+/**
+ * Utility to write SSTables.
+ * &lt;p&gt;
+ * Typical usage looks like:
+ * &lt;pre&gt;
+ *   String type = CREATE TYPE myKs.myType (a int, b int)&quot;;
+ *   String schema = &quot;CREATE TABLE myKs.myTable (&quot;
+ *                 + &quot;  k int PRIMARY KEY,&quot;
+ *                 + &quot;  v1 text,&quot;
+ *                 + &quot;  v2 int,&quot;
+ *                 + &quot;  v3 myType,&quot;
+ *                 + &quot;)&quot;;
+ *   String insert = &quot;INSERT INTO myKs.myTable (k, v1, v2, v3) VALUES (?, ?, ?, ?)&quot;;
+ *
+ *   // Creates a new writer. You need to provide at least the directory where to write the created sstable,
+ *   // the schema for the sstable to write and a (prepared) insert statement to use. If you do not use the
+ *   // default partitioner (Murmur3Partitioner), you will also need to provide the partitioner in use, see
+ *   // CQLSSTableWriter.Builder for more details on the available options.
+ *   CQLSSTableWriter writer = CQLSSTableWriter.builder()
+ *                                             .inDirectory(&quot;path/to/directory&quot;)
+ *                                             .withType(type)
+ *                                             .forTable(schema)
+ *                                             .using(insert).build();
+ *
+ *   UserType myType = writer.getUDType(&quot;myType&quot;);
+ *   // Adds a nember of rows to the resulting sstable
+ *   writer.addRow(0, &quot;test1&quot;, 24, myType.newValue().setInt(&quot;a&quot;, 10).setInt(&quot;b&quot;, 20));
+ *   writer.addRow(1, &quot;test2&quot;, null, null);
+ *   writer.addRow(2, &quot;test3&quot;, 42, myType.newValue().setInt(&quot;a&quot;, 30).setInt(&quot;b&quot;, 40));
+ *
+ *   // Close the writer, finalizing the sstable
+ *   writer.close();
+ * &lt;/pre&gt;
+ *
+ * Please note that {@code CQLSSTableWriter} is &lt;b&gt;not&lt;/b&gt; thread-safe (multiple threads cannot access the
+ * same instance). It is however safe to use multiple instances in parallel (even if those instance write
+ * sstables for the same table).
+ */
+public class CQLSSTableWriter implements Closeable
+{
+<span class="nc" id="L109">    public static final ByteBuffer UNSET_VALUE = ByteBufferUtil.UNSET_BYTE_BUFFER;</span>
+
+    static
+    {
+<span class="nc" id="L113">        DatabaseDescriptor.clientInitialization(false);</span>
+        // Partitioner is not set in client mode.
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (DatabaseDescriptor.getPartitioner() == null)</span>
+<span class="nc" id="L116">            DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);</span>
+<span class="nc" id="L117">    }</span>
+
+    private final AbstractSSTableSimpleWriter writer;
+    private final UpdateStatement insert;
+    private final List&lt;ColumnSpecification&gt; boundNames;
+    private final List&lt;TypeCodec&gt; typeCodecs;
+
+    private CQLSSTableWriter(AbstractSSTableSimpleWriter writer, UpdateStatement insert, List&lt;ColumnSpecification&gt; boundNames)
+<span class="nc" id="L125">    {</span>
+<span class="nc" id="L126">        this.writer = writer;</span>
+<span class="nc" id="L127">        this.insert = insert;</span>
+<span class="nc" id="L128">        this.boundNames = boundNames;</span>
+<span class="nc" id="L129">        this.typeCodecs = boundNames.stream().map(bn -&gt;  UDHelper.codecFor(UDHelper.driverType(bn.type)))</span>
+<span class="nc" id="L130">                                             .collect(Collectors.toList());</span>
+<span class="nc" id="L131">    }</span>
+
+    /**
+     * Returns a new builder for a CQLSSTableWriter.
+     *
+     * @return the new builder.
+     */
+    public static Builder builder()
+    {
+<span class="nc" id="L140">        return new Builder();</span>
+    }
+
+    /**
+     * Adds a new row to the writer.
+     * &lt;p&gt;
+     * This is a shortcut for {@code addRow(Arrays.asList(values))}.
+     *
+     * @param values the row values (corresponding to the bind variables of the
+     * insertion statement used when creating by this writer).
+     * @return this writer.
+     */
+    public CQLSSTableWriter addRow(Object... values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc" id="L155">        return addRow(Arrays.asList(values));</span>
+    }
+
+    /**
+     * Adds a new row to the writer.
+     * &lt;p&gt;
+     * Each provided value type should correspond to the types of the CQL column
+     * the value is for. The correspondance between java type and CQL type is the
+     * same one than the one documented at
+     * www.datastax.com/drivers/java/2.0/apidocs/com/datastax/driver/core/DataType.Name.html#asJavaClass().
+     * &lt;p&gt;
+     * If you prefer providing the values directly as binary, use
+     * {@link #rawAddRow} instead.
+     *
+     * @param values the row values (corresponding to the bind variables of the
+     * insertion statement used when creating by this writer).
+     * @return this writer.
+     */
+    public CQLSSTableWriter addRow(List&lt;Object&gt; values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc" id="L176">        int size = Math.min(values.size(), boundNames.size());</span>
+<span class="nc" id="L177">        List&lt;ByteBuffer&gt; rawValues = new ArrayList&lt;&gt;(size);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="nc" id="L181">            Object value = values.get(i);</span>
+<span class="nc" id="L182">            rawValues.add(serialize(value, typeCodecs.get(i)));</span>
+        }
+
+<span class="nc" id="L185">        return rawAddRow(rawValues);</span>
+    }
+
+    /**
+     * Adds a new row to the writer.
+     * &lt;p&gt;
+     * This is equivalent to the other addRow methods, but takes a map whose
+     * keys are the names of the columns to add instead of taking a list of the
+     * values in the order of the insert statement used during construction of
+     * this write.
+     * &lt;p&gt;
+     * Please note that the column names in the map keys must be in lowercase unless
+     * the declared column name is a
+     * &lt;a href=&quot;http://cassandra.apache.org/doc/cql3/CQL.html#identifiers&quot;&gt;case-sensitive quoted identifier&lt;/a&gt;
+     * (in which case the map key must use the exact case of the column).
+     *
+     * @param values a map of colum name to column values representing the new
+     * row to add. Note that if a column is not part of the map, it's value will
+     * be {@code null}. If the map contains keys that does not correspond to one
+     * of the column of the insert statement used when creating this writer, the
+     * the corresponding value is ignored.
+     * @return this writer.
+     */
+    public CQLSSTableWriter addRow(Map&lt;String, Object&gt; values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc" id="L211">        int size = boundNames.size();</span>
+<span class="nc" id="L212">        List&lt;ByteBuffer&gt; rawValues = new ArrayList&lt;&gt;(size);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++)</span>
+        {
+<span class="nc" id="L215">            ColumnSpecification spec = boundNames.get(i);</span>
+<span class="nc" id="L216">            Object value = values.get(spec.name.toString());</span>
+<span class="nc" id="L217">            rawValues.add(serialize(value, typeCodecs.get(i)));</span>
+        }
+<span class="nc" id="L219">        return rawAddRow(rawValues);</span>
+    }
+
+    /**
+     * Adds a new row to the writer given already serialized values.
+     *
+     * @param values the row values (corresponding to the bind variables of the
+     * insertion statement used when creating by this writer) as binary.
+     * @return this writer.
+     */
+    public CQLSSTableWriter rawAddRow(ByteBuffer... values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc" id="L232">        return rawAddRow(Arrays.asList(values));</span>
+    }
+
+    /**
+     * Adds a new row to the writer given already serialized values.
+     * &lt;p&gt;
+     * This is a shortcut for {@code rawAddRow(Arrays.asList(values))}.
+     *
+     * @param values the row values (corresponding to the bind variables of the
+     * insertion statement used when creating by this writer) as binary.
+     * @return this writer.
+     */
+    public CQLSSTableWriter rawAddRow(List&lt;ByteBuffer&gt; values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (values.size() != boundNames.size())</span>
+<span class="nc" id="L248">            throw new InvalidRequestException(String.format(&quot;Invalid number of arguments, expecting %d values but got %d&quot;, boundNames.size(), values.size()));</span>
+
+<span class="nc" id="L250">        QueryOptions options = QueryOptions.forInternalCalls(null, values);</span>
+<span class="nc" id="L251">        List&lt;ByteBuffer&gt; keys = insert.buildPartitionKeyNames(options);</span>
+<span class="nc" id="L252">        SortedSet&lt;Clustering&gt; clusterings = insert.createClustering(options);</span>
+
+<span class="nc" id="L254">        long now = System.currentTimeMillis() * 1000;</span>
+        // Note that we asks indexes to not validate values (the last 'false' arg below) because that triggers a 'Keyspace.open'
+        // and that forces a lot of initialization that we don't want.
+<span class="nc" id="L257">        UpdateParameters params = new UpdateParameters(insert.cfm,</span>
+<span class="nc" id="L258">                                                       insert.updatedColumns(),</span>
+                                                       options,
+<span class="nc" id="L260">                                                       insert.getTimestamp(now, options),</span>
+<span class="nc" id="L261">                                                       insert.getTimeToLive(options),</span>
+<span class="nc" id="L262">                                                       Collections.&lt;DecoratedKey, Partition&gt;emptyMap());</span>
+
+        try
+        {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                for (Clustering clustering : clusterings)</span>
+<span class="nc" id="L269">                    insert.addUpdateForKey(writer.getUpdateFor(key), clustering, params);</span>
+<span class="nc" id="L270">            }</span>
+<span class="nc" id="L271">            return this;</span>
+        }
+<span class="nc" id="L273">        catch (SSTableSimpleUnsortedWriter.SyncException e)</span>
+        {
+            // If we use a BufferedWriter and had a problem writing to disk, the IOException has been
+            // wrapped in a SyncException (see BufferedWriter below). We want to extract that IOE.
+<span class="nc" id="L277">            throw (IOException)e.getCause();</span>
+        }
+    }
+
+    /**
+     * Adds a new row to the writer given already serialized values.
+     * &lt;p&gt;
+     * This is equivalent to the other rawAddRow methods, but takes a map whose
+     * keys are the names of the columns to add instead of taking a list of the
+     * values in the order of the insert statement used during construction of
+     * this write.
+     *
+     * @param values a map of colum name to column values representing the new
+     * row to add. Note that if a column is not part of the map, it's value will
+     * be {@code null}. If the map contains keys that does not correspond to one
+     * of the column of the insert statement used when creating this writer, the
+     * the corresponding value is ignored.
+     * @return this writer.
+     */
+    public CQLSSTableWriter rawAddRow(Map&lt;String, ByteBuffer&gt; values)
+    throws InvalidRequestException, IOException
+    {
+<span class="nc" id="L299">        int size = Math.min(values.size(), boundNames.size());</span>
+<span class="nc" id="L300">        List&lt;ByteBuffer&gt; rawValues = new ArrayList&lt;&gt;(size);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        for (int i = 0; i &lt; size; i++) </span>
+        {
+<span class="nc" id="L303">            ColumnSpecification spec = boundNames.get(i);</span>
+<span class="nc" id="L304">            rawValues.add(values.get(spec.name.toString()));</span>
+        }
+<span class="nc" id="L306">        return rawAddRow(rawValues);</span>
+    }
+
+    /**
+     * Returns the User Defined type, used in this SSTable Writer, that can
+     * be used to create UDTValue instances.
+     *
+     * @param dataType name of the User Defined type
+     * @return user defined type
+     */
+    public com.datastax.driver.core.UserType getUDType(String dataType)
+    {
+<span class="nc" id="L318">        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(insert.keyspace());</span>
+<span class="nc" id="L319">        UserType userType = ksm.types.getNullable(ByteBufferUtil.bytes(dataType));</span>
+<span class="nc" id="L320">        return (com.datastax.driver.core.UserType) UDHelper.driverType(userType);</span>
+    }
+
+    /**
+     * Close this writer.
+     * &lt;p&gt;
+     * This method should be called, otherwise the produced sstables are not
+     * guaranteed to be complete (and won't be in practice).
+     */
+    public void close() throws IOException
+    {
+<span class="nc" id="L331">        writer.close();</span>
+<span class="nc" id="L332">    }</span>
+
+    private ByteBuffer serialize(Object value, TypeCodec codec)
+    {
+<span class="nc bnc" id="L336" title="All 4 branches missed.">        if (value == null || value == UNSET_VALUE)</span>
+<span class="nc" id="L337">            return (ByteBuffer) value;</span>
+
+<span class="nc" id="L339">        return codec.serialize(value, ProtocolVersion.NEWEST_SUPPORTED);</span>
+    }
+    /**
+     * A Builder for a CQLSSTableWriter object.
+     */
+    public static class Builder
+    {
+        private File directory;
+
+<span class="nc" id="L348">        protected SSTableFormat.Type formatType = null;</span>
+
+        private CreateTableStatement.RawStatement schemaStatement;
+        private final List&lt;CreateTypeStatement&gt; typeStatements;
+        private ModificationStatement.Parsed insertStatement;
+        private IPartitioner partitioner;
+
+<span class="nc" id="L355">        private boolean sorted = false;</span>
+<span class="nc" id="L356">        private long bufferSizeInMB = 128;</span>
+
+<span class="nc" id="L358">        protected Builder() {</span>
+<span class="nc" id="L359">            this.typeStatements = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L360">        }</span>
+
+        /**
+         * The directory where to write the sstables.
+         * &lt;p&gt;
+         * This is a mandatory option.
+         *
+         * @param directory the directory to use, which should exists and be writable.
+         * @return this builder.
+         *
+         * @throws IllegalArgumentException if {@code directory} doesn't exist or is not writable.
+         */
+        public Builder inDirectory(String directory)
+        {
+<span class="nc" id="L374">            return inDirectory(new File(directory));</span>
+        }
+
+        /**
+         * The directory where to write the sstables (mandatory option).
+         * &lt;p&gt;
+         * This is a mandatory option.
+         *
+         * @param directory the directory to use, which should exists and be writable.
+         * @return this builder.
+         *
+         * @throws IllegalArgumentException if {@code directory} doesn't exist or is not writable.
+         */
+        public Builder inDirectory(File directory)
+        {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (!directory.exists())</span>
+<span class="nc" id="L390">                throw new IllegalArgumentException(directory + &quot; doesn't exists&quot;);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            if (!directory.canWrite())</span>
+<span class="nc" id="L392">                throw new IllegalArgumentException(directory + &quot; exists but is not writable&quot;);</span>
+
+<span class="nc" id="L394">            this.directory = directory;</span>
+<span class="nc" id="L395">            return this;</span>
+        }
+
+        public Builder withType(String typeDefinition) throws SyntaxException
+        {
+<span class="nc" id="L400">            typeStatements.add(QueryProcessor.parseStatement(typeDefinition, CreateTypeStatement.class, &quot;CREATE TYPE&quot;));</span>
+<span class="nc" id="L401">            return this;</span>
+        }
+
+        /**
+         * The schema (CREATE TABLE statement) for the table for which sstable are to be created.
+         * &lt;p&gt;
+         * Please note that the provided CREATE TABLE statement &lt;b&gt;must&lt;/b&gt; use a fully-qualified
+         * table name, one that include the keyspace name.
+         * &lt;p&gt;
+         * This is a mandatory option.
+         *
+         * @param schema the schema of the table for which sstables are to be created.
+         * @return this builder.
+         *
+         * @throws IllegalArgumentException if {@code schema} is not a valid CREATE TABLE statement
+         * or does not have a fully-qualified table name.
+         */
+        public Builder forTable(String schema)
+        {
+<span class="nc" id="L420">            this.schemaStatement = QueryProcessor.parseStatement(schema, CreateTableStatement.RawStatement.class, &quot;CREATE TABLE&quot;);</span>
+<span class="nc" id="L421">            return this;</span>
+        }
+
+        /**
+         * The partitioner to use.
+         * &lt;p&gt;
+         * By default, {@code Murmur3Partitioner} will be used. If this is not the partitioner used
+         * by the cluster for which the SSTables are created, you need to use this method to
+         * provide the correct partitioner.
+         *
+         * @param partitioner the partitioner to use.
+         * @return this builder.
+         */
+        public Builder withPartitioner(IPartitioner partitioner)
+        {
+<span class="nc" id="L436">            this.partitioner = partitioner;</span>
+<span class="nc" id="L437">            return this;</span>
+        }
+
+        /**
+         * The INSERT or UPDATE statement defining the order of the values to add for a given CQL row.
+         * &lt;p&gt;
+         * Please note that the provided INSERT statement &lt;b&gt;must&lt;/b&gt; use a fully-qualified
+         * table name, one that include the keyspace name. Moreover, said statement must use
+         * bind variables since these variables will be bound to values by the resulting writer.
+         * &lt;p&gt;
+         * This is a mandatory option.
+         *
+         * @param insert an insertion statement that defines the order
+         * of column values to use.
+         * @return this builder.
+         *
+         * @throws IllegalArgumentException if {@code insertStatement} is not a valid insertion
+         * statement, does not have a fully-qualified table name or have no bind variables.
+         */
+        public Builder using(String insert)
+        {
+<span class="nc" id="L458">            this.insertStatement = QueryProcessor.parseStatement(insert, ModificationStatement.Parsed.class, &quot;INSERT/UPDATE&quot;);</span>
+<span class="nc" id="L459">            return this;</span>
+        }
+
+        /**
+         * The size of the buffer to use.
+         * &lt;p&gt;
+         * This defines how much data will be buffered before being written as
+         * a new SSTable. This correspond roughly to the data size that will have the created
+         * sstable.
+         * &lt;p&gt;
+         * The default is 128MB, which should be reasonable for a 1GB heap. If you experience
+         * OOM while using the writer, you should lower this value.
+         *
+         * @param size the size to use in MB.
+         * @return this builder.
+         */
+        public Builder withBufferSizeInMB(int size)
+        {
+<span class="nc" id="L477">            this.bufferSizeInMB = size;</span>
+<span class="nc" id="L478">            return this;</span>
+        }
+
+        /**
+         * Creates a CQLSSTableWriter that expects sorted inputs.
+         * &lt;p&gt;
+         * If this option is used, the resulting writer will expect rows to be
+         * added in SSTable sorted order (and an exception will be thrown if that
+         * is not the case during insertion). The SSTable sorted order means that
+         * rows are added such that their partition key respect the partitioner
+         * order.
+         * &lt;p&gt;
+         * You should thus only use this option is you know that you can provide
+         * the rows in order, which is rarely the case. If you can provide the
+         * rows in order however, using this sorted might be more efficient.
+         * &lt;p&gt;
+         * Note that if used, some option like withBufferSizeInMB will be ignored.
+         *
+         * @return this builder.
+         */
+        public Builder sorted()
+        {
+<span class="nc" id="L500">            this.sorted = true;</span>
+<span class="nc" id="L501">            return this;</span>
+        }
+
+        @SuppressWarnings(&quot;resource&quot;)
+        public CQLSSTableWriter build()
+        {
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            if (directory == null)</span>
+<span class="nc" id="L508">                throw new IllegalStateException(&quot;No ouptut directory specified, you should provide a directory with inDirectory()&quot;);</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (schemaStatement == null)</span>
+<span class="nc" id="L510">                throw new IllegalStateException(&quot;Missing schema, you should provide the schema for the SSTable to create with forTable()&quot;);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            if (insertStatement == null)</span>
+<span class="nc" id="L512">                throw new IllegalStateException(&quot;No insert statement specified, you should provide an insert statement through using()&quot;);</span>
+
+<span class="nc" id="L514">            synchronized (CQLSSTableWriter.class)</span>
+            {
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                if (Schema.instance.getKSMetaData(SchemaConstants.SCHEMA_KEYSPACE_NAME) == null)</span>
+<span class="nc" id="L517">                    Schema.instance.load(SchemaKeyspace.metadata());</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">                if (Schema.instance.getKSMetaData(SchemaConstants.SYSTEM_KEYSPACE_NAME) == null)</span>
+<span class="nc" id="L519">                    Schema.instance.load(SystemKeyspace.metadata());</span>
+
+<span class="nc" id="L521">                String keyspace = schemaStatement.keyspace();</span>
+
+<span class="nc bnc" id="L523" title="All 2 branches missed.">                if (Schema.instance.getKSMetaData(keyspace) == null)</span>
+                {
+<span class="nc" id="L525">                    Schema.instance.load(KeyspaceMetadata.create(keyspace,</span>
+<span class="nc" id="L526">                                                                 KeyspaceParams.simple(1),</span>
+<span class="nc" id="L527">                                                                 Tables.none(),</span>
+<span class="nc" id="L528">                                                                 Views.none(),</span>
+<span class="nc" id="L529">                                                                 Types.none(),</span>
+<span class="nc" id="L530">                                                                 Functions.none()));</span>
+                }
+
+
+<span class="nc" id="L534">                KeyspaceMetadata ksm = Schema.instance.getKSMetaData(keyspace);</span>
+<span class="nc" id="L535">                CFMetaData cfMetaData = ksm.tables.getNullable(schemaStatement.columnFamily());</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                if (cfMetaData == null)</span>
+                {
+<span class="nc" id="L538">                    Types types = createTypes(keyspace);</span>
+<span class="nc" id="L539">                    cfMetaData = createTable(types);</span>
+
+<span class="nc" id="L541">                    Schema.instance.load(cfMetaData);</span>
+<span class="nc" id="L542">                    Schema.instance.setKeyspaceMetadata(ksm.withSwapped(ksm.tables.with(cfMetaData)).withSwapped(types));</span>
+                }
+
+<span class="nc" id="L545">                Pair&lt;UpdateStatement, List&lt;ColumnSpecification&gt;&gt; preparedInsert = prepareInsert();</span>
+
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                AbstractSSTableSimpleWriter writer = sorted</span>
+<span class="nc" id="L548">                                                     ? new SSTableSimpleWriter(directory, cfMetaData, preparedInsert.left.updatedColumns())</span>
+<span class="nc" id="L549">                                                     : new SSTableSimpleUnsortedWriter(directory, cfMetaData, preparedInsert.left.updatedColumns(), bufferSizeInMB);</span>
+
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                if (formatType != null)</span>
+<span class="nc" id="L552">                    writer.setSSTableFormatType(formatType);</span>
+
+<span class="nc" id="L554">                return new CQLSSTableWriter(writer, preparedInsert.left, preparedInsert.right);</span>
+            }
+        }
+
+        private Types createTypes(String keyspace)
+        {
+<span class="nc" id="L560">            Types.RawBuilder builder = Types.rawBuilder(keyspace);</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">            for (CreateTypeStatement st : typeStatements)</span>
+<span class="nc" id="L562">                st.addToRawBuilder(builder);</span>
+<span class="nc" id="L563">            return builder.build();</span>
+        }
+
+        /**
+         * Creates the table according to schema statement
+         *
+         * @param types types this table should be created with
+         */
+        private CFMetaData createTable(Types types)
+        {
+<span class="nc" id="L573">            CreateTableStatement statement = (CreateTableStatement) schemaStatement.prepare(types).statement;</span>
+<span class="nc" id="L574">            statement.validate(ClientState.forInternalCalls());</span>
+
+<span class="nc" id="L576">            CFMetaData cfMetaData = statement.getCFMetaData();</span>
+
+<span class="nc bnc" id="L578" title="All 2 branches missed.">            if (partitioner != null)</span>
+<span class="nc" id="L579">                return cfMetaData.copy(partitioner);</span>
+            else
+<span class="nc" id="L581">                return cfMetaData;</span>
+        }
+
+        /**
+         * Prepares insert statement for writing data to SSTable
+         *
+         * @return prepared Insert statement and it's bound names
+         */
+        private Pair&lt;UpdateStatement, List&lt;ColumnSpecification&gt;&gt; prepareInsert()
+        {
+<span class="nc" id="L591">            ParsedStatement.Prepared cqlStatement = insertStatement.prepare(ClientState.forInternalCalls());</span>
+<span class="nc" id="L592">            UpdateStatement insert = (UpdateStatement) cqlStatement.statement;</span>
+<span class="nc" id="L593">            insert.validate(ClientState.forInternalCalls());</span>
+
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            if (insert.hasConditions())</span>
+<span class="nc" id="L596">                throw new IllegalArgumentException(&quot;Conditional statements are not supported&quot;);</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">            if (insert.isCounter())</span>
+<span class="nc" id="L598">                throw new IllegalArgumentException(&quot;Counter update statements are not supported&quot;);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">            if (cqlStatement.boundNames.isEmpty())</span>
+<span class="nc" id="L600">                throw new IllegalArgumentException(&quot;Provided insert statement has no bind variables&quot;);</span>
+
+<span class="nc" id="L602">            return Pair.create(insert, cqlStatement.boundNames);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

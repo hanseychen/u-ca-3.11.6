@@ -1,0 +1,495 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OpenBitSet.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.obs</a> &gt; <span class="el_source">OpenBitSet.java</span></div><h1>OpenBitSet.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils.obs;
+
+import java.util.Arrays;
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.utils.concurrent.Ref;
+
+/**
+ * &lt;p&gt;
+ * An &quot;open&quot; BitSet implementation that allows direct access to the arrays of words
+ * storing the bits.  Derived from Lucene's OpenBitSet, but with a paged backing array
+ * (see bits delaration, below).
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Unlike java.util.bitset, the fact that bits are packed into an array of longs
+ * is part of the interface.  This allows efficient implementation of other algorithms
+ * by someone other than the author.  It also allows one to efficiently implement
+ * alternate serialization or interchange formats.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * &lt;code&gt;OpenBitSet&lt;/code&gt; is faster than &lt;code&gt;java.util.BitSet&lt;/code&gt; in most operations
+ * and *much* faster at calculating cardinality of sets and results of set operations.
+ * It can also handle sets of larger cardinality (up to 64 * 2**32-1)
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * The goals of &lt;code&gt;OpenBitSet&lt;/code&gt; are the fastest implementation possible, and
+ * maximum code reuse.  Extra safety and encapsulation
+ * may always be built on top, but if that's built in, the cost can never be removed (and
+ * hence people re-implement their own version in order to get better performance).
+ * If you want a &quot;safe&quot;, totally encapsulated (and slower and limited) BitSet
+ * class, use &lt;code&gt;java.util.BitSet&lt;/code&gt;.
+ * &lt;/p&gt;
+ */
+
+public class OpenBitSet implements IBitSet
+{
+  /**
+   * We break the bitset up into multiple arrays to avoid promotion failure caused by attempting to allocate
+   * large, contiguous arrays (CASSANDRA-2466).  All sub-arrays but the last are uniformly PAGE_SIZE words;
+   * to avoid waste in small bloom filters (of which Cassandra has many: one per row) the last sub-array
+   * is sized to exactly the remaining number of words required to achieve the desired set size (CASSANDRA-3618).
+   */
+  private final long[][] bits;
+  private int wlen; // number of words (elements) used in the array
+  private final int pageCount;
+  private static final int PAGE_SIZE = 4096;
+
+  /**
+   * Constructs an OpenBitSet large enough to hold numBits.
+   * @param numBits
+   */
+  public OpenBitSet(long numBits)
+<span class="nc" id="L73">  {</span>
+<span class="nc" id="L74">      wlen = (int) bits2words(numBits);</span>
+<span class="nc" id="L75">      int lastPageSize = wlen % PAGE_SIZE;</span>
+<span class="nc" id="L76">      int fullPageCount = wlen / PAGE_SIZE;</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">      pageCount = fullPageCount + (lastPageSize == 0 ? 0 : 1);</span>
+
+<span class="nc" id="L79">      bits = new long[pageCount][];</span>
+
+<span class="nc bnc" id="L81" title="All 2 branches missed.">      for (int i = 0; i &lt; fullPageCount; ++i)</span>
+<span class="nc" id="L82">          bits[i] = new long[PAGE_SIZE];</span>
+
+<span class="nc bnc" id="L84" title="All 2 branches missed.">      if (lastPageSize != 0)</span>
+<span class="nc" id="L85">          bits[bits.length - 1] = new long[lastPageSize];</span>
+<span class="nc" id="L86">  }</span>
+
+  public OpenBitSet()
+  {
+<span class="nc" id="L90">    this(64);</span>
+<span class="nc" id="L91">  }</span>
+
+  /**
+   * @return the pageSize
+   */
+  public int getPageSize()
+  {
+<span class="nc" id="L98">      return PAGE_SIZE;</span>
+  }
+
+  public int getPageCount()
+  {
+<span class="nc" id="L103">      return pageCount;</span>
+  }
+
+  public long[] getPage(int pageIdx)
+  {
+<span class="nc" id="L108">      return bits[pageIdx];</span>
+  }
+
+  /** Returns the current capacity in bits (1 greater than the index of the last bit) */
+<span class="nc" id="L112">  public long capacity() { return ((long)wlen) &lt;&lt; 6; }</span>
+
+  @Override
+  public long offHeapSize()
+  {
+<span class="nc" id="L117">      return 0;</span>
+  }
+
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L122">    }</span>
+
+    /**
+  * Returns the current capacity of this set.  Included for
+  * compatibility.  This is *not* equal to {@link #cardinality}
+  */
+  public long size()
+  {
+<span class="nc" id="L130">      return capacity();</span>
+  }
+
+  // @Override -- not until Java 1.6
+  public long length()
+  {
+<span class="nc" id="L136">    return capacity();</span>
+  }
+
+  /** Returns true if there are no set bits */
+<span class="nc bnc" id="L140" title="All 2 branches missed.">  public boolean isEmpty() { return cardinality()==0; }</span>
+
+
+  /** Expert: gets the number of longs in the array that are in use */
+<span class="nc" id="L144">  public int getNumWords() { return wlen; }</span>
+
+
+  /**
+   * Returns true or false for the specified bit index.
+   * The index should be less than the OpenBitSet size
+   */
+  public boolean get(int index)
+  {
+<span class="nc" id="L153">    int i = index &gt;&gt; 6;               // div 64</span>
+    // signed shift will keep a negative index and force an
+    // array-index-out-of-bounds-exception, removing the need for an explicit check.
+<span class="nc" id="L156">    int bit = index &amp; 0x3f;           // mod 64</span>
+<span class="nc" id="L157">    long bitmask = 1L &lt;&lt; bit;</span>
+    // TODO perfectionist one can implement this using bit operations
+<span class="nc bnc" id="L159" title="All 2 branches missed.">    return (bits[i / PAGE_SIZE][i % PAGE_SIZE ] &amp; bitmask) != 0;</span>
+  }
+
+  /**
+   * Returns true or false for the specified bit index.
+   * The index should be less than the OpenBitSet size.
+   */
+  public boolean get(long index)
+  {
+<span class="nc" id="L168">    int i = (int)(index &gt;&gt; 6);               // div 64</span>
+<span class="nc" id="L169">    int bit = (int)index &amp; 0x3f;           // mod 64</span>
+<span class="nc" id="L170">    long bitmask = 1L &lt;&lt; bit;</span>
+    // TODO perfectionist one can implement this using bit operations
+<span class="nc bnc" id="L172" title="All 2 branches missed.">    return (bits[i / PAGE_SIZE][i % PAGE_SIZE ] &amp; bitmask) != 0;</span>
+  }
+
+  /**
+   * Sets the bit at the specified index.
+   * The index should be less than the OpenBitSet size.
+   */
+  public void set(long index)
+  {
+<span class="nc" id="L181">    int wordNum = (int)(index &gt;&gt; 6);</span>
+<span class="nc" id="L182">    int bit = (int)index &amp; 0x3f;</span>
+<span class="nc" id="L183">    long bitmask = 1L &lt;&lt; bit;</span>
+<span class="nc" id="L184">    bits[ wordNum / PAGE_SIZE ][ wordNum % PAGE_SIZE ] |= bitmask;</span>
+<span class="nc" id="L185">  }</span>
+
+  /**
+   * Sets the bit at the specified index.
+   * The index should be less than the OpenBitSet size.
+   */
+  public void set(int index)
+  {
+<span class="nc" id="L193">    int wordNum = index &gt;&gt; 6;      // div 64</span>
+<span class="nc" id="L194">    int bit = index &amp; 0x3f;     // mod 64</span>
+<span class="nc" id="L195">    long bitmask = 1L &lt;&lt; bit;</span>
+<span class="nc" id="L196">    bits[ wordNum / PAGE_SIZE ][ wordNum % PAGE_SIZE ] |= bitmask;</span>
+<span class="nc" id="L197">  }</span>
+
+  /**
+   * clears a bit.
+   * The index should be less than the OpenBitSet size.
+   */
+  public void clear(int index)
+  {
+<span class="nc" id="L205">    int wordNum = index &gt;&gt; 6;</span>
+<span class="nc" id="L206">    int bit = index &amp; 0x03f;</span>
+<span class="nc" id="L207">    long bitmask = 1L &lt;&lt; bit;</span>
+<span class="nc" id="L208">    bits[wordNum / PAGE_SIZE][wordNum % PAGE_SIZE] &amp;= ~bitmask;</span>
+    // hmmm, it takes one more instruction to clear than it does to set... any
+    // way to work around this?  If there were only 63 bits per word, we could
+    // use a right shift of 10111111...111 in binary to position the 0 in the
+    // correct place (using sign extension).
+    // Could also use Long.rotateRight() or rotateLeft() *if* they were converted
+    // by the JVM into a native instruction.
+    // bits[word] &amp;= Long.rotateLeft(0xfffffffe,bit);
+<span class="nc" id="L216">  }</span>
+
+  /**
+   * clears a bit.
+   * The index should be less than the OpenBitSet size.
+   */
+  public void clear(long index)
+  {
+<span class="nc" id="L224">    int wordNum = (int)(index &gt;&gt; 6); // div 64</span>
+<span class="nc" id="L225">    int bit = (int)index &amp; 0x3f;     // mod 64</span>
+<span class="nc" id="L226">    long bitmask = 1L &lt;&lt; bit;</span>
+<span class="nc" id="L227">    bits[wordNum / PAGE_SIZE][wordNum % PAGE_SIZE] &amp;= ~bitmask;</span>
+<span class="nc" id="L228">  }</span>
+
+  /**
+   * Clears a range of bits.  Clearing past the end does not change the size of the set.
+   *
+   * @param startIndex lower index
+   * @param endIndex one-past the last bit to clear
+   */
+  public void clear(int startIndex, int endIndex)
+  {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">    if (endIndex &lt;= startIndex) return;</span>
+
+<span class="nc" id="L240">    int startWord = (startIndex&gt;&gt;6);</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">    if (startWord &gt;= wlen) return;</span>
+
+    // since endIndex is one past the end, this is index of the last
+    // word to be changed.
+<span class="nc" id="L245">    int endWord   = ((endIndex-1)&gt;&gt;6);</span>
+
+<span class="nc" id="L247">    long startmask = -1L &lt;&lt; startIndex;</span>
+<span class="nc" id="L248">    long endmask = -1L &gt;&gt;&gt; -endIndex;  // 64-(endIndex&amp;0x3f) is the same as -endIndex due to wrap</span>
+
+    // invert masks since we are clearing
+<span class="nc" id="L251">    startmask = ~startmask;</span>
+<span class="nc" id="L252">    endmask = ~endmask;</span>
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">    if (startWord == endWord)</span>
+    {
+<span class="nc" id="L256">      bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE] &amp;= (startmask | endmask);</span>
+<span class="nc" id="L257">      return;</span>
+    }
+
+
+<span class="nc" id="L261">    bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE]  &amp;= startmask;</span>
+
+<span class="nc" id="L263">    int middle = Math.min(wlen, endWord);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">    if (startWord / PAGE_SIZE == middle / PAGE_SIZE)</span>
+    {
+<span class="nc" id="L266">        Arrays.fill(bits[startWord/PAGE_SIZE], (startWord+1) % PAGE_SIZE, middle % PAGE_SIZE, 0L);</span>
+    } else
+    {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        while (++startWord&lt;middle)</span>
+<span class="nc" id="L270">            bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE] = 0L;</span>
+    }
+<span class="nc bnc" id="L272" title="All 2 branches missed.">    if (endWord &lt; wlen)</span>
+    {
+<span class="nc" id="L274">      bits[endWord / PAGE_SIZE][endWord % PAGE_SIZE] &amp;= endmask;</span>
+    }
+<span class="nc" id="L276">  }</span>
+
+
+  /** Clears a range of bits.  Clearing past the end does not change the size of the set.
+   *
+   * @param startIndex lower index
+   * @param endIndex one-past the last bit to clear
+   */
+  public void clear(long startIndex, long endIndex)
+  {
+<span class="nc bnc" id="L286" title="All 2 branches missed.">    if (endIndex &lt;= startIndex) return;</span>
+
+<span class="nc" id="L288">    int startWord = (int)(startIndex&gt;&gt;6);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">    if (startWord &gt;= wlen) return;</span>
+
+    // since endIndex is one past the end, this is index of the last
+    // word to be changed.
+<span class="nc" id="L293">    int endWord   = (int)((endIndex-1)&gt;&gt;6);</span>
+
+<span class="nc" id="L295">    long startmask = -1L &lt;&lt; startIndex;</span>
+<span class="nc" id="L296">    long endmask = -1L &gt;&gt;&gt; -endIndex;  // 64-(endIndex&amp;0x3f) is the same as -endIndex due to wrap</span>
+
+    // invert masks since we are clearing
+<span class="nc" id="L299">    startmask = ~startmask;</span>
+<span class="nc" id="L300">    endmask = ~endmask;</span>
+
+<span class="nc bnc" id="L302" title="All 2 branches missed.">    if (startWord == endWord)</span>
+{
+<span class="nc" id="L304">        bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE] &amp;= (startmask | endmask);</span>
+<span class="nc" id="L305">        return;</span>
+    }
+
+<span class="nc" id="L308">    bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE]  &amp;= startmask;</span>
+
+<span class="nc" id="L310">    int middle = Math.min(wlen, endWord);</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if (startWord / PAGE_SIZE == middle / PAGE_SIZE)</span>
+    {
+<span class="nc" id="L313">        Arrays.fill(bits[startWord/PAGE_SIZE], (startWord+1) % PAGE_SIZE, middle % PAGE_SIZE, 0L);</span>
+    } else
+    {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        while (++startWord&lt;middle)</span>
+<span class="nc" id="L317">            bits[startWord / PAGE_SIZE][startWord % PAGE_SIZE] = 0L;</span>
+    }
+<span class="nc bnc" id="L319" title="All 2 branches missed.">    if (endWord &lt; wlen)</span>
+    {
+<span class="nc" id="L321">        bits[endWord / PAGE_SIZE][endWord % PAGE_SIZE] &amp;= endmask;</span>
+    }
+<span class="nc" id="L323">  }</span>
+
+  /** @return the number of set bits */
+  public long cardinality()
+  {
+<span class="nc" id="L328">    long bitCount = 0L;</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">    for (int i=getPageCount();i--&gt;0;)</span>
+<span class="nc" id="L330">        bitCount+=BitUtil.pop_array(bits[i],0,wlen);</span>
+
+<span class="nc" id="L332">    return bitCount;</span>
+  }
+
+  /** this = this AND other */
+  public void intersect(OpenBitSet other)
+  {
+<span class="nc" id="L338">    int newLen= Math.min(this.wlen,other.wlen);</span>
+<span class="nc" id="L339">    long[][] thisArr = this.bits;</span>
+<span class="nc" id="L340">    long[][] otherArr = other.bits;</span>
+<span class="nc" id="L341">    int thisPageSize = PAGE_SIZE;</span>
+<span class="nc" id="L342">    int otherPageSize = OpenBitSet.PAGE_SIZE;</span>
+    // testing against zero can be more efficient
+<span class="nc" id="L344">    int pos=newLen;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">    while(--pos&gt;=0)</span>
+    {
+<span class="nc" id="L347">      thisArr[pos / thisPageSize][ pos % thisPageSize] &amp;= otherArr[pos / otherPageSize][pos % otherPageSize];</span>
+    }
+
+<span class="nc bnc" id="L350" title="All 2 branches missed.">    if (this.wlen &gt; newLen)</span>
+    {
+      // fill zeros from the new shorter length to the old length
+<span class="nc bnc" id="L353" title="All 2 branches missed.">      for (pos=wlen;pos--&gt;newLen;)</span>
+<span class="nc" id="L354">          thisArr[pos / thisPageSize][ pos % thisPageSize] =0;</span>
+    }
+<span class="nc" id="L356">    this.wlen = newLen;</span>
+<span class="nc" id="L357">  }</span>
+
+  // some BitSet compatability methods
+
+  //** see {@link intersect} */
+  public void and(OpenBitSet other)
+  {
+<span class="nc" id="L364">    intersect(other);</span>
+<span class="nc" id="L365">  }</span>
+
+  /** Lowers numWords, the number of words in use,
+   * by checking for trailing zero words.
+   */
+  public void trimTrailingZeros()
+  {
+<span class="nc" id="L372">    int idx = wlen-1;</span>
+<span class="nc bnc" id="L373" title="All 4 branches missed.">    while (idx&gt;=0 &amp;&amp; bits[idx / PAGE_SIZE][idx % PAGE_SIZE]==0) idx--;</span>
+<span class="nc" id="L374">    wlen = idx+1;</span>
+<span class="nc" id="L375">  }</span>
+
+  /** returns the number of 64 bit words it would take to hold numBits */
+  public static long bits2words(long numBits)
+  {
+<span class="fc" id="L380">   return (((numBits-1)&gt;&gt;&gt;6)+1);</span>
+  }
+
+  /** returns true if both sets have the same bits set */
+  @Override
+  public boolean equals(Object o)
+  {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">    if (this == o) return true;</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">    if (!(o instanceof OpenBitSet)) return false;</span>
+    OpenBitSet a;
+<span class="nc" id="L390">    OpenBitSet b = (OpenBitSet)o;</span>
+    // make a the larger set.
+<span class="nc bnc" id="L392" title="All 2 branches missed.">    if (b.wlen &gt; this.wlen)</span>
+    {
+<span class="nc" id="L394">      a = b; b=this;</span>
+    }
+    else
+    {
+<span class="nc" id="L398">      a=this;</span>
+    }
+
+<span class="nc" id="L401">    int aPageSize = OpenBitSet.PAGE_SIZE;</span>
+<span class="nc" id="L402">    int bPageSize = OpenBitSet.PAGE_SIZE;</span>
+
+    // check for any set bits out of the range of b
+<span class="nc bnc" id="L405" title="All 2 branches missed.">    for (int i=a.wlen-1; i&gt;=b.wlen; i--)</span>
+    {
+<span class="nc bnc" id="L407" title="All 2 branches missed.">      if (a.bits[i/aPageSize][i % aPageSize]!=0) return false;</span>
+    }
+
+<span class="nc bnc" id="L410" title="All 2 branches missed.">    for (int i=b.wlen-1; i&gt;=0; i--)</span>
+    {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">      if (a.bits[i/aPageSize][i % aPageSize] != b.bits[i/bPageSize][i % bPageSize]) return false;</span>
+    }
+
+<span class="nc" id="L415">    return true;</span>
+  }
+
+
+  @Override
+  public int hashCode()
+  {
+    // Start with a zero hash and use a mix that results in zero if the input is zero.
+    // This effectively truncates trailing zeros without an explicit check.
+<span class="nc" id="L424">    long h = 0;</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">    for (int i = wlen; --i&gt;=0;)</span>
+    {
+<span class="nc" id="L427">      h ^= bits[i / PAGE_SIZE][i % PAGE_SIZE];</span>
+<span class="nc" id="L428">      h = (h &lt;&lt; 1) | (h &gt;&gt;&gt; 63); // rotate left</span>
+    }
+    // fold leftmost bits into right and add a constant to prevent
+    // empty sets from returning 0, which is too common.
+<span class="nc" id="L432">    return (int)((h&gt;&gt;32) ^ h) + 0x98761234;</span>
+  }
+
+  public void close()
+  {
+    // noop, let GC do the cleanup.
+<span class="nc" id="L438">  }</span>
+
+  public void serialize(DataOutput out) throws IOException
+  {
+<span class="nc" id="L442">    int bitLength = getNumWords();</span>
+<span class="nc" id="L443">    int pageSize = getPageSize();</span>
+<span class="nc" id="L444">    int pageCount = getPageCount();</span>
+
+<span class="nc" id="L446">    out.writeInt(bitLength);</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">    for (int p = 0; p &lt; pageCount; p++)</span>
+    {
+<span class="nc" id="L449">      long[] bits = getPage(p);</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">      for (int i = 0; i &lt; pageSize &amp;&amp; bitLength-- &gt; 0; i++)</span>
+      {
+<span class="nc" id="L452">        out.writeLong(bits[i]);</span>
+      }
+    }
+<span class="nc" id="L455">}</span>
+
+  public long serializedSize()
+  {
+<span class="nc" id="L459">    int bitLength = getNumWords();</span>
+<span class="nc" id="L460">    int pageSize = getPageSize();</span>
+<span class="nc" id="L461">    int pageCount = getPageCount();</span>
+
+<span class="nc" id="L463">    long size = TypeSizes.sizeof(bitLength); // length</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">    for (int p = 0; p &lt; pageCount; p++)</span>
+    {
+<span class="nc" id="L466">      long[] bits = getPage(p);</span>
+<span class="nc bnc" id="L467" title="All 4 branches missed.">      for (int i = 0; i &lt; pageSize &amp;&amp; bitLength-- &gt; 0; i++)</span>
+<span class="nc" id="L468">        size += TypeSizes.sizeof(bits[i]); // bucket</span>
+    }
+<span class="nc" id="L470">    return size;</span>
+  }
+
+  public void clear()
+  {
+<span class="nc" id="L475">    clear(0, capacity());</span>
+<span class="nc" id="L476">  }</span>
+
+  public static OpenBitSet deserialize(DataInput in) throws IOException
+  {
+<span class="nc" id="L480">    long bitLength = in.readInt();</span>
+
+<span class="nc" id="L482">    OpenBitSet bs = new OpenBitSet(bitLength &lt;&lt; 6);</span>
+<span class="nc" id="L483">    int pageSize = bs.getPageSize();</span>
+<span class="nc" id="L484">    int pageCount = bs.getPageCount();</span>
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">    for (int p = 0; p &lt; pageCount; p++)</span>
+    {
+<span class="nc" id="L488">      long[] bits = bs.getPage(p);</span>
+<span class="nc bnc" id="L489" title="All 4 branches missed.">      for (int i = 0; i &lt; pageSize &amp;&amp; bitLength-- &gt; 0; i++)</span>
+<span class="nc" id="L490">        bits[i] = in.readLong();</span>
+    }
+<span class="nc" id="L492">    return bs;</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

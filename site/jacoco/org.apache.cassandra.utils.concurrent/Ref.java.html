@@ -1,0 +1,717 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Ref.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.concurrent</a> &gt; <span class="el_source">Ref.java</span></div><h1>Ref.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.utils.concurrent;
+
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+
+import org.apache.cassandra.concurrent.InfiniteLoopExecutor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.Memory;
+import org.apache.cassandra.io.util.SafeMemory;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.Pair;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+import static java.util.Collections.emptyList;
+import org.apache.cassandra.concurrent.InfiniteLoopExecutor.InterruptibleRunnable;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdownNow;
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+import static org.apache.cassandra.utils.Throwables.merge;
+
+/**
+ * An object that needs ref counting does the two following:
+ *   - defines a Tidy object that will cleanup once it's gone,
+ *     (this must retain no references to the object we're tracking (only its resources and how to clean up))
+ * Then, one of two options:
+ * 1) Construct a Ref directly pointing to it, and always use this Ref; or
+ * 2)
+ *   - implements RefCounted
+ *   - encapsulates a Ref, we'll call selfRef, to which it proxies all calls to RefCounted behaviours
+ *   - users must ensure no references to the selfRef leak, or are retained outside of a method scope.
+ *     (to ensure the selfRef is collected with the object, so that leaks may be detected and corrected)
+ *
+ * This class' functionality is achieved by what may look at first glance like a complex web of references,
+ * but boils down to:
+ *
+ * {@code
+ * Target --&gt; selfRef --&gt; [Ref.State] &lt;--&gt; Ref.GlobalState --&gt; Tidy
+ *                                             ^
+ *                                             |
+ * Ref ----------------------------------------
+ *                                             |
+ * Global -------------------------------------
+ * }
+ * So that, if Target is collected, Impl is collected and, hence, so is selfRef.
+ *
+ * Once ref or selfRef are collected, the paired Ref.State's release method is called, which if it had
+ * not already been called will update Ref.GlobalState and log an error.
+ *
+ * Once the Ref.GlobalState has been completely released, the Tidy method is called and it removes the global reference
+ * to itself so it may also be collected.
+ */
+public final class Ref&lt;T&gt; implements RefCounted&lt;T&gt;
+{
+<span class="fc" id="L94">    static final Logger logger = LoggerFactory.getLogger(Ref.class);</span>
+<span class="fc" id="L95">    public static final boolean DEBUG_ENABLED = System.getProperty(&quot;cassandra.debugrefcount&quot;, &quot;false&quot;).equalsIgnoreCase(&quot;true&quot;);</span>
+
+    final State state;
+    final T referent;
+
+    public Ref(T referent, Tidy tidy)
+<span class="fc" id="L101">    {</span>
+<span class="fc" id="L102">        this.state = new State(new GlobalState(tidy), this, referenceQueue);</span>
+<span class="fc" id="L103">        this.referent = referent;</span>
+<span class="fc" id="L104">    }</span>
+
+    Ref(T referent, GlobalState state)
+<span class="fc" id="L107">    {</span>
+<span class="fc" id="L108">        this.state = new State(state, this, referenceQueue);</span>
+<span class="fc" id="L109">        this.referent = referent;</span>
+<span class="fc" id="L110">    }</span>
+
+    /**
+     * Must be called exactly once, when the logical operation for which this Ref was created has terminated.
+     * Failure to abide by this contract will result in an error (eventually) being reported, assuming a
+     * hard reference to the resource it managed is not leaked.
+     */
+    public void release()
+    {
+<span class="fc" id="L119">        state.release(false);</span>
+<span class="fc" id="L120">    }</span>
+
+    public Throwable ensureReleased(Throwable accumulate)
+    {
+<span class="fc" id="L124">        return state.ensureReleased(accumulate);</span>
+    }
+
+    public void ensureReleased()
+    {
+<span class="fc" id="L129">        maybeFail(state.ensureReleased(null));</span>
+<span class="fc" id="L130">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L134">        ensureReleased();</span>
+<span class="nc" id="L135">    }</span>
+
+    public T get()
+    {
+<span class="fc" id="L139">        state.assertNotReleased();</span>
+<span class="fc" id="L140">        return referent;</span>
+    }
+
+    public Ref&lt;T&gt; tryRef()
+    {
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">        return state.globalState.ref() ? new Ref&lt;&gt;(referent, state.globalState) : null;</span>
+    }
+
+    public Ref&lt;T&gt; ref()
+    {
+<span class="fc" id="L150">        Ref&lt;T&gt; ref = tryRef();</span>
+        // TODO: print the last release as well as the release here
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">        if (ref == null)</span>
+<span class="nc" id="L153">            state.assertNotReleased();</span>
+<span class="fc" id="L154">        return ref;</span>
+    }
+
+    public String printDebugInfo()
+    {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (DEBUG_ENABLED)</span>
+        {
+<span class="nc" id="L161">            state.debug.log(state.toString());</span>
+<span class="nc" id="L162">            return &quot;Memory was freed by &quot; + state.debug.deallocateThread;</span>
+        }
+<span class="nc" id="L164">        return &quot;Memory was freed&quot;;</span>
+    }
+
+    /**
+     * A convenience method for reporting:
+     * @return the number of currently extant references globally, including the shared reference
+     */
+    public int globalCount()
+    {
+<span class="fc" id="L173">        return state.globalState.count();</span>
+    }
+
+    // similar to Ref.GlobalState, but tracks only the management of each unique ref created to the managed object
+    // ensures it is only released once, and that it is always released
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">    static final class State extends PhantomReference&lt;Ref&gt;</span>
+    {
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">        final Debug debug = DEBUG_ENABLED ? new Debug() : null;</span>
+        final GlobalState globalState;
+        private volatile int released;
+
+<span class="fc" id="L184">        private static final AtomicIntegerFieldUpdater&lt;State&gt; releasedUpdater = AtomicIntegerFieldUpdater.newUpdater(State.class, &quot;released&quot;);</span>
+
+        public State(final GlobalState globalState, Ref reference, ReferenceQueue&lt;? super Ref&gt; q)
+        {
+<span class="fc" id="L188">            super(reference, q);</span>
+<span class="fc" id="L189">            this.globalState = globalState;</span>
+<span class="fc" id="L190">            globalState.register(this);</span>
+<span class="fc" id="L191">        }</span>
+
+        void assertNotReleased()
+        {
+<span class="pc bpc" id="L195" title="3 of 4 branches missed.">            if (DEBUG_ENABLED &amp;&amp; released == 1)</span>
+<span class="nc" id="L196">                debug.log(toString());</span>
+<span class="pc bpc" id="L197" title="2 of 4 branches missed.">            assert released == 0;</span>
+<span class="fc" id="L198">        }</span>
+
+        Throwable ensureReleased(Throwable accumulate)
+        {
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">            if (releasedUpdater.getAndSet(this, 1) == 0)</span>
+            {
+<span class="fc" id="L204">                accumulate = globalState.release(this, accumulate);</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">                if (DEBUG_ENABLED)</span>
+<span class="nc" id="L206">                    debug.deallocate();</span>
+            }
+<span class="fc" id="L208">            return accumulate;</span>
+        }
+
+        void release(boolean leak)
+        {
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">            if (!releasedUpdater.compareAndSet(this, 0, 1))</span>
+            {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                if (!leak)</span>
+                {
+<span class="nc" id="L217">                    String id = this.toString();</span>
+<span class="nc" id="L218">                    logger.error(&quot;BAD RELEASE: attempted to release a reference ({}) that has already been released&quot;, id);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                    if (DEBUG_ENABLED)</span>
+<span class="nc" id="L220">                        debug.log(id);</span>
+<span class="nc" id="L221">                    throw new IllegalStateException(&quot;Attempted to release a reference that has already been released&quot;);</span>
+                }
+<span class="nc" id="L223">                return;</span>
+            }
+<span class="fc" id="L225">            Throwable fail = globalState.release(this, null);</span>
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">            if (leak)</span>
+            {
+<span class="nc" id="L228">                String id = this.toString();</span>
+<span class="nc" id="L229">                logger.error(&quot;LEAK DETECTED: a reference ({}) to {} was not released before the reference was garbage collected&quot;, id, globalState);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                if (DEBUG_ENABLED)</span>
+<span class="nc" id="L231">                    debug.log(id);</span>
+<span class="nc" id="L232">            }</span>
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">            else if (DEBUG_ENABLED)</span>
+            {
+<span class="nc" id="L235">                debug.deallocate();</span>
+            }
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">            if (fail != null)</span>
+<span class="nc" id="L238">                logger.error(&quot;Error when closing {}&quot;, globalState, fail);</span>
+<span class="fc" id="L239">        }</span>
+    }
+
+    static final class Debug
+    {
+        String allocateThread, deallocateThread;
+        StackTraceElement[] allocateTrace, deallocateTrace;
+        Debug()
+<span class="nc" id="L247">        {</span>
+<span class="nc" id="L248">            Thread thread = Thread.currentThread();</span>
+<span class="nc" id="L249">            allocateThread = thread.toString();</span>
+<span class="nc" id="L250">            allocateTrace = thread.getStackTrace();</span>
+<span class="nc" id="L251">        }</span>
+        synchronized void deallocate()
+        {
+<span class="nc" id="L254">            Thread thread = Thread.currentThread();</span>
+<span class="nc" id="L255">            deallocateThread = thread.toString();</span>
+<span class="nc" id="L256">            deallocateTrace = thread.getStackTrace();</span>
+<span class="nc" id="L257">        }</span>
+        synchronized void log(String id)
+        {
+<span class="nc" id="L260">            logger.error(&quot;Allocate trace {}:\n{}&quot;, id, print(allocateThread, allocateTrace));</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (deallocateThread != null)</span>
+<span class="nc" id="L262">                logger.error(&quot;Deallocate trace {}:\n{}&quot;, id, print(deallocateThread, deallocateTrace));</span>
+<span class="nc" id="L263">        }</span>
+        String print(String thread, StackTraceElement[] trace)
+        {
+<span class="nc" id="L266">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L267">            sb.append(thread);</span>
+<span class="nc" id="L268">            sb.append(&quot;\n&quot;);</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            for (StackTraceElement element : trace)</span>
+            {
+<span class="nc" id="L271">                sb.append(&quot;\tat &quot;);</span>
+<span class="nc" id="L272">                sb.append(element );</span>
+<span class="nc" id="L273">                sb.append(&quot;\n&quot;);</span>
+            }
+<span class="nc" id="L275">            return sb.toString();</span>
+        }
+    }
+
+    // the object that manages the actual cleaning up; this does not reference the target object
+    // so that we can detect when references are lost to the resource itself, and still cleanup afterwards
+    // the Tidy object MUST NOT contain any references to the object we are managing
+    static final class GlobalState
+    {
+        // we need to retain a reference to each of the PhantomReference instances
+        // we are using to track individual refs
+<span class="fc" id="L286">        private final Collection&lt;State&gt; locallyExtant = new ConcurrentLinkedDeque&lt;&gt;();</span>
+        // the number of live refs
+<span class="fc" id="L288">        private final AtomicInteger counts = new AtomicInteger();</span>
+        // the object to call to cleanup when our refs are all finished with
+        private final Tidy tidy;
+
+        GlobalState(Tidy tidy)
+<span class="fc" id="L293">        {</span>
+<span class="fc" id="L294">            this.tidy = tidy;</span>
+<span class="fc" id="L295">            globallyExtant.add(this);</span>
+<span class="fc" id="L296">        }</span>
+
+        void register(Ref.State ref)
+        {
+<span class="fc" id="L300">            locallyExtant.add(ref);</span>
+<span class="fc" id="L301">        }</span>
+
+        // increment ref count if not already tidied, and return success/failure
+        boolean ref()
+        {
+            while (true)
+            {
+<span class="fc" id="L308">                int cur = counts.get();</span>
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">                if (cur &lt; 0)</span>
+<span class="nc" id="L310">                    return false;</span>
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">                if (counts.compareAndSet(cur, cur + 1))</span>
+<span class="fc" id="L312">                    return true;</span>
+<span class="nc" id="L313">            }</span>
+        }
+
+        // release a single reference, and cleanup if no more are extant
+        Throwable release(Ref.State ref, Throwable accumulate)
+        {
+<span class="fc" id="L319">            locallyExtant.remove(ref);</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">            if (-1 == counts.decrementAndGet())</span>
+            {
+<span class="fc" id="L322">                globallyExtant.remove(this);</span>
+                try
+                {
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">                    if (tidy != null)</span>
+<span class="fc" id="L326">                        tidy.tidy();</span>
+                }
+<span class="nc" id="L328">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L330">                    accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L331">                }</span>
+            }
+<span class="fc" id="L333">            return accumulate;</span>
+        }
+
+        int count()
+        {
+<span class="fc" id="L338">            return 1 + counts.get();</span>
+        }
+
+        public String toString()
+        {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">            if (tidy != null)</span>
+<span class="nc" id="L344">                return tidy.getClass() + &quot;@&quot; + System.identityHashCode(tidy) + &quot;:&quot; + tidy.name();</span>
+<span class="nc" id="L345">            return &quot;@&quot; + System.identityHashCode(this);</span>
+        }
+    }
+
+<span class="fc" id="L349">    private static final Class&lt;?&gt;[] concurrentIterableClasses = new Class&lt;?&gt;[]</span>
+    {
+        ConcurrentLinkedQueue.class,
+        ConcurrentLinkedDeque.class,
+        ConcurrentSkipListSet.class,
+        CopyOnWriteArrayList.class,
+        CopyOnWriteArraySet.class,
+        DelayQueue.class,
+        NonBlockingHashMap.class,
+    };
+<span class="fc" id="L359">    static final Set&lt;Class&lt;?&gt;&gt; concurrentIterables = Collections.newSetFromMap(new IdentityHashMap&lt;&gt;());</span>
+<span class="fc" id="L360">    private static final Set&lt;GlobalState&gt; globallyExtant = Collections.newSetFromMap(new ConcurrentHashMap&lt;&gt;());</span>
+<span class="fc" id="L361">    static final ReferenceQueue&lt;Object&gt; referenceQueue = new ReferenceQueue&lt;&gt;();</span>
+<span class="fc" id="L362">    private static final InfiniteLoopExecutor EXEC = new InfiniteLoopExecutor(&quot;Reference-Reaper&quot;, Ref::reapOneReference).start();</span>
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">    static final ScheduledExecutorService STRONG_LEAK_DETECTOR = !DEBUG_ENABLED ? null : Executors.newScheduledThreadPool(1, new NamedThreadFactory(&quot;Strong-Reference-Leak-Detector&quot;));</span>
+    static
+    {
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">        if (DEBUG_ENABLED)</span>
+        {
+<span class="nc" id="L368">            STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new Visitor(), 1, 15, TimeUnit.MINUTES);</span>
+<span class="nc" id="L369">            STRONG_LEAK_DETECTOR.scheduleAtFixedRate(new StrongLeakDetector(), 2, 15, TimeUnit.MINUTES);</span>
+        }
+<span class="fc" id="L371">        concurrentIterables.addAll(Arrays.asList(concurrentIterableClasses));</span>
+    }
+
+    private static void reapOneReference() throws InterruptedException
+    {
+<span class="fc" id="L376">        Object obj = referenceQueue.remove(100);</span>
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (obj instanceof Ref.State)</span>
+        {
+<span class="nc" id="L379">            ((Ref.State) obj).release(true);</span>
+        }
+<span class="fc" id="L381">    }</span>
+
+<span class="fc" id="L383">    static final Deque&lt;InProgressVisit&gt; inProgressVisitPool = new ArrayDeque&lt;InProgressVisit&gt;();</span>
+
+    @SuppressWarnings({ &quot;rawtypes&quot;, &quot;unchecked&quot; })
+    static InProgressVisit newInProgressVisit(Object o, List&lt;Field&gt; fields, Field field, String name)
+    {
+<span class="nc" id="L388">        Preconditions.checkNotNull(o);</span>
+<span class="nc" id="L389">        InProgressVisit ipv = inProgressVisitPool.pollLast();</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (ipv == null)</span>
+<span class="nc" id="L391">            ipv = new InProgressVisit();</span>
+
+<span class="nc" id="L393">        ipv.o = o;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (o instanceof Object[])</span>
+<span class="nc" id="L395">            ipv.collectionIterator = Arrays.asList((Object[])o).iterator();</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        else if (o instanceof ConcurrentMap)</span>
+        {
+<span class="nc" id="L398">            ipv.isMapIterator = true;</span>
+<span class="nc" id="L399">            ipv.collectionIterator = ((Map)o).entrySet().iterator();</span>
+        }
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        else if (concurrentIterables.contains(o.getClass()) | o instanceof BlockingQueue)</span>
+<span class="nc" id="L402">            ipv.collectionIterator = ((Iterable)o).iterator();</span>
+
+<span class="nc" id="L404">        ipv.fields = fields;</span>
+<span class="nc" id="L405">        ipv.field = field;</span>
+<span class="nc" id="L406">        ipv.name = name;</span>
+<span class="nc" id="L407">        return ipv;</span>
+    }
+
+    static void returnInProgressVisit(InProgressVisit ipv)
+    {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        if (inProgressVisitPool.size() &gt; 1024)</span>
+<span class="nc" id="L413">            return;</span>
+<span class="nc" id="L414">        ipv.name = null;</span>
+<span class="nc" id="L415">        ipv.fields = null;</span>
+<span class="nc" id="L416">        ipv.o = null;</span>
+<span class="nc" id="L417">        ipv.fieldIndex = 0;</span>
+<span class="nc" id="L418">        ipv.field = null;</span>
+<span class="nc" id="L419">        ipv.collectionIterator = null;</span>
+<span class="nc" id="L420">        ipv.mapEntryValue = null;</span>
+<span class="nc" id="L421">        ipv.isMapIterator = false;</span>
+<span class="nc" id="L422">        inProgressVisitPool.offer(ipv);</span>
+<span class="nc" id="L423">    }</span>
+
+    /*
+     * Stack state for walking an object graph.
+     * Field index is the index of the current field being fetched.
+     */
+    @SuppressWarnings({ &quot;rawtypes&quot;})
+<span class="nc" id="L430">    static class InProgressVisit</span>
+    {
+        String name;
+        List&lt;Field&gt; fields;
+        Object o;
+<span class="nc" id="L435">        int fieldIndex = 0;</span>
+        Field field;
+
+        //Need to know if Map.Entry should be returned or traversed as an object
+        boolean isMapIterator;
+        //If o is a ConcurrentMap, BlockingQueue, or Object[], this is populated with an iterator over the contents
+        Iterator&lt;Object&gt; collectionIterator;
+        //If o is a ConcurrentMap the entry set contains keys and values. The key is returned as the first child
+        //And the associated value is stashed here and returned next
+        Object mapEntryValue;
+
+        private Field nextField()
+        {
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (fields.isEmpty())</span>
+<span class="nc" id="L449">                return null;</span>
+
+<span class="nc bnc" id="L451" title="All 2 branches missed.">            if (fieldIndex &gt;= fields.size())</span>
+<span class="nc" id="L452">                return null;</span>
+
+<span class="nc" id="L454">            Field retval = fields.get(fieldIndex);</span>
+<span class="nc" id="L455">            fieldIndex++;</span>
+<span class="nc" id="L456">            return retval;</span>
+        }
+
+        Pair&lt;Object, Field&gt; nextChild() throws IllegalAccessException
+        {
+            //If the last child returned was a key from a map, the value from that entry is stashed
+            //so it can be returned next
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (mapEntryValue != null)</span>
+            {
+<span class="nc" id="L465">                Pair&lt;Object, Field&gt; retval = Pair.create(mapEntryValue, field);</span>
+<span class="nc" id="L466">                mapEntryValue = null;</span>
+<span class="nc" id="L467">                return retval;</span>
+            }
+
+            //If o is a ConcurrentMap, BlockingQueue, or Object[], then an iterator will be stored to return the elements
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (collectionIterator != null)</span>
+            {
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                if (!collectionIterator.hasNext())</span>
+<span class="nc" id="L474">                    return null;</span>
+<span class="nc" id="L475">                Object nextItem = null;</span>
+                //Find the next non-null element to traverse since returning null will cause the visitor to stop
+<span class="nc bnc" id="L477" title="All 4 branches missed.">                while (collectionIterator.hasNext() &amp;&amp; (nextItem = collectionIterator.next()) == null){}</span>
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                if (nextItem != null)</span>
+                {
+<span class="nc bnc" id="L480" title="All 2 branches missed.">                    if (isMapIterator &amp; nextItem instanceof Map.Entry)</span>
+                    {
+<span class="nc" id="L482">                        Map.Entry entry = (Map.Entry)nextItem;</span>
+<span class="nc" id="L483">                        mapEntryValue = entry.getValue();</span>
+<span class="nc" id="L484">                        return Pair.create(entry.getKey(), field);</span>
+                    }
+<span class="nc" id="L486">                    return Pair.create(nextItem, field);</span>
+                }
+                else
+                {
+<span class="nc" id="L490">                    return null;</span>
+                }
+            }
+
+            //Basic traversal of an object by its member fields
+            //Don't return null values as that indicates no more objects
+            while (true)
+            {
+<span class="nc" id="L498">                Field nextField = nextField();</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                if (nextField == null)</span>
+<span class="nc" id="L500">                    return null;</span>
+
+                //A weak reference isn't strongly reachable
+                //subclasses of WeakReference contain strong references in their fields, so those need to be traversed
+                //The weak reference fields are in the common Reference class base so filter those out
+<span class="nc bnc" id="L505" title="All 4 branches missed.">                if (o instanceof WeakReference &amp; nextField.getDeclaringClass() == Reference.class)</span>
+<span class="nc" id="L506">                    continue;</span>
+
+<span class="nc" id="L508">                Object nextObject = nextField.get(o);</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                if (nextObject != null)</span>
+<span class="nc" id="L510">                    return Pair.create(nextField.get(o), nextField);</span>
+<span class="nc" id="L511">            }</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">            return field == null ? name : field.toString() + &quot;-&quot; + o.getClass().getName();</span>
+        }
+    }
+
+<span class="nc" id="L521">    static class Visitor implements Runnable</span>
+    {
+<span class="nc" id="L523">        final Deque&lt;InProgressVisit&gt; path = new ArrayDeque&lt;&gt;();</span>
+<span class="nc" id="L524">        final Set&lt;Object&gt; visited = Collections.newSetFromMap(new IdentityHashMap&lt;&gt;());</span>
+        @VisibleForTesting
+        int lastVisitedCount;
+<span class="nc" id="L527">        @VisibleForTesting</span>
+        long iterations = 0;
+        GlobalState visiting;
+        Set&lt;GlobalState&gt; haveLoops;
+
+        public void run()
+        {
+            try
+            {
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                for (GlobalState globalState : globallyExtant)</span>
+                {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                    if (globalState.tidy == null)</span>
+<span class="nc" id="L539">                        continue;</span>
+
+                    // do a graph exploration of the GlobalState, since it should be shallow; if it references itself, we have a problem
+<span class="nc" id="L542">                    path.clear();</span>
+<span class="nc" id="L543">                    visited.clear();</span>
+<span class="nc" id="L544">                    lastVisitedCount = 0;</span>
+<span class="nc" id="L545">                    iterations = 0;</span>
+<span class="nc" id="L546">                    visited.add(globalState);</span>
+<span class="nc" id="L547">                    visiting = globalState;</span>
+<span class="nc" id="L548">                    traverse(globalState.tidy);</span>
+<span class="nc" id="L549">                }</span>
+            }
+<span class="nc" id="L551">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L553">                t.printStackTrace();</span>
+            }
+            finally
+            {
+<span class="nc" id="L557">                lastVisitedCount = visited.size();</span>
+<span class="nc" id="L558">                path.clear();</span>
+<span class="nc" id="L559">                visited.clear();</span>
+            }
+<span class="nc" id="L561">        }</span>
+
+        /*
+         * Searches for an indirect strong reference between rootObject and visiting.
+         */
+        void traverse(final RefCounted.Tidy rootObject)
+        {
+<span class="nc" id="L568">            path.offer(newInProgressVisit(rootObject, getFields(rootObject.getClass()), null, rootObject.name()));</span>
+
+<span class="nc" id="L570">            InProgressVisit inProgress = null;</span>
+<span class="nc bnc" id="L571" title="All 4 branches missed.">            while (inProgress != null || !path.isEmpty())</span>
+            {
+                //If necessary fetch the next object to start tracing
+<span class="nc bnc" id="L574" title="All 2 branches missed.">                if (inProgress == null)</span>
+<span class="nc" id="L575">                    inProgress = path.pollLast();</span>
+
+                try
+                {
+<span class="nc" id="L579">                    Pair&lt;Object, Field&gt; p = inProgress.nextChild();</span>
+<span class="nc" id="L580">                    Object child = null;</span>
+<span class="nc" id="L581">                    Field field = null;</span>
+
+<span class="nc bnc" id="L583" title="All 2 branches missed.">                    if (p != null)</span>
+                    {
+<span class="nc" id="L585">                        iterations++;</span>
+<span class="nc" id="L586">                        child = p.left;</span>
+<span class="nc" id="L587">                        field = p.right;</span>
+                    }
+
+<span class="nc bnc" id="L590" title="All 4 branches missed.">                    if (child != null &amp;&amp; visited.add(child))</span>
+                    {
+<span class="nc" id="L592">                        path.offer(inProgress);</span>
+<span class="nc" id="L593">                        inProgress = newInProgressVisit(child, getFields(child.getClass()), field, null);</span>
+<span class="nc" id="L594">                        continue;</span>
+                    }
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                    else if (visiting == child)</span>
+                    {
+<span class="nc bnc" id="L598" title="All 2 branches missed.">                        if (haveLoops != null)</span>
+<span class="nc" id="L599">                            haveLoops.add(visiting);</span>
+<span class="nc" id="L600">                        NoSpamLogger.log(logger,</span>
+                                NoSpamLogger.Level.ERROR,
+<span class="nc" id="L602">                                rootObject.getClass().getName(),</span>
+                                1,
+                                TimeUnit.SECONDS,
+                                &quot;Strong self-ref loop detected {}&quot;,
+                                path);
+                    }
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                    else if (child == null)</span>
+                    {
+<span class="nc" id="L610">                        returnInProgressVisit(inProgress);</span>
+<span class="nc" id="L611">                        inProgress = null;</span>
+<span class="nc" id="L612">                        continue;</span>
+                    }
+                }
+<span class="nc" id="L615">                catch (IllegalAccessException e)</span>
+                {
+<span class="nc" id="L617">                    NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 5, TimeUnit.MINUTES, &quot;Could not fully check for self-referential leaks&quot;, e);</span>
+<span class="nc" id="L618">                }</span>
+            }
+<span class="nc" id="L620">        }</span>
+    }
+
+<span class="fc" id="L623">    static final Map&lt;Class&lt;?&gt;, List&lt;Field&gt;&gt; fieldMap = new HashMap&lt;&gt;();</span>
+    static List&lt;Field&gt; getFields(Class&lt;?&gt; clazz)
+    {
+<span class="nc bnc" id="L626" title="All 8 branches missed.">        if (clazz == null || clazz == PhantomReference.class || clazz == Class.class || java.lang.reflect.Member.class.isAssignableFrom(clazz))</span>
+<span class="nc" id="L627">            return emptyList();</span>
+<span class="nc" id="L628">        List&lt;Field&gt; fields = fieldMap.get(clazz);</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (fields != null)</span>
+<span class="nc" id="L630">            return fields;</span>
+<span class="nc" id="L631">        fieldMap.put(clazz, fields = new ArrayList&lt;&gt;());</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">        for (Field field : clazz.getDeclaredFields())</span>
+        {
+<span class="nc bnc" id="L634" title="All 4 branches missed.">            if (field.getType().isPrimitive() || Modifier.isStatic(field.getModifiers()))</span>
+<span class="nc" id="L635">                continue;</span>
+<span class="nc" id="L636">            field.setAccessible(true);</span>
+<span class="nc" id="L637">            fields.add(field);</span>
+        }
+<span class="nc" id="L639">        fields.addAll(getFields(clazz.getSuperclass()));</span>
+<span class="nc" id="L640">        return fields;</span>
+    }
+
+    public static class IdentityCollection
+    {
+        final Set&lt;Tidy&gt; candidates;
+        public IdentityCollection(Set&lt;Tidy&gt; candidates)
+<span class="nc" id="L647">        {</span>
+<span class="nc" id="L648">            this.candidates = candidates;</span>
+<span class="nc" id="L649">        }</span>
+
+        public void add(Ref&lt;?&gt; ref)
+        {
+<span class="nc" id="L653">            candidates.remove(ref.state.globalState.tidy);</span>
+<span class="nc" id="L654">        }</span>
+        public void add(SelfRefCounted&lt;?&gt; ref)
+        {
+<span class="nc" id="L657">            add(ref.selfRef());</span>
+<span class="nc" id="L658">        }</span>
+        public void add(SharedCloseable ref)
+        {
+<span class="nc bnc" id="L661" title="All 2 branches missed.">            if (ref instanceof SharedCloseableImpl)</span>
+<span class="nc" id="L662">                add((SharedCloseableImpl)ref);</span>
+<span class="nc" id="L663">        }</span>
+        public void add(SharedCloseableImpl ref)
+        {
+<span class="nc" id="L666">            add(ref.ref);</span>
+<span class="nc" id="L667">        }</span>
+        public void add(Memory memory)
+        {
+<span class="nc bnc" id="L670" title="All 2 branches missed.">            if (memory instanceof SafeMemory)</span>
+<span class="nc" id="L671">                ((SafeMemory) memory).addTo(this);</span>
+<span class="nc" id="L672">        }</span>
+    }
+
+<span class="nc" id="L675">    private static class StrongLeakDetector implements Runnable</span>
+    {
+<span class="nc" id="L677">        Set&lt;Tidy&gt; candidates = new HashSet&lt;&gt;();</span>
+
+        public void run()
+        {
+<span class="nc" id="L681">            final Set&lt;Tidy&gt; candidates = Collections.newSetFromMap(new IdentityHashMap&lt;&gt;());</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            for (GlobalState state : globallyExtant)</span>
+<span class="nc" id="L683">                candidates.add(state.tidy);</span>
+<span class="nc" id="L684">            removeExpected(candidates);</span>
+<span class="nc" id="L685">            this.candidates.retainAll(candidates);</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (!this.candidates.isEmpty())</span>
+            {
+<span class="nc" id="L688">                List&lt;String&gt; names = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                for (Tidy tidy : this.candidates)</span>
+<span class="nc" id="L690">                    names.add(tidy.name());</span>
+<span class="nc" id="L691">                logger.warn(&quot;Strong reference leak candidates detected: {}&quot;, names);</span>
+            }
+<span class="nc" id="L693">            this.candidates = candidates;</span>
+<span class="nc" id="L694">        }</span>
+
+        private void removeExpected(Set&lt;Tidy&gt; candidates)
+        {
+<span class="nc" id="L698">            final Ref.IdentityCollection expected = new Ref.IdentityCollection(candidates);</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            for (Keyspace ks : Keyspace.all())</span>
+            {
+<span class="nc bnc" id="L701" title="All 2 branches missed.">                for (ColumnFamilyStore cfs : ks.getColumnFamilyStores())</span>
+                {
+<span class="nc" id="L703">                    View view = cfs.getTracker().getView();</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                    for (SSTableReader reader : view.allKnownSSTables())</span>
+<span class="nc" id="L705">                        reader.addTo(expected);</span>
+<span class="nc" id="L706">                }</span>
+<span class="nc" id="L707">            }</span>
+<span class="nc" id="L708">        }</span>
+    }
+
+    @VisibleForTesting
+    public static void shutdownReferenceReaper(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L714">        ExecutorUtils.shutdownNowAndWait(timeout, unit, EXEC, STRONG_LEAK_DETECTOR);</span>
+<span class="nc" id="L715">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,483 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PartitionRangeReadCommand.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">PartitionRangeReadCommand.java</span></div><h1>PartitionRangeReadCommand.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.BaseRowIterator;
+import org.apache.cassandra.db.transform.RTBoundValidator;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.pager.*;
+import org.apache.cassandra.thrift.ThriftResultsMerger;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.FBUtilities;
+
+/**
+ * A read command that selects a (part of a) range of partitions.
+ */
+public class PartitionRangeReadCommand extends ReadCommand
+{
+<span class="fc" id="L60">    protected static final SelectionDeserializer selectionDeserializer = new Deserializer();</span>
+
+    private final DataRange dataRange;
+<span class="fc" id="L63">    private int oldestUnrepairedTombstone = Integer.MAX_VALUE;</span>
+
+    private PartitionRangeReadCommand(boolean isDigest,
+                                      int digestVersion,
+                                      boolean isForThrift,
+                                      CFMetaData metadata,
+                                      int nowInSec,
+                                      ColumnFilter columnFilter,
+                                      RowFilter rowFilter,
+                                      DataLimits limits,
+                                      DataRange dataRange,
+                                      IndexMetadata index)
+    {
+<span class="fc" id="L76">        super(Kind.PARTITION_RANGE, isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, index);</span>
+<span class="fc" id="L77">        this.dataRange = dataRange;</span>
+<span class="fc" id="L78">    }</span>
+
+    public static PartitionRangeReadCommand create(boolean isForThrift,
+                                                   CFMetaData metadata,
+                                                   int nowInSec,
+                                                   ColumnFilter columnFilter,
+                                                   RowFilter rowFilter,
+                                                   DataLimits limits,
+                                                   DataRange dataRange)
+    {
+<span class="fc" id="L88">        return new PartitionRangeReadCommand(false,</span>
+                                             0,
+                                             isForThrift,
+                                             metadata,
+                                             nowInSec,
+                                             columnFilter,
+                                             rowFilter,
+                                             limits,
+                                             dataRange,
+<span class="fc" id="L97">                                             findIndex(metadata, rowFilter));</span>
+    }
+
+    /**
+     * Creates a new read command that query all the data in the table.
+     *
+     * @param metadata the table to query.
+     * @param nowInSec the time in seconds to use are &quot;now&quot; for this query.
+     *
+     * @return a newly created read command that queries everything in the table.
+     */
+    public static PartitionRangeReadCommand allDataRead(CFMetaData metadata, int nowInSec)
+    {
+<span class="fc" id="L110">        return new PartitionRangeReadCommand(false, 0, false,</span>
+                                             metadata,
+                                             nowInSec,
+<span class="fc" id="L113">                                             ColumnFilter.all(metadata),</span>
+                                             RowFilter.NONE,
+                                             DataLimits.NONE,
+<span class="fc" id="L116">                                             DataRange.allData(metadata.partitioner),</span>
+                                             null);
+    }
+
+    public DataRange dataRange()
+    {
+<span class="fc" id="L122">        return dataRange;</span>
+    }
+
+    public ClusteringIndexFilter clusteringIndexFilter(DecoratedKey key)
+    {
+<span class="nc" id="L127">        return dataRange.clusteringIndexFilter(key);</span>
+    }
+
+    public boolean isNamesQuery()
+    {
+<span class="nc" id="L132">        return dataRange.isNamesQuery();</span>
+    }
+
+    /**
+     * Returns an equivalent command but that only queries data within the provided range.
+     *
+     * @param range the sub-range to restrict the command to. This method &lt;b&gt;assumes&lt;/b&gt; that this is a proper sub-range
+     * of the command this is applied to.
+     * @param isRangeContinuation whether {@code range} is a direct continuation of whatever previous range we have
+     * queried. This matters for the {@code DataLimits} that may contain states when we do paging and in the context of
+     * parallel queries: that state only make sense if the range queried is indeed the follow-up of whatever range we've
+     * previously query (that yield said state). In practice this means that ranges for which {@code isRangeContinuation}
+     * is false may have to be slightly pessimistic when counting data and may include a little bit than necessary, and
+     * this should be dealt with post-query (in the case of {@code StorageProxy.getRangeSlice()}, which uses this method
+     * for replica queries, this is dealt with by re-counting results on the coordinator). Note that if this is the
+     * first range we queried, then the {@code DataLimits} will have not state and the value of this parameter doesn't
+     * matter.
+     */
+    public PartitionRangeReadCommand forSubRange(AbstractBounds&lt;PartitionPosition&gt; range, boolean isRangeContinuation)
+    {
+        // If we're not a continuation of whatever range we've previously queried, we should ignore the states of the
+        // DataLimits as it's either useless, or misleading. This is particularly important for GROUP BY queries, where
+        // DataLimits.CQLGroupByLimits.GroupByAwareCounter assumes that if GroupingState.hasClustering(), then we're in
+        // the middle of a group, but we can't make that assumption if we query and range &quot;in advance&quot; of where we are
+        // on the ring.
+<span class="fc" id="L157">        return new PartitionRangeReadCommand(isDigestQuery(),</span>
+<span class="fc" id="L158">                                             digestVersion(),</span>
+<span class="fc" id="L159">                                             isForThrift(),</span>
+<span class="fc" id="L160">                                             metadata(),</span>
+<span class="fc" id="L161">                                             nowInSec(),</span>
+<span class="fc" id="L162">                                             columnFilter(),</span>
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">                                             rowFilter(),</span>
+<span class="pc" id="L164">                                             isRangeContinuation ? limits() : limits().withoutState(),</span>
+<span class="fc" id="L165">                                             dataRange().forSubRange(range),</span>
+<span class="fc" id="L166">                                             indexMetadata());</span>
+    }
+
+    public PartitionRangeReadCommand copy()
+    {
+<span class="nc" id="L171">        return new PartitionRangeReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L172">                                             digestVersion(),</span>
+<span class="nc" id="L173">                                             isForThrift(),</span>
+<span class="nc" id="L174">                                             metadata(),</span>
+<span class="nc" id="L175">                                             nowInSec(),</span>
+<span class="nc" id="L176">                                             columnFilter(),</span>
+<span class="nc" id="L177">                                             rowFilter(),</span>
+<span class="nc" id="L178">                                             limits(),</span>
+<span class="nc" id="L179">                                             dataRange(),</span>
+<span class="nc" id="L180">                                             indexMetadata());</span>
+    }
+
+    public PartitionRangeReadCommand copyAsDigestQuery()
+    {
+<span class="nc" id="L185">        return new PartitionRangeReadCommand(true,</span>
+<span class="nc" id="L186">                                             digestVersion(),</span>
+<span class="nc" id="L187">                                             isForThrift(),</span>
+<span class="nc" id="L188">                                             metadata(),</span>
+<span class="nc" id="L189">                                             nowInSec(),</span>
+<span class="nc" id="L190">                                             columnFilter(),</span>
+<span class="nc" id="L191">                                             rowFilter(),</span>
+<span class="nc" id="L192">                                             limits(),</span>
+<span class="nc" id="L193">                                             dataRange(),</span>
+<span class="nc" id="L194">                                             indexMetadata());</span>
+    }
+
+    public ReadCommand withUpdatedLimit(DataLimits newLimits)
+    {
+<span class="nc" id="L199">        return new PartitionRangeReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L200">                                             digestVersion(),</span>
+<span class="nc" id="L201">                                             isForThrift(),</span>
+<span class="nc" id="L202">                                             metadata(),</span>
+<span class="nc" id="L203">                                             nowInSec(),</span>
+<span class="nc" id="L204">                                             columnFilter(),</span>
+<span class="nc" id="L205">                                             rowFilter(),</span>
+                                             newLimits,
+<span class="nc" id="L207">                                             dataRange(),</span>
+<span class="nc" id="L208">                                             indexMetadata());</span>
+    }
+
+    public PartitionRangeReadCommand withUpdatedDataRange(DataRange newDataRange)
+    {
+<span class="nc" id="L213">        return new PartitionRangeReadCommand(isDigestQuery(),</span>
+<span class="nc" id="L214">                                             digestVersion(),</span>
+<span class="nc" id="L215">                                             isForThrift(),</span>
+<span class="nc" id="L216">                                             metadata(),</span>
+<span class="nc" id="L217">                                             nowInSec(),</span>
+<span class="nc" id="L218">                                             columnFilter(),</span>
+<span class="nc" id="L219">                                             rowFilter(),</span>
+<span class="nc" id="L220">                                             limits(),</span>
+                                             newDataRange,
+<span class="nc" id="L222">                                             indexMetadata());</span>
+    }
+
+    public PartitionRangeReadCommand withUpdatedLimitsAndDataRange(DataLimits newLimits, DataRange newDataRange)
+    {
+<span class="fc" id="L227">        return new PartitionRangeReadCommand(isDigestQuery(),</span>
+<span class="fc" id="L228">                                             digestVersion(),</span>
+<span class="fc" id="L229">                                             isForThrift(),</span>
+<span class="fc" id="L230">                                             metadata(),</span>
+<span class="fc" id="L231">                                             nowInSec(),</span>
+<span class="fc" id="L232">                                             columnFilter(),</span>
+<span class="fc" id="L233">                                             rowFilter(),</span>
+                                             newLimits,
+                                             newDataRange,
+<span class="fc" id="L236">                                             indexMetadata());</span>
+    }
+
+    public long getTimeout()
+    {
+<span class="fc" id="L241">        return DatabaseDescriptor.getRangeRpcTimeout();</span>
+    }
+
+    public boolean selectsKey(DecoratedKey key)
+    {
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if (!dataRange().contains(key))</span>
+<span class="nc" id="L247">            return false;</span>
+
+<span class="nc" id="L249">        return rowFilter().partitionKeyRestrictionsAreSatisfiedBy(key, metadata().getKeyValidator());</span>
+    }
+
+    public boolean selectsClustering(DecoratedKey key, Clustering clustering)
+    {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        if (clustering == Clustering.STATIC_CLUSTERING)</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            return !columnFilter().fetchedColumns().statics.isEmpty();</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (!dataRange().clusteringIndexFilter(key).selects(clustering))</span>
+<span class="nc" id="L258">            return false;</span>
+<span class="nc" id="L259">        return rowFilter().clusteringKeyRestrictionsAreSatisfiedBy(clustering);</span>
+    }
+
+    public PartitionIterator execute(ConsistencyLevel consistency, ClientState clientState, long queryStartNanoTime) throws RequestExecutionException
+    {
+<span class="fc" id="L264">        return StorageProxy.getRangeSlice(this, consistency, queryStartNanoTime);</span>
+    }
+
+    public QueryPager getPager(PagingState pagingState, ProtocolVersion protocolVersion)
+    {
+<span class="fc" id="L269">            return new PartitionRangeQueryPager(this, pagingState, protocolVersion);</span>
+    }
+
+    protected void recordLatency(TableMetrics metric, long latencyNanos)
+    {
+<span class="fc" id="L274">        metric.rangeLatency.addNano(latencyNanos);</span>
+<span class="fc" id="L275">    }</span>
+
+    @VisibleForTesting
+    public UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController executionController)
+    {
+<span class="fc" id="L280">        ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));</span>
+<span class="fc" id="L281">        Tracing.trace(&quot;Executing seq scan across {} sstables for {}&quot;, view.sstables.size(), dataRange().keyRange().getString(metadata().getKeyValidator()));</span>
+
+        // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+<span class="fc" id="L284">        final List&lt;UnfilteredPartitionIterator&gt; iterators = new ArrayList&lt;&gt;(Iterables.size(view.memtables) + view.sstables.size());</span>
+
+        try
+        {
+<span class="fc bfc" id="L288" title="All 2 branches covered.">            for (Memtable memtable : view.memtables)</span>
+            {
+                @SuppressWarnings(&quot;resource&quot;) // We close on exception and on closing the result returned by this method
+<span class="fc" id="L291">                Memtable.MemtableUnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange(), isForThrift());</span>
+
+                @SuppressWarnings(&quot;resource&quot;) // We close on exception and on closing the result returned by this method
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">                UnfilteredPartitionIterator iterator = isForThrift() ? ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec()) : iter;</span>
+<span class="fc" id="L295">                iterators.add(RTBoundValidator.validate(iterator, RTBoundValidator.Stage.MEMTABLE, false));</span>
+
+<span class="fc" id="L297">                oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, iter.getMinLocalDeletionTime());</span>
+<span class="fc" id="L298">            }</span>
+
+<span class="fc" id="L300">            SSTableReadsListener readCountUpdater = newReadCountUpdater();</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">            for (SSTableReader sstable : view.sstables)</span>
+            {
+                @SuppressWarnings(&quot;resource&quot;) // We close on exception and on closing the result returned by this method
+<span class="fc" id="L304">                UnfilteredPartitionIterator iter = sstable.getScanner(columnFilter(), dataRange(), isForThrift(), readCountUpdater);</span>
+
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">                if (isForThrift())</span>
+<span class="nc" id="L307">                    iter = ThriftResultsMerger.maybeWrap(iter, metadata(), nowInSec());</span>
+
+<span class="fc" id="L309">                iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));</span>
+
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">                if (!sstable.isRepaired())</span>
+<span class="fc" id="L312">                    oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());</span>
+<span class="fc" id="L313">            }</span>
+            // iterators can be empty for offline tools
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">            return iterators.isEmpty() ? EmptyIterators.unfilteredPartition(metadata(), isForThrift())</span>
+<span class="fc" id="L316">                                       : checkCacheFilter(UnfilteredPartitionIterators.mergeLazily(iterators, nowInSec()), cfs);</span>
+        }
+<span class="nc" id="L318">        catch (RuntimeException | Error e)</span>
+        {
+            try
+            {
+<span class="nc" id="L322">                FBUtilities.closeAll(iterators);</span>
+            }
+<span class="nc" id="L324">            catch (Exception suppressed)</span>
+            {
+<span class="nc" id="L326">                e.addSuppressed(suppressed);</span>
+<span class="nc" id="L327">            }</span>
+
+<span class="nc" id="L329">            throw e;</span>
+        }
+    }
+
+    /**
+     * Creates a new {@code SSTableReadsListener} to update the SSTables read counts.
+     * @return a new {@code SSTableReadsListener} to update the SSTables read counts.
+     */
+    private static SSTableReadsListener newReadCountUpdater()
+    {
+<span class="fc" id="L339">        return new SSTableReadsListener()</span>
+<span class="fc" id="L340">                {</span>
+                    @Override
+                    public void onScanningStarted(SSTableReader sstable)
+                    {
+<span class="fc" id="L344">                        sstable.incrementReadCount();</span>
+<span class="fc" id="L345">                    }</span>
+                };
+    }
+
+    @Override
+    protected int oldestUnrepairedTombstone()
+    {
+<span class="fc" id="L352">        return oldestUnrepairedTombstone;</span>
+    }
+
+    private UnfilteredPartitionIterator checkCacheFilter(UnfilteredPartitionIterator iter, final ColumnFamilyStore cfs)
+    {
+<span class="fc" id="L357">        class CacheFilter extends Transformation</span>
+        {
+            @Override
+            public BaseRowIterator applyToPartition(BaseRowIterator iter)
+            {
+                // Note that we rely on the fact that until we actually advance 'iter', no really costly operation is actually done
+                // (except for reading the partition key from the index file) due to the call to mergeLazily in queryStorage.
+<span class="fc" id="L364">                DecoratedKey dk = iter.partitionKey();</span>
+
+                // Check if this partition is in the rowCache and if it is, if  it covers our filter
+<span class="fc" id="L367">                CachedPartition cached = cfs.getRawCachedPartition(dk);</span>
+<span class="fc" id="L368">                ClusteringIndexFilter filter = dataRange().clusteringIndexFilter(dk);</span>
+
+<span class="pc bpc" id="L370" title="3 of 4 branches missed.">                if (cached != null &amp;&amp; cfs.isFilterFullyCoveredBy(filter, limits(), cached, nowInSec()))</span>
+                {
+                    // We won't use 'iter' so close it now.
+<span class="nc" id="L373">                    iter.close();</span>
+
+<span class="nc" id="L375">                    return filter.getUnfilteredRowIterator(columnFilter(), cached);</span>
+                }
+
+<span class="fc" id="L378">                return iter;</span>
+            }
+        }
+<span class="fc" id="L381">        return Transformation.apply(iter, new CacheFilter());</span>
+    }
+
+    public MessageOut&lt;ReadCommand&gt; createMessage(int version)
+    {
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">        return dataRange().isPaging()</span>
+             ? new MessageOut&lt;&gt;(MessagingService.Verb.PAGED_RANGE, this, pagedRangeSerializer)
+             : new MessageOut&lt;&gt;(MessagingService.Verb.RANGE_SLICE, this, rangeSliceSerializer);
+    }
+
+    protected void appendCQLWhereClause(StringBuilder sb)
+    {
+<span class="nc bnc" id="L393" title="All 4 branches missed.">        if (dataRange.isUnrestricted() &amp;&amp; rowFilter().isEmpty())</span>
+<span class="nc" id="L394">            return;</span>
+
+<span class="nc" id="L396">        sb.append(&quot; WHERE &quot;);</span>
+        // We put the row filter first because the data range can end by &quot;ORDER BY&quot;
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (!rowFilter().isEmpty())</span>
+        {
+<span class="nc" id="L400">            sb.append(rowFilter());</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            if (!dataRange.isUnrestricted())</span>
+<span class="nc" id="L402">                sb.append(&quot; AND &quot;);</span>
+        }
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (!dataRange.isUnrestricted())</span>
+<span class="nc" id="L405">            sb.append(dataRange.toCQLString(metadata()));</span>
+<span class="nc" id="L406">    }</span>
+
+    /**
+     * Allow to post-process the result of the query after it has been reconciled on the coordinator
+     * but before it is passed to the CQL layer to return the ResultSet.
+     *
+     * See CASSANDRA-8717 for why this exists.
+     */
+    public PartitionIterator postReconciliationProcessing(PartitionIterator result)
+    {
+<span class="fc" id="L416">        ColumnFamilyStore cfs = Keyspace.open(metadata().ksName).getColumnFamilyStore(metadata().cfName);</span>
+<span class="fc" id="L417">        Index index = getIndex(cfs);</span>
+<span class="pc bpc" id="L418" title="1 of 2 branches missed.">        return index == null ? result : index.postProcessorFor(this).apply(result, this);</span>
+    }
+
+    @Override
+    public boolean selectsFullPartition()
+    {
+<span class="fc bfc" id="L424" title="All 2 branches covered.">        return metadata().isStaticCompactTable() ||</span>
+<span class="pc bpc" id="L425" title="1 of 4 branches missed.">               (dataRange.selectsAllPartition() &amp;&amp; !rowFilter().hasExpressionOnClusteringOrRegularColumns());</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L431">        return String.format(&quot;Read(%s.%s columns=%s rowfilter=%s limits=%s %s)&quot;,</span>
+<span class="nc" id="L432">                             metadata().ksName,</span>
+<span class="nc" id="L433">                             metadata().cfName,</span>
+<span class="nc" id="L434">                             columnFilter(),</span>
+<span class="nc" id="L435">                             rowFilter(),</span>
+<span class="nc" id="L436">                             limits(),</span>
+<span class="nc" id="L437">                             dataRange().toString(metadata()));</span>
+    }
+
+    protected void serializeSelection(DataOutputPlus out, int version) throws IOException
+    {
+<span class="fc" id="L442">        DataRange.serializer.serialize(dataRange(), out, version, metadata());</span>
+<span class="fc" id="L443">    }</span>
+
+    protected long selectionSerializedSize(int version)
+    {
+<span class="fc" id="L447">        return DataRange.serializer.serializedSize(dataRange(), version, metadata());</span>
+    }
+
+    /*
+     * We are currently using PartitionRangeReadCommand for most index queries, even if they are explicitly restricted
+     * to a single partition key. Return true if that is the case.
+     *
+     * See CASSANDRA-11617 and CASSANDRA-11872 for details.
+     */
+    public boolean isLimitedToOnePartition()
+    {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        return dataRange.keyRange instanceof Bounds</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            &amp;&amp; dataRange.startKey().kind() == PartitionPosition.Kind.ROW_KEY</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            &amp;&amp; dataRange.startKey().equals(dataRange.stopKey());</span>
+    }
+
+    private static class Deserializer extends SelectionDeserializer
+    {
+        public ReadCommand deserialize(DataInputPlus in,
+                                       int version,
+                                       boolean isDigest,
+                                       int digestVersion,
+                                       boolean isForThrift,
+                                       CFMetaData metadata,
+                                       int nowInSec,
+                                       ColumnFilter columnFilter,
+                                       RowFilter rowFilter,
+                                       DataLimits limits,
+                                       IndexMetadata index)
+        throws IOException
+        {
+<span class="fc" id="L478">            DataRange range = DataRange.serializer.deserialize(in, version, metadata);</span>
+<span class="fc" id="L479">            return new PartitionRangeReadCommand(isDigest, digestVersion, isForThrift, metadata, nowInSec, columnFilter, rowFilter, limits, range, index);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

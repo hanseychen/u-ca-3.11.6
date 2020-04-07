@@ -1,0 +1,593 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BatchlogManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.batchlog</a> &gt; <span class="el_source">BatchlogManager.java</span></div><h1>BatchlogManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.batchlog;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Multimap;
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.SchemaConstants;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.UUIDType;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.WriteFailureException;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.hints.Hint;
+import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.WriteResponseHandler;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.UUIDGen;
+
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternalWithPaging;
+
+public class BatchlogManager implements BatchlogManagerMBean
+{
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.db:type=BatchlogManager&quot;;
+    private static final long REPLAY_INTERVAL = 10 * 1000; // milliseconds
+    static final int DEFAULT_PAGE_SIZE = 128;
+
+<span class="fc" id="L90">    private static final Logger logger = LoggerFactory.getLogger(BatchlogManager.class);</span>
+<span class="fc" id="L91">    public static final BatchlogManager instance = new BatchlogManager();</span>
+<span class="fc" id="L92">    public static final long BATCHLOG_REPLAY_TIMEOUT = Long.getLong(&quot;cassandra.batchlog.replay_timeout_in_ms&quot;, DatabaseDescriptor.getWriteRpcTimeout() * 2);</span>
+
+<span class="fc" id="L94">    private volatile long totalBatchesReplayed = 0; // no concurrency protection necessary as only written by replay thread.</span>
+<span class="fc" id="L95">    private volatile UUID lastReplayedUuid = UUIDGen.minTimeUUID(0);</span>
+
+    // Single-thread executor service for scheduling and serializing log replay.
+    private final ScheduledExecutorService batchlogTasks;
+
+    public BatchlogManager()
+<span class="fc" id="L101">    {</span>
+<span class="fc" id="L102">        ScheduledThreadPoolExecutor executor = new DebuggableScheduledThreadPoolExecutor(&quot;BatchlogTasks&quot;);</span>
+<span class="fc" id="L103">        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);</span>
+<span class="fc" id="L104">        batchlogTasks = executor;</span>
+<span class="fc" id="L105">    }</span>
+
+    public void start()
+    {
+<span class="fc" id="L109">        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);</span>
+
+<span class="fc" id="L111">        batchlogTasks.scheduleWithFixedDelay(this::replayFailedBatches,</span>
+                                             StorageService.RING_DELAY,
+                                             REPLAY_INTERVAL,
+                                             TimeUnit.MILLISECONDS);
+<span class="fc" id="L115">    }</span>
+
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L119">        ExecutorUtils.shutdownAndWait(timeout, unit, batchlogTasks);</span>
+<span class="fc" id="L120">    }</span>
+
+    public static void remove(UUID id)
+    {
+<span class="nc" id="L124">        new Mutation(PartitionUpdate.fullPartitionDelete(SystemKeyspace.Batches,</span>
+<span class="nc" id="L125">                                                         UUIDType.instance.decompose(id),</span>
+<span class="nc" id="L126">                                                         FBUtilities.timestampMicros(),</span>
+<span class="nc" id="L127">                                                         FBUtilities.nowInSeconds()))</span>
+<span class="nc" id="L128">            .apply();</span>
+<span class="nc" id="L129">    }</span>
+
+    public static void store(Batch batch)
+    {
+<span class="nc" id="L133">        store(batch, true);</span>
+<span class="nc" id="L134">    }</span>
+
+    public static void store(Batch batch, boolean durableWrites)
+    {
+<span class="nc" id="L138">        List&lt;ByteBuffer&gt; mutations = new ArrayList&lt;&gt;(batch.encodedMutations.size() + batch.decodedMutations.size());</span>
+<span class="nc" id="L139">        mutations.addAll(batch.encodedMutations);</span>
+
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        for (Mutation mutation : batch.decodedMutations)</span>
+        {
+<span class="nc" id="L143">            try (DataOutputBuffer buffer = new DataOutputBuffer())</span>
+            {
+<span class="nc" id="L145">                Mutation.serializer.serialize(mutation, buffer, MessagingService.current_version);</span>
+<span class="nc" id="L146">                mutations.add(buffer.buffer());</span>
+            }
+<span class="nc" id="L148">            catch (IOException e)</span>
+            {
+                // shouldn't happen
+<span class="nc" id="L151">                throw new AssertionError(e);</span>
+<span class="nc" id="L152">            }</span>
+<span class="nc" id="L153">        }</span>
+
+<span class="nc" id="L155">        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(SystemKeyspace.Batches, batch.id);</span>
+<span class="nc" id="L156">        builder.row()</span>
+<span class="nc" id="L157">               .timestamp(batch.creationTime)</span>
+<span class="nc" id="L158">               .add(&quot;version&quot;, MessagingService.current_version)</span>
+<span class="nc" id="L159">               .appendAll(&quot;mutations&quot;, mutations);</span>
+
+<span class="nc" id="L161">        builder.buildAsMutation().apply(durableWrites);</span>
+<span class="nc" id="L162">    }</span>
+
+    @VisibleForTesting
+    public int countAllBatches()
+    {
+<span class="nc" id="L167">        String query = String.format(&quot;SELECT count(*) FROM %s.%s&quot;, SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.BATCHES);</span>
+<span class="nc" id="L168">        UntypedResultSet results = executeInternal(query);</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">        if (results == null || results.isEmpty())</span>
+<span class="nc" id="L170">            return 0;</span>
+
+<span class="nc" id="L172">        return (int) results.one().getLong(&quot;count&quot;);</span>
+    }
+
+    public long getTotalBatchesReplayed()
+    {
+<span class="nc" id="L177">        return totalBatchesReplayed;</span>
+    }
+
+    public void forceBatchlogReplay() throws Exception
+    {
+<span class="nc" id="L182">        startBatchlogReplay().get();</span>
+<span class="nc" id="L183">    }</span>
+
+    public Future&lt;?&gt; startBatchlogReplay()
+    {
+        // If a replay is already in progress this request will be executed after it completes.
+<span class="nc" id="L188">        return batchlogTasks.submit(this::replayFailedBatches);</span>
+    }
+
+    void performInitialReplay() throws InterruptedException, ExecutionException
+    {
+        // Invokes initial replay. Used for testing only.
+<span class="nc" id="L194">        batchlogTasks.submit(this::replayFailedBatches).get();</span>
+<span class="nc" id="L195">    }</span>
+
+    private void replayFailedBatches()
+    {
+<span class="fc" id="L199">        logger.trace(&quot;Started replayFailedBatches&quot;);</span>
+
+        // rate limit is in bytes per second. Uses Double.MAX_VALUE if disabled (set to 0 in cassandra.yaml).
+        // max rate is scaled by the number of nodes in the cluster (same as for HHOM - see CASSANDRA-5272).
+<span class="fc" id="L203">        int endpointsCount = StorageService.instance.getTokenMetadata().getAllEndpoints().size();</span>
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">        if (endpointsCount &lt;= 0)</span>
+        {
+<span class="nc" id="L206">            logger.trace(&quot;Replay cancelled as there are no peers in the ring.&quot;);</span>
+<span class="nc" id="L207">            return;</span>
+        }
+<span class="fc" id="L209">        int throttleInKB = DatabaseDescriptor.getBatchlogReplayThrottleInKB() / endpointsCount;</span>
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">        RateLimiter rateLimiter = RateLimiter.create(throttleInKB == 0 ? Double.MAX_VALUE : throttleInKB * 1024);</span>
+
+<span class="fc" id="L212">        UUID limitUuid = UUIDGen.maxTimeUUID(System.currentTimeMillis() - getBatchlogTimeout());</span>
+<span class="fc" id="L213">        ColumnFamilyStore store = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.BATCHES);</span>
+<span class="fc" id="L214">        int pageSize = calculatePageSize(store);</span>
+        // There cannot be any live content where token(id) &lt;= token(lastReplayedUuid) as every processed batch is
+        // deleted, but the tombstoned content may still be present in the tables. To avoid walking over it we specify
+        // token(id) &gt; token(lastReplayedUuid) as part of the query.
+<span class="fc" id="L218">        String query = String.format(&quot;SELECT id, mutations, version FROM %s.%s WHERE token(id) &gt; token(?) AND token(id) &lt;= token(?)&quot;,</span>
+                                     SchemaConstants.SYSTEM_KEYSPACE_NAME,
+                                     SystemKeyspace.BATCHES);
+<span class="fc" id="L221">        UntypedResultSet batches = executeInternalWithPaging(query, pageSize, lastReplayedUuid, limitUuid);</span>
+<span class="fc" id="L222">        processBatchlogEntries(batches, pageSize, rateLimiter);</span>
+<span class="fc" id="L223">        lastReplayedUuid = limitUuid;</span>
+<span class="fc" id="L224">        logger.trace(&quot;Finished replayFailedBatches&quot;);</span>
+<span class="fc" id="L225">    }</span>
+
+    // read less rows (batches) per page if they are very large
+    static int calculatePageSize(ColumnFamilyStore store)
+    {
+<span class="fc" id="L230">        double averageRowSize = store.getMeanPartitionSize();</span>
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        if (averageRowSize &lt;= 0)</span>
+<span class="fc" id="L232">            return DEFAULT_PAGE_SIZE;</span>
+
+<span class="nc" id="L234">        return (int) Math.max(1, Math.min(DEFAULT_PAGE_SIZE, 4 * 1024 * 1024 / averageRowSize));</span>
+    }
+
+    private void processBatchlogEntries(UntypedResultSet batches, int pageSize, RateLimiter rateLimiter)
+    {
+<span class="fc" id="L239">        int positionInPage = 0;</span>
+<span class="fc" id="L240">        ArrayList&lt;ReplayingBatch&gt; unfinishedBatches = new ArrayList&lt;&gt;(pageSize);</span>
+
+<span class="fc" id="L242">        Set&lt;InetAddress&gt; hintedNodes = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L243">        Set&lt;UUID&gt; replayedBatches = new HashSet&lt;&gt;();</span>
+
+        // Sending out batches for replay without waiting for them, so that one stuck batch doesn't affect others
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : batches)</span>
+        {
+<span class="nc" id="L248">            UUID id = row.getUUID(&quot;id&quot;);</span>
+<span class="nc" id="L249">            int version = row.getInt(&quot;version&quot;);</span>
+            try
+            {
+<span class="nc" id="L252">                ReplayingBatch batch = new ReplayingBatch(id, version, row.getList(&quot;mutations&quot;, BytesType.instance));</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">                if (batch.replay(rateLimiter, hintedNodes) &gt; 0)</span>
+                {
+<span class="nc" id="L255">                    unfinishedBatches.add(batch);</span>
+                }
+                else
+                {
+<span class="nc" id="L259">                    remove(id); // no write mutations were sent (either expired or all CFs involved truncated).</span>
+<span class="nc" id="L260">                    ++totalBatchesReplayed;</span>
+                }
+            }
+<span class="nc" id="L263">            catch (IOException e)</span>
+            {
+<span class="nc" id="L265">                logger.warn(&quot;Skipped batch replay of {} due to {}&quot;, id, e);</span>
+<span class="nc" id="L266">                remove(id);</span>
+<span class="nc" id="L267">            }</span>
+
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (++positionInPage == pageSize)</span>
+            {
+                // We have reached the end of a batch. To avoid keeping more than a page of mutations in memory,
+                // finish processing the page before requesting the next row.
+<span class="nc" id="L273">                finishAndClearBatches(unfinishedBatches, hintedNodes, replayedBatches);</span>
+<span class="nc" id="L274">                positionInPage = 0;</span>
+            }
+<span class="nc" id="L276">        }</span>
+
+<span class="fc" id="L278">        finishAndClearBatches(unfinishedBatches, hintedNodes, replayedBatches);</span>
+
+        // to preserve batch guarantees, we must ensure that hints (if any) have made it to disk, before deleting the batches
+<span class="fc" id="L281">        HintsService.instance.flushAndFsyncBlockingly(transform(hintedNodes, StorageService.instance::getHostIdForEndpoint));</span>
+
+        // once all generated hints are fsynced, actually delete the batches
+<span class="fc" id="L284">        replayedBatches.forEach(BatchlogManager::remove);</span>
+<span class="fc" id="L285">    }</span>
+
+    private void finishAndClearBatches(ArrayList&lt;ReplayingBatch&gt; batches, Set&lt;InetAddress&gt; hintedNodes, Set&lt;UUID&gt; replayedBatches)
+    {
+        // schedule hints for timed out deliveries
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">        for (ReplayingBatch batch : batches)</span>
+        {
+<span class="nc" id="L292">            batch.finish(hintedNodes);</span>
+<span class="nc" id="L293">            replayedBatches.add(batch.id);</span>
+<span class="nc" id="L294">        }</span>
+
+<span class="fc" id="L296">        totalBatchesReplayed += batches.size();</span>
+<span class="fc" id="L297">        batches.clear();</span>
+<span class="fc" id="L298">    }</span>
+
+    public static long getBatchlogTimeout()
+    {
+<span class="fc" id="L302">        return BATCHLOG_REPLAY_TIMEOUT; // enough time for the actual write + BM removal mutation</span>
+    }
+
+    private static class ReplayingBatch
+    {
+        private final UUID id;
+        private final long writtenAt;
+        private final List&lt;Mutation&gt; mutations;
+        private final int replayedBytes;
+
+        private List&lt;ReplayWriteResponseHandler&lt;Mutation&gt;&gt; replayHandlers;
+
+        ReplayingBatch(UUID id, int version, List&lt;ByteBuffer&gt; serializedMutations) throws IOException
+<span class="nc" id="L315">        {</span>
+<span class="nc" id="L316">            this.id = id;</span>
+<span class="nc" id="L317">            this.writtenAt = UUIDGen.unixTimestamp(id);</span>
+<span class="nc" id="L318">            this.mutations = new ArrayList&lt;&gt;(serializedMutations.size());</span>
+<span class="nc" id="L319">            this.replayedBytes = addMutations(version, serializedMutations);</span>
+<span class="nc" id="L320">        }</span>
+
+        public int replay(RateLimiter rateLimiter, Set&lt;InetAddress&gt; hintedNodes) throws IOException
+        {
+<span class="nc" id="L324">            logger.trace(&quot;Replaying batch {}&quot;, id);</span>
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (mutations.isEmpty())</span>
+<span class="nc" id="L327">                return 0;</span>
+
+<span class="nc" id="L329">            int gcgs = gcgs(mutations);</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if (TimeUnit.MILLISECONDS.toSeconds(writtenAt) + gcgs &lt;= FBUtilities.nowInSeconds())</span>
+<span class="nc" id="L331">                return 0;</span>
+
+<span class="nc" id="L333">            replayHandlers = sendReplays(mutations, writtenAt, hintedNodes);</span>
+
+<span class="nc" id="L335">            rateLimiter.acquire(replayedBytes); // acquire afterwards, to not mess up ttl calculation.</span>
+
+<span class="nc" id="L337">            return replayHandlers.size();</span>
+        }
+
+        public void finish(Set&lt;InetAddress&gt; hintedNodes)
+        {
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            for (int i = 0; i &lt; replayHandlers.size(); i++)</span>
+            {
+<span class="nc" id="L344">                ReplayWriteResponseHandler&lt;Mutation&gt; handler = replayHandlers.get(i);</span>
+                try
+                {
+<span class="nc" id="L347">                    handler.get();</span>
+                }
+<span class="nc" id="L349">                catch (WriteTimeoutException|WriteFailureException e)</span>
+                {
+<span class="nc" id="L351">                    logger.trace(&quot;Failed replaying a batched mutation to a node, will write a hint&quot;);</span>
+<span class="nc" id="L352">                    logger.trace(&quot;Failure was : {}&quot;, e.getMessage());</span>
+                    // writing hints for the rest to hints, starting from i
+<span class="nc" id="L354">                    writeHintsForUndeliveredEndpoints(i, hintedNodes);</span>
+<span class="nc" id="L355">                    return;</span>
+<span class="nc" id="L356">                }</span>
+            }
+<span class="nc" id="L358">        }</span>
+
+        private int addMutations(int version, List&lt;ByteBuffer&gt; serializedMutations) throws IOException
+        {
+<span class="nc" id="L362">            int ret = 0;</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            for (ByteBuffer serializedMutation : serializedMutations)</span>
+            {
+<span class="nc" id="L365">                ret += serializedMutation.remaining();</span>
+<span class="nc" id="L366">                try (DataInputBuffer in = new DataInputBuffer(serializedMutation, true))</span>
+                {
+<span class="nc" id="L368">                    addMutation(Mutation.serializer.deserialize(in, version));</span>
+                }
+<span class="nc" id="L370">            }</span>
+
+<span class="nc" id="L372">            return ret;</span>
+        }
+
+        // Remove CFs that have been truncated since. writtenAt and SystemTable#getTruncatedAt() both return millis.
+        // We don't abort the replay entirely b/c this can be considered a success (truncated is same as delivered then
+        // truncated.
+        private void addMutation(Mutation mutation)
+        {
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            for (UUID cfId : mutation.getColumnFamilyIds())</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">                if (writtenAt &lt;= SystemKeyspace.getTruncatedAt(cfId))</span>
+<span class="nc" id="L382">                    mutation = mutation.without(cfId);</span>
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (!mutation.isEmpty())</span>
+<span class="nc" id="L385">                mutations.add(mutation);</span>
+<span class="nc" id="L386">        }</span>
+
+        private void writeHintsForUndeliveredEndpoints(int startFrom, Set&lt;InetAddress&gt; hintedNodes)
+        {
+<span class="nc" id="L390">            int gcgs = gcgs(mutations);</span>
+
+            // expired
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            if (TimeUnit.MILLISECONDS.toSeconds(writtenAt) + gcgs &lt;= FBUtilities.nowInSeconds())</span>
+<span class="nc" id="L394">                return;</span>
+
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            for (int i = startFrom; i &lt; replayHandlers.size(); i++)</span>
+            {
+<span class="nc" id="L398">                ReplayWriteResponseHandler&lt;Mutation&gt; handler = replayHandlers.get(i);</span>
+<span class="nc" id="L399">                Mutation undeliveredMutation = mutations.get(i);</span>
+
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                if (handler != null)</span>
+                {
+<span class="nc" id="L403">                    hintedNodes.addAll(handler.undelivered);</span>
+<span class="nc" id="L404">                    HintsService.instance.write(transform(handler.undelivered, StorageService.instance::getHostIdForEndpoint),</span>
+<span class="nc" id="L405">                                                Hint.create(undeliveredMutation, writtenAt));</span>
+                }
+            }
+<span class="nc" id="L408">        }</span>
+
+        private static List&lt;ReplayWriteResponseHandler&lt;Mutation&gt;&gt; sendReplays(List&lt;Mutation&gt; mutations,
+                                                                              long writtenAt,
+                                                                              Set&lt;InetAddress&gt; hintedNodes)
+        {
+<span class="nc" id="L414">            List&lt;ReplayWriteResponseHandler&lt;Mutation&gt;&gt; handlers = new ArrayList&lt;&gt;(mutations.size());</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            for (Mutation mutation : mutations)</span>
+            {
+<span class="nc" id="L417">                ReplayWriteResponseHandler&lt;Mutation&gt; handler = sendSingleReplayMutation(mutation, writtenAt, hintedNodes);</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">                if (handler != null)</span>
+<span class="nc" id="L419">                    handlers.add(handler);</span>
+<span class="nc" id="L420">            }</span>
+<span class="nc" id="L421">            return handlers;</span>
+        }
+
+        /**
+         * We try to deliver the mutations to the replicas ourselves if they are alive and only resort to writing hints
+         * when a replica is down or a write request times out.
+         *
+         * @return direct delivery handler to wait on or null, if no live nodes found
+         */
+        private static ReplayWriteResponseHandler&lt;Mutation&gt; sendSingleReplayMutation(final Mutation mutation,
+                                                                                     long writtenAt,
+                                                                                     Set&lt;InetAddress&gt; hintedNodes)
+        {
+<span class="nc" id="L434">            Set&lt;InetAddress&gt; liveEndpoints = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L435">            String ks = mutation.getKeyspaceName();</span>
+<span class="nc" id="L436">            Token tk = mutation.key().getToken();</span>
+
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            for (InetAddress endpoint : StorageService.instance.getNaturalAndPendingEndpoints(ks, tk))</span>
+            {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                if (endpoint.equals(FBUtilities.getBroadcastAddress()))</span>
+                {
+<span class="nc" id="L442">                    mutation.apply();</span>
+                }
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                else if (FailureDetector.instance.isAlive(endpoint))</span>
+                {
+<span class="nc" id="L446">                    liveEndpoints.add(endpoint); // will try delivering directly instead of writing a hint.</span>
+                }
+                else
+                {
+<span class="nc" id="L450">                    hintedNodes.add(endpoint);</span>
+<span class="nc" id="L451">                    HintsService.instance.write(StorageService.instance.getHostIdForEndpoint(endpoint),</span>
+<span class="nc" id="L452">                                                Hint.create(mutation, writtenAt));</span>
+                }
+<span class="nc" id="L454">            }</span>
+
+<span class="nc bnc" id="L456" title="All 2 branches missed.">            if (liveEndpoints.isEmpty())</span>
+<span class="nc" id="L457">                return null;</span>
+
+<span class="nc" id="L459">            ReplayWriteResponseHandler&lt;Mutation&gt; handler = new ReplayWriteResponseHandler&lt;&gt;(liveEndpoints, System.nanoTime());</span>
+<span class="nc" id="L460">            MessageOut&lt;Mutation&gt; message = mutation.createMessage();</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            for (InetAddress endpoint : liveEndpoints)</span>
+<span class="nc" id="L462">                MessagingService.instance().sendRR(message, endpoint, handler, false);</span>
+<span class="nc" id="L463">            return handler;</span>
+        }
+
+        private static int gcgs(Collection&lt;Mutation&gt; mutations)
+        {
+<span class="nc" id="L468">            int gcgs = Integer.MAX_VALUE;</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            for (Mutation mutation : mutations)</span>
+<span class="nc" id="L470">                gcgs = Math.min(gcgs, mutation.smallestGCGS());</span>
+<span class="nc" id="L471">            return gcgs;</span>
+        }
+
+        /**
+         * A wrapper of WriteResponseHandler that stores the addresses of the endpoints from
+         * which we did not receive a successful reply.
+         */
+<span class="nc bnc" id="L478" title="All 2 branches missed.">        private static class ReplayWriteResponseHandler&lt;T&gt; extends WriteResponseHandler&lt;T&gt;</span>
+        {
+<span class="nc" id="L480">            private final Set&lt;InetAddress&gt; undelivered = Collections.newSetFromMap(new ConcurrentHashMap&lt;&gt;());</span>
+
+            ReplayWriteResponseHandler(Collection&lt;InetAddress&gt; writeEndpoints, long queryStartNanoTime)
+            {
+<span class="nc" id="L484">                super(writeEndpoints, Collections.&lt;InetAddress&gt;emptySet(), null, null, null, WriteType.UNLOGGED_BATCH, queryStartNanoTime);</span>
+<span class="nc" id="L485">                undelivered.addAll(writeEndpoints);</span>
+<span class="nc" id="L486">            }</span>
+
+            @Override
+            protected int totalBlockFor()
+            {
+<span class="nc" id="L491">                return this.naturalEndpoints.size();</span>
+            }
+
+            @Override
+            public void response(MessageIn&lt;T&gt; m)
+            {
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                boolean removed = undelivered.remove(m == null ? FBUtilities.getBroadcastAddress() : m.from);</span>
+<span class="nc bnc" id="L498" title="All 4 branches missed.">                assert removed;</span>
+<span class="nc" id="L499">                super.response(m);</span>
+<span class="nc" id="L500">            }</span>
+        }
+    }
+
+    public static class EndpointFilter
+    {
+        private final String localRack;
+        private final Multimap&lt;String, InetAddress&gt; endpoints;
+
+        public EndpointFilter(String localRack, Multimap&lt;String, InetAddress&gt; endpoints)
+<span class="nc" id="L510">        {</span>
+<span class="nc" id="L511">            this.localRack = localRack;</span>
+<span class="nc" id="L512">            this.endpoints = endpoints;</span>
+<span class="nc" id="L513">        }</span>
+
+        /**
+         * @return list of candidates for batchlog hosting. If possible these will be two nodes from different racks.
+         */
+        public Collection&lt;InetAddress&gt; filter()
+        {
+            // special case for single-node data centers
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            if (endpoints.values().size() == 1)</span>
+<span class="nc" id="L522">                return endpoints.values();</span>
+
+            // strip out dead endpoints and localhost
+<span class="nc" id="L525">            ListMultimap&lt;String, InetAddress&gt; validated = ArrayListMultimap.create();</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            for (Map.Entry&lt;String, InetAddress&gt; entry : endpoints.entries())</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                if (isValid(entry.getValue()))</span>
+<span class="nc" id="L528">                    validated.put(entry.getKey(), entry.getValue());</span>
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (validated.size() &lt;= 2)</span>
+<span class="nc" id="L531">                return validated.values();</span>
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">            if (validated.size() - validated.get(localRack).size() &gt;= 2)</span>
+            {
+                // we have enough endpoints in other racks
+<span class="nc" id="L536">                validated.removeAll(localRack);</span>
+            }
+
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            if (validated.keySet().size() == 1)</span>
+            {
+                /*
+                 * we have only 1 `other` rack to select replicas from (whether it be the local rack or a single non-local rack)
+                 * pick two random nodes from there; we are guaranteed to have at least two nodes in the single remaining rack
+                 * because of the preceding if block.
+                 */
+<span class="nc" id="L546">                List&lt;InetAddress&gt; otherRack = Lists.newArrayList(validated.values());</span>
+<span class="nc" id="L547">                shuffle(otherRack);</span>
+<span class="nc" id="L548">                return otherRack.subList(0, 2);</span>
+            }
+
+            // randomize which racks we pick from if more than 2 remaining
+            Collection&lt;String&gt; racks;
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            if (validated.keySet().size() == 2)</span>
+            {
+<span class="nc" id="L555">                racks = validated.keySet();</span>
+            }
+            else
+            {
+<span class="nc" id="L559">                racks = Lists.newArrayList(validated.keySet());</span>
+<span class="nc" id="L560">                shuffle((List&lt;String&gt;) racks);</span>
+            }
+
+            // grab a random member of up to two racks
+<span class="nc" id="L564">            List&lt;InetAddress&gt; result = new ArrayList&lt;&gt;(2);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">            for (String rack : Iterables.limit(racks, 2))</span>
+            {
+<span class="nc" id="L567">                List&lt;InetAddress&gt; rackMembers = validated.get(rack);</span>
+<span class="nc" id="L568">                result.add(rackMembers.get(getRandomInt(rackMembers.size())));</span>
+<span class="nc" id="L569">            }</span>
+
+<span class="nc" id="L571">            return result;</span>
+        }
+
+        @VisibleForTesting
+        protected boolean isValid(InetAddress input)
+        {
+<span class="nc bnc" id="L577" title="All 4 branches missed.">            return !input.equals(FBUtilities.getBroadcastAddress()) &amp;&amp; FailureDetector.instance.isAlive(input);</span>
+        }
+
+        @VisibleForTesting
+        protected int getRandomInt(int bound)
+        {
+<span class="nc" id="L583">            return ThreadLocalRandom.current().nextInt(bound);</span>
+        }
+
+        @VisibleForTesting
+        protected void shuffle(List&lt;?&gt; list)
+        {
+<span class="nc" id="L589">            Collections.shuffle(list);</span>
+<span class="nc" id="L590">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

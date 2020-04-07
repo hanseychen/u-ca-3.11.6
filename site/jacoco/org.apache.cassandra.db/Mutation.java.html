@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Mutation.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">Mutation.java</span></div><h1>Mutation.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.base.Throwables;
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.SerializationHelper;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+// TODO convert this to a Builder pattern instead of encouraging M.add directly,
+// which is less-efficient since we have to keep a mutable HashMap around
+<span class="pc bpc" id="L44" title="1 of 2 branches missed.">public class Mutation implements IMutation</span>
+{
+<span class="fc" id="L46">    public static final MutationSerializer serializer = new MutationSerializer();</span>
+
+    public static final String FORWARD_TO = &quot;FWD_TO&quot;;
+    public static final String FORWARD_FROM = &quot;FWD_FRM&quot;;
+
+    // todo this is redundant
+    // when we remove it, also restore SerializationsTest.testMutationRead to not regenerate new Mutations each test
+    private final String keyspaceName;
+
+    private final DecoratedKey key;
+    // map of column family id to mutations for that column family.
+    private final Map&lt;UUID, PartitionUpdate&gt; modifications;
+
+    // Time at which this mutation was instantiated
+<span class="fc" id="L60">    public final long createdAt = System.currentTimeMillis();</span>
+    // keep track of when mutation has started waiting for a MV partition lock
+<span class="fc" id="L62">    public final AtomicLong viewLockAcquireStart = new AtomicLong(0);</span>
+
+<span class="fc" id="L64">    private boolean cdcEnabled = false;</span>
+
+    public Mutation(String keyspaceName, DecoratedKey key)
+    {
+<span class="fc" id="L68">        this(keyspaceName, key, new HashMap&lt;&gt;());</span>
+<span class="fc" id="L69">    }</span>
+
+    public Mutation(PartitionUpdate update)
+    {
+<span class="fc" id="L73">        this(update.metadata().ksName, update.partitionKey(), Collections.singletonMap(update.metadata().cfId, update));</span>
+<span class="fc" id="L74">    }</span>
+
+    protected Mutation(String keyspaceName, DecoratedKey key, Map&lt;UUID, PartitionUpdate&gt; modifications)
+<span class="fc" id="L77">    {</span>
+<span class="fc" id="L78">        this.keyspaceName = keyspaceName;</span>
+<span class="fc" id="L79">        this.key = key;</span>
+<span class="fc" id="L80">        this.modifications = modifications;</span>
+<span class="fc bfc" id="L81" title="All 2 branches covered.">        for (PartitionUpdate pu : modifications.values())</span>
+<span class="fc" id="L82">            cdcEnabled |= pu.metadata().params.cdc;</span>
+<span class="fc" id="L83">    }</span>
+
+    public Mutation copy()
+    {
+<span class="nc" id="L87">        return new Mutation(keyspaceName, key, new HashMap&lt;&gt;(modifications));</span>
+    }
+
+    public Mutation without(Set&lt;UUID&gt; cfIds)
+    {
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (cfIds.isEmpty())</span>
+<span class="nc" id="L93">            return this;</span>
+
+<span class="nc" id="L95">        Mutation copy = copy();</span>
+<span class="nc" id="L96">        copy.modifications.keySet().removeAll(cfIds);</span>
+
+<span class="nc" id="L98">        copy.cdcEnabled = false;</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        for (PartitionUpdate pu : modifications.values())</span>
+<span class="nc" id="L100">            copy.cdcEnabled |= pu.metadata().params.cdc;</span>
+
+<span class="nc" id="L102">        return copy;</span>
+    }
+
+    public Mutation without(UUID cfId)
+    {
+<span class="nc" id="L107">        return without(Collections.singleton(cfId));</span>
+    }
+
+    public String getKeyspaceName()
+    {
+<span class="fc" id="L112">        return keyspaceName;</span>
+    }
+
+    public Collection&lt;UUID&gt; getColumnFamilyIds()
+    {
+<span class="nc" id="L117">        return modifications.keySet();</span>
+    }
+
+    public DecoratedKey key()
+    {
+<span class="fc" id="L122">        return key;</span>
+    }
+
+    public Collection&lt;PartitionUpdate&gt; getPartitionUpdates()
+    {
+<span class="fc" id="L127">        return modifications.values();</span>
+    }
+
+    public PartitionUpdate getPartitionUpdate(UUID cfId)
+    {
+<span class="nc" id="L132">        return modifications.get(cfId);</span>
+    }
+
+    /**
+     * Adds PartitionUpdate to the local set of modifications.
+     * Assumes no updates for the Table this PartitionUpdate impacts.
+     *
+     * @param update PartitionUpdate to append to Modifications list
+     * @return Mutation this mutation
+     * @throws IllegalArgumentException If PartitionUpdate for duplicate table is passed as argument
+     */
+    public Mutation add(PartitionUpdate update)
+    {
+<span class="pc bpc" id="L145" title="2 of 4 branches missed.">        assert update != null;</span>
+<span class="pc bpc" id="L146" title="2 of 4 branches missed.">        assert update.partitionKey().getPartitioner() == key.getPartitioner();</span>
+
+<span class="fc" id="L148">        cdcEnabled |= update.metadata().params.cdc;</span>
+
+<span class="fc" id="L150">        PartitionUpdate prev = modifications.put(update.metadata().cfId, update);</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">        if (prev != null)</span>
+            // developer error
+<span class="nc" id="L153">            throw new IllegalArgumentException(&quot;Table &quot; + update.metadata().cfName + &quot; already has modifications in this mutation: &quot; + prev);</span>
+<span class="fc" id="L154">        return this;</span>
+    }
+
+    public PartitionUpdate get(CFMetaData cfm)
+    {
+<span class="fc" id="L159">        return modifications.get(cfm.cfId);</span>
+    }
+
+    public boolean isEmpty()
+    {
+<span class="nc" id="L164">        return modifications.isEmpty();</span>
+    }
+
+    /**
+     * Creates a new mutation that merges all the provided mutations.
+     *
+     * @param mutations the mutations to merge together. All mutation must be
+     * on the same keyspace and partition key. There should also be at least one
+     * mutation.
+     * @return a mutation that contains all the modifications contained in {@code mutations}.
+     *
+     * @throws IllegalArgumentException if not all the mutations are on the same
+     * keyspace and key.
+     */
+    public static Mutation merge(List&lt;Mutation&gt; mutations)
+    {
+<span class="nc bnc" id="L180" title="All 4 branches missed.">        assert !mutations.isEmpty();</span>
+
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (mutations.size() == 1)</span>
+<span class="nc" id="L183">            return mutations.get(0);</span>
+
+<span class="nc" id="L185">        Set&lt;UUID&gt; updatedTables = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L186">        String ks = null;</span>
+<span class="nc" id="L187">        DecoratedKey key = null;</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        for (Mutation mutation : mutations)</span>
+        {
+<span class="nc" id="L190">            updatedTables.addAll(mutation.modifications.keySet());</span>
+<span class="nc bnc" id="L191" title="All 4 branches missed.">            if (ks != null &amp;&amp; !ks.equals(mutation.keyspaceName))</span>
+<span class="nc" id="L192">                throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L193" title="All 4 branches missed.">            if (key != null &amp;&amp; !key.equals(mutation.key))</span>
+<span class="nc" id="L194">                throw new IllegalArgumentException();</span>
+<span class="nc" id="L195">            ks = mutation.keyspaceName;</span>
+<span class="nc" id="L196">            key = mutation.key;</span>
+<span class="nc" id="L197">        }</span>
+
+<span class="nc" id="L199">        List&lt;PartitionUpdate&gt; updates = new ArrayList&lt;&gt;(mutations.size());</span>
+<span class="nc" id="L200">        Map&lt;UUID, PartitionUpdate&gt; modifications = new HashMap&lt;&gt;(updatedTables.size());</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        for (UUID table : updatedTables)</span>
+        {
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            for (Mutation mutation : mutations)</span>
+            {
+<span class="nc" id="L205">                PartitionUpdate upd = mutation.modifications.get(table);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                if (upd != null)</span>
+<span class="nc" id="L207">                    updates.add(upd);</span>
+<span class="nc" id="L208">            }</span>
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (updates.isEmpty())</span>
+<span class="nc" id="L211">                continue;</span>
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            modifications.put(table, updates.size() == 1 ? updates.get(0) : PartitionUpdate.merge(updates));</span>
+<span class="nc" id="L214">            updates.clear();</span>
+<span class="nc" id="L215">        }</span>
+<span class="nc" id="L216">        return new Mutation(ks, key, modifications);</span>
+    }
+
+    public CompletableFuture&lt;?&gt; applyFuture()
+    {
+<span class="nc" id="L221">        Keyspace ks = Keyspace.open(keyspaceName);</span>
+<span class="nc" id="L222">        return ks.applyFuture(this, Keyspace.open(keyspaceName).getMetadata().params.durableWrites, true);</span>
+    }
+
+    public void apply(boolean durableWrites, boolean isDroppable)
+    {
+<span class="fc" id="L227">        Keyspace.open(keyspaceName).apply(this, durableWrites, true, isDroppable);</span>
+<span class="fc" id="L228">    }</span>
+
+    public void apply(boolean durableWrites)
+    {
+<span class="fc" id="L232">        apply(durableWrites, true);</span>
+<span class="fc" id="L233">    }</span>
+
+    /*
+     * This is equivalent to calling commit. Applies the changes to
+     * to the keyspace that is obtained by calling Keyspace.open().
+     */
+    public void apply()
+    {
+<span class="fc" id="L241">        apply(Keyspace.open(keyspaceName).getMetadata().params.durableWrites);</span>
+<span class="fc" id="L242">    }</span>
+
+    public void applyUnsafe()
+    {
+<span class="nc" id="L246">        apply(false);</span>
+<span class="nc" id="L247">    }</span>
+
+    public MessageOut&lt;Mutation&gt; createMessage()
+    {
+<span class="nc" id="L251">        return createMessage(MessagingService.Verb.MUTATION);</span>
+    }
+
+    public MessageOut&lt;Mutation&gt; createMessage(MessagingService.Verb verb)
+    {
+<span class="nc" id="L256">        return new MessageOut&lt;&gt;(verb, this, serializer);</span>
+    }
+
+    public long getTimeout()
+    {
+<span class="nc" id="L261">        return DatabaseDescriptor.getWriteRpcTimeout();</span>
+    }
+
+    public int smallestGCGS()
+    {
+<span class="nc" id="L266">        int gcgs = Integer.MAX_VALUE;</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        for (PartitionUpdate update : getPartitionUpdates())</span>
+<span class="nc" id="L268">            gcgs = Math.min(gcgs, update.metadata().params.gcGraceSeconds);</span>
+<span class="nc" id="L269">        return gcgs;</span>
+    }
+
+    public boolean trackedByCDC()
+    {
+<span class="nc" id="L274">        return cdcEnabled;</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L279">        return toString(false);</span>
+    }
+
+    public String toString(boolean shallow)
+    {
+<span class="nc" id="L284">        StringBuilder buff = new StringBuilder(&quot;Mutation(&quot;);</span>
+<span class="nc" id="L285">        buff.append(&quot;keyspace='&quot;).append(keyspaceName).append('\'');</span>
+<span class="nc" id="L286">        buff.append(&quot;, key='&quot;).append(ByteBufferUtil.bytesToHex(key.getKey())).append('\'');</span>
+<span class="nc" id="L287">        buff.append(&quot;, modifications=[&quot;);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        if (shallow)</span>
+        {
+<span class="nc" id="L290">            List&lt;String&gt; cfnames = new ArrayList&lt;&gt;(modifications.size());</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            for (UUID cfid : modifications.keySet())</span>
+            {
+<span class="nc" id="L293">                CFMetaData cfm = Schema.instance.getCFMetaData(cfid);</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">                cfnames.add(cfm == null ? &quot;-dropped-&quot; : cfm.cfName);</span>
+<span class="nc" id="L295">            }</span>
+<span class="nc" id="L296">            buff.append(StringUtils.join(cfnames, &quot;, &quot;));</span>
+<span class="nc" id="L297">        }</span>
+        else
+        {
+<span class="nc" id="L300">            buff.append(&quot;\n  &quot;).append(StringUtils.join(modifications.values(), &quot;\n  &quot;)).append('\n');</span>
+        }
+<span class="nc" id="L302">        return buff.append(&quot;])&quot;).toString();</span>
+    }
+
+    /**
+     * Creates a new simple mutuation builder.
+     *
+     * @param keyspaceName the name of the keyspace this is a mutation for.
+     * @param partitionKey the key of partition this if a mutation for.
+     * @return a newly created builder.
+     */
+    public static SimpleBuilder simpleBuilder(String keyspaceName, DecoratedKey partitionKey)
+    {
+<span class="fc" id="L314">        return new SimpleBuilders.MutationBuilder(keyspaceName, partitionKey);</span>
+    }
+
+    /**
+     * Interface for building mutations geared towards human.
+     * &lt;p&gt;
+     * This should generally not be used when performance matters too much, but provides a more convenient interface to
+     * build a mutation than using the class constructor when performance is not of the utmost importance.
+     */
+    public interface SimpleBuilder
+    {
+        /**
+         * Sets the timestamp to use for the following additions to this builder or any derived (update or row) builder.
+         *
+         * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+         * time in microseconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder timestamp(long timestamp);
+
+        /**
+         * Sets the ttl to use for the following additions to this builder or any derived (update or row) builder.
+         * &lt;p&gt;
+         * Note that the for non-compact tables, this method must be called before any column addition for this
+         * ttl to be used for the row {@code LivenessInfo}.
+         *
+         * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder ttl(int ttl);
+
+        /**
+         * Adds an update for table identified by the provided metadata and return a builder for that partition.
+         *
+         * @param metadata the metadata of the table for which to add an update.
+         * @return a builder for the partition identified by {@code metadata} (and the partition key for which this is a
+         * mutation of).
+         */
+        public PartitionUpdate.SimpleBuilder update(CFMetaData metadata);
+
+        /**
+         * Adds an update for table identified by the provided name and return a builder for that partition.
+         *
+         * @param tableName the name of the table for which to add an update.
+         * @return a builder for the partition identified by {@code metadata} (and the partition key for which this is a
+         * mutation of).
+         */
+        public PartitionUpdate.SimpleBuilder update(String tableName);
+
+        /**
+         * Build the mutation represented by this builder.
+         *
+         * @return the built mutation.
+         */
+        public Mutation build();
+    }
+
+<span class="pc bpc" id="L371" title="1 of 2 branches missed.">    public static class MutationSerializer implements IVersionedSerializer&lt;Mutation&gt;</span>
+    {
+        public void serialize(Mutation mutation, DataOutputPlus out, int version) throws IOException
+        {
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">            if (version &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L376">                out.writeUTF(mutation.getKeyspaceName());</span>
+
+            /* serialize the modifications in the mutation */
+<span class="fc" id="L379">            int size = mutation.modifications.size();</span>
+
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">            if (version &lt; MessagingService.VERSION_30)</span>
+            {
+<span class="nc" id="L383">                ByteBufferUtil.writeWithShortLength(mutation.key().getKey(), out);</span>
+<span class="nc" id="L384">                out.writeInt(size);</span>
+            }
+            else
+            {
+<span class="fc" id="L388">                out.writeUnsignedVInt(size);</span>
+            }
+
+<span class="pc bpc" id="L391" title="2 of 4 branches missed.">            assert size &gt; 0;</span>
+<span class="fc bfc" id="L392" title="All 2 branches covered.">            for (Map.Entry&lt;UUID, PartitionUpdate&gt; entry : mutation.modifications.entrySet())</span>
+<span class="fc" id="L393">                PartitionUpdate.serializer.serialize(entry.getValue(), out, version);</span>
+<span class="fc" id="L394">        }</span>
+
+        public Mutation deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+        {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L399">                in.readUTF(); // read pre-2.0 keyspace name</span>
+
+<span class="nc" id="L401">            ByteBuffer key = null;</span>
+            int size;
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_30)</span>
+            {
+<span class="nc" id="L405">                key = ByteBufferUtil.readWithShortLength(in);</span>
+<span class="nc" id="L406">                size = in.readInt();</span>
+            }
+            else
+            {
+<span class="nc" id="L410">                size = (int)in.readUnsignedVInt();</span>
+            }
+
+<span class="nc bnc" id="L413" title="All 4 branches missed.">            assert size &gt; 0;</span>
+
+<span class="nc" id="L415">            PartitionUpdate update = PartitionUpdate.serializer.deserialize(in, version, flag, key);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (size == 1)</span>
+<span class="nc" id="L417">                return new Mutation(update);</span>
+
+<span class="nc" id="L419">            Map&lt;UUID, PartitionUpdate&gt; modifications = new HashMap&lt;&gt;(size);</span>
+<span class="nc" id="L420">            DecoratedKey dk = update.partitionKey();</span>
+
+<span class="nc" id="L422">            modifications.put(update.metadata().cfId, update);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            for (int i = 1; i &lt; size; ++i)</span>
+            {
+<span class="nc" id="L425">                update = PartitionUpdate.serializer.deserialize(in, version, flag, dk);</span>
+<span class="nc" id="L426">                modifications.put(update.metadata().cfId, update);</span>
+            }
+
+<span class="nc" id="L429">            return new Mutation(update.metadata().ksName, dk, modifications);</span>
+        }
+
+        public Mutation deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L434">            return deserialize(in, version, SerializationHelper.Flag.FROM_REMOTE);</span>
+        }
+
+        public long serializedSize(Mutation mutation, int version)
+        {
+<span class="nc" id="L439">            int size = 0;</span>
+
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_20)</span>
+<span class="nc" id="L442">                size += TypeSizes.sizeof(mutation.getKeyspaceName());</span>
+
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if (version &lt; MessagingService.VERSION_30)</span>
+            {
+<span class="nc" id="L446">                int keySize = mutation.key().getKey().remaining();</span>
+<span class="nc" id="L447">                size += TypeSizes.sizeof((short) keySize) + keySize;</span>
+<span class="nc" id="L448">                size += TypeSizes.sizeof(mutation.modifications.size());</span>
+<span class="nc" id="L449">            }</span>
+            else
+            {
+<span class="nc" id="L452">                size += TypeSizes.sizeofUnsignedVInt(mutation.modifications.size());</span>
+            }
+
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            for (Map.Entry&lt;UUID, PartitionUpdate&gt; entry : mutation.modifications.entrySet())</span>
+<span class="nc" id="L456">                size += PartitionUpdate.serializer.serializedSize(entry.getValue(), version);</span>
+
+<span class="nc" id="L458">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NativeAllocator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.memory</a> &gt; <span class="el_source">NativeAllocator.java</span></div><h1>NativeAllocator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils.memory;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+/**
+ * This NativeAllocator uses global slab allocation strategy
+ * with slab size that scales exponentially from 8kb to 1Mb to
+ * serve allocation of up to 128kb.
+ * &lt;p&gt;
+ * &lt;/p&gt;
+ * The slab allocation reduces heap fragmentation from small
+ * long-lived objects.
+ *
+ */
+<span class="nc bnc" id="L41" title="All 2 branches missed.">public class NativeAllocator extends MemtableAllocator</span>
+{
+    private final static int MAX_REGION_SIZE = 1 * 1024 * 1024;
+    private final static int MAX_CLONED_SIZE = 128 * 1024; // bigger than this don't go in the region
+    private final static int MIN_REGION_SIZE = 8 * 1024;
+
+    // globally stash any Regions we allocate but are beaten to using, and use these up before allocating any more
+<span class="nc" id="L48">    private static final Map&lt;Integer, RaceAllocated&gt; RACE_ALLOCATED = new HashMap&lt;&gt;();</span>
+
+    static
+    {
+<span class="nc bnc" id="L52" title="All 2 branches missed.">        for(int i = MIN_REGION_SIZE ; i &lt;= MAX_REGION_SIZE; i *= 2)</span>
+<span class="nc" id="L53">            RACE_ALLOCATED.put(i, new RaceAllocated());</span>
+<span class="nc" id="L54">    }</span>
+
+<span class="nc" id="L56">    private final AtomicReference&lt;Region&gt; currentRegion = new AtomicReference&lt;&gt;();</span>
+<span class="nc" id="L57">    private final ConcurrentLinkedQueue&lt;Region&gt; regions = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L58">    private final EnsureOnHeap.CloneToHeap cloneToHeap = new EnsureOnHeap.CloneToHeap();</span>
+
+    protected NativeAllocator(NativePool pool)
+    {
+<span class="nc" id="L62">        super(pool.onHeap.newAllocator(), pool.offHeap.newAllocator());</span>
+<span class="nc" id="L63">    }</span>
+
+    private static class CloningBTreeRowBuilder extends BTreeRow.Builder
+    {
+        final OpOrder.Group writeOp;
+        final NativeAllocator allocator;
+        private CloningBTreeRowBuilder(OpOrder.Group writeOp, NativeAllocator allocator)
+        {
+<span class="nc" id="L71">            super(true);</span>
+<span class="nc" id="L72">            this.writeOp = writeOp;</span>
+<span class="nc" id="L73">            this.allocator = allocator;</span>
+<span class="nc" id="L74">        }</span>
+
+        @Override
+        public void newRow(Clustering clustering)
+        {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            if (clustering != Clustering.STATIC_CLUSTERING)</span>
+<span class="nc" id="L80">                clustering = new NativeClustering(allocator, writeOp, clustering);</span>
+<span class="nc" id="L81">            super.newRow(clustering);</span>
+<span class="nc" id="L82">        }</span>
+
+        @Override
+        public void addCell(Cell cell)
+        {
+<span class="nc" id="L87">            super.addCell(new NativeCell(allocator, writeOp, cell));</span>
+<span class="nc" id="L88">        }</span>
+    }
+
+    public Row.Builder rowBuilder(OpOrder.Group opGroup)
+    {
+<span class="nc" id="L93">        return new CloningBTreeRowBuilder(opGroup, this);</span>
+    }
+
+    public DecoratedKey clone(DecoratedKey key, OpOrder.Group writeOp)
+    {
+<span class="nc" id="L98">        return new NativeDecoratedKey(key.getToken(), this, writeOp, key.getKey());</span>
+    }
+
+    public EnsureOnHeap ensureOnHeap()
+    {
+<span class="nc" id="L103">        return cloneToHeap;</span>
+    }
+
+    public long allocate(int size, OpOrder.Group opGroup)
+    {
+<span class="nc bnc" id="L108" title="All 4 branches missed.">        assert size &gt;= 0;</span>
+<span class="nc" id="L109">        offHeap().allocate(size, opGroup);</span>
+        // satisfy large allocations directly from JVM since they don't cause fragmentation
+        // as badly, and fill up our regions quickly
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        if (size &gt; MAX_CLONED_SIZE)</span>
+<span class="nc" id="L113">            return allocateOversize(size);</span>
+
+        while (true)
+        {
+<span class="nc" id="L117">            Region region = currentRegion.get();</span>
+            long peer;
+<span class="nc bnc" id="L119" title="All 4 branches missed.">            if (region != null &amp;&amp; (peer = region.allocate(size)) &gt; 0)</span>
+<span class="nc" id="L120">                return peer;</span>
+
+<span class="nc" id="L122">            trySwapRegion(region, size);</span>
+<span class="nc" id="L123">        }</span>
+    }
+
+    private void trySwapRegion(Region current, int minSize)
+    {
+        // decide how big we want the new region to be:
+        //  * if there is no prior region, we set it to min size
+        //  * otherwise we double its size; if it's too small to fit the allocation, we round it up to 4-8x its size
+        int size;
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (current == null) size = MIN_REGION_SIZE;</span>
+<span class="nc" id="L133">        else size = current.capacity * 2;</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        if (minSize &gt; size)</span>
+<span class="nc" id="L135">            size = Integer.highestOneBit(minSize) &lt;&lt; 3;</span>
+<span class="nc" id="L136">        size = Math.min(MAX_REGION_SIZE, size);</span>
+
+        // first we try and repurpose a previously allocated region
+<span class="nc" id="L139">        RaceAllocated raceAllocated = RACE_ALLOCATED.get(size);</span>
+<span class="nc" id="L140">        Region next = raceAllocated.poll();</span>
+
+        // if there are none, we allocate one
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (next == null)</span>
+<span class="nc" id="L144">            next = new Region(MemoryUtil.allocate(size), size);</span>
+
+        // we try to swap in the region we've obtained;
+        // if we fail to swap the region, we try to stash it for repurposing later; if we're out of stash room, we free it
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (currentRegion.compareAndSet(current, next))</span>
+<span class="nc" id="L149">            regions.add(next);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        else if (!raceAllocated.stash(next))</span>
+<span class="nc" id="L151">            MemoryUtil.free(next.peer);</span>
+<span class="nc" id="L152">    }</span>
+
+    private long allocateOversize(int size)
+    {
+        // satisfy large allocations directly from JVM since they don't cause fragmentation
+        // as badly, and fill up our regions quickly
+<span class="nc" id="L158">        Region region = new Region(MemoryUtil.allocate(size), size);</span>
+<span class="nc" id="L159">        regions.add(region);</span>
+
+        long peer;
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if ((peer = region.allocate(size)) == -1)</span>
+<span class="nc" id="L163">            throw new AssertionError();</span>
+
+<span class="nc" id="L165">        return peer;</span>
+    }
+
+    public void setDiscarded()
+    {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        for (Region region : regions)</span>
+<span class="nc" id="L171">            MemoryUtil.free(region.peer);</span>
+
+<span class="nc" id="L173">        super.setDiscarded();</span>
+<span class="nc" id="L174">    }</span>
+
+    // used to ensure we don't keep loads of race allocated regions around indefinitely. keeps the total bound on wasted memory low.
+<span class="nc" id="L177">    private static class RaceAllocated</span>
+    {
+<span class="nc" id="L179">        final ConcurrentLinkedQueue&lt;Region&gt; stash = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L180">        final Semaphore permits = new Semaphore(8);</span>
+        boolean stash(Region region)
+        {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (!permits.tryAcquire())</span>
+<span class="nc" id="L184">                return false;</span>
+<span class="nc" id="L185">            stash.add(region);</span>
+<span class="nc" id="L186">            return true;</span>
+        }
+        Region poll()
+        {
+<span class="nc" id="L190">            Region next = stash.poll();</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            if (next != null)</span>
+<span class="nc" id="L192">                permits.release();</span>
+<span class="nc" id="L193">            return next;</span>
+        }
+    }
+
+    /**
+     * A region of memory out of which allocations are sliced.
+     *
+     * This serves two purposes:
+     *  - to provide a step between initialization and allocation, so that racing to CAS a
+     *    new region in is harmless
+     *  - encapsulates the allocation offset
+     */
+    private static class Region
+    {
+        /**
+         * Actual underlying data
+         */
+        private final long peer;
+
+        private final int capacity;
+
+        /**
+         * Offset for the next allocation, or the sentinel value -1
+         * which implies that the region is still uninitialized.
+         */
+<span class="nc" id="L218">        private final AtomicInteger nextFreeOffset = new AtomicInteger(0);</span>
+
+        /**
+         * Total number of allocations satisfied from this buffer
+         */
+<span class="nc" id="L223">        private final AtomicInteger allocCount = new AtomicInteger();</span>
+
+        /**
+         * Create an uninitialized region. Note that memory is not allocated yet, so
+         * this is cheap.
+         *
+         * @param peer peer
+         */
+        private Region(long peer, int capacity)
+<span class="nc" id="L232">        {</span>
+<span class="nc" id="L233">            this.peer = peer;</span>
+<span class="nc" id="L234">            this.capacity = capacity;</span>
+<span class="nc" id="L235">        }</span>
+
+        /**
+         * Try to allocate &lt;code&gt;size&lt;/code&gt; bytes from the region.
+         *
+         * @return the successful allocation, or null to indicate not-enough-space
+         */
+        long allocate(int size)
+        {
+            while (true)
+            {
+<span class="nc" id="L246">                int oldOffset = nextFreeOffset.get();</span>
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (oldOffset + size &gt; capacity) // capacity == remaining</span>
+<span class="nc" id="L249">                    return -1;</span>
+
+                // Try to atomically claim this region
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size))</span>
+                {
+                    // we got the alloc
+<span class="nc" id="L255">                    allocCount.incrementAndGet();</span>
+<span class="nc" id="L256">                    return peer + oldOffset;</span>
+                }
+                // we raced and lost alloc, try again
+<span class="nc" id="L259">            }</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L265">            return &quot;Region@&quot; + System.identityHashCode(this) +</span>
+<span class="nc" id="L266">                    &quot; allocs=&quot; + allocCount.get() + &quot;waste=&quot; +</span>
+<span class="nc" id="L267">                    (capacity - nextFreeOffset.get());</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

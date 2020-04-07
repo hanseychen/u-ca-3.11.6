@@ -1,0 +1,401 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SEPWorker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.concurrent</a> &gt; <span class="el_source">SEPWorker.java</span></div><h1>SEPWorker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.concurrent;
+
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.util.concurrent.FastThreadLocalThread;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+<span class="pc bpc" id="L30" title="1 of 2 branches missed.">final class SEPWorker extends AtomicReference&lt;SEPWorker.Work&gt; implements Runnable</span>
+{
+<span class="fc" id="L32">    private static final Logger logger = LoggerFactory.getLogger(SEPWorker.class);</span>
+<span class="fc" id="L33">    private static final boolean SET_THREAD_NAME = Boolean.parseBoolean(System.getProperty(&quot;cassandra.set_sep_thread_name&quot;, &quot;true&quot;));</span>
+
+    final Long workerId;
+    final Thread thread;
+    final SharedExecutorPool pool;
+
+    // prevStopCheck stores the value of pool.stopCheck after we last incremented it; if it hasn't changed,
+    // we know nobody else was spinning in the interval, so we increment our soleSpinnerSpinTime accordingly,
+    // and otherwise we set it to zero; this is then used to terminate the final spinning thread, as the coordinated
+    // strategy can only work when there are multiple threads spinning (as more sleep time must elapse than real time)
+<span class="fc" id="L43">    long prevStopCheck = 0;</span>
+<span class="fc" id="L44">    long soleSpinnerSpinTime = 0;</span>
+
+    SEPWorker(Long workerId, Work initialState, SharedExecutorPool pool)
+<span class="fc" id="L47">    {</span>
+<span class="fc" id="L48">        this.pool = pool;</span>
+<span class="fc" id="L49">        this.workerId = workerId;</span>
+<span class="fc" id="L50">        thread = new FastThreadLocalThread(this, pool.poolName + &quot;-Worker-&quot; + workerId);</span>
+<span class="fc" id="L51">        thread.setDaemon(true);</span>
+<span class="fc" id="L52">        set(initialState);</span>
+<span class="fc" id="L53">        thread.start();</span>
+<span class="fc" id="L54">    }</span>
+
+    public void run()
+    {
+        /**
+         * we maintain two important invariants:
+         * 1)   after exiting spinning phase, we ensure at least one more task on _each_ queue will be processed
+         *      promptly after we begin, assuming any are outstanding on any pools. this is to permit producers to
+         *      avoid signalling if there are _any_ spinning threads. we achieve this by simply calling maybeSchedule()
+         *      on each queue if on decrementing the spin counter we hit zero.
+         * 2)   before processing a task on a given queue, we attempt to assign another worker to the _same queue only_;
+         *      this allows a producer to skip signalling work if the task queue is currently non-empty, and in conjunction
+         *      with invariant (1) ensures that if any thread was spinning when a task was added to any executor, that
+         *      task will be processed immediately if work permits are available
+         */
+
+<span class="fc" id="L70">        SEPExecutor assigned = null;</span>
+<span class="fc" id="L71">        Runnable task = null;</span>
+        try
+        {
+            while (true)
+            {
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">                if (pool.shuttingDown)</span>
+<span class="nc" id="L77">                    return;</span>
+
+<span class="fc bfc" id="L79" title="All 4 branches covered.">                if (isSpinning() &amp;&amp; !selfAssign())</span>
+                {
+<span class="fc" id="L81">                    doWaitSpin();</span>
+                    // if the pool is terminating, but we have been assigned STOP_SIGNALLED, if we do not re-check
+                    // whether the pool is shutting down this thread will go to sleep and block forever
+<span class="fc" id="L84">                    continue;</span>
+                }
+
+                // if stop was signalled, go to sleep (don't try self-assign; being put to sleep is rare, so let's obey it
+                // whenever we receive it - though we don't apply this constraint to producers, who may reschedule us before
+                // we go to sleep)
+<span class="fc bfc" id="L90" title="All 2 branches covered.">                if (stop())</span>
+<span class="fc bfc" id="L91" title="All 2 branches covered.">                    while (isStopped())</span>
+<span class="fc" id="L92">                        LockSupport.park();</span>
+
+                // we can be assigned any state from STOPPED, so loop if we don't actually have any tasks assigned
+<span class="fc" id="L95">                assigned = get().assigned;</span>
+<span class="fc bfc" id="L96" title="All 2 branches covered.">                if (assigned == null)</span>
+<span class="fc" id="L97">                    continue;</span>
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">                if (SET_THREAD_NAME)</span>
+<span class="fc" id="L99">                    Thread.currentThread().setName(assigned.name + &quot;-&quot; + workerId);</span>
+<span class="fc" id="L100">                task = assigned.tasks.poll();</span>
+
+                // if we do have tasks assigned, nobody will change our state so we can simply set it to WORKING
+                // (which is also a state that will never be interrupted externally)
+<span class="fc" id="L104">                set(Work.WORKING);</span>
+                while (true)
+                {
+                    // before we process any task, we maybe schedule a new worker _to our executor only_; this
+                    // ensures that even once all spinning threads have found work, if more work is left to be serviced
+                    // and permits are available, it will be dealt with immediately.
+<span class="fc" id="L110">                    assigned.maybeSchedule();</span>
+
+                    // we know there is work waiting, as we have a work permit, so poll() will always succeed
+<span class="fc" id="L113">                    task.run();</span>
+<span class="fc" id="L114">                    task = null;</span>
+
+                    // if we're shutting down, or we fail to take a permit, we don't perform any more work
+<span class="fc bfc" id="L117" title="All 2 branches covered.">                    if (!assigned.takeTaskPermit())</span>
+<span class="fc" id="L118">                        break;</span>
+<span class="fc" id="L119">                    task = assigned.tasks.poll();</span>
+                }
+
+                // return our work permit, and maybe signal shutdown
+<span class="fc" id="L123">                assigned.returnWorkPermit();</span>
+<span class="fc" id="L124">                assigned = null;</span>
+
+                // try to immediately reassign ourselves some work; if we fail, start spinning
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">                if (!selfAssign())</span>
+<span class="fc" id="L128">                    startSpinning();</span>
+            }
+        }
+<span class="nc" id="L131">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L133">            JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (task != null)</span>
+<span class="nc" id="L135">                logger.error(&quot;Failed to execute task, unexpected exception killed worker: {}&quot;, t);</span>
+            else
+<span class="nc" id="L137">                logger.error(&quot;Unexpected exception killed worker: {}&quot;, t);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if (assigned != null)</span>
+<span class="nc" id="L142">                assigned.returnWorkPermit();</span>
+
+            do
+            {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">                if (get().assigned != null)</span>
+                {
+<span class="nc" id="L148">                    get().assigned.returnWorkPermit();</span>
+<span class="nc" id="L149">                    set(Work.WORKING);</span>
+                }
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            } while (!assign(Work.STOPPED, true));</span>
+        }
+<span class="nc" id="L153">    }</span>
+
+    // try to assign this worker the provided work
+    // valid states to assign are SPINNING, STOP_SIGNALLED, (ASSIGNED);
+    // restores invariants of the various states (e.g. spinningCount, descheduled collection and thread park status)
+    boolean assign(Work work, boolean self)
+    {
+<span class="fc" id="L160">        Work state = get();</span>
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">        while (state.canAssign(self))</span>
+        {
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">            if (!compareAndSet(state, work))</span>
+            {
+<span class="nc" id="L165">                state = get();</span>
+<span class="nc" id="L166">                continue;</span>
+            }
+            // if we were spinning, exit the state (decrement the count); this is valid even if we are already spinning,
+            // as the assigning thread will have incremented the spinningCount
+<span class="fc bfc" id="L170" title="All 2 branches covered.">            if (state.isSpinning())</span>
+<span class="fc" id="L171">                stopSpinning();</span>
+
+            // if we're being descheduled, place ourselves in the descheduled collection
+<span class="fc bfc" id="L174" title="All 2 branches covered.">            if (work.isStop())</span>
+            {
+<span class="fc" id="L176">                pool.descheduled.put(workerId, this);</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">                if (pool.shuttingDown)</span>
+<span class="nc" id="L178">                    return true;</span>
+            }
+
+            // if we're currently stopped, and the new state is not a stop signal
+            // (which we can immediately convert to stopped), unpark the worker
+<span class="pc bpc" id="L183" title="3 of 6 branches missed.">            if (state.isStopped() &amp;&amp; (!work.isStop() || !stop()))</span>
+<span class="fc" id="L184">                LockSupport.unpark(thread);</span>
+<span class="fc" id="L185">            return true;</span>
+        }
+<span class="nc" id="L187">        return false;</span>
+    }
+
+    // try to assign ourselves an executor with work available
+    private boolean selfAssign()
+    {
+        // if we aren't permitted to assign in this state, fail
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">        if (!get().canAssign(true))</span>
+<span class="nc" id="L195">            return false;</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        for (SEPExecutor exec : pool.executors)</span>
+        {
+<span class="fc bfc" id="L198" title="All 2 branches covered.">            if (exec.takeWorkPermit(true))</span>
+            {
+<span class="fc" id="L200">                Work work = new Work(exec);</span>
+                // we successfully started work on this executor, so we must either assign it to ourselves or ...
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">                if (assign(work, true))</span>
+<span class="fc" id="L203">                    return true;</span>
+                // ... if we fail, schedule it to another worker
+<span class="nc" id="L205">                pool.schedule(work);</span>
+                // and return success as we must have already been assigned a task
+<span class="nc bnc" id="L207" title="All 4 branches missed.">                assert get().assigned != null;</span>
+<span class="nc" id="L208">                return true;</span>
+            }
+<span class="fc" id="L210">        }</span>
+<span class="fc" id="L211">        return false;</span>
+    }
+
+    // we can only call this when our state is WORKING, and no other thread may change our state in this case;
+    // so in this case only we do not need to CAS. We increment the spinningCount and add ourselves to the spinning
+    // collection at the same time
+    private void startSpinning()
+    {
+<span class="pc bpc" id="L219" title="2 of 4 branches missed.">        assert get() == Work.WORKING;</span>
+<span class="fc" id="L220">        pool.spinningCount.incrementAndGet();</span>
+<span class="fc" id="L221">        set(Work.SPINNING);</span>
+<span class="fc" id="L222">    }</span>
+
+    // exit the spinning state; if there are no remaining spinners, we immediately try and schedule work for all executors
+    // so that any producer is safe to not spin up a worker when they see a spinning thread (invariant (1) above)
+    private void stopSpinning()
+    {
+<span class="fc bfc" id="L228" title="All 2 branches covered.">        if (pool.spinningCount.decrementAndGet() == 0)</span>
+<span class="fc bfc" id="L229" title="All 2 branches covered.">            for (SEPExecutor executor : pool.executors)</span>
+<span class="fc" id="L230">                executor.maybeSchedule();</span>
+<span class="fc" id="L231">        prevStopCheck = soleSpinnerSpinTime = 0;</span>
+<span class="fc" id="L232">    }</span>
+
+    // perform a sleep-spin, incrementing pool.stopCheck accordingly
+    private void doWaitSpin()
+    {
+        // pick a random sleep interval based on the number of threads spinning, so that
+        // we should always have a thread about to wake up, but most threads are sleeping
+<span class="fc" id="L239">        long sleep = 10000L * pool.spinningCount.get();</span>
+<span class="fc" id="L240">        sleep = Math.min(1000000, sleep);</span>
+<span class="fc" id="L241">        sleep *= Math.random();</span>
+<span class="fc" id="L242">        sleep = Math.max(10000, sleep);</span>
+
+<span class="fc" id="L244">        long start = System.nanoTime();</span>
+
+        // place ourselves in the spinning collection; if we clash with another thread just exit
+<span class="fc" id="L247">        Long target = start + sleep;</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">        if (pool.spinning.putIfAbsent(target, this) != null)</span>
+<span class="fc" id="L249">            return;</span>
+<span class="fc" id="L250">        LockSupport.parkNanos(sleep);</span>
+
+        // remove ourselves (if haven't been already) - we should be at or near the front, so should be cheap-ish
+<span class="fc" id="L253">        pool.spinning.remove(target, this);</span>
+
+        // finish timing and grab spinningTime (before we finish timing so it is under rather than overestimated)
+<span class="fc" id="L256">        long end = System.nanoTime();</span>
+<span class="fc" id="L257">        long spin = end - start;</span>
+<span class="fc" id="L258">        long stopCheck = pool.stopCheck.addAndGet(spin);</span>
+<span class="fc" id="L259">        maybeStop(stopCheck, end);</span>
+<span class="fc bfc" id="L260" title="All 2 branches covered.">        if (prevStopCheck + spin == stopCheck)</span>
+<span class="fc" id="L261">            soleSpinnerSpinTime += spin;</span>
+        else
+<span class="fc" id="L263">            soleSpinnerSpinTime = 0;</span>
+<span class="fc" id="L264">        prevStopCheck = stopCheck;</span>
+<span class="fc" id="L265">    }</span>
+
+<span class="fc" id="L267">    private static final long stopCheckInterval = TimeUnit.MILLISECONDS.toNanos(10L);</span>
+
+    // stops a worker if elapsed real time is less than elapsed spin time, as this implies the equivalent of
+    // at least one worker achieved nothing in the interval. we achieve this by maintaining a stopCheck which
+    // is initialised to a negative offset from realtime; as we spin we add to this value, and if we ever exceed
+    // realtime we have spun too much and deschedule; if we get too far behind realtime, we reset to our initial offset
+    private void maybeStop(long stopCheck, long now)
+    {
+<span class="fc" id="L275">        long delta = now - stopCheck;</span>
+<span class="fc bfc" id="L276" title="All 2 branches covered.">        if (delta &lt;= 0)</span>
+        {
+            // if stopCheck has caught up with present, we've been spinning too much, so if we can atomically
+            // set it to the past again, we should stop a worker
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">            if (pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))</span>
+            {
+                // try and stop ourselves;
+                // if we've already been assigned work stop another worker
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">                if (!assign(Work.STOP_SIGNALLED, true))</span>
+<span class="nc" id="L285">                    pool.schedule(Work.STOP_SIGNALLED);</span>
+            }
+        }
+<span class="pc bpc" id="L288" title="1 of 4 branches missed.">        else if (soleSpinnerSpinTime &gt; stopCheckInterval &amp;&amp; pool.spinningCount.get() == 1)</span>
+        {
+            // permit self-stopping
+<span class="fc" id="L291">            assign(Work.STOP_SIGNALLED, true);</span>
+        }
+        else
+        {
+            // if stop check has gotten too far behind present, update it so new spins can affect it
+<span class="pc bpc" id="L296" title="1 of 4 branches missed.">            while (delta &gt; stopCheckInterval * 2 &amp;&amp; !pool.stopCheck.compareAndSet(stopCheck, now - stopCheckInterval))</span>
+            {
+<span class="nc" id="L298">                stopCheck = pool.stopCheck.get();</span>
+<span class="nc" id="L299">                delta = now - stopCheck;</span>
+            }
+        }
+<span class="fc" id="L302">    }</span>
+
+    private boolean isSpinning()
+    {
+<span class="fc" id="L306">        return get().isSpinning();</span>
+    }
+
+    private boolean stop()
+    {
+<span class="pc bpc" id="L311" title="1 of 4 branches missed.">        return get().isStop() &amp;&amp; compareAndSet(Work.STOP_SIGNALLED, Work.STOPPED);</span>
+    }
+
+    private boolean isStopped()
+    {
+<span class="fc" id="L316">        return get().isStopped();</span>
+    }
+
+    /**
+     * Represents, and communicates changes to, a worker's work state - there are three non-actively-working
+     * states (STOP_SIGNALLED, STOPPED, AND SPINNING) and two working states: WORKING, and (ASSIGNED), the last
+     * being represented by a non-static instance with its &quot;assigned&quot; executor set.
+     *
+     * STOPPED:         indicates the worker is descheduled, and whilst accepts work in this state (causing it to
+     *                  be rescheduled) it will generally not be considered for work until all other worker threads are busy.
+     *                  In this state we should be present in the pool.descheduled collection, and should be parked
+     * -&gt; (ASSIGNED)|SPINNING
+     * STOP_SIGNALLED:  the worker has been asked to deschedule itself, but has not yet done so; only entered from a SPINNING
+     *                  state, and generally communicated to itself, but maybe set from any worker. this state may be preempted
+     *                  and replaced with (ASSIGNED) or SPINNING
+     *                  In this state we should be present in the pool.descheduled collection
+     * -&gt; (ASSIGNED)|STOPPED|SPINNING
+     * SPINNING:        indicates the worker has no work to perform, so is performing a friendly wait-based-spinning
+     *                  until it either is (ASSIGNED) some work (by itself or another thread), or sent STOP_SIGNALLED
+     *                  In this state we _may_ be in the pool.spinning collection (but only if we are in the middle of a sleep)
+     * -&gt; (ASSIGNED)|STOP_SIGNALLED|SPINNING
+     * (ASSIGNED):      asks the worker to perform some work against the specified executor, and preassigns a task permit
+     *                  from that executor so that in this state there is always work to perform.
+     *                  In general a worker assigns itself this state, but sometimes it may assign another worker the state
+     *                  either if there is work outstanding and no-spinning threads, or there is a race to self-assign
+     * -&gt; WORKING
+     * WORKING:         indicates the worker is actively processing an executor's task queue; in this state it accepts
+     *                  no state changes/communications, except from itself; it usually exits this mode into SPINNING,
+     *                  but if work is immediately available on another executor it self-triggers (ASSIGNED)
+     * -&gt; SPINNING|(ASSIGNED)
+     */
+
+    static final class Work
+    {
+<span class="fc" id="L350">        static final Work STOP_SIGNALLED = new Work();</span>
+<span class="fc" id="L351">        static final Work STOPPED = new Work();</span>
+<span class="fc" id="L352">        static final Work SPINNING = new Work();</span>
+<span class="fc" id="L353">        static final Work WORKING = new Work();</span>
+
+        final SEPExecutor assigned;
+
+        Work(SEPExecutor executor)
+<span class="fc" id="L358">        {</span>
+<span class="fc" id="L359">            this.assigned = executor;</span>
+<span class="fc" id="L360">        }</span>
+
+        private Work()
+<span class="fc" id="L363">        {</span>
+<span class="fc" id="L364">            this.assigned = null;</span>
+<span class="fc" id="L365">        }</span>
+
+        boolean canAssign(boolean self)
+        {
+            // we can assign work if there isn't new work already assigned and either
+            // 1) we are assigning to ourselves
+            // 2) the worker we are assigning to is not already in the middle of WORKING
+<span class="pc bpc" id="L372" title="2 of 6 branches missed.">            return assigned == null &amp;&amp; (self || !isWorking());</span>
+        }
+
+        boolean isSpinning()
+        {
+<span class="fc bfc" id="L377" title="All 2 branches covered.">            return this == Work.SPINNING;</span>
+        }
+
+        boolean isWorking()
+        {
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">            return this == Work.WORKING;</span>
+        }
+
+        boolean isStop()
+        {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">            return this == Work.STOP_SIGNALLED;</span>
+        }
+
+        boolean isStopped()
+        {
+<span class="fc bfc" id="L392" title="All 2 branches covered.">            return this == Work.STOPPED;</span>
+        }
+
+        boolean isAssigned()
+        {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            return assigned != null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

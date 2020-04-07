@@ -1,0 +1,1821 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Gossiper.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.gms</a> &gt; <span class="el_source">Gossiper.java</span></div><h1>Gossiper.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.gms;
+
+import java.lang.management.ManagementFactory;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.annotation.Nullable;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.ListenableFutureTask;
+import com.google.common.util.concurrent.Uninterruptibles;
+
+import io.netty.util.concurrent.FastThreadLocal;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdown;
+
+/**
+ * This module is responsible for Gossiping information for the local endpoint. This abstraction
+ * maintains the list of live and dead endpoints. Periodically i.e. every 1 second this module
+ * chooses a random node and initiates a round of Gossip with it. A round of Gossip involves 3
+ * rounds of messaging. For instance if node A wants to initiate a round of Gossip with node B
+ * it starts off by sending node B a GossipDigestSynMessage. Node B on receipt of this message
+ * sends node A a GossipDigestAckMessage. On receipt of this message node A sends node B a
+ * GossipDigestAck2Message which completes a round of Gossip. This module as and when it hears one
+ * of the three above mentioned messages updates the Failure Detector with the liveness information.
+ * Upon hearing a GossipShutdownMessage, this module will instantly mark the remote node as down in
+ * the Failure Detector.
+ *
+ * This class is not threadsafe and any state changes should happen in the gossip stage.
+ */
+
+<span class="pc bpc" id="L78" title="1 of 2 branches missed.">public class Gossiper implements IFailureDetectionEventListener, GossiperMBean</span>
+{
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.net:type=Gossiper&quot;;
+<span class="nc" id="L81">    public static class Props</span>
+    {
+        public static final String DISABLE_THREAD_VALIDATION = &quot;cassandra.gossip.disable_thread_validation&quot;;
+    }
+
+<span class="fc" id="L86">    private static final DebuggableScheduledThreadPoolExecutor executor = new DebuggableScheduledThreadPoolExecutor(&quot;GossipTasks&quot;);</span>
+
+<span class="fc" id="L88">    static final ApplicationState[] STATES = ApplicationState.values();</span>
+<span class="fc" id="L89">    static final List&lt;String&gt; DEAD_STATES = Arrays.asList(VersionedValue.REMOVING_TOKEN, VersionedValue.REMOVED_TOKEN,</span>
+                                                          VersionedValue.STATUS_LEFT, VersionedValue.HIBERNATE);
+<span class="fc" id="L91">    static ArrayList&lt;String&gt; SILENT_SHUTDOWN_STATES = new ArrayList&lt;&gt;();</span>
+
+    static
+    {
+<span class="fc" id="L95">        SILENT_SHUTDOWN_STATES.addAll(DEAD_STATES);</span>
+<span class="fc" id="L96">        SILENT_SHUTDOWN_STATES.add(VersionedValue.STATUS_BOOTSTRAPPING);</span>
+<span class="fc" id="L97">        SILENT_SHUTDOWN_STATES.add(VersionedValue.STATUS_BOOTSTRAPPING_REPLACE);</span>
+    }
+
+    private volatile ScheduledFuture&lt;?&gt; scheduledGossipTask;
+<span class="fc" id="L101">    private static final ReentrantLock taskLock = new ReentrantLock();</span>
+    public final static int intervalInMillis = 1000;
+<span class="fc" id="L103">    public final static int QUARANTINE_DELAY = StorageService.RING_DELAY * 2;</span>
+<span class="fc" id="L104">    private static final Logger logger = LoggerFactory.getLogger(Gossiper.class);</span>
+<span class="fc" id="L105">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 15L, TimeUnit.MINUTES);</span>
+<span class="fc" id="L106">    public static final Gossiper instance = new Gossiper();</span>
+
+    // Timestamp to prevent processing any in-flight messages for we've not send any SYN yet, see CASSANDRA-12653.
+<span class="fc" id="L109">    volatile long firstSynSendAt = 0L;</span>
+
+    public static final long aVeryLongTime = 259200 * 1000; // 3 days
+
+    // Maximimum difference between generation value and local time we are willing to accept about a peer
+    static final int MAX_GENERATION_DIFFERENCE = 86400 * 365;
+    private long fatClientTimeout;
+<span class="fc" id="L116">    private final Random random = new Random();</span>
+<span class="fc" id="L117">    private final Comparator&lt;InetAddress&gt; inetcomparator = new Comparator&lt;InetAddress&gt;()</span>
+<span class="fc" id="L118">    {</span>
+        public int compare(InetAddress addr1, InetAddress addr2)
+        {
+<span class="fc" id="L121">            return addr1.getHostAddress().compareTo(addr2.getHostAddress());</span>
+        }
+    };
+
+    /* subscribers for interest in EndpointState change */
+<span class="fc" id="L126">    private final List&lt;IEndpointStateChangeSubscriber&gt; subscribers = new CopyOnWriteArrayList&lt;IEndpointStateChangeSubscriber&gt;();</span>
+
+    /* live member set */
+<span class="fc" id="L129">    private final Set&lt;InetAddress&gt; liveEndpoints = new ConcurrentSkipListSet&lt;InetAddress&gt;(inetcomparator);</span>
+
+    /* unreachable member set */
+<span class="fc" id="L132">    private final Map&lt;InetAddress, Long&gt; unreachableEndpoints = new ConcurrentHashMap&lt;InetAddress, Long&gt;();</span>
+
+    /* initial seeds for joining the cluster */
+<span class="fc" id="L135">    @VisibleForTesting</span>
+    final Set&lt;InetAddress&gt; seeds = new ConcurrentSkipListSet&lt;InetAddress&gt;(inetcomparator);
+
+    /* map where key is the endpoint and value is the state associated with the endpoint */
+<span class="fc" id="L139">    final ConcurrentMap&lt;InetAddress, EndpointState&gt; endpointStateMap = new ConcurrentHashMap&lt;InetAddress, EndpointState&gt;();</span>
+
+    /* map where key is endpoint and value is timestamp when this endpoint was removed from
+     * gossip. We will ignore any gossip regarding these endpoints for QUARANTINE_DELAY time
+     * after removal to prevent nodes from falsely reincarnating during the time when removal
+     * gossip gets propagated to all nodes */
+<span class="fc" id="L145">    private final Map&lt;InetAddress, Long&gt; justRemovedEndpoints = new ConcurrentHashMap&lt;InetAddress, Long&gt;();</span>
+
+<span class="fc" id="L147">    private final Map&lt;InetAddress, Long&gt; expireTimeEndpointMap = new ConcurrentHashMap&lt;InetAddress, Long&gt;();</span>
+
+<span class="fc" id="L149">    private volatile boolean anyNodeOn30 = false; // we assume the regular case here - all nodes are on 3.11</span>
+<span class="fc" id="L150">    private volatile boolean inShadowRound = false;</span>
+    // seeds gathered during shadow round that indicated to be in the shadow round phase as well
+<span class="fc" id="L152">    private final Set&lt;InetAddress&gt; seedsInShadowRound = new ConcurrentSkipListSet&lt;&gt;(inetcomparator);</span>
+    // endpoint states as gathered during shadow round
+<span class="fc" id="L154">    private final Map&lt;InetAddress, EndpointState&gt; endpointShadowStateMap = new ConcurrentHashMap&lt;&gt;();</span>
+
+<span class="fc" id="L156">    private volatile long lastProcessedMessageAt = System.currentTimeMillis();</span>
+
+<span class="fc" id="L158">    private static FastThreadLocal&lt;Boolean&gt; isGossipStage = new FastThreadLocal&lt;&gt;();</span>
+
+<span class="fc" id="L160">    private static final boolean disableThreadValidation = Boolean.getBoolean(Props.DISABLE_THREAD_VALIDATION);</span>
+
+    private static boolean isInGossipStage()
+    {
+<span class="fc" id="L164">        Boolean isGossip = isGossipStage.get();</span>
+<span class="fc bfc" id="L165" title="All 2 branches covered.">        if (isGossip == null)</span>
+        {
+<span class="fc" id="L167">            isGossip = Thread.currentThread().getName().contains(Stage.GOSSIP.getJmxName());</span>
+<span class="fc" id="L168">            isGossipStage.set(isGossip);</span>
+        }
+<span class="fc" id="L170">        return isGossip;</span>
+    }
+
+    private static void checkProperThreadForStateMutation()
+    {
+<span class="pc bpc" id="L175" title="2 of 4 branches missed.">        if (disableThreadValidation || isInGossipStage())</span>
+<span class="fc" id="L176">            return;</span>
+
+<span class="nc" id="L178">        IllegalStateException e = new IllegalStateException(&quot;Attempting gossip state mutation from illegal thread: &quot; + Thread.currentThread().getName());</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (DatabaseDescriptor.strictRuntimeChecks())</span>
+        {
+<span class="nc" id="L181">            throw e;</span>
+        }
+        else
+        {
+<span class="nc" id="L185">            noSpamLogger.getStatement(Throwables.getStackTraceAsString(e)).error(e.getMessage(), e);</span>
+        }
+<span class="nc" id="L187">    }</span>
+
+<span class="fc" id="L189">    private class GossipTask implements Runnable</span>
+    {
+        public void run()
+        {
+            try
+            {
+                //wait on messaging service to start listening
+<span class="fc" id="L196">                MessagingService.instance().waitUntilListening();</span>
+
+<span class="fc" id="L198">                taskLock.lock();</span>
+
+                /* Update the local heartbeat counter. */
+<span class="fc" id="L201">                endpointStateMap.get(FBUtilities.getBroadcastAddress()).getHeartBeatState().updateHeartBeat();</span>
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L203">                    logger.trace(&quot;My heartbeat is now {}&quot;, endpointStateMap.get(FBUtilities.getBroadcastAddress()).getHeartBeatState().getHeartBeatVersion());</span>
+<span class="fc" id="L204">                final List&lt;GossipDigest&gt; gDigests = new ArrayList&lt;GossipDigest&gt;();</span>
+<span class="fc" id="L205">                Gossiper.instance.makeRandomGossipDigest(gDigests);</span>
+
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">                if (gDigests.size() &gt; 0)</span>
+                {
+<span class="fc" id="L209">                    GossipDigestSyn digestSynMessage = new GossipDigestSyn(DatabaseDescriptor.getClusterName(),</span>
+<span class="fc" id="L210">                                                                           DatabaseDescriptor.getPartitionerName(),</span>
+                                                                           gDigests);
+<span class="fc" id="L212">                    MessageOut&lt;GossipDigestSyn&gt; message = new MessageOut&lt;GossipDigestSyn&gt;(MessagingService.Verb.GOSSIP_DIGEST_SYN,</span>
+                                                                                          digestSynMessage,
+                                                                                          GossipDigestSyn.serializer);
+                    /* Gossip to some random live member */
+<span class="fc" id="L216">                    boolean gossipedToSeed = doGossipToLiveMember(message);</span>
+
+                    /* Gossip to some unreachable member with some probability to check if he is back up */
+<span class="fc" id="L219">                    maybeGossipToUnreachableMember(message);</span>
+
+                    /* Gossip to a seed if we did not do so above, or we have seen less nodes
+                       than there are seeds.  This prevents partitions where each group of nodes
+                       is only gossiping to a subset of the seeds.
+
+                       The most straightforward check would be to check that all the seeds have been
+                       verified either as live or unreachable.  To avoid that computation each round,
+                       we reason that:
+
+                       either all the live nodes are seeds, in which case non-seeds that come online
+                       will introduce themselves to a member of the ring by definition,
+
+                       or there is at least one non-seed node in the list, in which case eventually
+                       someone will gossip to it, and then do a gossip to a random seed from the
+                       gossipedToSeed check.
+
+                       See CASSANDRA-150 for more exposition. */
+<span class="pc bpc" id="L237" title="1 of 4 branches missed.">                    if (!gossipedToSeed || liveEndpoints.size() &lt; seeds.size())</span>
+<span class="fc" id="L238">                        maybeGossipToSeed(message);</span>
+
+<span class="fc" id="L240">                    doStatusCheck();</span>
+                }
+            }
+<span class="nc" id="L243">            catch (Exception e)</span>
+            {
+<span class="nc" id="L245">                JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L246">                logger.error(&quot;Gossip error&quot;, e);</span>
+            }
+            finally
+            {
+<span class="fc" id="L250">                taskLock.unlock();</span>
+            }
+<span class="fc" id="L252">        }</span>
+    }
+
+    private Gossiper()
+<span class="fc" id="L256">    {</span>
+        // half of QUARATINE_DELAY, to ensure justRemovedEndpoints has enough leeway to prevent re-gossip
+<span class="fc" id="L258">        fatClientTimeout = (QUARANTINE_DELAY / 2);</span>
+        /* register with the Failure Detector for receiving Failure detector events */
+<span class="fc" id="L260">        FailureDetector.instance.registerFailureDetectionEventListener(this);</span>
+
+        // Register this instance with JMX
+<span class="fc" id="L263">        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);</span>
+<span class="fc" id="L264">    }</span>
+
+    public void setLastProcessedMessageAt(long timeInMillis)
+    {
+<span class="fc" id="L268">        this.lastProcessedMessageAt = timeInMillis;</span>
+<span class="fc" id="L269">    }</span>
+
+    public boolean seenAnySeed()
+    {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, EndpointState&gt; entry : endpointStateMap.entrySet())</span>
+        {
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            if (seeds.contains(entry.getKey()))</span>
+<span class="nc" id="L276">                return true;</span>
+            try
+            {
+<span class="nc" id="L279">                VersionedValue internalIp = entry.getValue().getApplicationState(ApplicationState.INTERNAL_IP);</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">                if (internalIp != null &amp;&amp; seeds.contains(InetAddress.getByName(internalIp.value)))</span>
+<span class="nc" id="L281">                    return true;</span>
+            }
+<span class="nc" id="L283">            catch (UnknownHostException e)</span>
+            {
+<span class="nc" id="L285">                throw new RuntimeException(e);</span>
+<span class="nc" id="L286">            }</span>
+<span class="nc" id="L287">        }</span>
+<span class="nc" id="L288">        return false;</span>
+    }
+
+    /**
+     * Register for interesting state changes.
+     *
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void register(IEndpointStateChangeSubscriber subscriber)
+    {
+<span class="fc" id="L298">        subscribers.add(subscriber);</span>
+<span class="fc" id="L299">    }</span>
+
+    /**
+     * Unregister interest for state changes.
+     *
+     * @param subscriber module which implements the IEndpointStateChangeSubscriber
+     */
+    public void unregister(IEndpointStateChangeSubscriber subscriber)
+    {
+<span class="nc" id="L308">        subscribers.remove(subscriber);</span>
+<span class="nc" id="L309">    }</span>
+
+    /**
+     * @return a list of live gossip participants, including fat clients
+     */
+    public Set&lt;InetAddress&gt; getLiveMembers()
+    {
+<span class="fc" id="L316">        Set&lt;InetAddress&gt; liveMembers = new HashSet&lt;&gt;(liveEndpoints);</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (!liveMembers.contains(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L318">            liveMembers.add(FBUtilities.getBroadcastAddress());</span>
+<span class="fc" id="L319">        return liveMembers;</span>
+    }
+
+    /**
+     * @return a list of live ring members.
+     */
+    public Set&lt;InetAddress&gt; getLiveTokenOwners()
+    {
+<span class="nc" id="L327">        return StorageService.instance.getLiveRingMembers(true);</span>
+    }
+
+    /**
+     * @return a list of unreachable gossip participants, including fat clients
+     */
+    public Set&lt;InetAddress&gt; getUnreachableMembers()
+    {
+<span class="nc" id="L335">        return unreachableEndpoints.keySet();</span>
+    }
+
+    /**
+     * @return a list of unreachable token owners
+     */
+    public Set&lt;InetAddress&gt; getUnreachableTokenOwners()
+    {
+<span class="nc" id="L343">        Set&lt;InetAddress&gt; tokenOwners = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        for (InetAddress endpoint : unreachableEndpoints.keySet())</span>
+        {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            if (StorageService.instance.getTokenMetadata().isMember(endpoint))</span>
+<span class="nc" id="L347">                tokenOwners.add(endpoint);</span>
+<span class="nc" id="L348">        }</span>
+
+<span class="nc" id="L350">        return tokenOwners;</span>
+    }
+
+    public long getEndpointDowntime(InetAddress ep)
+    {
+<span class="nc" id="L355">        Long downtime = unreachableEndpoints.get(ep);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        if (downtime != null)</span>
+<span class="nc" id="L357">            return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - downtime);</span>
+        else
+<span class="nc" id="L359">            return 0L;</span>
+    }
+
+    private boolean isShutdown(InetAddress endpoint)
+    {
+<span class="fc" id="L364">        EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        if (epState == null)</span>
+<span class="nc" id="L366">            return false;</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">        if (epState.getApplicationState(ApplicationState.STATUS) == null)</span>
+<span class="nc" id="L368">            return false;</span>
+<span class="fc" id="L369">        String value = epState.getApplicationState(ApplicationState.STATUS).value;</span>
+<span class="fc" id="L370">        String[] pieces = value.split(VersionedValue.DELIMITER_STR, -1);</span>
+<span class="pc bpc" id="L371" title="2 of 4 branches missed.">        assert (pieces.length &gt; 0);</span>
+<span class="fc" id="L372">        String state = pieces[0];</span>
+<span class="fc" id="L373">        return state.equals(VersionedValue.SHUTDOWN);</span>
+    }
+
+    public static void runInGossipStageBlocking(Runnable runnable)
+    {
+        // run immediately if we're already in the gossip stage
+<span class="fc bfc" id="L379" title="All 2 branches covered.">        if (isInGossipStage())</span>
+        {
+<span class="fc" id="L381">            runnable.run();</span>
+<span class="fc" id="L382">            return;</span>
+        }
+
+<span class="fc" id="L385">        ListenableFutureTask task = ListenableFutureTask.create(runnable, null);</span>
+<span class="fc" id="L386">        StageManager.getStage(Stage.GOSSIP).execute(task);</span>
+        try
+        {
+<span class="fc" id="L389">            task.get();</span>
+        }
+<span class="nc" id="L391">        catch (InterruptedException | ExecutionException e)</span>
+        {
+<span class="nc" id="L393">            throw new AssertionError(e);</span>
+<span class="fc" id="L394">        }</span>
+<span class="fc" id="L395">    }</span>
+
+    /**
+     * This method is part of IFailureDetectionEventListener interface. This is invoked
+     * by the Failure Detector when it convicts an end point.
+     *
+     * @param endpoint end point that is convicted.
+     */
+    public void convict(InetAddress endpoint, double phi)
+    {
+<span class="fc" id="L405">        runInGossipStageBlocking(() -&gt; {</span>
+<span class="fc" id="L406">            EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">            if (epState == null)</span>
+<span class="nc" id="L408">                return;</span>
+
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">            if (!epState.isAlive())</span>
+<span class="fc" id="L411">                return;</span>
+
+<span class="nc" id="L413">            logger.debug(&quot;Convicting {} with status {} - alive {}&quot;, endpoint, getGossipStatus(epState), epState.isAlive());</span>
+
+
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (isShutdown(endpoint))</span>
+            {
+<span class="nc" id="L418">                markAsShutdown(endpoint);</span>
+            }
+            else
+            {
+<span class="nc" id="L422">                markDead(endpoint, epState);</span>
+            }
+<span class="nc" id="L424">        });</span>
+<span class="fc" id="L425">    }</span>
+
+    /**
+     * This method is used to mark a node as shutdown; that is it gracefully exited on its own and told us about it
+     * @param endpoint endpoint that has shut itself down
+     */
+    protected void markAsShutdown(InetAddress endpoint)
+    {
+<span class="fc" id="L433">        checkProperThreadForStateMutation();</span>
+<span class="fc" id="L434">        EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">        if (epState == null)</span>
+<span class="nc" id="L436">            return;</span>
+<span class="fc" id="L437">        epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.shutdown(true));</span>
+<span class="fc" id="L438">        epState.addApplicationState(ApplicationState.RPC_READY, StorageService.instance.valueFactory.rpcReady(false));</span>
+<span class="fc" id="L439">        epState.getHeartBeatState().forceHighestPossibleVersionUnsafe();</span>
+<span class="fc" id="L440">        markDead(endpoint, epState);</span>
+<span class="fc" id="L441">        FailureDetector.instance.forceConviction(endpoint);</span>
+<span class="fc" id="L442">    }</span>
+
+    /**
+     * Return either: the greatest heartbeat or application state
+     *
+     * @param epState
+     * @return
+     */
+    int getMaxEndpointStateVersion(EndpointState epState)
+    {
+<span class="fc" id="L452">        int maxVersion = epState.getHeartBeatState().getHeartBeatVersion();</span>
+<span class="fc bfc" id="L453" title="All 2 branches covered.">        for (Map.Entry&lt;ApplicationState, VersionedValue&gt; state : epState.states())</span>
+<span class="fc" id="L454">            maxVersion = Math.max(maxVersion, state.getValue().version);</span>
+<span class="fc" id="L455">        return maxVersion;</span>
+    }
+
+    /**
+     * Removes the endpoint from gossip completely
+     *
+     * @param endpoint endpoint to be removed from the current membership.
+     */
+    private void evictFromMembership(InetAddress endpoint)
+    {
+<span class="nc" id="L465">        checkProperThreadForStateMutation();</span>
+<span class="nc" id="L466">        unreachableEndpoints.remove(endpoint);</span>
+<span class="nc" id="L467">        endpointStateMap.remove(endpoint);</span>
+<span class="nc" id="L468">        expireTimeEndpointMap.remove(endpoint);</span>
+<span class="nc" id="L469">        FailureDetector.instance.remove(endpoint);</span>
+<span class="nc" id="L470">        quarantineEndpoint(endpoint);</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        if (logger.isDebugEnabled())</span>
+<span class="nc" id="L472">            logger.debug(&quot;evicting {} from gossip&quot;, endpoint);</span>
+<span class="nc" id="L473">    }</span>
+
+    /**
+     * Removes the endpoint from Gossip but retains endpoint state
+     */
+    public void removeEndpoint(InetAddress endpoint)
+    {
+<span class="nc" id="L480">        checkProperThreadForStateMutation();</span>
+        // do subscribers first so anything in the subscriber that depends on gossiper state won't get confused
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+<span class="nc" id="L483">            subscriber.onRemove(endpoint);</span>
+
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        if(seeds.contains(endpoint))</span>
+        {
+<span class="nc" id="L487">            buildSeedsList();</span>
+<span class="nc" id="L488">            seeds.remove(endpoint);</span>
+<span class="nc" id="L489">            logger.info(&quot;removed {} from seeds, updated seeds list = {}&quot;, endpoint, seeds);</span>
+        }
+
+<span class="nc" id="L492">        liveEndpoints.remove(endpoint);</span>
+<span class="nc" id="L493">        unreachableEndpoints.remove(endpoint);</span>
+<span class="nc" id="L494">        MessagingService.instance().resetVersion(endpoint);</span>
+<span class="nc" id="L495">        quarantineEndpoint(endpoint);</span>
+<span class="nc" id="L496">        MessagingService.instance().destroyConnectionPool(endpoint);</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        if (logger.isDebugEnabled())</span>
+<span class="nc" id="L498">            logger.debug(&quot;removing endpoint {}&quot;, endpoint);</span>
+<span class="nc" id="L499">    }</span>
+
+    /**
+     * Quarantines the endpoint for QUARANTINE_DELAY
+     *
+     * @param endpoint
+     */
+    private void quarantineEndpoint(InetAddress endpoint)
+    {
+<span class="nc" id="L508">        quarantineEndpoint(endpoint, System.currentTimeMillis());</span>
+<span class="nc" id="L509">    }</span>
+
+    /**
+     * Quarantines the endpoint until quarantineExpiration + QUARANTINE_DELAY
+     *
+     * @param endpoint
+     * @param quarantineExpiration
+     */
+    private void quarantineEndpoint(InetAddress endpoint, long quarantineExpiration)
+    {
+<span class="nc" id="L519">        justRemovedEndpoints.put(endpoint, quarantineExpiration);</span>
+<span class="nc" id="L520">    }</span>
+
+    /**
+     * Quarantine endpoint specifically for replacement purposes.
+     * @param endpoint
+     */
+    public void replacementQuarantine(InetAddress endpoint)
+    {
+        // remember, quarantineEndpoint will effectively already add QUARANTINE_DELAY, so this is 2x
+<span class="nc" id="L529">        logger.debug(&quot;&quot;);</span>
+<span class="nc" id="L530">        quarantineEndpoint(endpoint, System.currentTimeMillis() + QUARANTINE_DELAY);</span>
+<span class="nc" id="L531">    }</span>
+
+    /**
+     * Remove the Endpoint and evict immediately, to avoid gossiping about this node.
+     * This should only be called when a token is taken over by a new IP address.
+     *
+     * @param endpoint The endpoint that has been replaced
+     */
+    public void replacedEndpoint(InetAddress endpoint)
+    {
+<span class="nc" id="L541">        checkProperThreadForStateMutation();</span>
+<span class="nc" id="L542">        removeEndpoint(endpoint);</span>
+<span class="nc" id="L543">        evictFromMembership(endpoint);</span>
+<span class="nc" id="L544">        replacementQuarantine(endpoint);</span>
+<span class="nc" id="L545">    }</span>
+
+    /**
+     * The gossip digest is built based on randomization
+     * rather than just looping through the collection of live endpoints.
+     *
+     * @param gDigests list of Gossip Digests.
+     */
+    private void makeRandomGossipDigest(List&lt;GossipDigest&gt; gDigests)
+    {
+        EndpointState epState;
+<span class="fc" id="L556">        int generation = 0;</span>
+<span class="fc" id="L557">        int maxVersion = 0;</span>
+
+        // local epstate will be part of endpointStateMap
+<span class="fc" id="L560">        List&lt;InetAddress&gt; endpoints = new ArrayList&lt;InetAddress&gt;(endpointStateMap.keySet());</span>
+<span class="fc" id="L561">        Collections.shuffle(endpoints, random);</span>
+<span class="fc bfc" id="L562" title="All 2 branches covered.">        for (InetAddress endpoint : endpoints)</span>
+        {
+<span class="fc" id="L564">            epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L565" title="1 of 2 branches missed.">            if (epState != null)</span>
+            {
+<span class="fc" id="L567">                generation = epState.getHeartBeatState().getGeneration();</span>
+<span class="fc" id="L568">                maxVersion = getMaxEndpointStateVersion(epState);</span>
+            }
+<span class="fc" id="L570">            gDigests.add(new GossipDigest(endpoint, generation, maxVersion));</span>
+<span class="fc" id="L571">        }</span>
+
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc" id="L575">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            for (GossipDigest gDigest : gDigests)</span>
+            {
+<span class="nc" id="L578">                sb.append(gDigest);</span>
+<span class="nc" id="L579">                sb.append(&quot; &quot;);</span>
+<span class="nc" id="L580">            }</span>
+<span class="nc" id="L581">            logger.trace(&quot;Gossip Digests are : {}&quot;, sb);</span>
+        }
+<span class="fc" id="L583">    }</span>
+
+    /**
+     * This method will begin removing an existing endpoint from the cluster by spoofing its state
+     * This should never be called unless this coordinator has had 'removenode' invoked
+     *
+     * @param endpoint    - the endpoint being removed
+     * @param hostId      - the ID of the host being removed
+     * @param localHostId - my own host ID for replication coordination
+     */
+    public void advertiseRemoving(InetAddress endpoint, UUID hostId, UUID localHostId)
+    {
+<span class="nc" id="L595">        EndpointState epState = endpointStateMap.get(endpoint);</span>
+        // remember this node's generation
+<span class="nc" id="L597">        int generation = epState.getHeartBeatState().getGeneration();</span>
+<span class="nc" id="L598">        logger.info(&quot;Removing host: {}&quot;, hostId);</span>
+<span class="nc" id="L599">        logger.info(&quot;Sleeping for {}ms to ensure {} does not change&quot;, StorageService.RING_DELAY, endpoint);</span>
+<span class="nc" id="L600">        Uninterruptibles.sleepUninterruptibly(StorageService.RING_DELAY, TimeUnit.MILLISECONDS);</span>
+        // make sure it did not change
+<span class="nc" id="L602">        epState = endpointStateMap.get(endpoint);</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        if (epState.getHeartBeatState().getGeneration() != generation)</span>
+<span class="nc" id="L604">            throw new RuntimeException(&quot;Endpoint &quot; + endpoint + &quot; generation changed while trying to remove it&quot;);</span>
+        // update the other node's generation to mimic it as if it had changed it itself
+<span class="nc" id="L606">        logger.info(&quot;Advertising removal for {}&quot;, endpoint);</span>
+<span class="nc" id="L607">        epState.updateTimestamp(); // make sure we don't evict it too soon</span>
+<span class="nc" id="L608">        epState.getHeartBeatState().forceNewerGenerationUnsafe();</span>
+<span class="nc" id="L609">        Map&lt;ApplicationState, VersionedValue&gt; states = new EnumMap&lt;&gt;(ApplicationState.class);</span>
+<span class="nc" id="L610">        states.put(ApplicationState.STATUS, StorageService.instance.valueFactory.removingNonlocal(hostId));</span>
+<span class="nc" id="L611">        states.put(ApplicationState.REMOVAL_COORDINATOR, StorageService.instance.valueFactory.removalCoordinator(localHostId));</span>
+<span class="nc" id="L612">        epState.addApplicationStates(states);</span>
+<span class="nc" id="L613">        endpointStateMap.put(endpoint, epState);</span>
+<span class="nc" id="L614">    }</span>
+
+    /**
+     * Handles switching the endpoint's state from REMOVING_TOKEN to REMOVED_TOKEN
+     * This should only be called after advertiseRemoving
+     *
+     * @param endpoint
+     * @param hostId
+     */
+    public void advertiseTokenRemoved(InetAddress endpoint, UUID hostId)
+    {
+<span class="nc" id="L625">        EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="nc" id="L626">        epState.updateTimestamp(); // make sure we don't evict it too soon</span>
+<span class="nc" id="L627">        epState.getHeartBeatState().forceNewerGenerationUnsafe();</span>
+<span class="nc" id="L628">        long expireTime = computeExpireTime();</span>
+<span class="nc" id="L629">        epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.removedNonlocal(hostId, expireTime));</span>
+<span class="nc" id="L630">        logger.info(&quot;Completing removal of {}&quot;, endpoint);</span>
+<span class="nc" id="L631">        addExpireTimeForEndpoint(endpoint, expireTime);</span>
+<span class="nc" id="L632">        endpointStateMap.put(endpoint, epState);</span>
+        // ensure at least one gossip round occurs before returning
+<span class="nc" id="L634">        Uninterruptibles.sleepUninterruptibly(intervalInMillis * 2, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L635">    }</span>
+
+    public void unsafeAssassinateEndpoint(String address) throws UnknownHostException
+    {
+<span class="nc" id="L639">        logger.warn(&quot;Gossiper.unsafeAssassinateEndpoint is deprecated and will be removed in the next release; use assassinateEndpoint instead&quot;);</span>
+<span class="nc" id="L640">        assassinateEndpoint(address);</span>
+<span class="nc" id="L641">    }</span>
+
+    /**
+     * Do not call this method unless you know what you are doing.
+     * It will try extremely hard to obliterate any endpoint from the ring,
+     * even if it does not know about it.
+     *
+     * @param address
+     * @throws UnknownHostException
+     */
+    public void assassinateEndpoint(String address) throws UnknownHostException
+    {
+<span class="nc" id="L653">        InetAddress endpoint = InetAddress.getByName(address);</span>
+<span class="nc" id="L654">        runInGossipStageBlocking(() -&gt; {</span>
+<span class="nc" id="L655">            EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="nc" id="L656">            Collection&lt;Token&gt; tokens = null;</span>
+<span class="nc" id="L657">            logger.warn(&quot;Assassinating {} via gossip&quot;, endpoint);</span>
+
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            if (epState == null)</span>
+            {
+<span class="nc" id="L661">                epState = new EndpointState(new HeartBeatState((int) ((System.currentTimeMillis() + 60000) / 1000), 9999));</span>
+            }
+            else
+            {
+<span class="nc" id="L665">                int generation = epState.getHeartBeatState().getGeneration();</span>
+<span class="nc" id="L666">                int heartbeat = epState.getHeartBeatState().getHeartBeatVersion();</span>
+<span class="nc" id="L667">                logger.info(&quot;Sleeping for {}ms to ensure {} does not change&quot;, StorageService.RING_DELAY, endpoint);</span>
+<span class="nc" id="L668">                Uninterruptibles.sleepUninterruptibly(StorageService.RING_DELAY, TimeUnit.MILLISECONDS);</span>
+                // make sure it did not change
+<span class="nc" id="L670">                EndpointState newState = endpointStateMap.get(endpoint);</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                if (newState == null)</span>
+<span class="nc" id="L672">                    logger.warn(&quot;Endpoint {} disappeared while trying to assassinate, continuing anyway&quot;, endpoint);</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                else if (newState.getHeartBeatState().getGeneration() != generation)</span>
+<span class="nc" id="L674">                    throw new RuntimeException(&quot;Endpoint still alive: &quot; + endpoint + &quot; generation changed while trying to assassinate it&quot;);</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">                else if (newState.getHeartBeatState().getHeartBeatVersion() != heartbeat)</span>
+<span class="nc" id="L676">                    throw new RuntimeException(&quot;Endpoint still alive: &quot; + endpoint + &quot; heartbeat changed while trying to assassinate it&quot;);</span>
+<span class="nc" id="L677">                epState.updateTimestamp(); // make sure we don't evict it too soon</span>
+<span class="nc" id="L678">                epState.getHeartBeatState().forceNewerGenerationUnsafe();</span>
+            }
+
+            try
+            {
+<span class="nc" id="L683">                tokens = StorageService.instance.getTokenMetadata().getTokens(endpoint);</span>
+            }
+<span class="nc" id="L685">            catch (Throwable th)</span>
+            {
+<span class="nc" id="L687">                JVMStabilityInspector.inspectThrowable(th);</span>
+                // TODO this is broken
+<span class="nc" id="L689">                logger.warn(&quot;Unable to calculate tokens for {}.  Will use a random one&quot;, address);</span>
+<span class="nc" id="L690">                tokens = Collections.singletonList(StorageService.instance.getTokenMetadata().partitioner.getRandomToken());</span>
+<span class="nc" id="L691">            }</span>
+
+            // do not pass go, do not collect 200 dollars, just gtfo
+<span class="nc" id="L694">            epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.left(tokens, computeExpireTime()));</span>
+<span class="nc" id="L695">            handleMajorStateChange(endpoint, epState);</span>
+<span class="nc" id="L696">            Uninterruptibles.sleepUninterruptibly(intervalInMillis * 4, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L697">            logger.warn(&quot;Finished assassinating {}&quot;, endpoint);</span>
+<span class="nc" id="L698">        });</span>
+<span class="nc" id="L699">    }</span>
+
+    public boolean isKnownEndpoint(InetAddress endpoint)
+    {
+<span class="nc" id="L703">        return endpointStateMap.containsKey(endpoint);</span>
+    }
+
+    public int getCurrentGenerationNumber(InetAddress endpoint)
+    {
+<span class="nc" id="L708">        return endpointStateMap.get(endpoint).getHeartBeatState().getGeneration();</span>
+    }
+
+    /**
+     * Returns true if the chosen target was also a seed. False otherwise
+     *
+     * @param message
+     * @param epSet   a set of endpoint from which a random endpoint is chosen.
+     * @return true if the chosen endpoint is also a seed.
+     */
+    private boolean sendGossip(MessageOut&lt;GossipDigestSyn&gt; message, Set&lt;InetAddress&gt; epSet)
+    {
+<span class="fc" id="L720">        List&lt;InetAddress&gt; liveEndpoints = ImmutableList.copyOf(epSet);</span>
+
+<span class="fc" id="L722">        int size = liveEndpoints.size();</span>
+<span class="pc bpc" id="L723" title="1 of 2 branches missed.">        if (size &lt; 1)</span>
+<span class="nc" id="L724">            return false;</span>
+        /* Generate a random number from 0 -&gt; size */
+<span class="pc bpc" id="L726" title="1 of 2 branches missed.">        int index = (size == 1) ? 0 : random.nextInt(size);</span>
+<span class="fc" id="L727">        InetAddress to = liveEndpoints.get(index);</span>
+<span class="pc bpc" id="L728" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L729">            logger.trace(&quot;Sending a GossipDigestSyn to {} ...&quot;, to);</span>
+<span class="fc bfc" id="L730" title="All 2 branches covered.">        if (firstSynSendAt == 0)</span>
+<span class="fc" id="L731">            firstSynSendAt = System.nanoTime();</span>
+<span class="fc" id="L732">        MessagingService.instance().sendOneWay(message, to);</span>
+<span class="fc" id="L733">        return seeds.contains(to);</span>
+    }
+
+    /* Sends a Gossip message to a live member and returns true if the recipient was a seed */
+    private boolean doGossipToLiveMember(MessageOut&lt;GossipDigestSyn&gt; message)
+    {
+<span class="fc" id="L739">        int size = liveEndpoints.size();</span>
+<span class="fc bfc" id="L740" title="All 2 branches covered.">        if (size == 0)</span>
+<span class="fc" id="L741">            return false;</span>
+<span class="fc" id="L742">        return sendGossip(message, liveEndpoints);</span>
+    }
+
+    /* Sends a Gossip message to an unreachable member */
+    private void maybeGossipToUnreachableMember(MessageOut&lt;GossipDigestSyn&gt; message)
+    {
+<span class="fc" id="L748">        double liveEndpointCount = liveEndpoints.size();</span>
+<span class="fc" id="L749">        double unreachableEndpointCount = unreachableEndpoints.size();</span>
+<span class="fc bfc" id="L750" title="All 2 branches covered.">        if (unreachableEndpointCount &gt; 0)</span>
+        {
+            /* based on some probability */
+<span class="fc" id="L753">            double prob = unreachableEndpointCount / (liveEndpointCount + 1);</span>
+<span class="fc" id="L754">            double randDbl = random.nextDouble();</span>
+<span class="pc bpc" id="L755" title="1 of 2 branches missed.">            if (randDbl &lt; prob)</span>
+<span class="fc" id="L756">                sendGossip(message, unreachableEndpoints.keySet());</span>
+        }
+<span class="fc" id="L758">    }</span>
+
+    /* Possibly gossip to a seed for facilitating partition healing */
+    private void maybeGossipToSeed(MessageOut&lt;GossipDigestSyn&gt; prod)
+    {
+<span class="fc" id="L763">        int size = seeds.size();</span>
+<span class="fc bfc" id="L764" title="All 2 branches covered.">        if (size &gt; 0)</span>
+        {
+<span class="pc bpc" id="L766" title="2 of 4 branches missed.">            if (size == 1 &amp;&amp; seeds.contains(FBUtilities.getBroadcastAddress()))</span>
+            {
+<span class="nc" id="L768">                return;</span>
+            }
+
+<span class="pc bpc" id="L771" title="1 of 2 branches missed.">            if (liveEndpoints.size() == 0)</span>
+            {
+<span class="fc" id="L773">                sendGossip(prod, seeds);</span>
+            }
+            else
+            {
+                /* Gossip with the seed with some probability. */
+<span class="nc" id="L778">                double probability = seeds.size() / (double) (liveEndpoints.size() + unreachableEndpoints.size());</span>
+<span class="nc" id="L779">                double randDbl = random.nextDouble();</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">                if (randDbl &lt;= probability)</span>
+<span class="nc" id="L781">                    sendGossip(prod, seeds);</span>
+            }
+        }
+<span class="fc" id="L784">    }</span>
+
+    public boolean isGossipOnlyMember(InetAddress endpoint)
+    {
+<span class="fc" id="L788">        EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">        if (epState == null)</span>
+        {
+<span class="nc" id="L791">            return false;</span>
+        }
+<span class="pc bpc" id="L793" title="2 of 4 branches missed.">        return !isDeadState(epState) &amp;&amp; !StorageService.instance.getTokenMetadata().isMember(endpoint);</span>
+    }
+
+    /**
+     * Check if this node can safely be started and join the ring.
+     * If the node is bootstrapping, examines gossip state for any previous status to decide whether
+     * it's safe to allow this node to start and bootstrap. If not bootstrapping, compares the host ID
+     * that the node itself has (obtained by reading from system.local or generated if not present)
+     * with the host ID obtained from gossip for the endpoint address (if any). This latter case
+     * prevents a non-bootstrapping, new node from being started with the same address of a
+     * previously started, but currently down predecessor.
+     *
+     * @param endpoint - the endpoint to check
+     * @param localHostUUID - the host id to check
+     * @param isBootstrapping - whether the node intends to bootstrap when joining
+     * @param epStates - endpoint states in the cluster
+     * @return true if it is safe to start the node, false otherwise
+     */
+    public boolean isSafeForStartup(InetAddress endpoint, UUID localHostUUID, boolean isBootstrapping,
+                                    Map&lt;InetAddress, EndpointState&gt; epStates)
+    {
+<span class="fc" id="L814">        EndpointState epState = epStates.get(endpoint);</span>
+        // if there's no previous state, or the node was previously removed from the cluster, we're good
+<span class="pc bpc" id="L816" title="3 of 4 branches missed.">        if (epState == null || isDeadState(epState))</span>
+<span class="fc" id="L817">            return true;</span>
+
+<span class="nc bnc" id="L819" title="All 2 branches missed.">        if (isBootstrapping)</span>
+        {
+<span class="nc" id="L821">            String status = getGossipStatus(epState);</span>
+            // these states are not allowed to join the cluster as it would not be safe
+<span class="nc" id="L823">            final List&lt;String&gt; unsafeStatuses = new ArrayList&lt;String&gt;()</span>
+<span class="nc" id="L824">            {{</span>
+<span class="nc" id="L825">                add(&quot;&quot;);                           // failed bootstrap but we did start gossiping</span>
+<span class="nc" id="L826">                add(VersionedValue.STATUS_NORMAL); // node is legit in the cluster or it was stopped with kill -9</span>
+<span class="nc" id="L827">                add(VersionedValue.SHUTDOWN);      // node was shutdown</span>
+<span class="nc" id="L828">            }};</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">            return !unsafeStatuses.contains(status);</span>
+        }
+        else
+        {
+            // if the previous UUID matches what we currently have (i.e. what was read from
+            // system.local at startup), then we're good to start up. Otherwise, something
+            // is amiss and we need to replace the previous node
+<span class="nc" id="L836">            VersionedValue previous = epState.getApplicationState(ApplicationState.HOST_ID);</span>
+<span class="nc" id="L837">            return UUID.fromString(previous.value).equals(localHostUUID);</span>
+        }
+    }
+
+    private void doStatusCheck()
+    {
+<span class="pc bpc" id="L843" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L844">            logger.trace(&quot;Performing status check ...&quot;);</span>
+
+<span class="fc" id="L846">        long now = System.currentTimeMillis();</span>
+<span class="fc" id="L847">        long nowNano = System.nanoTime();</span>
+
+<span class="fc" id="L849">        long pending = ((JMXEnabledThreadPoolExecutor) StageManager.getStage(Stage.GOSSIP)).metrics.pendingTasks.getValue();</span>
+<span class="pc bpc" id="L850" title="3 of 4 branches missed.">        if (pending &gt; 0 &amp;&amp; lastProcessedMessageAt &lt; now - 1000)</span>
+        {
+            // if some new messages just arrived, give the executor some time to work on them
+<span class="nc" id="L853">            Uninterruptibles.sleepUninterruptibly(100, TimeUnit.MILLISECONDS);</span>
+
+            // still behind?  something's broke
+<span class="nc bnc" id="L856" title="All 2 branches missed.">            if (lastProcessedMessageAt &lt; now - 1000)</span>
+            {
+<span class="nc" id="L858">                logger.warn(&quot;Gossip stage has {} pending tasks; skipping status check (no nodes will be marked down)&quot;, pending);</span>
+<span class="nc" id="L859">                return;</span>
+            }
+        }
+
+<span class="fc" id="L863">        Set&lt;InetAddress&gt; eps = endpointStateMap.keySet();</span>
+<span class="fc bfc" id="L864" title="All 2 branches covered.">        for (InetAddress endpoint : eps)</span>
+        {
+<span class="fc bfc" id="L866" title="All 2 branches covered.">            if (endpoint.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L867">                continue;</span>
+
+<span class="fc" id="L869">            FailureDetector.instance.interpret(endpoint);</span>
+<span class="fc" id="L870">            EndpointState epState = endpointStateMap.get(endpoint);</span>
+<span class="pc bpc" id="L871" title="1 of 2 branches missed.">            if (epState != null)</span>
+            {
+                // check if this is a fat client. fat clients are removed automatically from
+                // gossip after FatClientTimeout.  Do not remove dead states here.
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">                if (isGossipOnlyMember(endpoint)</span>
+<span class="nc bnc" id="L876" title="All 2 branches missed.">                    &amp;&amp; !justRemovedEndpoints.containsKey(endpoint)</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">                    &amp;&amp; TimeUnit.NANOSECONDS.toMillis(nowNano - epState.getUpdateTimestamp()) &gt; fatClientTimeout)</span>
+                {
+<span class="nc" id="L879">                    logger.info(&quot;FatClient {} has been silent for {}ms, removing from gossip&quot;, endpoint, fatClientTimeout);</span>
+<span class="nc" id="L880">                    runInGossipStageBlocking(() -&gt; {</span>
+<span class="nc" id="L881">                        removeEndpoint(endpoint); // will put it in justRemovedEndpoints to respect quarantine delay</span>
+<span class="nc" id="L882">                        evictFromMembership(endpoint); // can get rid of the state immediately</span>
+<span class="nc" id="L883">                    });</span>
+                }
+
+                // check for dead state removal
+<span class="fc" id="L887">                long expireTime = getExpireTimeForEndpoint(endpoint);</span>
+<span class="pc bpc" id="L888" title="1 of 4 branches missed.">                if (!epState.isAlive() &amp;&amp; (now &gt; expireTime)</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">                    &amp;&amp; (!StorageService.instance.getTokenMetadata().isMember(endpoint)))</span>
+                {
+<span class="nc bnc" id="L891" title="All 2 branches missed.">                    if (logger.isDebugEnabled())</span>
+                    {
+<span class="nc" id="L893">                        logger.debug(&quot;time is expiring for endpoint : {} ({})&quot;, endpoint, expireTime);</span>
+                    }
+<span class="nc" id="L895">                    evictFromMembership(endpoint);</span>
+                }
+            }
+<span class="fc" id="L898">        }</span>
+
+<span class="pc bpc" id="L900" title="1 of 2 branches missed.">        if (!justRemovedEndpoints.isEmpty())</span>
+        {
+<span class="nc bnc" id="L902" title="All 2 branches missed.">            for (Entry&lt;InetAddress, Long&gt; entry : justRemovedEndpoints.entrySet())</span>
+            {
+<span class="nc bnc" id="L904" title="All 2 branches missed.">                if ((now - entry.getValue()) &gt; QUARANTINE_DELAY)</span>
+                {
+<span class="nc bnc" id="L906" title="All 2 branches missed.">                    if (logger.isDebugEnabled())</span>
+<span class="nc" id="L907">                        logger.debug(&quot;{} elapsed, {} gossip quarantine over&quot;, QUARANTINE_DELAY, entry.getKey());</span>
+<span class="nc" id="L908">                    justRemovedEndpoints.remove(entry.getKey());</span>
+                }
+<span class="nc" id="L910">            }</span>
+        }
+<span class="fc" id="L912">    }</span>
+
+    protected long getExpireTimeForEndpoint(InetAddress endpoint)
+    {
+        /* default expireTime is aVeryLongTime */
+<span class="fc" id="L917">        Long storedTime = expireTimeEndpointMap.get(endpoint);</span>
+<span class="pc bpc" id="L918" title="1 of 2 branches missed.">        return storedTime == null ? computeExpireTime() : storedTime;</span>
+    }
+
+    public EndpointState getEndpointStateForEndpoint(InetAddress ep)
+    {
+<span class="fc" id="L923">        return endpointStateMap.get(ep);</span>
+    }
+
+    public Set&lt;Entry&lt;InetAddress, EndpointState&gt;&gt; getEndpointStates()
+    {
+<span class="fc" id="L928">        return endpointStateMap.entrySet();</span>
+    }
+
+    public UUID getHostId(InetAddress endpoint)
+    {
+<span class="fc" id="L933">        return getHostId(endpoint, endpointStateMap);</span>
+    }
+
+    public UUID getHostId(InetAddress endpoint, Map&lt;InetAddress, EndpointState&gt; epStates)
+    {
+<span class="fc" id="L938">        return UUID.fromString(epStates.get(endpoint).getApplicationState(ApplicationState.HOST_ID).value);</span>
+    }
+
+    EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+    {
+<span class="fc" id="L943">        EndpointState epState = endpointStateMap.get(forEndpoint);</span>
+<span class="fc" id="L944">        EndpointState reqdEndpointState = null;</span>
+
+<span class="pc bpc" id="L946" title="1 of 2 branches missed.">        if (epState != null)</span>
+        {
+            /*
+             * Here we try to include the Heart Beat state only if it is
+             * greater than the version passed in. It might happen that
+             * the heart beat version maybe lesser than the version passed
+             * in and some application state has a version that is greater
+             * than the version passed in. In this case we also send the old
+             * heart beat and throw it away on the receiver if it is redundant.
+            */
+<span class="fc" id="L956">            HeartBeatState heartBeatState = epState.getHeartBeatState();</span>
+<span class="fc" id="L957">            int localHbGeneration = heartBeatState.getGeneration();</span>
+<span class="fc" id="L958">            int localHbVersion = heartBeatState.getHeartBeatVersion();</span>
+<span class="fc bfc" id="L959" title="All 2 branches covered.">            if (localHbVersion &gt; version)</span>
+            {
+<span class="fc" id="L961">                reqdEndpointState = new EndpointState(new HeartBeatState(localHbGeneration, localHbVersion));</span>
+<span class="pc bpc" id="L962" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L963">                    logger.trace(&quot;local heartbeat version {} greater than {} for {}&quot;, localHbVersion, version, forEndpoint);</span>
+            }
+            /* Accumulate all application states whose versions are greater than &quot;version&quot; variable */
+<span class="fc" id="L966">            Map&lt;ApplicationState, VersionedValue&gt; states = new EnumMap&lt;&gt;(ApplicationState.class);</span>
+<span class="fc bfc" id="L967" title="All 2 branches covered.">            for (Entry&lt;ApplicationState, VersionedValue&gt; entry : epState.states())</span>
+            {
+<span class="fc" id="L969">                VersionedValue value = entry.getValue();</span>
+<span class="fc bfc" id="L970" title="All 2 branches covered.">                if (value.version &gt; version)</span>
+                {
+<span class="fc bfc" id="L972" title="All 2 branches covered.">                    if (reqdEndpointState == null)</span>
+                    {
+<span class="fc" id="L974">                        reqdEndpointState = new EndpointState(new HeartBeatState(localHbGeneration, localHbVersion));</span>
+                    }
+<span class="fc" id="L976">                    final ApplicationState key = entry.getKey();</span>
+<span class="pc bpc" id="L977" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L978">                        logger.trace(&quot;Adding state {}: {}&quot; , key, value.value);</span>
+
+<span class="fc" id="L980">                    states.put(key, value);</span>
+                }
+<span class="fc" id="L982">            }</span>
+<span class="pc bpc" id="L983" title="1 of 2 branches missed.">            if (reqdEndpointState != null)</span>
+<span class="fc" id="L984">                reqdEndpointState.addApplicationStates(states);</span>
+        }
+<span class="fc" id="L986">        return reqdEndpointState;</span>
+    }
+
+    /**
+     * determine which endpoint started up earlier
+     */
+    public int compareEndpointStartup(InetAddress addr1, InetAddress addr2)
+    {
+<span class="nc" id="L994">        EndpointState ep1 = getEndpointStateForEndpoint(addr1);</span>
+<span class="nc" id="L995">        EndpointState ep2 = getEndpointStateForEndpoint(addr2);</span>
+<span class="nc bnc" id="L996" title="All 6 branches missed.">        assert ep1 != null &amp;&amp; ep2 != null;</span>
+<span class="nc" id="L997">        return ep1.getHeartBeatState().getGeneration() - ep2.getHeartBeatState().getGeneration();</span>
+    }
+
+    void notifyFailureDetector(Map&lt;InetAddress, EndpointState&gt; remoteEpStateMap)
+    {
+<span class="fc bfc" id="L1002" title="All 2 branches covered.">        for (Entry&lt;InetAddress, EndpointState&gt; entry : remoteEpStateMap.entrySet())</span>
+        {
+<span class="fc" id="L1004">            notifyFailureDetector(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L1005">        }</span>
+<span class="fc" id="L1006">    }</span>
+
+    void notifyFailureDetector(InetAddress endpoint, EndpointState remoteEndpointState)
+    {
+<span class="fc" id="L1010">        EndpointState localEndpointState = endpointStateMap.get(endpoint);</span>
+        /*
+         * If the local endpoint state exists then report to the FD only
+         * if the versions workout.
+        */
+<span class="fc bfc" id="L1015" title="All 2 branches covered.">        if (localEndpointState != null)</span>
+        {
+<span class="fc" id="L1017">            IFailureDetector fd = FailureDetector.instance;</span>
+<span class="fc" id="L1018">            int localGeneration = localEndpointState.getHeartBeatState().getGeneration();</span>
+<span class="fc" id="L1019">            int remoteGeneration = remoteEndpointState.getHeartBeatState().getGeneration();</span>
+<span class="pc bpc" id="L1020" title="1 of 2 branches missed.">            if (remoteGeneration &gt; localGeneration)</span>
+            {
+<span class="nc" id="L1022">                localEndpointState.updateTimestamp();</span>
+                // this node was dead and the generation changed, this indicates a reboot, or possibly a takeover
+                // we will clean the fd intervals for it and relearn them
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">                if (!localEndpointState.isAlive())</span>
+                {
+<span class="nc" id="L1027">                    logger.debug(&quot;Clearing interval times for {} due to generation change&quot;, endpoint);</span>
+<span class="nc" id="L1028">                    fd.remove(endpoint);</span>
+                }
+<span class="nc" id="L1030">                fd.report(endpoint);</span>
+<span class="nc" id="L1031">                return;</span>
+            }
+
+<span class="pc bpc" id="L1034" title="1 of 2 branches missed.">            if (remoteGeneration == localGeneration)</span>
+            {
+<span class="fc" id="L1036">                int localVersion = getMaxEndpointStateVersion(localEndpointState);</span>
+<span class="fc" id="L1037">                int remoteVersion = remoteEndpointState.getHeartBeatState().getHeartBeatVersion();</span>
+<span class="fc bfc" id="L1038" title="All 2 branches covered.">                if (remoteVersion &gt; localVersion)</span>
+                {
+<span class="fc" id="L1040">                    localEndpointState.updateTimestamp();</span>
+                    // just a version change, report to the fd
+<span class="fc" id="L1042">                    fd.report(endpoint);</span>
+                }
+            }
+        }
+
+<span class="fc" id="L1047">    }</span>
+
+    private void markAlive(final InetAddress addr, final EndpointState localState)
+    {
+<span class="pc bpc" id="L1051" title="1 of 2 branches missed.">        if (MessagingService.instance().getVersion(addr) &lt; MessagingService.VERSION_20)</span>
+        {
+<span class="nc" id="L1053">            realMarkAlive(addr, localState);</span>
+<span class="nc" id="L1054">            return;</span>
+        }
+
+<span class="fc" id="L1057">        localState.markDead();</span>
+
+<span class="fc" id="L1059">        MessageOut&lt;EchoMessage&gt; echoMessage = new MessageOut&lt;EchoMessage&gt;(MessagingService.Verb.ECHO, EchoMessage.instance, EchoMessage.serializer);</span>
+<span class="fc" id="L1060">        logger.trace(&quot;Sending a EchoMessage to {}&quot;, addr);</span>
+<span class="fc" id="L1061">        IAsyncCallback echoHandler = new IAsyncCallback()</span>
+<span class="fc" id="L1062">        {</span>
+            public boolean isLatencyForSnitch()
+            {
+<span class="fc" id="L1065">                return false;</span>
+            }
+
+            public void response(MessageIn msg)
+            {
+<span class="fc" id="L1070">                runInGossipStageBlocking(() -&gt; realMarkAlive(addr, localState));</span>
+<span class="fc" id="L1071">            }</span>
+        };
+
+<span class="fc" id="L1074">        MessagingService.instance().sendRR(echoMessage, addr, echoHandler);</span>
+<span class="fc" id="L1075">    }</span>
+
+    @VisibleForTesting
+    public void realMarkAlive(final InetAddress addr, final EndpointState localState)
+    {
+<span class="fc" id="L1080">        checkProperThreadForStateMutation();</span>
+<span class="pc bpc" id="L1081" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1082">            logger.trace(&quot;marking as alive {}&quot;, addr);</span>
+<span class="fc" id="L1083">        localState.markAlive();</span>
+<span class="fc" id="L1084">        localState.updateTimestamp(); // prevents doStatusCheck from racing us and evicting if it was down &gt; aVeryLongTime</span>
+<span class="fc" id="L1085">        liveEndpoints.add(addr);</span>
+<span class="fc" id="L1086">        unreachableEndpoints.remove(addr);</span>
+<span class="fc" id="L1087">        expireTimeEndpointMap.remove(addr);</span>
+<span class="fc" id="L1088">        logger.debug(&quot;removing expire time for endpoint : {}&quot;, addr);</span>
+<span class="fc" id="L1089">        logger.info(&quot;InetAddress {} is now UP&quot;, addr);</span>
+<span class="fc bfc" id="L1090" title="All 2 branches covered.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+<span class="fc" id="L1091">            subscriber.onAlive(addr, localState);</span>
+<span class="pc bpc" id="L1092" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1093">            logger.trace(&quot;Notified {}&quot;, subscribers);</span>
+<span class="fc" id="L1094">    }</span>
+
+    @VisibleForTesting
+    public void markDead(InetAddress addr, EndpointState localState)
+    {
+<span class="fc" id="L1099">        checkProperThreadForStateMutation();</span>
+<span class="pc bpc" id="L1100" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1101">            logger.trace(&quot;marking as down {}&quot;, addr);</span>
+<span class="fc" id="L1102">        localState.markDead();</span>
+<span class="fc" id="L1103">        liveEndpoints.remove(addr);</span>
+<span class="fc" id="L1104">        unreachableEndpoints.put(addr, System.nanoTime());</span>
+<span class="fc" id="L1105">        logger.info(&quot;InetAddress {} is now DOWN&quot;, addr);</span>
+<span class="fc bfc" id="L1106" title="All 2 branches covered.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+<span class="fc" id="L1107">            subscriber.onDead(addr, localState);</span>
+<span class="pc bpc" id="L1108" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1109">            logger.trace(&quot;Notified {}&quot;, subscribers);</span>
+<span class="fc" id="L1110">    }</span>
+
+    /**
+     * This method is called whenever there is a &quot;big&quot; change in ep state (a generation change for a known node).
+     *
+     * @param ep      endpoint
+     * @param epState EndpointState for the endpoint
+     */
+    private void handleMajorStateChange(InetAddress ep, EndpointState epState)
+    {
+<span class="fc" id="L1120">        checkProperThreadForStateMutation();</span>
+<span class="fc" id="L1121">        EndpointState localEpState = endpointStateMap.get(ep);</span>
+<span class="pc bpc" id="L1122" title="1 of 2 branches missed.">        if (!isDeadState(epState))</span>
+        {
+<span class="pc bpc" id="L1124" title="1 of 2 branches missed.">            if (localEpState != null)</span>
+<span class="nc" id="L1125">                logger.info(&quot;Node {} has restarted, now UP&quot;, ep);</span>
+            else
+<span class="fc" id="L1127">                logger.info(&quot;Node {} is now part of the cluster&quot;, ep);</span>
+        }
+<span class="pc bpc" id="L1129" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1130">            logger.trace(&quot;Adding endpoint state for {}&quot;, ep);</span>
+<span class="fc" id="L1131">        endpointStateMap.put(ep, epState);</span>
+
+<span class="pc bpc" id="L1133" title="1 of 2 branches missed.">        if (localEpState != null)</span>
+        {   // the node restarted: it is up to the subscriber to take whatever action is necessary
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">            for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+<span class="nc" id="L1136">                subscriber.onRestart(ep, localEpState);</span>
+        }
+
+<span class="pc bpc" id="L1139" title="1 of 2 branches missed.">        if (!isDeadState(epState))</span>
+<span class="fc" id="L1140">            markAlive(ep, epState);</span>
+        else
+        {
+<span class="nc" id="L1143">            logger.debug(&quot;Not marking {} alive due to dead state&quot;, ep);</span>
+<span class="nc" id="L1144">            markDead(ep, epState);</span>
+        }
+<span class="fc bfc" id="L1146" title="All 2 branches covered.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+<span class="fc" id="L1147">            subscriber.onJoin(ep, epState);</span>
+        // check this at the end so nodes will learn about the endpoint
+<span class="pc bpc" id="L1149" title="1 of 2 branches missed.">        if (isShutdown(ep))</span>
+<span class="nc" id="L1150">            markAsShutdown(ep);</span>
+<span class="fc" id="L1151">    }</span>
+
+    public boolean isAlive(InetAddress endpoint)
+    {
+<span class="fc" id="L1155">        EndpointState epState = getEndpointStateForEndpoint(endpoint);</span>
+<span class="pc bpc" id="L1156" title="1 of 2 branches missed.">        if (epState == null)</span>
+<span class="nc" id="L1157">            return false;</span>
+<span class="pc bpc" id="L1158" title="1 of 4 branches missed.">        return epState.isAlive() &amp;&amp; !isDeadState(epState);</span>
+    }
+
+    public boolean isDeadState(EndpointState epState)
+    {
+<span class="fc" id="L1163">        String status = getGossipStatus(epState);</span>
+<span class="fc bfc" id="L1164" title="All 2 branches covered.">        if (status.isEmpty())</span>
+<span class="fc" id="L1165">            return false;</span>
+
+<span class="fc" id="L1167">        return DEAD_STATES.contains(status);</span>
+    }
+
+    public boolean isSilentShutdownState(EndpointState epState)
+    {
+<span class="fc" id="L1172">        String status = getGossipStatus(epState);</span>
+<span class="pc bpc" id="L1173" title="1 of 2 branches missed.">        if (status.isEmpty())</span>
+<span class="nc" id="L1174">            return false;</span>
+
+<span class="fc" id="L1176">        return SILENT_SHUTDOWN_STATES.contains(status);</span>
+    }
+
+    private static String getGossipStatus(EndpointState epState)
+    {
+<span class="pc bpc" id="L1181" title="1 of 4 branches missed.">        if (epState == null || epState.getApplicationState(ApplicationState.STATUS) == null)</span>
+<span class="fc" id="L1182">            return &quot;&quot;;</span>
+
+<span class="fc" id="L1184">        String value = epState.getApplicationState(ApplicationState.STATUS).value;</span>
+<span class="fc" id="L1185">        String[] pieces = value.split(VersionedValue.DELIMITER_STR, -1);</span>
+<span class="pc bpc" id="L1186" title="2 of 4 branches missed.">        assert (pieces.length &gt; 0);</span>
+<span class="fc" id="L1187">        return pieces[0];</span>
+    }
+
+    void applyStateLocally(Map&lt;InetAddress, EndpointState&gt; epStateMap)
+    {
+<span class="fc" id="L1192">        checkProperThreadForStateMutation();</span>
+<span class="fc bfc" id="L1193" title="All 2 branches covered.">        for (Entry&lt;InetAddress, EndpointState&gt; entry : epStateMap.entrySet())</span>
+        {
+<span class="fc" id="L1195">            InetAddress ep = entry.getKey();</span>
+<span class="pc bpc" id="L1196" title="3 of 4 branches missed.">            if ( ep.equals(FBUtilities.getBroadcastAddress()) &amp;&amp; !isInShadowRound())</span>
+<span class="nc" id="L1197">                continue;</span>
+<span class="pc bpc" id="L1198" title="1 of 2 branches missed.">            if (justRemovedEndpoints.containsKey(ep))</span>
+            {
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1201">                    logger.trace(&quot;Ignoring gossip for {} because it is quarantined&quot;, ep);</span>
+                continue;
+            }
+
+<span class="fc" id="L1205">            EndpointState localEpStatePtr = endpointStateMap.get(ep);</span>
+<span class="fc" id="L1206">            EndpointState remoteState = entry.getValue();</span>
+
+            /*
+                If state does not exist just add it. If it does then add it if the remote generation is greater.
+                If there is a generation tie, attempt to break it by heartbeat version.
+            */
+<span class="fc bfc" id="L1212" title="All 2 branches covered.">            if (localEpStatePtr != null)</span>
+            {
+<span class="fc" id="L1214">                int localGeneration = localEpStatePtr.getHeartBeatState().getGeneration();</span>
+<span class="fc" id="L1215">                int remoteGeneration = remoteState.getHeartBeatState().getGeneration();</span>
+<span class="fc" id="L1216">                long localTime = System.currentTimeMillis()/1000;</span>
+<span class="pc bpc" id="L1217" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1218">                    logger.trace(&quot;{} local generation {}, remote generation {}&quot;, ep, localGeneration, remoteGeneration);</span>
+
+                // We measure generation drift against local time, based on the fact that generation is initialized by time
+<span class="pc bpc" id="L1221" title="1 of 2 branches missed.">                if (remoteGeneration &gt; localTime + MAX_GENERATION_DIFFERENCE)</span>
+                {
+                    // assume some peer has corrupted memory and is broadcasting an unbelievable generation about another peer (or itself)
+<span class="nc" id="L1224">                    logger.warn(&quot;received an invalid gossip generation for peer {}; local time = {}, received generation = {}&quot;, ep, localTime, remoteGeneration);</span>
+                }
+<span class="pc bpc" id="L1226" title="1 of 2 branches missed.">                else if (remoteGeneration &gt; localGeneration)</span>
+                {
+<span class="nc bnc" id="L1228" title="All 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1229">                        logger.trace(&quot;Updating heartbeat state generation to {} from {} for {}&quot;, remoteGeneration, localGeneration, ep);</span>
+                    // major state change will handle the update by inserting the remote state directly
+<span class="nc" id="L1231">                    handleMajorStateChange(ep, remoteState);</span>
+                }
+<span class="pc bpc" id="L1233" title="1 of 2 branches missed.">                else if (remoteGeneration == localGeneration) // generation has not changed, apply new states</span>
+                {
+                    /* find maximum state */
+<span class="fc" id="L1236">                    int localMaxVersion = getMaxEndpointStateVersion(localEpStatePtr);</span>
+<span class="fc" id="L1237">                    int remoteMaxVersion = getMaxEndpointStateVersion(remoteState);</span>
+<span class="pc bpc" id="L1238" title="1 of 2 branches missed.">                    if (remoteMaxVersion &gt; localMaxVersion)</span>
+                    {
+                        // apply states, but do not notify since there is no major change
+<span class="fc" id="L1241">                        applyNewStates(ep, localEpStatePtr, remoteState);</span>
+                    }
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                    else if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1244">                            logger.trace(&quot;Ignoring remote version {} &lt;= {} for {}&quot;, remoteMaxVersion, localMaxVersion, ep);</span>
+
+<span class="pc bpc" id="L1246" title="3 of 4 branches missed.">                    if (!localEpStatePtr.isAlive() &amp;&amp; !isDeadState(localEpStatePtr)) // unless of course, it was dead</span>
+<span class="nc" id="L1247">                        markAlive(ep, localEpStatePtr);</span>
+<span class="fc" id="L1248">                }</span>
+                else
+                {
+<span class="nc bnc" id="L1251" title="All 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1252">                        logger.trace(&quot;Ignoring remote generation {} &lt; {}&quot;, remoteGeneration, localGeneration);</span>
+                }
+<span class="fc" id="L1254">            }</span>
+            else
+            {
+                // this is a new node, report it to the FD in case it is the first time we are seeing it AND it's not alive
+<span class="fc" id="L1258">                FailureDetector.instance.report(ep);</span>
+<span class="fc" id="L1259">                handleMajorStateChange(ep, remoteState);</span>
+            }
+<span class="fc" id="L1261">        }</span>
+
+<span class="fc" id="L1263">        boolean any30 = anyEndpointOn30();</span>
+<span class="pc bpc" id="L1264" title="1 of 2 branches missed.">        if (any30 != anyNodeOn30)</span>
+        {
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">            logger.info(any30</span>
+                        ? &quot;There is at least one 3.0 node in the cluster - will store and announce compatible schema version&quot;
+                        : &quot;There are no 3.0 nodes in the cluster - will store and announce real schema version&quot;);
+
+<span class="nc" id="L1270">            anyNodeOn30 = any30;</span>
+<span class="nc" id="L1271">            executor.submit(Schema.instance::updateVersionAndAnnounce);</span>
+        }
+<span class="fc" id="L1273">    }</span>
+
+    private boolean anyEndpointOn30()
+    {
+<span class="fc" id="L1277">        return endpointStateMap.values()</span>
+<span class="fc" id="L1278">                               .stream()</span>
+<span class="fc" id="L1279">                               .map(EndpointState::getReleaseVersion)</span>
+<span class="fc" id="L1280">                               .filter(Objects::nonNull)</span>
+<span class="fc" id="L1281">                               .anyMatch(CassandraVersion::is30);</span>
+    }
+
+    private void applyNewStates(InetAddress addr, EndpointState localState, EndpointState remoteState)
+    {
+        // don't assert here, since if the node restarts the version will go back to zero
+<span class="fc" id="L1287">        int oldVersion = localState.getHeartBeatState().getHeartBeatVersion();</span>
+
+<span class="fc" id="L1289">        localState.setHeartBeatState(remoteState.getHeartBeatState());</span>
+<span class="pc bpc" id="L1290" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1291">            logger.trace(&quot;Updating heartbeat state version to {} from {} for {} ...&quot;, localState.getHeartBeatState().getHeartBeatVersion(), oldVersion, addr);</span>
+
+<span class="fc" id="L1293">        Set&lt;Entry&lt;ApplicationState, VersionedValue&gt;&gt; remoteStates = remoteState.states();</span>
+<span class="pc bpc" id="L1294" title="2 of 4 branches missed.">        assert remoteState.getHeartBeatState().getGeneration() == localState.getHeartBeatState().getGeneration();</span>
+
+        // filter out the states that are already up to date (has the same or higher version)
+<span class="fc" id="L1297">        Set&lt;Entry&lt;ApplicationState, VersionedValue&gt;&gt; updatedStates = remoteStates.stream().filter(entry -&gt; {</span>
+<span class="fc" id="L1298">            VersionedValue local = localState.getApplicationState(entry.getKey());</span>
+<span class="pc bpc" id="L1299" title="3 of 4 branches missed.">            return (local == null || local.version &lt; entry.getValue().version);</span>
+<span class="fc" id="L1300">            }).collect(Collectors.toSet());</span>
+
+<span class="pc bpc" id="L1302" title="3 of 4 branches missed.">        if (logger.isTraceEnabled() &amp;&amp; updatedStates.size() &gt; 0)</span>
+        {
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">            for (Entry&lt;ApplicationState, VersionedValue&gt; entry : updatedStates)</span>
+            {
+<span class="nc" id="L1306">                logger.trace(&quot;Updating {} state version to {} for {}&quot;, entry.getKey().toString(), entry.getValue().version, addr);</span>
+<span class="nc" id="L1307">            }</span>
+        }
+<span class="fc" id="L1309">        localState.addApplicationStates(updatedStates);</span>
+
+<span class="fc bfc" id="L1311" title="All 2 branches covered.">        for (Entry&lt;ApplicationState, VersionedValue&gt; updatedEntry : updatedStates)</span>
+<span class="fc" id="L1312">            doOnChangeNotifications(addr, updatedEntry.getKey(), updatedEntry.getValue());</span>
+<span class="fc" id="L1313">    }</span>
+
+    // notify that a local application state is going to change (doesn't get triggered for remote changes)
+    private void doBeforeChangeNotifications(InetAddress addr, EndpointState epState, ApplicationState apState, VersionedValue newValue)
+    {
+<span class="fc bfc" id="L1318" title="All 2 branches covered.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+        {
+<span class="fc" id="L1320">            subscriber.beforeChange(addr, epState, apState, newValue);</span>
+<span class="fc" id="L1321">        }</span>
+<span class="fc" id="L1322">    }</span>
+
+    // notify that an application state has changed
+    private void doOnChangeNotifications(InetAddress addr, ApplicationState state, VersionedValue value)
+    {
+<span class="fc bfc" id="L1327" title="All 2 branches covered.">        for (IEndpointStateChangeSubscriber subscriber : subscribers)</span>
+        {
+<span class="fc" id="L1329">            subscriber.onChange(addr, state, value);</span>
+<span class="fc" id="L1330">        }</span>
+<span class="fc" id="L1331">    }</span>
+
+    /* Request all the state for the endpoint in the gDigest */
+    private void requestAll(GossipDigest gDigest, List&lt;GossipDigest&gt; deltaGossipDigestList, int remoteGeneration)
+    {
+        /* We are here since we have no data for this endpoint locally so request everthing. */
+<span class="fc" id="L1337">        deltaGossipDigestList.add(new GossipDigest(gDigest.getEndpoint(), remoteGeneration, 0));</span>
+<span class="pc bpc" id="L1338" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1339">            logger.trace(&quot;requestAll for {}&quot;, gDigest.getEndpoint());</span>
+<span class="fc" id="L1340">    }</span>
+
+    /* Send all the data with version greater than maxRemoteVersion */
+    private void sendAll(GossipDigest gDigest, Map&lt;InetAddress, EndpointState&gt; deltaEpStateMap, int maxRemoteVersion)
+    {
+<span class="fc" id="L1345">        EndpointState localEpStatePtr = getStateForVersionBiggerThan(gDigest.getEndpoint(), maxRemoteVersion);</span>
+<span class="pc bpc" id="L1346" title="1 of 2 branches missed.">        if (localEpStatePtr != null)</span>
+<span class="fc" id="L1347">            deltaEpStateMap.put(gDigest.getEndpoint(), localEpStatePtr);</span>
+<span class="fc" id="L1348">    }</span>
+
+    /*
+        This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+        and the delta state are built up.
+    */
+    void examineGossiper(List&lt;GossipDigest&gt; gDigestList, List&lt;GossipDigest&gt; deltaGossipDigestList, Map&lt;InetAddress, EndpointState&gt; deltaEpStateMap)
+    {
+<span class="fc bfc" id="L1356" title="All 2 branches covered.">        if (gDigestList.size() == 0)</span>
+        {
+           /* we've been sent a *completely* empty syn, which should normally never happen since an endpoint will at least send a syn with itself.
+              If this is happening then the node is attempting shadow gossip, and we should reply with everything we know.
+            */
+<span class="fc" id="L1361">            logger.debug(&quot;Shadow request received, adding all states&quot;);</span>
+<span class="fc bfc" id="L1362" title="All 2 branches covered.">            for (Map.Entry&lt;InetAddress, EndpointState&gt; entry : endpointStateMap.entrySet())</span>
+            {
+<span class="fc" id="L1364">                gDigestList.add(new GossipDigest(entry.getKey(), 0, 0));</span>
+<span class="fc" id="L1365">            }</span>
+        }
+<span class="fc bfc" id="L1367" title="All 2 branches covered.">        for ( GossipDigest gDigest : gDigestList )</span>
+        {
+<span class="fc" id="L1369">            int remoteGeneration = gDigest.getGeneration();</span>
+<span class="fc" id="L1370">            int maxRemoteVersion = gDigest.getMaxVersion();</span>
+            /* Get state associated with the end point in digest */
+<span class="fc" id="L1372">            EndpointState epStatePtr = endpointStateMap.get(gDigest.getEndpoint());</span>
+            /*
+                Here we need to fire a GossipDigestAckMessage. If we have some data associated with this endpoint locally
+                then we follow the &quot;if&quot; path of the logic. If we have absolutely nothing for this endpoint we need to
+                request all the data for this endpoint.
+            */
+<span class="fc bfc" id="L1378" title="All 2 branches covered.">            if (epStatePtr != null)</span>
+            {
+<span class="fc" id="L1380">                int localGeneration = epStatePtr.getHeartBeatState().getGeneration();</span>
+                /* get the max version of all keys in the state associated with this endpoint */
+<span class="fc" id="L1382">                int maxLocalVersion = getMaxEndpointStateVersion(epStatePtr);</span>
+<span class="fc bfc" id="L1383" title="All 4 branches covered.">                if (remoteGeneration == localGeneration &amp;&amp; maxRemoteVersion == maxLocalVersion)</span>
+<span class="fc" id="L1384">                    continue;</span>
+
+<span class="pc bpc" id="L1386" title="1 of 2 branches missed.">                if (remoteGeneration &gt; localGeneration)</span>
+                {
+                    /* we request everything from the gossiper */
+<span class="nc" id="L1389">                    requestAll(gDigest, deltaGossipDigestList, remoteGeneration);</span>
+                }
+<span class="fc bfc" id="L1391" title="All 2 branches covered.">                else if (remoteGeneration &lt; localGeneration)</span>
+                {
+                    /* send all data with generation = localgeneration and version &gt; 0 */
+<span class="fc" id="L1394">                    sendAll(gDigest, deltaEpStateMap, 0);</span>
+                }
+<span class="pc bpc" id="L1396" title="1 of 2 branches missed.">                else if (remoteGeneration == localGeneration)</span>
+                {
+                    /*
+                        If the max remote version is greater then we request the remote endpoint send us all the data
+                        for this endpoint with version greater than the max version number we have locally for this
+                        endpoint.
+                        If the max remote version is lesser, then we send all the data we have locally for this endpoint
+                        with version greater than the max remote version.
+                    */
+<span class="fc bfc" id="L1405" title="All 2 branches covered.">                    if (maxRemoteVersion &gt; maxLocalVersion)</span>
+                    {
+<span class="fc" id="L1407">                        deltaGossipDigestList.add(new GossipDigest(gDigest.getEndpoint(), remoteGeneration, maxLocalVersion));</span>
+                    }
+<span class="pc bpc" id="L1409" title="1 of 2 branches missed.">                    else if (maxRemoteVersion &lt; maxLocalVersion)</span>
+                    {
+                        /* send all data with generation = localgeneration and version &gt; maxRemoteVersion */
+<span class="fc" id="L1412">                        sendAll(gDigest, deltaEpStateMap, maxRemoteVersion);</span>
+                    }
+                }
+<span class="fc" id="L1415">            }</span>
+            else
+            {
+                /* We are here since we have no data for this endpoint locally so request everything. */
+<span class="fc" id="L1419">                requestAll(gDigest, deltaGossipDigestList, remoteGeneration);</span>
+            }
+<span class="fc" id="L1421">        }</span>
+<span class="fc" id="L1422">    }</span>
+
+    public void start(int generationNumber)
+    {
+<span class="nc" id="L1426">        start(generationNumber, new EnumMap&lt;ApplicationState, VersionedValue&gt;(ApplicationState.class));</span>
+<span class="nc" id="L1427">    }</span>
+
+    /**
+     * Start the gossiper with the generation number, preloading the map of application states before starting
+     */
+    public void start(int generationNbr, Map&lt;ApplicationState, VersionedValue&gt; preloadLocalStates)
+    {
+<span class="fc" id="L1434">        buildSeedsList();</span>
+        /* initialize the heartbeat state for this localEndpoint */
+<span class="fc" id="L1436">        maybeInitializeLocalState(generationNbr);</span>
+<span class="fc" id="L1437">        EndpointState localState = endpointStateMap.get(FBUtilities.getBroadcastAddress());</span>
+<span class="fc" id="L1438">        localState.addApplicationStates(preloadLocalStates);</span>
+
+        //notify snitches that Gossiper is about to start
+<span class="fc" id="L1441">        DatabaseDescriptor.getEndpointSnitch().gossiperStarting();</span>
+<span class="pc bpc" id="L1442" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1443">            logger.trace(&quot;gossip started with generation {}&quot;, localState.getHeartBeatState().getGeneration());</span>
+
+<span class="fc" id="L1445">        scheduledGossipTask = executor.scheduleWithFixedDelay(new GossipTask(),</span>
+                                                              Gossiper.intervalInMillis,
+                                                              Gossiper.intervalInMillis,
+                                                              TimeUnit.MILLISECONDS);
+<span class="fc" id="L1449">    }</span>
+
+    public synchronized Map&lt;InetAddress, EndpointState&gt; doShadowRound()
+    {
+<span class="nc" id="L1453">        return doShadowRound(Collections.EMPTY_SET);</span>
+    }
+
+    /**
+     * Do a single 'shadow' round of gossip by retrieving endpoint states that will be stored exclusively in the
+     * map return value, instead of endpointStateMap.
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;when replacing a node, to get and assume its tokens&lt;/li&gt;
+     *     &lt;li&gt;when joining, to check that the local host id matches any previous id for the endpoint address&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * Method is synchronized, as we use an in-progress flag to indicate that shadow round must be cleared
+     * again by calling {@link Gossiper#maybeFinishShadowRound(InetAddress, boolean, Map)}. This will update
+     * {@link Gossiper#endpointShadowStateMap} with received values, in order to return an immutable copy to the
+     * caller of {@link Gossiper#doShadowRound()}. Therefor only a single shadow round execution is permitted at
+     * the same time.
+     *
+     * @param peers Additional peers to try gossiping with.
+     * @return endpoint states gathered during shadow round or empty map
+     */
+    public synchronized Map&lt;InetAddress, EndpointState&gt; doShadowRound(Set&lt;InetAddress&gt; peers)
+    {
+<span class="fc" id="L1476">        buildSeedsList();</span>
+        // it may be that the local address is the only entry in the seed + peers
+        // list in which case, attempting a shadow round is pointless
+<span class="pc bpc" id="L1479" title="1 of 4 branches missed.">        if (seeds.isEmpty() &amp;&amp; peers.isEmpty())</span>
+<span class="fc" id="L1480">            return endpointShadowStateMap;</span>
+
+<span class="fc" id="L1482">        boolean isSeed = DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress());</span>
+        // We double RING_DELAY if we're not a seed to increase chance of successful startup during a full cluster bounce,
+        // giving the seeds a chance to startup before we fail the shadow round
+<span class="pc bpc" id="L1485" title="1 of 2 branches missed.">        int shadowRoundDelay =  isSeed ? StorageService.RING_DELAY : StorageService.RING_DELAY * 2;</span>
+<span class="fc" id="L1486">        seedsInShadowRound.clear();</span>
+<span class="fc" id="L1487">        endpointShadowStateMap.clear();</span>
+        // send a completely empty syn
+<span class="fc" id="L1489">        List&lt;GossipDigest&gt; gDigests = new ArrayList&lt;GossipDigest&gt;();</span>
+<span class="fc" id="L1490">        GossipDigestSyn digestSynMessage = new GossipDigestSyn(DatabaseDescriptor.getClusterName(),</span>
+<span class="fc" id="L1491">                DatabaseDescriptor.getPartitionerName(),</span>
+                gDigests);
+<span class="fc" id="L1493">        MessageOut&lt;GossipDigestSyn&gt; message = new MessageOut&lt;GossipDigestSyn&gt;(MessagingService.Verb.GOSSIP_DIGEST_SYN,</span>
+                digestSynMessage,
+                GossipDigestSyn.serializer);
+
+<span class="fc" id="L1497">        inShadowRound = true;</span>
+<span class="fc" id="L1498">        boolean includePeers = false;</span>
+<span class="fc" id="L1499">        int slept = 0;</span>
+        try
+        {
+            while (true)
+            {
+<span class="pc bpc" id="L1504" title="1 of 2 branches missed.">                if (slept % 5000 == 0)</span>
+                { // CASSANDRA-8072, retry at the beginning and every 5 seconds
+<span class="fc" id="L1506">                    logger.trace(&quot;Sending shadow round GOSSIP DIGEST SYN to seeds {}&quot;, seeds);</span>
+
+<span class="fc bfc" id="L1508" title="All 2 branches covered.">                    for (InetAddress seed : seeds)</span>
+<span class="fc" id="L1509">                        MessagingService.instance().sendOneWay(message, seed);</span>
+
+                    // Send to any peers we already know about, but only if a seed didn't respond.
+<span class="pc bpc" id="L1512" title="1 of 2 branches missed.">                    if (includePeers)</span>
+                    {
+<span class="nc" id="L1514">                        logger.trace(&quot;Sending shadow round GOSSIP DIGEST SYN to known peers {}&quot;, peers);</span>
+<span class="nc bnc" id="L1515" title="All 2 branches missed.">                        for (InetAddress peer : peers)</span>
+<span class="nc" id="L1516">                            MessagingService.instance().sendOneWay(message, peer);</span>
+                    }
+<span class="fc" id="L1518">                    includePeers = true;</span>
+                }
+
+<span class="fc" id="L1521">                Thread.sleep(1000);</span>
+<span class="pc bpc" id="L1522" title="1 of 2 branches missed.">                if (!inShadowRound)</span>
+<span class="fc" id="L1523">                    break;</span>
+
+<span class="nc" id="L1525">                slept += 1000;</span>
+<span class="nc bnc" id="L1526" title="All 2 branches missed.">                if (slept &gt; shadowRoundDelay)</span>
+                {
+                    // if we got here no peers could be gossiped to. If we're a seed that's OK, but otherwise we stop. See CASSANDRA-13851
+<span class="nc bnc" id="L1529" title="All 2 branches missed.">                    if (!isSeed)</span>
+<span class="nc" id="L1530">                        throw new RuntimeException(&quot;Unable to gossip with any peers&quot;);</span>
+
+<span class="nc" id="L1532">                    inShadowRound = false;</span>
+<span class="nc" id="L1533">                    break;</span>
+                }
+            }
+        }
+<span class="nc" id="L1537">        catch (InterruptedException wtf)</span>
+        {
+<span class="nc" id="L1539">            throw new RuntimeException(wtf);</span>
+<span class="fc" id="L1540">        }</span>
+
+<span class="fc" id="L1542">        return ImmutableMap.copyOf(endpointShadowStateMap);</span>
+    }
+
+    @VisibleForTesting
+    void buildSeedsList()
+    {
+<span class="fc bfc" id="L1548" title="All 2 branches covered.">        for (InetAddress seed : DatabaseDescriptor.getSeeds())</span>
+        {
+<span class="fc bfc" id="L1550" title="All 2 branches covered.">            if (seed.equals(FBUtilities.getBroadcastAddress()))</span>
+<span class="fc" id="L1551">                continue;</span>
+<span class="fc" id="L1552">            seeds.add(seed);</span>
+<span class="fc" id="L1553">        }</span>
+<span class="fc" id="L1554">    }</span>
+
+    // initialize local HB state if needed, i.e., if gossiper has never been started before.
+    public void maybeInitializeLocalState(int generationNbr)
+    {
+<span class="fc" id="L1559">        HeartBeatState hbState = new HeartBeatState(generationNbr);</span>
+<span class="fc" id="L1560">        EndpointState localState = new EndpointState(hbState);</span>
+<span class="fc" id="L1561">        localState.markAlive();</span>
+<span class="fc" id="L1562">        endpointStateMap.putIfAbsent(FBUtilities.getBroadcastAddress(), localState);</span>
+<span class="fc" id="L1563">    }</span>
+
+    public void forceNewerGeneration()
+    {
+<span class="nc" id="L1567">        EndpointState epstate = endpointStateMap.get(FBUtilities.getBroadcastAddress());</span>
+<span class="nc" id="L1568">        epstate.getHeartBeatState().forceNewerGenerationUnsafe();</span>
+<span class="nc" id="L1569">    }</span>
+
+
+    /**
+     * Add an endpoint we knew about previously, but whose state is unknown
+     */
+    public void addSavedEndpoint(InetAddress ep)
+    {
+<span class="nc" id="L1577">        checkProperThreadForStateMutation();</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">        if (ep.equals(FBUtilities.getBroadcastAddress()))</span>
+        {
+<span class="nc" id="L1580">            logger.debug(&quot;Attempt to add self as saved endpoint&quot;);</span>
+<span class="nc" id="L1581">            return;</span>
+        }
+
+        //preserve any previously known, in-memory data about the endpoint (such as DC, RACK, and so on)
+<span class="nc" id="L1585">        EndpointState epState = endpointStateMap.get(ep);</span>
+<span class="nc bnc" id="L1586" title="All 2 branches missed.">        if (epState != null)</span>
+        {
+<span class="nc" id="L1588">            logger.debug(&quot;not replacing a previous epState for {}, but reusing it: {}&quot;, ep, epState);</span>
+<span class="nc" id="L1589">            epState.setHeartBeatState(new HeartBeatState(0));</span>
+        }
+        else
+        {
+<span class="nc" id="L1593">            epState = new EndpointState(new HeartBeatState(0));</span>
+        }
+
+<span class="nc" id="L1596">        epState.markDead();</span>
+<span class="nc" id="L1597">        endpointStateMap.put(ep, epState);</span>
+<span class="nc" id="L1598">        unreachableEndpoints.put(ep, System.nanoTime());</span>
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1600">            logger.trace(&quot;Adding saved endpoint {} {}&quot;, ep, epState.getHeartBeatState().getGeneration());</span>
+<span class="nc" id="L1601">    }</span>
+
+    private void addLocalApplicationStateInternal(ApplicationState state, VersionedValue value)
+    {
+<span class="pc bpc" id="L1605" title="2 of 4 branches missed.">        assert taskLock.isHeldByCurrentThread();</span>
+<span class="fc" id="L1606">        EndpointState epState = endpointStateMap.get(FBUtilities.getBroadcastAddress());</span>
+<span class="fc" id="L1607">        InetAddress epAddr = FBUtilities.getBroadcastAddress();</span>
+<span class="pc bpc" id="L1608" title="2 of 4 branches missed.">        assert epState != null;</span>
+        // Fire &quot;before change&quot; notifications:
+<span class="fc" id="L1610">        doBeforeChangeNotifications(epAddr, epState, state, value);</span>
+        // Notifications may have taken some time, so preventively raise the version
+        // of the new value, otherwise it could be ignored by the remote node
+        // if another value with a newer version was received in the meantime:
+<span class="fc" id="L1614">        value = StorageService.instance.valueFactory.cloneWithHigherVersion(value);</span>
+        // Add to local application state and fire &quot;on change&quot; notifications:
+<span class="fc" id="L1616">        epState.addApplicationState(state, value);</span>
+<span class="fc" id="L1617">        doOnChangeNotifications(epAddr, state, value);</span>
+<span class="fc" id="L1618">    }</span>
+
+    public void addLocalApplicationState(ApplicationState applicationState, VersionedValue value)
+    {
+<span class="fc" id="L1622">        addLocalApplicationStates(Arrays.asList(Pair.create(applicationState, value)));</span>
+<span class="fc" id="L1623">    }</span>
+
+    public void addLocalApplicationStates(List&lt;Pair&lt;ApplicationState, VersionedValue&gt;&gt; states)
+    {
+<span class="fc" id="L1627">        taskLock.lock();</span>
+        try
+        {
+<span class="fc bfc" id="L1630" title="All 2 branches covered.">            for (Pair&lt;ApplicationState, VersionedValue&gt; pair : states)</span>
+            {
+<span class="fc" id="L1632">               addLocalApplicationStateInternal(pair.left, pair.right);</span>
+<span class="fc" id="L1633">            }</span>
+        }
+        finally
+        {
+<span class="fc" id="L1637">            taskLock.unlock();</span>
+        }
+
+<span class="fc" id="L1640">    }</span>
+
+    public void stop()
+    {
+<span class="fc" id="L1644">        EndpointState mystate = endpointStateMap.get(FBUtilities.getBroadcastAddress());</span>
+<span class="pc bpc" id="L1645" title="3 of 6 branches missed.">        if (mystate != null &amp;&amp; !isSilentShutdownState(mystate) &amp;&amp; StorageService.instance.isJoined())</span>
+        {
+<span class="fc" id="L1647">            logger.info(&quot;Announcing shutdown&quot;);</span>
+<span class="fc" id="L1648">            addLocalApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.shutdown(true));</span>
+<span class="fc" id="L1649">            MessageOut message = new MessageOut(MessagingService.Verb.GOSSIP_SHUTDOWN);</span>
+<span class="pc bpc" id="L1650" title="1 of 2 branches missed.">            for (InetAddress ep : liveEndpoints)</span>
+<span class="fc" id="L1651">                MessagingService.instance().sendOneWay(message, ep);</span>
+<span class="nc" id="L1652">            Uninterruptibles.sleepUninterruptibly(Integer.getInteger(&quot;cassandra.shutdown_announce_in_ms&quot;, 2000), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1653">        }</span>
+        else
+<span class="nc" id="L1655">            logger.warn(&quot;No local state, state is in silent shutdown, or node hasn't joined, not announcing shutdown&quot;);</span>
+<span class="nc bnc" id="L1656" title="All 2 branches missed.">        if (scheduledGossipTask != null)</span>
+<span class="nc" id="L1657">            scheduledGossipTask.cancel(false);</span>
+<span class="nc" id="L1658">    }</span>
+
+    public boolean isEnabled()
+    {
+<span class="pc bpc" id="L1662" title="1 of 4 branches missed.">        return (scheduledGossipTask != null) &amp;&amp; (!scheduledGossipTask.isCancelled());</span>
+    }
+
+    public boolean isAnyNodeOn30()
+    {
+<span class="fc" id="L1667">        return anyNodeOn30;</span>
+    }
+
+    protected void maybeFinishShadowRound(InetAddress respondent, boolean isInShadowRound, Map&lt;InetAddress, EndpointState&gt; epStateMap)
+    {
+<span class="pc bpc" id="L1672" title="1 of 2 branches missed.">        if (inShadowRound)</span>
+        {
+<span class="pc bpc" id="L1674" title="1 of 2 branches missed.">            if (!isInShadowRound)</span>
+            {
+<span class="pc bpc" id="L1676" title="1 of 2 branches missed.">                if (!seeds.contains(respondent))</span>
+<span class="nc" id="L1677">                    logger.warn(&quot;Received an ack from {}, who isn't a seed. Ensure your seed list includes a live node. Exiting shadow round&quot;,</span>
+                                respondent);
+<span class="fc" id="L1679">                logger.debug(&quot;Received a regular ack from {}, can now exit shadow round&quot;, respondent);</span>
+                // respondent sent back a full ack, so we can exit our shadow round
+<span class="fc" id="L1681">                endpointShadowStateMap.putAll(epStateMap);</span>
+<span class="fc" id="L1682">                inShadowRound = false;</span>
+<span class="fc" id="L1683">                seedsInShadowRound.clear();</span>
+            }
+            else
+            {
+                // respondent indicates it too is in a shadow round, if all seeds
+                // are in this state then we can exit our shadow round. Otherwise,
+                // we keep retrying the SR until one responds with a full ACK or
+                // we learn that all seeds are in SR.
+<span class="nc" id="L1691">                logger.debug(&quot;Received an ack from {} indicating it is also in shadow round&quot;, respondent);</span>
+<span class="nc" id="L1692">                seedsInShadowRound.add(respondent);</span>
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">                if (seedsInShadowRound.containsAll(seeds))</span>
+                {
+<span class="nc" id="L1695">                    logger.debug(&quot;All seeds are in a shadow round, clearing this node to exit its own&quot;);</span>
+<span class="nc" id="L1696">                    inShadowRound = false;</span>
+<span class="nc" id="L1697">                    seedsInShadowRound.clear();</span>
+                }
+            }
+        }
+<span class="fc" id="L1701">    }</span>
+
+    protected boolean isInShadowRound()
+    {
+<span class="fc" id="L1705">        return inShadowRound;</span>
+    }
+
+    @VisibleForTesting
+    public void initializeNodeUnsafe(InetAddress addr, UUID uuid, int generationNbr)
+    {
+<span class="nc" id="L1711">        HeartBeatState hbState = new HeartBeatState(generationNbr);</span>
+<span class="nc" id="L1712">        EndpointState newState = new EndpointState(hbState);</span>
+<span class="nc" id="L1713">        newState.markAlive();</span>
+<span class="nc" id="L1714">        EndpointState oldState = endpointStateMap.putIfAbsent(addr, newState);</span>
+<span class="nc bnc" id="L1715" title="All 2 branches missed.">        EndpointState localState = oldState == null ? newState : oldState;</span>
+
+        // always add the version state
+<span class="nc" id="L1718">        Map&lt;ApplicationState, VersionedValue&gt; states = new EnumMap&lt;&gt;(ApplicationState.class);</span>
+<span class="nc" id="L1719">        states.put(ApplicationState.NET_VERSION, StorageService.instance.valueFactory.networkVersion());</span>
+<span class="nc" id="L1720">        states.put(ApplicationState.HOST_ID, StorageService.instance.valueFactory.hostId(uuid));</span>
+<span class="nc" id="L1721">        localState.addApplicationStates(states);</span>
+<span class="nc" id="L1722">    }</span>
+
+    @VisibleForTesting
+    public void injectApplicationState(InetAddress endpoint, ApplicationState state, VersionedValue value)
+    {
+<span class="nc" id="L1727">        EndpointState localState = endpointStateMap.get(endpoint);</span>
+<span class="nc" id="L1728">        localState.addApplicationState(state, value);</span>
+<span class="nc" id="L1729">    }</span>
+
+    public long getEndpointDowntime(String address) throws UnknownHostException
+    {
+<span class="nc" id="L1733">        return getEndpointDowntime(InetAddress.getByName(address));</span>
+    }
+
+    public int getCurrentGenerationNumber(String address) throws UnknownHostException
+    {
+<span class="nc" id="L1738">        return getCurrentGenerationNumber(InetAddress.getByName(address));</span>
+    }
+
+    public void addExpireTimeForEndpoint(InetAddress endpoint, long expireTime)
+    {
+<span class="nc bnc" id="L1743" title="All 2 branches missed.">        if (logger.isDebugEnabled())</span>
+        {
+<span class="nc" id="L1745">            logger.debug(&quot;adding expire time for endpoint : {} ({})&quot;, endpoint, expireTime);</span>
+        }
+<span class="nc" id="L1747">        expireTimeEndpointMap.put(endpoint, expireTime);</span>
+<span class="nc" id="L1748">    }</span>
+
+    public static long computeExpireTime()
+    {
+<span class="fc" id="L1752">        return System.currentTimeMillis() + Gossiper.aVeryLongTime;</span>
+    }
+
+    @Nullable
+    public CassandraVersion getReleaseVersion(InetAddress ep)
+    {
+<span class="nc" id="L1758">        EndpointState state = getEndpointStateForEndpoint(ep);</span>
+<span class="nc bnc" id="L1759" title="All 2 branches missed.">        return state != null ? state.getReleaseVersion() : null;</span>
+    }
+
+    @Nullable
+    public UUID getSchemaVersion(InetAddress ep)
+    {
+<span class="nc" id="L1765">        EndpointState state = getEndpointStateForEndpoint(ep);</span>
+<span class="nc bnc" id="L1766" title="All 2 branches missed.">        return state != null ? state.getSchemaVersion() : null;</span>
+    }
+
+    public static void waitToSettle()
+    {
+<span class="fc" id="L1771">        int forceAfter = Integer.getInteger(&quot;cassandra.skip_wait_for_gossip_to_settle&quot;, -1);</span>
+<span class="pc bpc" id="L1772" title="1 of 2 branches missed.">        if (forceAfter == 0)</span>
+        {
+<span class="nc" id="L1774">            return;</span>
+        }
+<span class="fc" id="L1776">        final int GOSSIP_SETTLE_MIN_WAIT_MS = 5000;</span>
+<span class="fc" id="L1777">        final int GOSSIP_SETTLE_POLL_INTERVAL_MS = 1000;</span>
+<span class="fc" id="L1778">        final int GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED = 3;</span>
+
+<span class="fc" id="L1780">        logger.info(&quot;Waiting for gossip to settle...&quot;);</span>
+<span class="fc" id="L1781">        Uninterruptibles.sleepUninterruptibly(GOSSIP_SETTLE_MIN_WAIT_MS, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L1782">        int totalPolls = 0;</span>
+<span class="fc" id="L1783">        int numOkay = 0;</span>
+<span class="fc" id="L1784">        int epSize = Gossiper.instance.getEndpointStates().size();</span>
+<span class="fc bfc" id="L1785" title="All 2 branches covered.">        while (numOkay &lt; GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED)</span>
+        {
+<span class="fc" id="L1787">            Uninterruptibles.sleepUninterruptibly(GOSSIP_SETTLE_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L1788">            int currentSize = Gossiper.instance.getEndpointStates().size();</span>
+<span class="fc" id="L1789">            totalPolls++;</span>
+<span class="pc bpc" id="L1790" title="1 of 2 branches missed.">            if (currentSize == epSize)</span>
+            {
+<span class="fc" id="L1792">                logger.debug(&quot;Gossip looks settled.&quot;);</span>
+<span class="fc" id="L1793">                numOkay++;</span>
+            }
+            else
+            {
+<span class="nc" id="L1797">                logger.info(&quot;Gossip not settled after {} polls.&quot;, totalPolls);</span>
+<span class="nc" id="L1798">                numOkay = 0;</span>
+            }
+<span class="fc" id="L1800">            epSize = currentSize;</span>
+<span class="pc bpc" id="L1801" title="3 of 4 branches missed.">            if (forceAfter &gt; 0 &amp;&amp; totalPolls &gt; forceAfter)</span>
+            {
+<span class="nc" id="L1803">                logger.warn(&quot;Gossip not settled but startup forced by cassandra.skip_wait_for_gossip_to_settle. Gossip total polls: {}&quot;,</span>
+<span class="nc" id="L1804">                            totalPolls);</span>
+<span class="nc" id="L1805">                break;</span>
+            }
+<span class="fc" id="L1807">        }</span>
+<span class="pc bpc" id="L1808" title="1 of 2 branches missed.">        if (totalPolls &gt; GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED)</span>
+<span class="nc" id="L1809">            logger.info(&quot;Gossip settled after {} extra polls; proceeding&quot;, totalPolls - GOSSIP_SETTLE_POLL_SUCCESSES_REQUIRED);</span>
+        else
+<span class="fc" id="L1811">            logger.info(&quot;No gossip backlog; proceeding&quot;);</span>
+<span class="fc" id="L1812">    }</span>
+
+    @VisibleForTesting
+    public void stopShutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L1817">        stop();</span>
+<span class="nc" id="L1818">        ExecutorUtils.shutdownAndWait(timeout, unit, executor);</span>
+<span class="nc" id="L1819">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

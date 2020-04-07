@@ -1,0 +1,336 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractReplicationStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.locator</a> &gt; <span class="el_source">AbstractReplicationStrategy.java</span></div><h1>AbstractReplicationStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.locator;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.net.InetAddress;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.RingPosition;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.service.AbstractWriteResponseHandler;
+import org.apache.cassandra.service.DatacenterSyncWriteResponseHandler;
+import org.apache.cassandra.service.DatacenterWriteResponseHandler;
+import org.apache.cassandra.service.WriteResponseHandler;
+import org.apache.cassandra.utils.FBUtilities;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+/**
+ * A abstract parent for all replication strategies.
+*/
+<span class="pc bpc" id="L48" title="1 of 2 branches missed.">public abstract class AbstractReplicationStrategy</span>
+{
+<span class="fc" id="L50">    private static final Logger logger = LoggerFactory.getLogger(AbstractReplicationStrategy.class);</span>
+
+    @VisibleForTesting
+    final String keyspaceName;
+    private Keyspace keyspace;
+    public final Map&lt;String, String&gt; configOptions;
+    private final TokenMetadata tokenMetadata;
+
+    // track when the token range changes, signaling we need to invalidate our endpoint cache
+<span class="fc" id="L59">    private volatile long lastInvalidatedVersion = 0;</span>
+
+    public IEndpointSnitch snitch;
+
+    protected AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map&lt;String, String&gt; configOptions)
+<span class="fc" id="L64">    {</span>
+<span class="pc bpc" id="L65" title="2 of 4 branches missed.">        assert keyspaceName != null;</span>
+<span class="pc bpc" id="L66" title="2 of 4 branches missed.">        assert snitch != null;</span>
+<span class="pc bpc" id="L67" title="2 of 4 branches missed.">        assert tokenMetadata != null;</span>
+<span class="fc" id="L68">        this.tokenMetadata = tokenMetadata;</span>
+<span class="fc" id="L69">        this.snitch = snitch;</span>
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">        this.configOptions = configOptions == null ? Collections.&lt;String, String&gt;emptyMap() : configOptions;</span>
+<span class="fc" id="L71">        this.keyspaceName = keyspaceName;</span>
+        // lazy-initialize keyspace itself since we don't create them until after the replication strategies
+<span class="fc" id="L73">    }</span>
+
+<span class="fc" id="L75">    private final Map&lt;Token, ArrayList&lt;InetAddress&gt;&gt; cachedEndpoints = new NonBlockingHashMap&lt;Token, ArrayList&lt;InetAddress&gt;&gt;();</span>
+
+    public ArrayList&lt;InetAddress&gt; getCachedEndpoints(Token t)
+    {
+<span class="fc" id="L79">        long lastVersion = tokenMetadata.getRingVersion();</span>
+
+<span class="fc bfc" id="L81" title="All 2 branches covered.">        if (lastVersion &gt; lastInvalidatedVersion)</span>
+        {
+<span class="fc" id="L83">            synchronized (this)</span>
+            {
+<span class="pc bpc" id="L85" title="1 of 2 branches missed.">                if (lastVersion &gt; lastInvalidatedVersion)</span>
+                {
+<span class="fc" id="L87">                    logger.trace(&quot;clearing cached endpoints&quot;);</span>
+<span class="fc" id="L88">                    cachedEndpoints.clear();</span>
+<span class="fc" id="L89">                    lastInvalidatedVersion = lastVersion;</span>
+                }
+<span class="fc" id="L91">            }</span>
+        }
+
+<span class="fc" id="L94">        return cachedEndpoints.get(t);</span>
+    }
+
+    /**
+     * get the (possibly cached) endpoints that should store the given Token.
+     * Note that while the endpoints are conceptually a Set (no duplicates will be included),
+     * we return a List to avoid an extra allocation when sorting by proximity later
+     * @param searchPosition the position the natural endpoints are requested for
+     * @return a copy of the natural endpoints for the given token
+     */
+    public ArrayList&lt;InetAddress&gt; getNaturalEndpoints(RingPosition searchPosition)
+    {
+<span class="fc" id="L106">        Token searchToken = searchPosition.getToken();</span>
+<span class="fc" id="L107">        Token keyToken = TokenMetadata.firstToken(tokenMetadata.sortedTokens(), searchToken);</span>
+<span class="fc" id="L108">        ArrayList&lt;InetAddress&gt; endpoints = getCachedEndpoints(keyToken);</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        if (endpoints == null)</span>
+        {
+<span class="fc" id="L111">            TokenMetadata tm = tokenMetadata.cachedOnlyTokenMap();</span>
+            // if our cache got invalidated, it's possible there is a new token to account for too
+<span class="fc" id="L113">            keyToken = TokenMetadata.firstToken(tm.sortedTokens(), searchToken);</span>
+<span class="fc" id="L114">            endpoints = new ArrayList&lt;InetAddress&gt;(calculateNaturalEndpoints(searchToken, tm));</span>
+<span class="fc" id="L115">            cachedEndpoints.put(keyToken, endpoints);</span>
+        }
+
+<span class="fc" id="L118">        return new ArrayList&lt;InetAddress&gt;(endpoints);</span>
+    }
+
+    /**
+     * calculate the natural endpoints for the given token
+     *
+     * @see #getNaturalEndpoints(org.apache.cassandra.dht.RingPosition)
+     *
+     * @param searchToken the token the natural endpoints are requested for
+     * @return a copy of the natural endpoints for the given token
+     */
+    public abstract List&lt;InetAddress&gt; calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata);
+
+    public &lt;T&gt; AbstractWriteResponseHandler&lt;T&gt; getWriteResponseHandler(Collection&lt;InetAddress&gt; naturalEndpoints,
+                                                                       Collection&lt;InetAddress&gt; pendingEndpoints,
+                                                                       ConsistencyLevel consistency_level,
+                                                                       Runnable callback,
+                                                                       WriteType writeType,
+                                                                       long queryStartNanoTime)
+    {
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">        if (consistency_level.isDatacenterLocal())</span>
+        {
+            // block for in this context will be localnodes block.
+<span class="nc" id="L141">            return new DatacenterWriteResponseHandler&lt;T&gt;(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);</span>
+        }
+<span class="pc bpc" id="L143" title="3 of 4 branches missed.">        else if (consistency_level == ConsistencyLevel.EACH_QUORUM &amp;&amp; (this instanceof NetworkTopologyStrategy))</span>
+        {
+<span class="nc" id="L145">            return new DatacenterSyncWriteResponseHandler&lt;T&gt;(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);</span>
+        }
+<span class="fc" id="L147">        return new WriteResponseHandler&lt;T&gt;(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType, queryStartNanoTime);</span>
+    }
+
+    private Keyspace getKeyspace()
+    {
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">        if (keyspace == null)</span>
+<span class="fc" id="L153">            keyspace = Keyspace.open(keyspaceName);</span>
+<span class="fc" id="L154">        return keyspace;</span>
+    }
+
+    /**
+     * calculate the RF based on strategy_options. When overwriting, ensure that this get()
+     *  is FAST, as this is called often.
+     *
+     * @return the replication factor
+     */
+    public abstract int getReplicationFactor();
+
+    /*
+     * NOTE: this is pretty inefficient. also the inverse (getRangeAddresses) below.
+     * this is fine as long as we don't use this on any critical path.
+     * (fixing this would probably require merging tokenmetadata into replicationstrategy,
+     * so we could cache/invalidate cleanly.)
+     */
+    public Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; getAddressRanges(TokenMetadata metadata)
+    {
+<span class="fc" id="L173">        Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; map = HashMultimap.create();</span>
+
+<span class="fc bfc" id="L175" title="All 2 branches covered.">        for (Token token : metadata.sortedTokens())</span>
+        {
+<span class="fc" id="L177">            Range&lt;Token&gt; range = metadata.getPrimaryRangeFor(token);</span>
+<span class="fc bfc" id="L178" title="All 2 branches covered.">            for (InetAddress ep : calculateNaturalEndpoints(token, metadata))</span>
+            {
+<span class="fc" id="L180">                map.put(ep, range);</span>
+<span class="fc" id="L181">            }</span>
+<span class="fc" id="L182">        }</span>
+
+<span class="fc" id="L184">        return map;</span>
+    }
+
+    public Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; getRangeAddresses(TokenMetadata metadata)
+    {
+<span class="nc" id="L189">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; map = HashMultimap.create();</span>
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        for (Token token : metadata.sortedTokens())</span>
+        {
+<span class="nc" id="L193">            Range&lt;Token&gt; range = metadata.getPrimaryRangeFor(token);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">            for (InetAddress ep : calculateNaturalEndpoints(token, metadata))</span>
+            {
+<span class="nc" id="L196">                map.put(range, ep);</span>
+<span class="nc" id="L197">            }</span>
+<span class="nc" id="L198">        }</span>
+
+<span class="nc" id="L200">        return map;</span>
+    }
+
+    public Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; getAddressRanges()
+    {
+<span class="nc" id="L205">        return getAddressRanges(tokenMetadata.cloneOnlyTokenMap());</span>
+    }
+
+    public Collection&lt;Range&lt;Token&gt;&gt; getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddress pendingAddress)
+    {
+<span class="nc" id="L210">        return getPendingAddressRanges(metadata, Arrays.asList(pendingToken), pendingAddress);</span>
+    }
+
+    public Collection&lt;Range&lt;Token&gt;&gt; getPendingAddressRanges(TokenMetadata metadata, Collection&lt;Token&gt; pendingTokens, InetAddress pendingAddress)
+    {
+<span class="nc" id="L215">        TokenMetadata temp = metadata.cloneOnlyTokenMap();</span>
+<span class="nc" id="L216">        temp.updateNormalTokens(pendingTokens, pendingAddress);</span>
+<span class="nc" id="L217">        return getAddressRanges(temp).get(pendingAddress);</span>
+    }
+
+    public abstract void validateOptions() throws ConfigurationException;
+
+    /*
+     * The options recognized by the strategy.
+     * The empty collection means that no options are accepted, but null means
+     * that any option is accepted.
+     */
+    public Collection&lt;String&gt; recognizedOptions()
+    {
+        // We default to null for backward compatibility sake
+<span class="nc" id="L230">        return null;</span>
+    }
+
+    private static AbstractReplicationStrategy createInternal(String keyspaceName,
+                                                              Class&lt;? extends AbstractReplicationStrategy&gt; strategyClass,
+                                                              TokenMetadata tokenMetadata,
+                                                              IEndpointSnitch snitch,
+                                                              Map&lt;String, String&gt; strategyOptions)
+        throws ConfigurationException
+    {
+        AbstractReplicationStrategy strategy;
+<span class="fc" id="L241">        Class [] parameterTypes = new Class[] {String.class, TokenMetadata.class, IEndpointSnitch.class, Map.class};</span>
+        try
+        {
+<span class="fc" id="L244">            Constructor&lt;? extends AbstractReplicationStrategy&gt; constructor = strategyClass.getConstructor(parameterTypes);</span>
+<span class="fc" id="L245">            strategy = constructor.newInstance(keyspaceName, tokenMetadata, snitch, strategyOptions);</span>
+        }
+<span class="nc" id="L247">        catch (InvocationTargetException e)</span>
+        {
+<span class="nc" id="L249">            Throwable targetException = e.getTargetException();</span>
+<span class="nc" id="L250">            throw new ConfigurationException(targetException.getMessage(), targetException);</span>
+        }
+<span class="nc" id="L252">        catch (Exception e)</span>
+        {
+<span class="nc" id="L254">            throw new ConfigurationException(&quot;Error constructing replication strategy class&quot;, e);</span>
+<span class="fc" id="L255">        }</span>
+<span class="fc" id="L256">        return strategy;</span>
+    }
+
+    public static AbstractReplicationStrategy createReplicationStrategy(String keyspaceName,
+                                                                        Class&lt;? extends AbstractReplicationStrategy&gt; strategyClass,
+                                                                        TokenMetadata tokenMetadata,
+                                                                        IEndpointSnitch snitch,
+                                                                        Map&lt;String, String&gt; strategyOptions)
+    {
+<span class="fc" id="L265">        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);</span>
+
+        // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
+        try
+        {
+<span class="fc" id="L270">            strategy.validateExpectedOptions();</span>
+        }
+<span class="nc" id="L272">        catch (ConfigurationException e)</span>
+        {
+<span class="nc" id="L274">            logger.warn(&quot;Ignoring {}&quot;, e.getMessage());</span>
+<span class="fc" id="L275">        }</span>
+
+<span class="fc" id="L277">        strategy.validateOptions();</span>
+<span class="fc" id="L278">        return strategy;</span>
+    }
+
+    public static void validateReplicationStrategy(String keyspaceName,
+                                                   Class&lt;? extends AbstractReplicationStrategy&gt; strategyClass,
+                                                   TokenMetadata tokenMetadata,
+                                                   IEndpointSnitch snitch,
+                                                   Map&lt;String, String&gt; strategyOptions) throws ConfigurationException
+    {
+<span class="nc" id="L287">        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);</span>
+<span class="nc" id="L288">        strategy.validateExpectedOptions();</span>
+<span class="nc" id="L289">        strategy.validateOptions();</span>
+<span class="nc" id="L290">    }</span>
+
+    public static Class&lt;AbstractReplicationStrategy&gt; getClass(String cls) throws ConfigurationException
+    {
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">        String className = cls.contains(&quot;.&quot;) ? cls : &quot;org.apache.cassandra.locator.&quot; + cls;</span>
+<span class="fc" id="L295">        Class&lt;AbstractReplicationStrategy&gt; strategyClass = FBUtilities.classForName(className, &quot;replication strategy&quot;);</span>
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">        if (!AbstractReplicationStrategy.class.isAssignableFrom(strategyClass))</span>
+        {
+<span class="nc" id="L298">            throw new ConfigurationException(String.format(&quot;Specified replication strategy class (%s) is not derived from AbstractReplicationStrategy&quot;, className));</span>
+        }
+<span class="fc" id="L300">        return strategyClass;</span>
+    }
+
+    public boolean hasSameSettings(AbstractReplicationStrategy other)
+    {
+<span class="nc bnc" id="L305" title="All 4 branches missed.">        return getClass().equals(other.getClass()) &amp;&amp; getReplicationFactor() == other.getReplicationFactor();</span>
+    }
+
+    protected void validateReplicationFactor(String rf) throws ConfigurationException
+    {
+        try
+        {
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">            if (Integer.parseInt(rf) &lt; 0)</span>
+            {
+<span class="nc" id="L314">                throw new ConfigurationException(&quot;Replication factor must be non-negative; found &quot; + rf);</span>
+            }
+        }
+<span class="nc" id="L317">        catch (NumberFormatException e2)</span>
+        {
+<span class="nc" id="L319">            throw new ConfigurationException(&quot;Replication factor must be numeric; found &quot; + rf);</span>
+<span class="fc" id="L320">        }</span>
+<span class="fc" id="L321">    }</span>
+
+    private void validateExpectedOptions() throws ConfigurationException
+    {
+<span class="fc" id="L325">        Collection expectedOptions = recognizedOptions();</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">        if (expectedOptions == null)</span>
+<span class="nc" id="L327">            return;</span>
+
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        for (String key : configOptions.keySet())</span>
+        {
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">            if (!expectedOptions.contains(key))</span>
+<span class="nc" id="L332">                throw new ConfigurationException(String.format(&quot;Unrecognized strategy option {%s} passed to %s for keyspace %s&quot;, key, getClass().getSimpleName(), keyspaceName));</span>
+<span class="fc" id="L333">        }</span>
+<span class="fc" id="L334">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

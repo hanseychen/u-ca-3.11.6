@@ -1,0 +1,396 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeStreamer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.dht</a> &gt; <span class="el_source">RangeStreamer.java</span></div><h1>RangeStreamer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.dht;
+
+import java.net.InetAddress;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.Sets;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamResultFuture;
+import org.apache.cassandra.utils.FBUtilities;
+
+/**
+ * Assists in streaming ranges to a node.
+ */
+<span class="nc bnc" id="L48" title="All 2 branches missed.">public class RangeStreamer</span>
+{
+<span class="nc" id="L50">    private static final Logger logger = LoggerFactory.getLogger(RangeStreamer.class);</span>
+
+    /* bootstrap tokens. can be null if replacing the node. */
+    private final Collection&lt;Token&gt; tokens;
+    /* current token ring */
+    private final TokenMetadata metadata;
+    /* address of this node */
+    private final InetAddress address;
+    /* streaming description */
+    private final String description;
+<span class="nc" id="L60">    private final Multimap&lt;String, Map.Entry&lt;InetAddress, Collection&lt;Range&lt;Token&gt;&gt;&gt;&gt; toFetch = HashMultimap.create();</span>
+<span class="nc" id="L61">    private final Set&lt;ISourceFilter&gt; sourceFilters = new HashSet&lt;&gt;();</span>
+    private final StreamPlan streamPlan;
+    private final boolean useStrictConsistency;
+    private final IEndpointSnitch snitch;
+    private final StreamStateStore stateStore;
+
+    /**
+     * A filter applied to sources to stream from when constructing a fetch map.
+     */
+    public static interface ISourceFilter
+    {
+        public boolean shouldInclude(InetAddress endpoint);
+    }
+
+    /**
+     * Source filter which excludes any endpoints that are not alive according to a
+     * failure detector.
+     */
+    public static class FailureDetectorSourceFilter implements ISourceFilter
+    {
+        private final IFailureDetector fd;
+
+        public FailureDetectorSourceFilter(IFailureDetector fd)
+<span class="nc" id="L84">        {</span>
+<span class="nc" id="L85">            this.fd = fd;</span>
+<span class="nc" id="L86">        }</span>
+
+        public boolean shouldInclude(InetAddress endpoint)
+        {
+<span class="nc" id="L90">            return fd.isAlive(endpoint);</span>
+        }
+    }
+
+    /**
+     * Source filter which excludes any endpoints that are not in a specific data center.
+     */
+    public static class SingleDatacenterFilter implements ISourceFilter
+    {
+        private final String sourceDc;
+        private final IEndpointSnitch snitch;
+
+        public SingleDatacenterFilter(IEndpointSnitch snitch, String sourceDc)
+<span class="nc" id="L103">        {</span>
+<span class="nc" id="L104">            this.sourceDc = sourceDc;</span>
+<span class="nc" id="L105">            this.snitch = snitch;</span>
+<span class="nc" id="L106">        }</span>
+
+        public boolean shouldInclude(InetAddress endpoint)
+        {
+<span class="nc" id="L110">            return snitch.getDatacenter(endpoint).equals(sourceDc);</span>
+        }
+    }
+
+    /**
+     * Source filter which excludes the current node from source calculations
+     */
+<span class="nc" id="L117">    public static class ExcludeLocalNodeFilter implements ISourceFilter</span>
+    {
+        public boolean shouldInclude(InetAddress endpoint)
+        {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">            return !FBUtilities.getBroadcastAddress().equals(endpoint);</span>
+        }
+    }
+
+    /**
+     * Source filter which only includes endpoints contained within a provided set.
+     */
+    public static class WhitelistedSourcesFilter implements ISourceFilter
+    {
+        private final Set&lt;InetAddress&gt; whitelistedSources;
+
+        public WhitelistedSourcesFilter(Set&lt;InetAddress&gt; whitelistedSources)
+<span class="nc" id="L133">        {</span>
+<span class="nc" id="L134">            this.whitelistedSources = whitelistedSources;</span>
+<span class="nc" id="L135">        }</span>
+
+        public boolean shouldInclude(InetAddress endpoint)
+        {
+<span class="nc" id="L139">            return whitelistedSources.contains(endpoint);</span>
+        }
+    }
+
+    public RangeStreamer(TokenMetadata metadata,
+                         Collection&lt;Token&gt; tokens,
+                         InetAddress address,
+                         String description,
+                         boolean useStrictConsistency,
+                         IEndpointSnitch snitch,
+                         StreamStateStore stateStore,
+                         boolean connectSequentially)
+<span class="nc" id="L151">    {</span>
+<span class="nc" id="L152">        this.metadata = metadata;</span>
+<span class="nc" id="L153">        this.tokens = tokens;</span>
+<span class="nc" id="L154">        this.address = address;</span>
+<span class="nc" id="L155">        this.description = description;</span>
+<span class="nc" id="L156">        this.streamPlan = new StreamPlan(description, true, connectSequentially);</span>
+<span class="nc" id="L157">        this.useStrictConsistency = useStrictConsistency;</span>
+<span class="nc" id="L158">        this.snitch = snitch;</span>
+<span class="nc" id="L159">        this.stateStore = stateStore;</span>
+<span class="nc" id="L160">        streamPlan.listeners(this.stateStore);</span>
+<span class="nc" id="L161">    }</span>
+
+    public void addSourceFilter(ISourceFilter filter)
+    {
+<span class="nc" id="L165">        sourceFilters.add(filter);</span>
+<span class="nc" id="L166">    }</span>
+
+    /**
+     * Add ranges to be streamed for given keyspace.
+     *
+     * @param keyspaceName keyspace name
+     * @param ranges ranges to be streamed
+     */
+    public void addRanges(String keyspaceName, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangesForKeyspace = useStrictSourcesForRanges(keyspaceName)</span>
+<span class="nc" id="L177">                ? getAllRangesWithStrictSourcesFor(keyspaceName, ranges) : getAllRangesWithSourcesFor(keyspaceName, ranges);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">            for (Map.Entry&lt;Range&lt;Token&gt;, InetAddress&gt; entry : rangesForKeyspace.entries())</span>
+<span class="nc" id="L182">                logger.trace(&quot;{}: range {} exists on {}&quot;, description, entry.getKey(), entry.getValue());</span>
+        }
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddress, Collection&lt;Range&lt;Token&gt;&gt;&gt; entry : getRangeFetchMap(rangesForKeyspace, sourceFilters, keyspaceName, useStrictConsistency).asMap().entrySet())</span>
+        {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+            {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">                for (Range&lt;Token&gt; r : entry.getValue())</span>
+<span class="nc" id="L190">                    logger.trace(&quot;{}: range {} from source {} for keyspace {}&quot;, description, r, entry.getKey(), keyspaceName);</span>
+            }
+<span class="nc" id="L192">            toFetch.put(keyspaceName, entry);</span>
+<span class="nc" id="L193">        }</span>
+<span class="nc" id="L194">    }</span>
+
+    /**
+     * @param keyspaceName keyspace name to check
+     * @return true when the node is bootstrapping, useStrictConsistency is true and # of nodes in the cluster is more than # of replica
+     */
+    private boolean useStrictSourcesForRanges(String keyspaceName)
+    {
+<span class="nc" id="L202">        AbstractReplicationStrategy strat = Keyspace.open(keyspaceName).getReplicationStrategy();</span>
+<span class="nc bnc" id="L203" title="All 4 branches missed.">        return useStrictConsistency</span>
+                &amp;&amp; tokens != null
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                &amp;&amp; metadata.getAllEndpoints().size() != strat.getReplicationFactor();</span>
+    }
+
+    /**
+     * Get a map of all ranges and their respective sources that are candidates for streaming the given ranges
+     * to us. For each range, the list of sources is sorted by proximity relative to the given destAddress.
+     *
+     * @throws java.lang.IllegalStateException when there is no source to get data streamed
+     */
+    private Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; getAllRangesWithSourcesFor(String keyspaceName, Collection&lt;Range&lt;Token&gt;&gt; desiredRanges)
+    {
+<span class="nc" id="L216">        AbstractReplicationStrategy strat = Keyspace.open(keyspaceName).getReplicationStrategy();</span>
+<span class="nc" id="L217">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangeAddresses = strat.getRangeAddresses(metadata.cloneOnlyTokenMap());</span>
+
+<span class="nc" id="L219">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangeSources = ArrayListMultimap.create();</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (Range&lt;Token&gt; desiredRange : desiredRanges)</span>
+        {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : rangeAddresses.keySet())</span>
+            {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">                if (range.contains(desiredRange))</span>
+                {
+<span class="nc" id="L226">                    List&lt;InetAddress&gt; preferred = snitch.getSortedListByProximity(address, rangeAddresses.get(range));</span>
+<span class="nc" id="L227">                    rangeSources.putAll(desiredRange, preferred);</span>
+<span class="nc" id="L228">                    break;</span>
+                }
+<span class="nc" id="L230">            }</span>
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            if (!rangeSources.keySet().contains(desiredRange))</span>
+<span class="nc" id="L233">                throw new IllegalStateException(&quot;No sources found for &quot; + desiredRange);</span>
+<span class="nc" id="L234">        }</span>
+
+<span class="nc" id="L236">        return rangeSources;</span>
+    }
+
+    /**
+     * Get a map of all ranges and the source that will be cleaned up once this bootstrapped node is added for the given ranges.
+     * For each range, the list should only contain a single source. This allows us to consistently migrate data without violating
+     * consistency.
+     *
+     * @throws java.lang.IllegalStateException when there is no source to get data streamed, or more than 1 source found.
+     */
+    private Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; getAllRangesWithStrictSourcesFor(String keyspace, Collection&lt;Range&lt;Token&gt;&gt; desiredRanges)
+    {
+<span class="nc bnc" id="L248" title="All 4 branches missed.">        assert tokens != null;</span>
+<span class="nc" id="L249">        AbstractReplicationStrategy strat = Keyspace.open(keyspace).getReplicationStrategy();</span>
+
+        // Active ranges
+<span class="nc" id="L252">        TokenMetadata metadataClone = metadata.cloneOnlyTokenMap();</span>
+<span class="nc" id="L253">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; addressRanges = strat.getRangeAddresses(metadataClone);</span>
+
+        // Pending ranges
+<span class="nc" id="L256">        metadataClone.updateNormalTokens(tokens, address);</span>
+<span class="nc" id="L257">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; pendingRangeAddresses = strat.getRangeAddresses(metadataClone);</span>
+
+        // Collects the source that will have its range moved to the new node
+<span class="nc" id="L260">        Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangeSources = ArrayListMultimap.create();</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        for (Range&lt;Token&gt; desiredRange : desiredRanges)</span>
+        {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            for (Map.Entry&lt;Range&lt;Token&gt;, Collection&lt;InetAddress&gt;&gt; preEntry : addressRanges.asMap().entrySet())</span>
+            {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                if (preEntry.getKey().contains(desiredRange))</span>
+                {
+<span class="nc" id="L268">                    Set&lt;InetAddress&gt; oldEndpoints = Sets.newHashSet(preEntry.getValue());</span>
+<span class="nc" id="L269">                    Set&lt;InetAddress&gt; newEndpoints = Sets.newHashSet(pendingRangeAddresses.get(desiredRange));</span>
+
+                    // Due to CASSANDRA-5953 we can have a higher RF then we have endpoints.
+                    // So we need to be careful to only be strict when endpoints == RF
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                    if (oldEndpoints.size() == strat.getReplicationFactor())</span>
+                    {
+<span class="nc" id="L275">                        oldEndpoints.removeAll(newEndpoints);</span>
+<span class="nc bnc" id="L276" title="All 4 branches missed.">                        assert oldEndpoints.size() == 1 : &quot;Expected 1 endpoint but found &quot; + oldEndpoints.size();</span>
+                    }
+
+<span class="nc" id="L279">                    rangeSources.put(desiredRange, oldEndpoints.iterator().next());</span>
+                }
+<span class="nc" id="L281">            }</span>
+
+            // Validate
+<span class="nc" id="L284">            Collection&lt;InetAddress&gt; addressList = rangeSources.get(desiredRange);</span>
+<span class="nc bnc" id="L285" title="All 4 branches missed.">            if (addressList == null || addressList.isEmpty())</span>
+<span class="nc" id="L286">                throw new IllegalStateException(&quot;No sources found for &quot; + desiredRange);</span>
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (addressList.size() &gt; 1)</span>
+<span class="nc" id="L289">                throw new IllegalStateException(&quot;Multiple endpoints found for &quot; + desiredRange);</span>
+
+<span class="nc" id="L291">            InetAddress sourceIp = addressList.iterator().next();</span>
+<span class="nc" id="L292">            EndpointState sourceState = Gossiper.instance.getEndpointStateForEndpoint(sourceIp);</span>
+<span class="nc bnc" id="L293" title="All 6 branches missed.">            if (Gossiper.instance.isEnabled() &amp;&amp; (sourceState == null || !sourceState.isAlive()))</span>
+<span class="nc" id="L294">                throw new RuntimeException(&quot;A node required to move the data consistently is down (&quot; + sourceIp + &quot;). &quot; +</span>
+                                           &quot;If you wish to move the data from a potentially inconsistent replica, restart the node with -Dcassandra.consistent.rangemovement=false&quot;);
+<span class="nc" id="L296">        }</span>
+
+<span class="nc" id="L298">        return rangeSources;</span>
+    }
+
+    /**
+     * @param rangesWithSources The ranges we want to fetch (key) and their potential sources (value)
+     * @param sourceFilters A (possibly empty) collection of source filters to apply. In addition to any filters given
+     *                      here, we always exclude ourselves.
+     * @param keyspace keyspace name
+     * @return Map of source endpoint to collection of ranges
+     */
+    private static Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; getRangeFetchMap(Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangesWithSources,
+                                                                        Collection&lt;ISourceFilter&gt; sourceFilters, String keyspace,
+                                                                        boolean useStrictConsistency)
+    {
+<span class="nc" id="L312">        Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; rangeFetchMapMap = HashMultimap.create();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : rangesWithSources.keySet())</span>
+        {
+<span class="nc" id="L315">            boolean foundSource = false;</span>
+
+            outer:
+<span class="nc bnc" id="L318" title="All 2 branches missed.">            for (InetAddress address : rangesWithSources.get(range))</span>
+            {
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                for (ISourceFilter filter : sourceFilters)</span>
+                {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                    if (!filter.shouldInclude(address))</span>
+<span class="nc" id="L323">                        continue outer;</span>
+<span class="nc" id="L324">                }</span>
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                if (address.equals(FBUtilities.getBroadcastAddress()))</span>
+                {
+                    // If localhost is a source, we have found one, but we don't add it to the map to avoid streaming locally
+<span class="nc" id="L329">                    foundSource = true;</span>
+<span class="nc" id="L330">                    continue;</span>
+                }
+
+<span class="nc" id="L333">                rangeFetchMapMap.put(address, range);</span>
+<span class="nc" id="L334">                foundSource = true;</span>
+<span class="nc" id="L335">                break; // ensure we only stream from one other node for each range</span>
+            }
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            if (!foundSource)</span>
+            {
+<span class="nc" id="L340">                AbstractReplicationStrategy strat = Keyspace.open(keyspace).getReplicationStrategy();</span>
+<span class="nc bnc" id="L341" title="All 4 branches missed.">                if (strat != null &amp;&amp; strat.getReplicationFactor() == 1)</span>
+                {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    if (useStrictConsistency)</span>
+<span class="nc" id="L344">                        throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + range + &quot; in keyspace &quot; + keyspace + &quot; with RF=1. &quot; +</span>
+                                                        &quot;Ensure this keyspace contains replicas in the source datacenter.&quot;);
+                    else
+<span class="nc" id="L347">                        logger.warn(&quot;Unable to find sufficient sources for streaming range {} in keyspace {} with RF=1. &quot; +</span>
+                                    &quot;Keyspace might be missing data.&quot;, range, keyspace);
+                }
+                else
+<span class="nc" id="L351">                    throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + range + &quot; in keyspace &quot; + keyspace);</span>
+            }
+<span class="nc" id="L353">        }</span>
+
+<span class="nc" id="L355">        return rangeFetchMapMap;</span>
+    }
+
+    public static Multimap&lt;InetAddress, Range&lt;Token&gt;&gt; getWorkMap(Multimap&lt;Range&lt;Token&gt;, InetAddress&gt; rangesWithSourceTarget, String keyspace,
+                                                                 IFailureDetector fd, boolean useStrictConsistency)
+    {
+<span class="nc" id="L361">        return getRangeFetchMap(rangesWithSourceTarget, Collections.&lt;ISourceFilter&gt;singleton(new FailureDetectorSourceFilter(fd)), keyspace, useStrictConsistency);</span>
+    }
+
+    // For testing purposes
+    @VisibleForTesting
+    Multimap&lt;String, Map.Entry&lt;InetAddress, Collection&lt;Range&lt;Token&gt;&gt;&gt;&gt; toFetch()
+    {
+<span class="nc" id="L368">        return toFetch;</span>
+    }
+
+    public StreamResultFuture fetchAsync()
+    {
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        for (Map.Entry&lt;String, Map.Entry&lt;InetAddress, Collection&lt;Range&lt;Token&gt;&gt;&gt;&gt; entry : toFetch.entries())</span>
+        {
+<span class="nc" id="L375">            String keyspace = entry.getKey();</span>
+<span class="nc" id="L376">            InetAddress source = entry.getValue().getKey();</span>
+<span class="nc" id="L377">            InetAddress preferred = SystemKeyspace.getPreferredIP(source);</span>
+<span class="nc" id="L378">            Collection&lt;Range&lt;Token&gt;&gt; ranges = entry.getValue().getValue();</span>
+
+            // filter out already streamed ranges
+<span class="nc" id="L381">            Set&lt;Range&lt;Token&gt;&gt; availableRanges = stateStore.getAvailableRanges(keyspace, StorageService.instance.getTokenMetadata().partitioner);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (ranges.removeAll(availableRanges))</span>
+            {
+<span class="nc" id="L384">                logger.info(&quot;Some ranges of {} are already available. Skipping streaming those ranges.&quot;, availableRanges);</span>
+            }
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L388">                logger.trace(&quot;{}ing from {} ranges {}&quot;, description, source, StringUtils.join(ranges, &quot;, &quot;));</span>
+            /* Send messages to respective folks to stream data over to me */
+<span class="nc" id="L390">            streamPlan.requestRanges(source, preferred, keyspace, ranges);</span>
+<span class="nc" id="L391">        }</span>
+
+<span class="nc" id="L393">        return streamPlan.execute();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>

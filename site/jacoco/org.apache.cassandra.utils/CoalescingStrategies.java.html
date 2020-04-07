@@ -1,0 +1,573 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoalescingStrategies.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Ant Example</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">CoalescingStrategies.java</span></div><h1>CoalescingStrategies.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.util.FileUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.RandomAccessFile;
+import java.lang.reflect.Constructor;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel.MapMode;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+import java.util.Locale;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+<span class="nc" id="L44">public class CoalescingStrategies</span>
+{
+<span class="fc" id="L46">    static protected final Logger logger = LoggerFactory.getLogger(CoalescingStrategies.class);</span>
+
+    /*
+     * Log debug information at info level about what the average is and when coalescing is enabled/disabled
+     */
+    private static final String DEBUG_COALESCING_PROPERTY = Config.PROPERTY_PREFIX + &quot;coalescing_debug&quot;;
+<span class="fc" id="L52">    private static final boolean DEBUG_COALESCING = Boolean.getBoolean(DEBUG_COALESCING_PROPERTY);</span>
+
+    private static final String DEBUG_COALESCING_PATH_PROPERTY = Config.PROPERTY_PREFIX + &quot;coalescing_debug_path&quot;;
+<span class="fc" id="L55">    private static final String DEBUG_COALESCING_PATH = System.getProperty(DEBUG_COALESCING_PATH_PROPERTY, &quot;/tmp/coleascing_debug&quot;);</span>
+
+    static
+    {
+<span class="pc bpc" id="L59" title="1 of 2 branches missed.">        if (DEBUG_COALESCING)</span>
+        {
+<span class="nc" id="L61">            File directory = new File(DEBUG_COALESCING_PATH);</span>
+
+<span class="nc bnc" id="L63" title="All 2 branches missed.">            if (directory.exists())</span>
+<span class="nc" id="L64">                FileUtils.deleteRecursive(directory);</span>
+
+<span class="nc bnc" id="L66" title="All 2 branches missed.">            if (!directory.mkdirs())</span>
+<span class="nc" id="L67">                throw new ExceptionInInitializerError(&quot;Couldn't create log dir&quot;);</span>
+        }
+    }
+
+    @VisibleForTesting
+    interface Clock
+    {
+        long nanoTime();
+    }
+
+    @VisibleForTesting
+<span class="fc" id="L78">    static Clock CLOCK = new Clock()</span>
+<span class="fc" id="L79">    {</span>
+        public long nanoTime()
+        {
+<span class="nc" id="L82">            return System.nanoTime();</span>
+        }
+    };
+
+    public static interface Coalescable
+    {
+        long timestampNanos();
+    }
+
+    @VisibleForTesting
+    static void parkLoop(long nanos)
+    {
+<span class="nc" id="L94">        long now = System.nanoTime();</span>
+<span class="nc" id="L95">        final long timer = now + nanos;</span>
+        // We shouldn't loop if it's within a few % of the target sleep time if on a second iteration.
+        // See CASSANDRA-8692.
+<span class="nc" id="L98">        final long limit = timer - nanos / 16;</span>
+        do
+        {
+<span class="nc" id="L101">            LockSupport.parkNanos(timer - now);</span>
+<span class="nc" id="L102">            now = System.nanoTime();</span>
+        }
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        while (now &lt; limit);</span>
+<span class="nc" id="L105">    }</span>
+
+    private static boolean maybeSleep(int messages, long averageGap, long maxCoalesceWindow, Parker parker)
+    {
+        // Do not sleep if there are still items in the backlog (CASSANDRA-13090).
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        if (messages &gt;= DatabaseDescriptor.getOtcCoalescingEnoughCoalescedMessages())</span>
+<span class="nc" id="L111">            return false;</span>
+
+        // only sleep if we can expect to double the number of messages we're sending in the time interval
+<span class="nc" id="L114">        long sleep = messages * averageGap;</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">        if (sleep &lt;= 0 || sleep &gt; maxCoalesceWindow)</span>
+<span class="nc" id="L116">            return false;</span>
+
+        // assume we receive as many messages as we expect; apply the same logic to the future batch:
+        // expect twice as many messages to consider sleeping for &quot;another&quot; interval; this basically translates
+        // to doubling our sleep period until we exceed our max sleep window
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        while (sleep * 2 &lt; maxCoalesceWindow)</span>
+<span class="nc" id="L122">            sleep *= 2;</span>
+<span class="nc" id="L123">        parker.park(sleep);</span>
+<span class="nc" id="L124">        return true;</span>
+    }
+
+    public static abstract class CoalescingStrategy
+    {
+        protected final Parker parker;
+        protected final Logger logger;
+<span class="fc" id="L131">        protected volatile boolean shouldLogAverage = false;</span>
+        protected final ByteBuffer logBuffer;
+        private RandomAccessFile ras;
+        private final String displayName;
+
+        protected CoalescingStrategy(Parker parker, Logger logger, String displayName)
+<span class="fc" id="L137">        {</span>
+<span class="fc" id="L138">            this.parker = parker;</span>
+<span class="fc" id="L139">            this.logger = logger;</span>
+<span class="fc" id="L140">            this.displayName = displayName;</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">            if (DEBUG_COALESCING)</span>
+            {
+<span class="nc" id="L143">                NamedThreadFactory.createThread(() -&gt;</span>
+                {
+                    while (true)
+                    {
+                        try
+                        {
+<span class="nc" id="L149">                            Thread.sleep(5000);</span>
+                        }
+<span class="nc" id="L151">                        catch (InterruptedException e)</span>
+                        {
+<span class="nc" id="L153">                            throw new AssertionError();</span>
+<span class="nc" id="L154">                        }</span>
+<span class="nc" id="L155">                        shouldLogAverage = true;</span>
+                    }
+<span class="nc" id="L157">                }, displayName + &quot; debug thread&quot;).start();</span>
+            }
+<span class="fc" id="L159">            RandomAccessFile rasTemp = null;</span>
+<span class="fc" id="L160">            ByteBuffer logBufferTemp = null;</span>
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">            if (DEBUG_COALESCING)</span>
+            {
+                try
+                {
+<span class="nc" id="L165">                    File outFile = File.createTempFile(&quot;coalescing_&quot; + this.displayName + &quot;_&quot;, &quot;.log&quot;, new File(DEBUG_COALESCING_PATH));</span>
+<span class="nc" id="L166">                    rasTemp = new RandomAccessFile(outFile, &quot;rw&quot;);</span>
+<span class="nc" id="L167">                    logBufferTemp = ras.getChannel().map(MapMode.READ_WRITE, 0, Integer.MAX_VALUE);</span>
+<span class="nc" id="L168">                    logBufferTemp.putLong(0);</span>
+                }
+<span class="nc" id="L170">                catch (Exception e)</span>
+                {
+<span class="nc" id="L172">                    logger.error(&quot;Unable to create output file for debugging coalescing&quot;, e);</span>
+<span class="nc" id="L173">                }</span>
+            }
+<span class="fc" id="L175">            ras = rasTemp;</span>
+<span class="fc" id="L176">            logBuffer = logBufferTemp;</span>
+<span class="fc" id="L177">        }</span>
+
+        /*
+         * If debugging is enabled log to the logger the current average gap calculation result.
+         */
+        final protected void debugGap(long averageGap)
+        {
+<span class="nc bnc" id="L184" title="All 4 branches missed.">            if (DEBUG_COALESCING &amp;&amp; shouldLogAverage)</span>
+            {
+<span class="nc" id="L186">                shouldLogAverage = false;</span>
+<span class="nc" id="L187">                logger.info(&quot;{} gap {}μs&quot;, this, TimeUnit.NANOSECONDS.toMicros(averageGap));</span>
+            }
+<span class="nc" id="L189">        }</span>
+
+        /*
+         * If debugging is enabled log the provided nanotime timestamp to a file.
+         */
+        final protected void debugTimestamp(long timestamp)
+        {
+<span class="nc bnc" id="L196" title="All 4 branches missed.">            if(DEBUG_COALESCING &amp;&amp; logBuffer != null)</span>
+            {
+<span class="nc" id="L198">                logBuffer.putLong(0, logBuffer.getLong(0) + 1);</span>
+<span class="nc" id="L199">                logBuffer.putLong(timestamp);</span>
+            }
+<span class="nc" id="L201">        }</span>
+
+        /*
+         * If debugging is enabled log the timestamps of all the items in the provided collection
+         * to a file.
+         */
+        final protected &lt;C extends Coalescable&gt; void debugTimestamps(Collection&lt;C&gt; coalescables)
+        {
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">            if (DEBUG_COALESCING)</span>
+            {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                for (C coalescable : coalescables)</span>
+                {
+<span class="nc" id="L213">                    debugTimestamp(coalescable.timestampNanos());</span>
+<span class="nc" id="L214">                }</span>
+            }
+<span class="fc" id="L216">        }</span>
+
+        /**
+         * Drain from the input blocking queue to the output list up to maxItems elements.
+         *
+         * The coalescing strategy may choose to park the current thread if it thinks it will
+         * be able to produce an output list with more elements.
+         *
+         * @param input Blocking queue to retrieve elements from
+         * @param out Output list to place retrieved elements in. Must be empty.
+         * @param maxItems Maximum number of elements to place in the output list
+         */
+        public &lt;C extends Coalescable&gt; void coalesce(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out, int maxItems) throws InterruptedException
+        {
+<span class="fc" id="L230">            Preconditions.checkArgument(out.isEmpty(), &quot;out list should be empty&quot;);</span>
+<span class="fc" id="L231">            coalesceInternal(input, out, maxItems);</span>
+<span class="fc" id="L232">        }</span>
+
+        protected abstract &lt;C extends Coalescable&gt; void coalesceInternal(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out, int maxItems) throws InterruptedException;
+
+    }
+
+    @VisibleForTesting
+    interface Parker
+    {
+        void park(long nanos);
+    }
+
+<span class="fc" id="L244">    private static final Parker PARKER = new Parker()</span>
+<span class="fc" id="L245">    {</span>
+        @Override
+        public void park(long nanos)
+        {
+<span class="nc" id="L249">            parkLoop(nanos);</span>
+<span class="nc" id="L250">        }</span>
+    };
+
+    @VisibleForTesting
+    static class TimeHorizonMovingAverageCoalescingStrategy extends CoalescingStrategy
+    {
+        // for now we'll just use 64ms per bucket; this can be made configurable, but results in ~1s for 16 samples
+        private static final int INDEX_SHIFT = 26;
+        private static final long BUCKET_INTERVAL = 1L &lt;&lt; 26;
+        private static final int BUCKET_COUNT = 16;
+        private static final long INTERVAL = BUCKET_INTERVAL * BUCKET_COUNT;
+        private static final long MEASURED_INTERVAL = BUCKET_INTERVAL * (BUCKET_COUNT - 1);
+
+        // the minimum timestamp we will now accept updates for; only moves forwards, never backwards
+<span class="nc" id="L264">        private long epoch = CLOCK.nanoTime();</span>
+        // the buckets, each following on from epoch; the measurements run from ix(epoch) to ix(epoch - 1)
+        // ix(epoch-1) is a partial result, that is never actually part of the calculation, and most updates
+        // are expected to hit this bucket
+<span class="nc" id="L268">        private final int samples[] = new int[BUCKET_COUNT];</span>
+<span class="nc" id="L269">        private long sum = 0;</span>
+        private final long maxCoalesceWindow;
+
+        public TimeHorizonMovingAverageCoalescingStrategy(int maxCoalesceWindow, Parker parker, Logger logger, String displayName)
+        {
+<span class="nc" id="L274">            super(parker, logger, displayName);</span>
+<span class="nc" id="L275">            this.maxCoalesceWindow = TimeUnit.MICROSECONDS.toNanos(maxCoalesceWindow);</span>
+<span class="nc" id="L276">            sum = 0;</span>
+<span class="nc" id="L277">        }</span>
+
+        private void logSample(long nanos)
+        {
+<span class="nc" id="L281">            debugTimestamp(nanos);</span>
+<span class="nc" id="L282">            long epoch = this.epoch;</span>
+<span class="nc" id="L283">            long delta = nanos - epoch;</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (delta &lt; 0)</span>
+                // have to simply ignore, but would be a bit crazy to get such reordering
+<span class="nc" id="L286">                return;</span>
+
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (delta &gt; INTERVAL)</span>
+<span class="nc" id="L289">                epoch = rollepoch(delta, epoch, nanos);</span>
+
+<span class="nc" id="L291">            int ix = ix(nanos);</span>
+<span class="nc" id="L292">            samples[ix]++;</span>
+
+            // if we've updated an old bucket, we need to update the sum to match
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (ix != ix(epoch - 1))</span>
+<span class="nc" id="L296">                sum++;</span>
+<span class="nc" id="L297">        }</span>
+
+        private long averageGap()
+        {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (sum == 0)</span>
+<span class="nc" id="L302">                return Integer.MAX_VALUE;</span>
+<span class="nc" id="L303">            return MEASURED_INTERVAL / sum;</span>
+        }
+
+        // this sample extends past the end of the range we cover, so rollover
+        private long rollepoch(long delta, long epoch, long nanos)
+        {
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (delta &gt; 2 * INTERVAL)</span>
+            {
+                // this sample is more than twice our interval ahead, so just clear our counters completely
+<span class="nc" id="L312">                epoch = epoch(nanos);</span>
+<span class="nc" id="L313">                sum = 0;</span>
+<span class="nc" id="L314">                Arrays.fill(samples, 0);</span>
+            }
+            else
+            {
+                // ix(epoch - 1) =&gt; last index; this is our partial result bucket, so we add this to the sum
+<span class="nc" id="L319">                sum += samples[ix(epoch - 1)];</span>
+                // then we roll forwards, clearing buckets, until our interval covers the new sample time
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                while (epoch + INTERVAL &lt; nanos)</span>
+                {
+<span class="nc" id="L323">                    int index = ix(epoch);</span>
+<span class="nc" id="L324">                    sum -= samples[index];</span>
+<span class="nc" id="L325">                    samples[index] = 0;</span>
+<span class="nc" id="L326">                    epoch += BUCKET_INTERVAL;</span>
+<span class="nc" id="L327">                }</span>
+            }
+            // store the new epoch
+<span class="nc" id="L330">            this.epoch = epoch;</span>
+<span class="nc" id="L331">            return epoch;</span>
+        }
+
+        private long epoch(long latestNanos)
+        {
+<span class="nc" id="L336">            return (latestNanos - MEASURED_INTERVAL) &amp; ~(BUCKET_INTERVAL - 1);</span>
+        }
+
+        private int ix(long nanos)
+        {
+<span class="nc" id="L341">            return (int) ((nanos &gt;&gt;&gt; INDEX_SHIFT) &amp; 15);</span>
+        }
+
+        @Override
+        protected &lt;C extends Coalescable&gt; void coalesceInternal(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out,  int maxItems) throws InterruptedException
+        {
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (input.drainTo(out, maxItems) == 0)</span>
+            {
+<span class="nc" id="L349">                out.add(input.take());</span>
+<span class="nc" id="L350">                input.drainTo(out, maxItems - out.size());</span>
+            }
+
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            for (Coalescable qm : out)</span>
+<span class="nc" id="L354">                logSample(qm.timestampNanos());</span>
+
+<span class="nc" id="L356">            long averageGap = averageGap();</span>
+<span class="nc" id="L357">            debugGap(averageGap);</span>
+
+<span class="nc" id="L359">            int count = out.size();</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            if (maybeSleep(count, averageGap, maxCoalesceWindow, parker))</span>
+            {
+<span class="nc" id="L362">                input.drainTo(out, maxItems - out.size());</span>
+<span class="nc" id="L363">                int prevCount = count;</span>
+<span class="nc" id="L364">                count = out.size();</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                for (int  i = prevCount; i &lt; count; i++)</span>
+<span class="nc" id="L366">                    logSample(out.get(i).timestampNanos());</span>
+            }
+<span class="nc" id="L368">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L373">            return &quot;Time horizon moving average&quot;;</span>
+        }
+    }
+
+    /*
+     * Start coalescing by sleeping if the moving average is &lt; the requested window.
+     * The actual time spent waiting to coalesce will be the min( window, moving average * 2)
+     * The actual amount of time spent waiting can be greater then the window. For instance
+     * observed time spent coalescing was 400 microseconds with the window set to 200 in one benchmark.
+     */
+    @VisibleForTesting
+    static class MovingAverageCoalescingStrategy extends CoalescingStrategy
+    {
+<span class="nc" id="L386">        private final int samples[] = new int[16];</span>
+<span class="nc" id="L387">        private long lastSample = 0;</span>
+<span class="nc" id="L388">        private int index = 0;</span>
+<span class="nc" id="L389">        private long sum = 0;</span>
+
+        private final long maxCoalesceWindow;
+
+        public MovingAverageCoalescingStrategy(int maxCoalesceWindow, Parker parker, Logger logger, String displayName)
+        {
+<span class="nc" id="L395">            super(parker, logger, displayName);</span>
+<span class="nc" id="L396">            this.maxCoalesceWindow = TimeUnit.MICROSECONDS.toNanos(maxCoalesceWindow);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            for (int ii = 0; ii &lt; samples.length; ii++)</span>
+<span class="nc" id="L398">                samples[ii] = Integer.MAX_VALUE;</span>
+<span class="nc" id="L399">            sum = Integer.MAX_VALUE * (long)samples.length;</span>
+<span class="nc" id="L400">        }</span>
+
+        private long logSample(int value)
+        {
+<span class="nc" id="L404">            sum -= samples[index];</span>
+<span class="nc" id="L405">            sum += value;</span>
+<span class="nc" id="L406">            samples[index] = value;</span>
+<span class="nc" id="L407">            index++;</span>
+<span class="nc" id="L408">            index = index &amp; ((1 &lt;&lt; 4) - 1);</span>
+<span class="nc" id="L409">            return sum / 16;</span>
+        }
+
+        private long notifyOfSample(long sample)
+        {
+<span class="nc" id="L414">            debugTimestamp(sample);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (sample &gt; lastSample)</span>
+            {
+<span class="nc" id="L417">                final int delta = (int)(Math.min(Integer.MAX_VALUE, sample - lastSample));</span>
+<span class="nc" id="L418">                lastSample = sample;</span>
+<span class="nc" id="L419">                return logSample(delta);</span>
+            }
+            else
+            {
+<span class="nc" id="L423">                return logSample(1);</span>
+            }
+        }
+
+        @Override
+        protected &lt;C extends Coalescable&gt; void coalesceInternal(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out,  int maxItems) throws InterruptedException
+        {
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            if (input.drainTo(out, maxItems) == 0)</span>
+            {
+<span class="nc" id="L432">                out.add(input.take());</span>
+<span class="nc" id="L433">                input.drainTo(out, maxItems - out.size());</span>
+            }
+
+<span class="nc" id="L436">            long average = notifyOfSample(out.get(0).timestampNanos());</span>
+<span class="nc" id="L437">            debugGap(average);</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            if (maybeSleep(out.size(), average, maxCoalesceWindow, parker)) {</span>
+<span class="nc" id="L440">                input.drainTo(out, maxItems - out.size());</span>
+            }
+
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            for (int ii = 1; ii &lt; out.size(); ii++)</span>
+<span class="nc" id="L444">                notifyOfSample(out.get(ii).timestampNanos());</span>
+<span class="nc" id="L445">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L450">            return &quot;Moving average&quot;;</span>
+        }
+    }
+
+    /*
+     * A fixed strategy as a backup in case MovingAverage or TimeHorizongMovingAverage fails in some scenario
+     */
+    @VisibleForTesting
+    static class FixedCoalescingStrategy extends CoalescingStrategy
+    {
+        private final long coalesceWindow;
+
+        public FixedCoalescingStrategy(int coalesceWindowMicros, Parker parker, Logger logger, String displayName)
+        {
+<span class="nc" id="L464">            super(parker, logger, displayName);</span>
+<span class="nc" id="L465">            coalesceWindow = TimeUnit.MICROSECONDS.toNanos(coalesceWindowMicros);</span>
+<span class="nc" id="L466">        }</span>
+
+        @Override
+        protected &lt;C extends Coalescable&gt; void coalesceInternal(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out,  int maxItems) throws InterruptedException
+        {
+<span class="nc" id="L471">            int enough = DatabaseDescriptor.getOtcCoalescingEnoughCoalescedMessages();</span>
+
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (input.drainTo(out, maxItems) == 0)</span>
+            {
+<span class="nc" id="L475">                out.add(input.take());</span>
+<span class="nc" id="L476">                input.drainTo(out, maxItems - out.size());</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                if (out.size() &lt; enough) {</span>
+<span class="nc" id="L478">                    parker.park(coalesceWindow);</span>
+<span class="nc" id="L479">                    input.drainTo(out, maxItems - out.size());</span>
+                }
+            }
+<span class="nc" id="L482">            debugTimestamps(out);</span>
+<span class="nc" id="L483">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L488">            return &quot;Fixed&quot;;</span>
+        }
+    }
+
+    /*
+     * A coalesscing strategy that just returns all currently available elements
+     */
+    @VisibleForTesting
+    static class DisabledCoalescingStrategy extends CoalescingStrategy
+    {
+
+        public DisabledCoalescingStrategy(int coalesceWindowMicros, Parker parker, Logger logger, String displayName)
+        {
+<span class="fc" id="L501">            super(parker, logger, displayName);</span>
+<span class="fc" id="L502">        }</span>
+
+        @Override
+        protected &lt;C extends Coalescable&gt; void coalesceInternal(BlockingQueue&lt;C&gt; input, List&lt;C&gt; out,  int maxItems) throws InterruptedException
+        {
+<span class="fc bfc" id="L507" title="All 2 branches covered.">            if (input.drainTo(out, maxItems) == 0)</span>
+            {
+<span class="fc" id="L509">                out.add(input.take());</span>
+<span class="fc" id="L510">                input.drainTo(out, maxItems - 1);</span>
+            }
+<span class="fc" id="L512">            debugTimestamps(out);</span>
+<span class="fc" id="L513">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L518">            return &quot;Disabled&quot;;</span>
+        }
+    }
+
+    @VisibleForTesting
+    static CoalescingStrategy newCoalescingStrategy(String strategy,
+                                                    int coalesceWindow,
+                                                    Parker parker,
+                                                    Logger logger,
+                                                    String displayName)
+    {
+<span class="fc" id="L529">        String classname = null;</span>
+<span class="fc" id="L530">        String strategyCleaned = strategy.trim().toUpperCase(Locale.ENGLISH);</span>
+<span class="pc bpc" id="L531" title="4 of 5 branches missed.">        switch(strategyCleaned)</span>
+        {
+        case &quot;MOVINGAVERAGE&quot;:
+<span class="nc" id="L534">            classname = MovingAverageCoalescingStrategy.class.getName();</span>
+<span class="nc" id="L535">            break;</span>
+        case &quot;FIXED&quot;:
+<span class="nc" id="L537">            classname = FixedCoalescingStrategy.class.getName();</span>
+<span class="nc" id="L538">            break;</span>
+        case &quot;TIMEHORIZON&quot;:
+<span class="nc" id="L540">            classname = TimeHorizonMovingAverageCoalescingStrategy.class.getName();</span>
+<span class="nc" id="L541">            break;</span>
+        case &quot;DISABLED&quot;:
+<span class="fc" id="L543">            classname = DisabledCoalescingStrategy.class.getName();</span>
+<span class="fc" id="L544">            break;</span>
+        default:
+<span class="nc" id="L546">            classname = strategy;</span>
+        }
+
+        try
+        {
+<span class="fc" id="L551">            Class&lt;?&gt; clazz = Class.forName(classname);</span>
+
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">            if (!CoalescingStrategy.class.isAssignableFrom(clazz))</span>
+            {
+<span class="nc" id="L555">                throw new RuntimeException(classname + &quot; is not an instance of CoalescingStrategy&quot;);</span>
+            }
+
+<span class="fc" id="L558">            Constructor&lt;?&gt; constructor = clazz.getConstructor(int.class, Parker.class, Logger.class, String.class);</span>
+
+<span class="fc" id="L560">            return (CoalescingStrategy)constructor.newInstance(coalesceWindow, parker, logger, displayName);</span>
+        }
+<span class="nc" id="L562">        catch (Exception e)</span>
+        {
+<span class="nc" id="L564">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    public static CoalescingStrategy newCoalescingStrategy(String strategy, int coalesceWindow, Logger logger, String displayName)
+    {
+<span class="fc" id="L570">        return newCoalescingStrategy(strategy, coalesceWindow, PARKER, logger, displayName);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.5.201910111838</span></div></body></html>
